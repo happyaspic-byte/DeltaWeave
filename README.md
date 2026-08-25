@@ -1,6 +1,7 @@
 # DeltaWeave
 
 [![CI](https://github.com/happyaspic-byte/DeltaWeave/actions/workflows/ci.yml/badge.svg)](https://github.com/happyaspic-byte/DeltaWeave/actions/workflows/ci.yml)
+[![Security](https://github.com/happyaspic-byte/DeltaWeave/actions/workflows/security.yml/badge.svg)](https://github.com/happyaspic-byte/DeltaWeave/actions/workflows/security.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 DeltaWeave is a Rust foundation for authenticated, content-defined P2P file
@@ -44,7 +45,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and
 
 ## Download a test release
 
-The pre-alpha [v0.1.0 release](https://github.com/happyaspic-byte/DeltaWeave/releases/tag/v0.1.0)
+The pre-alpha [v0.1.1 release](https://github.com/happyaspic-byte/DeltaWeave/releases/tag/v0.1.1)
 provides ready-to-run packages for:
 
 - Windows x86-64

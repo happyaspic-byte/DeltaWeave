@@ -19,7 +19,7 @@ use deltaweave_cdc::{manifest_from_path, verify_chunk};
 use deltaweave_core::{ChunkingProfile, FileManifest, Hash32, WirePath};
 use deltaweave_store::Store;
 use iroh::{
-    Endpoint, EndpointAddr, EndpointId, RelayUrl, SecretKey, TransportAddr,
+    Endpoint, EndpointAddr, EndpointId, RelayUrl, SecretKey, TransportAddr, Watcher,
     endpoint::{Connection, RecvStream, SendStream, presets},
     protocol::{AcceptError, ProtocolHandler, Router},
 };
@@ -167,7 +167,7 @@ impl Server {
     /// Returns the endpoint's current authenticated address information.
     #[must_use]
     pub fn endpoint_addr(&self) -> EndpointAddr {
-        self.router.endpoint().addr()
+        endpoint_addr_with_local_fallback(self.router.endpoint())
     }
 
     /// Returns data suitable for displaying or copying to a client.
@@ -184,7 +184,9 @@ impl Server {
     /// Waits for the internet-mode endpoint to establish discovery/relay reachability.
     pub async fn wait_online(&self, timeout: Duration) -> bool {
         if self.network_mode == NetworkMode::DirectOnly {
-            return true;
+            return wait_for_direct_address(self.router.endpoint(), timeout)
+                .await
+                .is_ok();
         }
         tokio::time::timeout(timeout, self.router.endpoint().online())
             .await
@@ -210,23 +212,89 @@ pub struct AddressInfo {
 
 /// Starts a receiving DeltaWeave endpoint.
 pub async fn start_server(config: ServerConfig) -> Result<Server> {
-    let store = Arc::new(Store::open(&config.state_root)?);
-    let endpoint = bind_endpoint(
-        config.secret_key,
-        config.network_mode,
-        Some(ALPN_V1.to_vec()),
-    )
-    .await?;
+    let ServerConfig {
+        secret_key,
+        destination_root,
+        state_root,
+        peer_policy,
+        network_mode,
+    } = config;
+    let (destination_root, state_root) = prepare_server_roots(&destination_root, &state_root)?;
+    let store = Arc::new(Store::open(&state_root)?);
+    let endpoint = bind_endpoint(secret_key, network_mode, Some(ALPN_V1.to_vec())).await?;
     let handler = PushHandler {
         store,
-        destination_root: config.destination_root,
-        peer_policy: config.peer_policy,
+        destination_root,
+        peer_policy,
     };
     let router = Router::builder(endpoint).accept(ALPN_V1, handler).spawn();
     Ok(Server {
         router,
-        network_mode: config.network_mode,
+        network_mode,
     })
+}
+
+async fn wait_for_direct_address(endpoint: &Endpoint, limit: Duration) -> Result<()> {
+    let mut addresses = endpoint.watch_addr();
+    let wait = async {
+        loop {
+            let current = addresses.get();
+            if current.ip_addrs().next().is_some() {
+                return Ok::<(), anyhow::Error>(());
+            }
+            addresses
+                .updated()
+                .await
+                .context("endpoint address watcher disconnected")?;
+        }
+    };
+    tokio::time::timeout(limit, wait)
+        .await
+        .context("direct endpoint advertised no address before the readiness deadline")??;
+    Ok(())
+}
+
+fn endpoint_addr_with_local_fallback(endpoint: &Endpoint) -> EndpointAddr {
+    let current = endpoint.addr();
+    if current.ip_addrs().next().is_some() {
+        return current;
+    }
+
+    let relays = current.relay_urls().cloned().map(TransportAddr::Relay);
+    let sockets = endpoint.bound_sockets().into_iter().map(|socket| {
+        let socket = if socket.ip().is_unspecified() {
+            let ip = if socket.is_ipv4() {
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+            } else {
+                std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+            };
+            SocketAddr::new(ip, socket.port())
+        } else {
+            socket
+        };
+        TransportAddr::Ip(socket)
+    });
+    EndpointAddr::from_parts(current.id, relays.chain(sockets))
+}
+
+fn prepare_server_roots(destination_root: &Path, state_root: &Path) -> Result<(PathBuf, PathBuf)> {
+    fs::create_dir_all(destination_root).with_context(|| {
+        format!(
+            "failed to create destination root {}",
+            destination_root.display()
+        )
+    })?;
+    fs::create_dir_all(state_root)
+        .with_context(|| format!("failed to create state root {}", state_root.display()))?;
+    let destination_root = fs::canonicalize(destination_root)?;
+    let state_root = fs::canonicalize(state_root)?;
+    ensure!(
+        !destination_root.starts_with(&state_root) && !state_root.starts_with(&destination_root),
+        "destination root {} and state root {} must not overlap",
+        destination_root.display(),
+        state_root.display()
+    );
+    Ok((destination_root, state_root))
 }
 
 async fn bind_endpoint(
@@ -326,6 +394,7 @@ async fn push_connected(
     remote: EndpointAddr,
     manifest: FileManifest,
 ) -> Result<TransferReceipt> {
+    let expected_path = remote_path.clone();
     let connection = endpoint
         .connect(remote, ALPN_V1)
         .await
@@ -353,8 +422,19 @@ async fn push_connected(
         .iter()
         .map(|chunk| (chunk.hash, chunk.clone()))
         .collect();
+    let missing_set: HashSet<_> = missing.iter().copied().collect();
+    ensure!(
+        missing_set.len() == missing.len(),
+        "receiver requested duplicate chunks"
+    );
+    let expected_reused_extents = manifest
+        .chunks
+        .iter()
+        .filter(|chunk| !missing_set.contains(&chunk.hash))
+        .count();
     let mut source = tokio::fs::File::open(source_path).await?;
     let mut sent = HashSet::new();
+    let mut sent_bytes = 0_u64;
     for hash in missing {
         ensure!(
             sent.insert(hash),
@@ -378,6 +458,9 @@ async fn push_connected(
         )
         .await?;
         send.write_all(&bytes).await?;
+        sent_bytes = sent_bytes
+            .checked_add(u64::from(descriptor.length))
+            .context("sent-byte counter overflow")?;
     }
     send.finish().context("finish transfer upload")?;
 
@@ -390,6 +473,18 @@ async fn push_connected(
             ensure!(
                 receipt.manifest_hash == manifest.manifest_hash(),
                 "receipt manifest hash mismatch"
+            );
+            ensure!(
+                receipt.path == expected_path,
+                "receipt destination path mismatch"
+            );
+            ensure!(
+                receipt.transferred_bytes == sent_bytes,
+                "receipt transferred-byte count mismatch"
+            );
+            ensure!(
+                receipt.reused_extents == expected_reused_extents,
+                "receipt reused-extent count mismatch"
             );
             connection.close(0_u8.into(), b"complete");
             Ok(receipt)
@@ -420,21 +515,13 @@ impl fmt::Debug for PushHandler {
 impl ProtocolHandler for PushHandler {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
         let peer = connection.remote_id();
-        let (mut send, mut receive) = connection.accept_bi().await?;
         if !self.peer_policy.allows(peer) {
             warn!(%peer, "rejected unauthorized DeltaWeave peer");
-            let _ = write_frame(
-                &mut send,
-                &WireResponse::Rejected {
-                    message: "endpoint ID is not allow-listed".to_owned(),
-                },
-            )
-            .await;
-            let _ = send.finish();
-            connection.closed().await;
+            connection.close(0_u8.into(), b"endpoint ID is not allow-listed");
             return Ok(());
         }
 
+        let (mut send, mut receive) = connection.accept_bi().await?;
         info!(%peer, "accepted DeltaWeave peer");
         if let Err(error) = self.handle_push(&mut send, &mut receive).await {
             warn!(%peer, error = %error, "DeltaWeave transfer failed");
@@ -468,7 +555,13 @@ impl PushHandler {
             "manifest exceeds chunk-count limit"
         );
 
-        let missing = self.store.missing_chunks(&manifest);
+        let inventory_store = Arc::clone(&self.store);
+        let inventory_manifest = manifest.clone();
+        let missing = tokio::task::spawn_blocking(move || {
+            inventory_store.missing_chunks(&inventory_manifest)
+        })
+        .await
+        .context("chunk inventory task failed")?;
         let missing_set: HashSet<_> = missing.iter().copied().collect();
         let reused_extents = manifest
             .chunks
@@ -664,8 +757,8 @@ mod tests {
         modified.splice(700_000..700_000, b"delta insertion".iter().copied());
         fs::write(&source, &modified).expect("modified source can be written");
         let second = push_file(PushOptions {
-            secret_key: client_key,
-            source,
+            secret_key: client_key.clone(),
+            source: source.clone(),
             remote_path: remote_path.clone(),
             remote: server.endpoint_addr(),
             profile: ChunkingProfile::DEFAULT,
@@ -680,7 +773,55 @@ mod tests {
         );
         assert!(second.reused_extents > 0);
         assert!(second.transferred_bytes < modified.len() as u64);
+
+        let unchanged = push_file(PushOptions {
+            secret_key: client_key.clone(),
+            source: source.clone(),
+            remote_path: remote_path.clone(),
+            remote: server.endpoint_addr(),
+            profile: ChunkingProfile::DEFAULT,
+            network_mode: NetworkMode::DirectOnly,
+        })
+        .await
+        .expect("unchanged retry succeeds");
+        assert_eq!(unchanged.transferred_bytes, 0);
+        assert!(unchanged.reused_extents > 0);
+
+        fs::write(&source, b"").expect("empty source can be written");
+        let empty_path = WirePath::new("sync/empty.bin").expect("path is portable");
+        let empty = push_file(PushOptions {
+            secret_key: client_key,
+            source,
+            remote_path: empty_path.clone(),
+            remote: server.endpoint_addr(),
+            profile: ChunkingProfile::DEFAULT,
+            network_mode: NetworkMode::DirectOnly,
+        })
+        .await
+        .expect("empty transfer succeeds");
+        assert_eq!(empty.transferred_bytes, 0);
+        assert_eq!(empty.reused_extents, 0);
+        assert_eq!(
+            fs::read(destination.path().join(empty_path.as_str()))
+                .expect("empty destination can be read"),
+            Vec::<u8>::new()
+        );
         server.shutdown().await.expect("server shuts down");
+    }
+
+    #[tokio::test]
+    async fn server_rejects_overlapping_destination_and_state_roots() {
+        let root = TempDir::new().expect("root can be created");
+        let result = start_server(ServerConfig {
+            secret_key: SecretKey::generate(),
+            destination_root: root.path().to_path_buf(),
+            state_root: root.path().join("state"),
+            peer_policy: PeerPolicy::AllowListed(HashSet::new()),
+            network_mode: NetworkMode::DirectOnly,
+        })
+        .await;
+
+        assert!(result.is_err());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

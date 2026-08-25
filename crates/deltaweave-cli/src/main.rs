@@ -172,6 +172,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
         bail!("serve requires at least one --allow-peer, or explicit --allow-any-authenticated");
     }
     let identity = load_or_create_identity(&args.identity)?;
+    ensure_identity_outside_destination(&args.identity, &args.root)?;
     let peer_policy = if args.allow_any_authenticated {
         PeerPolicy::AnyAuthenticated
     } else {
@@ -206,10 +207,52 @@ async fn serve(args: ServeArgs) -> Result<()> {
         "direct_addresses": address.direct_addresses,
         "relay_urls": address.relay_urls,
     }))?;
+    wait_for_shutdown_signal().await?;
+    server.shutdown().await
+}
+
+fn ensure_identity_outside_destination(identity: &Path, destination_root: &Path) -> Result<()> {
+    fs::create_dir_all(destination_root).with_context(|| {
+        format!(
+            "failed to create destination root {}",
+            destination_root.display()
+        )
+    })?;
+    let identity = fs::canonicalize(identity)
+        .with_context(|| format!("failed to resolve identity file {}", identity.display()))?;
+    let destination_root = fs::canonicalize(destination_root).with_context(|| {
+        format!(
+            "failed to resolve destination root {}",
+            destination_root.display()
+        )
+    })?;
+    ensure!(
+        !identity.starts_with(&destination_root),
+        "identity file {} must be outside destination root {}",
+        identity.display(),
+        destination_root.display()
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() -> Result<()> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("failed to register SIGTERM handler")?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => {
+            result.context("failed to wait for Ctrl-C")?;
+        }
+        _ = terminate.recv() => {}
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() -> Result<()> {
     tokio::signal::ctrl_c()
         .await
-        .context("failed to wait for Ctrl-C")?;
-    server.shutdown().await
+        .context("failed to wait for Ctrl-C")
 }
 
 async fn push(args: PushArgs) -> Result<()> {
@@ -351,6 +394,7 @@ fn init_tracing() {
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
+        .with_ansi(false)
         .init();
 }
 
@@ -420,5 +464,16 @@ mod tests {
         let cli =
             Cli::try_parse_from(["deltaweave", "self-test"]).expect("self-test command parses");
         assert!(matches!(cli.command, Command::SelfTest));
+    }
+
+    #[test]
+    fn identity_inside_destination_is_rejected() {
+        let temp = tempfile::tempdir().expect("temporary directory can be created");
+        let root = temp.path().join("received");
+        fs::create_dir_all(&root).expect("destination can be created");
+        let identity = root.join("receiver.key");
+        load_or_create_identity(&identity).expect("identity can be created");
+
+        assert!(ensure_identity_outside_destination(&identity, &root).is_err());
     }
 }

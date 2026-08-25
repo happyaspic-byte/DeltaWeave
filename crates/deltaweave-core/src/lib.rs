@@ -225,6 +225,7 @@ impl FileManifest {
         }
 
         let mut expected_offset = 0_u64;
+        let mut lengths_by_hash = BTreeMap::new();
         for (index, chunk) in self.chunks.iter().enumerate() {
             if chunk.offset != expected_offset {
                 return Err(ManifestError::NonContiguous {
@@ -241,6 +242,15 @@ impl FileManifest {
                     index,
                     length: chunk.length,
                     maximum: self.profile.max_size,
+                });
+            }
+            if let Some(previous_length) = lengths_by_hash.insert(chunk.hash, chunk.length)
+                && previous_length != chunk.length
+            {
+                return Err(ManifestError::InconsistentDuplicateChunk {
+                    hash: chunk.hash,
+                    first_length: previous_length,
+                    later_length: chunk.length,
                 });
             }
             expected_offset = expected_offset
@@ -316,6 +326,16 @@ pub enum ManifestError {
         length: u32,
         /// Configured maximum.
         maximum: u32,
+    },
+    /// Equal content hashes must always describe equal-length bytes.
+    #[error("duplicate chunk {hash} has inconsistent lengths {first_length} and {later_length}")]
+    InconsistentDuplicateChunk {
+        /// Repeated chunk digest.
+        hash: Hash32,
+        /// Length from the first descriptor.
+        first_length: u32,
+        /// Conflicting length from a later descriptor.
+        later_length: u32,
     },
     /// Chunk offsets overflowed `u64`.
     #[error("manifest size overflow")]
@@ -572,6 +592,34 @@ mod tests {
         assert!(matches!(
             manifest.validate(),
             Err(ManifestError::NonContiguous { .. })
+        ));
+    }
+
+    #[test]
+    fn manifest_rejects_inconsistent_duplicate_chunk_lengths() {
+        let repeated_hash = Hash32::digest(b"same-content-address");
+        let manifest = FileManifest {
+            schema_version: MANIFEST_SCHEMA_V1,
+            size: 9,
+            file_hash: Hash32::digest(b"123456789"),
+            profile: ChunkingProfile::DEFAULT,
+            chunks: vec![
+                ChunkDescriptor {
+                    offset: 0,
+                    length: 4,
+                    hash: repeated_hash,
+                },
+                ChunkDescriptor {
+                    offset: 4,
+                    length: 5,
+                    hash: repeated_hash,
+                },
+            ],
+        };
+
+        assert!(matches!(
+            manifest.validate(),
+            Err(ManifestError::InconsistentDuplicateChunk { .. })
         ));
     }
 

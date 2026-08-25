@@ -102,12 +102,15 @@ jobs:
         include:
           - arch: x86_64
             target: x86_64-unknown-linux-musl
+            platform: linux/amd64
           - arch: aarch64
             target: aarch64-unknown-linux-musl
+            platform: linux/arm64
     steps:
       - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ needs.prepare.outputs.sha }}
+      - uses: docker/setup-qemu-action@v4
       - uses: dtolnay/rust-toolchain@1.91.0
         with:
           targets: ${{ matrix.target }}
@@ -127,11 +130,15 @@ jobs:
             echo "Synology artifact unexpectedly requires a dynamic interpreter" >&2
             exit 1
           fi
-      - name: Run x86-64 packaged-binary self-test
-        if: matrix.arch == 'x86_64'
+      - name: Run packaged-binary self-test
         env:
+          PLATFORM: ${{ matrix.platform }}
           TARGET: ${{ matrix.target }}
-        run: target/$TARGET/release/deltaweave self-test
+        run: >-
+          docker run --rm --platform "$PLATFORM"
+          --mount "type=bind,source=$PWD/target/$TARGET/release/deltaweave,target=/deltaweave,readonly"
+          --entrypoint /deltaweave
+          debian:bookworm-slim self-test
       - name: Package
         env:
           ARCH: ${{ matrix.arch }}
