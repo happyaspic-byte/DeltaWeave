@@ -96,7 +96,9 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: |
+            type=gha,scope=container-amd64
+            type=gha,scope=container-arm64
+          cache-to: type=gha,mode=max,scope=container-publish
           provenance: mode=max
           sbom: true
