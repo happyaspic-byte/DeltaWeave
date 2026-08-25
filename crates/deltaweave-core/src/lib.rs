@@ -534,7 +534,12 @@ mod tests {
     #[test]
     fn hash_text_round_trip() {
         let hash = Hash32::digest(b"deltaweave");
-        assert_eq!(hash.to_string().parse::<Hash32>(), Ok(hash));
+        assert_eq!(
+            hash.to_string()
+                .parse::<Hash32>()
+                .expect("valid hash text parses"),
+            hash
+        );
         assert!("abc".parse::<Hash32>().is_err());
     }
 
