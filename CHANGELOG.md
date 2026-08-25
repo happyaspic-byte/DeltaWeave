@@ -17,6 +17,7 @@ Versioning after its first stable release.
 ### Changed
 
 - Move chunk-inventory disk verification off Tokio worker threads.
+- Upgrade iroh from 1.0.3 to 1.1.0 while retaining Rust 1.91 compatibility.
 - Eliminate a direct-mode startup race with a safe loopback fallback for local self-tests.
 - Handle SIGTERM for graceful Portainer/Docker shutdown.
 - Disable ANSI log escapes so Windows consoles render clean output.

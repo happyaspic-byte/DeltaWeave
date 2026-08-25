@@ -21,6 +21,7 @@ the only copy of important data.
 - Protected separation of receiver data, private state, and identity paths
 - Strict duplicate-chunk and transfer-receipt validation
 - Graceful Docker/Portainer SIGTERM handling
+- iroh 1.1.0 transport update with Rust 1.91 compatibility retained
 - Reliable direct-mode startup without intermittent missing-address failures
 - RustSec dependency auditing and runtime checks for both Synology architectures
 

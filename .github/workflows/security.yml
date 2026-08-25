@@ -10,8 +10,6 @@ on:
 
 permissions:
   contents: read
-  checks: write
-  issues: write
 
 concurrency:
   group: security-${{ github.workflow }}-${{ github.ref }}
@@ -24,7 +22,14 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@1.91.0
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.22.2 --locked
       - name: Audit Cargo.lock
-        uses: rustsec/audit-check@v2.0.0
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+        # These are unmaintained transitive-only crates still pulled by the
+        # latest iroh/postcard graph (tracked in #7). Keep every other RustSec
+        # warning fatal.
+        run: >-
+          cargo audit --deny warnings
+          --ignore RUSTSEC-2023-0089
+          --ignore RUSTSEC-2024-0436
