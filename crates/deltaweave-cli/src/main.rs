@@ -310,7 +310,10 @@ async fn exercise_self_test(
     })
     .await
     .context("self-test delta transfer failed")?;
-    ensure!(second.reused_extents > 0, "delta transfer reused no extents");
+    ensure!(
+        second.reused_extents > 0,
+        "delta transfer reused no extents"
+    );
     ensure!(
         second.transferred_bytes < modified.len() as u64,
         "delta transfer sent the complete modified file"
@@ -414,8 +417,8 @@ mod tests {
 
     #[test]
     fn parses_self_test_command() {
-        let cli = Cli::try_parse_from(["deltaweave", "self-test"])
-            .expect("self-test command parses");
+        let cli =
+            Cli::try_parse_from(["deltaweave", "self-test"]).expect("self-test command parses");
         assert!(matches!(cli.command, Command::SelfTest));
     }
 }
