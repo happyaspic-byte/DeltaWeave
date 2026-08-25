@@ -1,0 +1,28 @@
+[package]
+name = "deltaweave-net"
+description = "Authenticated iroh transport and resumable chunk transfer for DeltaWeave"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+deltaweave-cdc = { path = "../deltaweave-cdc" }
+deltaweave-core = { path = "../deltaweave-core" }
+deltaweave-store = { path = "../deltaweave-store" }
+hex.workspace = true
+iroh.workspace = true
+postcard.workspace = true
+serde.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
+
