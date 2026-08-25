@@ -1,0 +1,40 @@
+name: deltaweave
+
+services:
+  receiver:
+    image: ${DELTAWEAVE_IMAGE:-ghcr.io/happyaspic-byte/deltaweave:main}
+    container_name: deltaweave-receiver
+    restart: unless-stopped
+    init: true
+    network_mode: host
+    user: "${PUID:?Set PUID to the owner of DELTAWEAVE_DATA_DIR}:${PGID:?Set PGID to the group of DELTAWEAVE_DATA_DIR}"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      RUST_LOG: ${DELTAWEAVE_LOG_LEVEL:-info}
+    command:
+      - serve
+      - --root
+      - /data/received
+      - --state
+      - /data/state
+      - --identity
+      - /data/config/receiver.key
+      - --allow-peer
+      - ${DELTAWEAVE_ALLOWED_PEER:?Set DELTAWEAVE_ALLOWED_PEER to the Windows sender endpoint ID}
+      - --direct-only
+    volumes:
+      - type: bind
+        source: ${DELTAWEAVE_DATA_DIR:-/volume1/docker/deltaweave}
+        target: /data
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
