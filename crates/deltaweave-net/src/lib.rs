@@ -16,7 +16,7 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use deltaweave_cdc::{manifest_from_path, verify_chunk};
-use deltaweave_core::{ChunkDescriptor, ChunkingProfile, FileManifest, Hash32, WirePath};
+use deltaweave_core::{ChunkingProfile, FileManifest, Hash32, WirePath};
 use deltaweave_store::Store;
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayUrl, SecretKey, TransportAddr,
