@@ -15,7 +15,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use deltaweave_core::{FileManifest, Hash32, WirePath};
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
 const MANIFESTS: TableDefinition<&str, &[u8]> = TableDefinition::new("manifests");
