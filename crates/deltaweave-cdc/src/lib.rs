@@ -34,15 +34,15 @@ pub fn manifest_from_reader<R: Read>(
     );
 
     for result in chunker {
-        let chunk = result.map_err(CdcError::Io)?;
+        let chunk = result.map_err(CdcError::FastCdc)?;
         if chunk.offset != expected_offset {
             return Err(CdcError::UnexpectedOffset {
                 expected: expected_offset,
                 actual: chunk.offset,
             });
         }
-        let length = u32::try_from(chunk.length)
-            .map_err(|_| CdcError::ChunkLengthOverflow(chunk.length))?;
+        let length =
+            u32::try_from(chunk.length).map_err(|_| CdcError::ChunkLengthOverflow(chunk.length))?;
         let hash = Hash32::digest(&chunk.data);
         file_hasher.update(&chunk.data);
         chunks.push(ChunkDescriptor {
@@ -91,8 +91,8 @@ pub fn read_chunk<R: Read + Seek>(
 
 /// Verifies a chunk's length and BLAKE3 digest.
 pub fn verify_chunk(descriptor: &ChunkDescriptor, bytes: &[u8]) -> Result<(), CdcError> {
-    let actual_length = u32::try_from(bytes.len())
-        .map_err(|_| CdcError::ChunkLengthOverflow(bytes.len()))?;
+    let actual_length =
+        u32::try_from(bytes.len()).map_err(|_| CdcError::ChunkLengthOverflow(bytes.len()))?;
     if actual_length != descriptor.length {
         return Err(CdcError::LengthMismatch {
             expected: descriptor.length,
@@ -123,10 +123,7 @@ pub struct DeltaPlan {
 impl DeltaPlan {
     /// Compares a manifest with the receiver's content-addressed inventory.
     #[must_use]
-    pub fn build(
-        manifest: &FileManifest,
-        available: impl IntoIterator<Item = Hash32>,
-    ) -> Self {
+    pub fn build(manifest: &FileManifest, available: impl IntoIterator<Item = Hash32>) -> Self {
         let available: HashSet<_> = available.into_iter().collect();
         let mut scheduled = HashSet::new();
         let mut missing = Vec::new();
@@ -158,6 +155,9 @@ pub enum CdcError {
     /// The generated or supplied manifest was invalid.
     #[error("invalid file manifest: {0}")]
     Manifest(ManifestError),
+    /// The streaming FastCDC implementation failed.
+    #[error("FastCDC stream failed: {0}")]
+    FastCdc(fastcdc::v2020::Error),
     /// File I/O failed.
     #[error("file I/O failed: {0}")]
     Io(std::io::Error),
@@ -260,7 +260,11 @@ mod tests {
         let manifest = manifest_from_reader(Cursor::new(&bytes), ChunkingProfile::DEFAULT)
             .expect("fixture can be chunked");
         let mut repeated = manifest.clone();
-        let first = repeated.chunks.first().expect("fixture has a chunk").clone();
+        let first = repeated
+            .chunks
+            .first()
+            .expect("fixture has a chunk")
+            .clone();
         repeated.size += u64::from(first.length);
         repeated.chunks.push(ChunkDescriptor {
             offset: manifest.size,
@@ -288,4 +292,3 @@ mod tests {
         ));
     }
 }
-

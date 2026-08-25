@@ -108,9 +108,8 @@ impl ChunkStore {
             }
             Err(error) => {
                 let _ = fs::remove_file(&temporary);
-                return Err(error).with_context(|| {
-                    format!("failed to install chunk {}", destination.display())
-                });
+                return Err(error)
+                    .with_context(|| format!("failed to install chunk {}", destination.display()));
             }
         }
         sync_directory(destination.parent())?;
@@ -120,8 +119,8 @@ impl ChunkStore {
     /// Reads a chunk and verifies its name against its content.
     pub fn read_verified(&self, hash: Hash32) -> Result<Vec<u8>> {
         let path = self.chunk_path(hash);
-        let bytes = fs::read(&path)
-            .with_context(|| format!("failed to read chunk {}", path.display()))?;
+        let bytes =
+            fs::read(&path).with_context(|| format!("failed to read chunk {}", path.display()))?;
         let actual = Hash32::digest(&bytes);
         if actual != hash {
             bail!("chunk {hash} is corrupt; actual digest is {actual}");
@@ -290,9 +289,8 @@ impl Store {
             .chunks
             .iter()
             .filter_map(|chunk| {
-                (seen.insert(chunk.hash)
-                    && self.chunks.read_verified(chunk.hash).is_err())
-                .then_some(chunk.hash)
+                (seen.insert(chunk.hash) && self.chunks.read_verified(chunk.hash).is_err())
+                    .then_some(chunk.hash)
             })
             .collect()
     }
@@ -384,7 +382,8 @@ impl Store {
         }
 
         let replaced_existing = destination.exists();
-        let backup = replaced_existing.then(|| self.chunks.trash_path(path, manifest.manifest_hash()));
+        let backup =
+            replaced_existing.then(|| self.chunks.trash_path(path, manifest.manifest_hash()));
         if let Some(backup) = &backup {
             if let Some(parent) = backup.parent() {
                 fs::create_dir_all(parent)?;
@@ -540,7 +539,11 @@ mod tests {
     fn chunk_store_rejects_mislabeled_data() {
         let temp = TempDir::new().expect("temporary directory can be created");
         let store = ChunkStore::open(temp.path()).expect("chunk store can open");
-        assert!(store.put_verified(Hash32::digest(b"good"), b"evil").is_err());
+        assert!(
+            store
+                .put_verified(Hash32::digest(b"good"), b"evil")
+                .is_err()
+        );
     }
 
     #[test]
@@ -581,7 +584,10 @@ mod tests {
         let first = store
             .materialize(&manifest, &path, destination.path())
             .expect("file can be materialized");
-        assert_eq!(fs::read(&first.destination).expect("file can be read"), bytes);
+        assert_eq!(
+            fs::read(&first.destination).expect("file can be read"),
+            bytes
+        );
         assert!(!first.already_current);
 
         let second = store
@@ -608,7 +614,10 @@ mod tests {
             .materialize(&manifest, &path, destination.path())
             .expect("file can be replaced");
         assert!(outcome.replaced_existing);
-        assert_eq!(fs::read(outcome.destination).expect("file can be read"), bytes);
+        assert_eq!(
+            fs::read(outcome.destination).expect("file can be read"),
+            bytes
+        );
         let trash_entries = fs::read_dir(temp.path().join("trash"))
             .expect("trash can be read")
             .count();
@@ -638,8 +647,7 @@ mod tests {
         let state = TempDir::new().expect("state directory can be created");
         let destination = TempDir::new().expect("destination can be created");
         let outside = TempDir::new().expect("outside directory can be created");
-        symlink(outside.path(), destination.path().join("linked"))
-            .expect("symlink can be created");
+        symlink(outside.path(), destination.path().join("linked")).expect("symlink can be created");
         let bytes = fixture(300_000);
         let manifest = manifest_from_reader(Cursor::new(&bytes), ChunkingProfile::DEFAULT)
             .expect("fixture can be chunked");
@@ -647,7 +655,11 @@ mod tests {
         populate(&store, &bytes, &manifest);
         let path = WirePath::new("linked/escape.bin").expect("path is portable");
 
-        assert!(store.materialize(&manifest, &path, destination.path()).is_err());
+        assert!(
+            store
+                .materialize(&manifest, &path, destination.path())
+                .is_err()
+        );
         assert!(!outside.path().join("escape.bin").exists());
     }
 }

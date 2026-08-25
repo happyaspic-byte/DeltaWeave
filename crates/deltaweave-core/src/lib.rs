@@ -392,9 +392,8 @@ fn validate_wire_path(value: &str) -> Result<(), WirePathError> {
 
     const ILLEGAL: [char; 9] = ['<', '>', ':', '"', '|', '?', '*', '\0', '\r'];
     const RESERVED: [&str; 22] = [
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6",
-        "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7",
-        "LPT8", "LPT9",
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
     ];
 
     for component in value.split('/') {
@@ -414,7 +413,10 @@ fn validate_wire_path(value: &str) -> Result<(), WirePathError> {
             return Err(WirePathError::InvalidComponent(component.to_owned()));
         }
         let stem = component.split('.').next().unwrap_or(component);
-        if RESERVED.iter().any(|reserved| stem.eq_ignore_ascii_case(reserved)) {
+        if RESERVED
+            .iter()
+            .any(|reserved| stem.eq_ignore_ascii_case(reserved))
+        {
             return Err(WirePathError::ReservedName(component.to_owned()));
         }
     }

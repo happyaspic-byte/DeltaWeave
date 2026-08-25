@@ -14,8 +14,8 @@ use clap::{Args, Parser, Subcommand};
 use deltaweave_cdc::manifest_from_path;
 use deltaweave_core::{ChunkingProfile, WirePath};
 use deltaweave_net::{
-    NetworkMode, PeerPolicy, PushOptions, ServerConfig, endpoint_addr,
-    load_or_create_identity, push_file, start_server,
+    NetworkMode, PeerPolicy, PushOptions, ServerConfig, endpoint_addr, load_or_create_identity,
+    push_file, start_server,
 };
 use iroh::EndpointId;
 use serde_json::json;
@@ -202,7 +202,9 @@ async fn serve(args: ServeArgs) -> Result<()> {
         "direct_addresses": address.direct_addresses,
         "relay_urls": address.relay_urls,
     }))?;
-    tokio::signal::ctrl_c().await.context("failed to wait for Ctrl-C")?;
+    tokio::signal::ctrl_c()
+        .await
+        .context("failed to wait for Ctrl-C")?;
     server.shutdown().await
 }
 

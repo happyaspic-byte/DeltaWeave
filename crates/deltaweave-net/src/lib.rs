@@ -68,7 +68,10 @@ pub fn load_or_create_identity(path: impl AsRef<Path>) -> Result<Identity> {
             created: false,
         });
     }
-    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         fs::create_dir_all(parent)?;
     }
 
@@ -96,8 +99,9 @@ pub fn load_or_create_identity(path: impl AsRef<Path>) -> Result<Identity> {
                 created: false,
             })
         }
-        Err(error) => Err(error)
-            .with_context(|| format!("failed to create identity file {}", path.display())),
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to create identity file {}", path.display()))
+        }
     }
 }
 
@@ -173,10 +177,7 @@ impl Server {
         AddressInfo {
             endpoint_id: address.id.to_string(),
             direct_addresses: address.ip_addrs().map(|value| value.to_string()).collect(),
-            relay_urls: address
-                .relay_urls()
-                .map(ToString::to_string)
-                .collect(),
+            relay_urls: address.relay_urls().map(ToString::to_string).collect(),
         }
     }
 
@@ -300,11 +301,10 @@ pub async fn push_file(options: PushOptions) -> Result<TransferReceipt> {
     ensure!(options.source.is_file(), "source is not a regular file");
     let source_for_manifest = options.source.clone();
     let profile = options.profile;
-    let manifest = tokio::task::spawn_blocking(move || {
-        manifest_from_path(source_for_manifest, profile)
-    })
-    .await
-    .context("manifest task failed")??;
+    let manifest =
+        tokio::task::spawn_blocking(move || manifest_from_path(source_for_manifest, profile))
+            .await
+            .context("manifest task failed")??;
 
     let endpoint = bind_endpoint(options.secret_key, options.network_mode, None).await?;
     let result = push_connected(
@@ -356,7 +356,10 @@ async fn push_connected(
     let mut source = tokio::fs::File::open(source_path).await?;
     let mut sent = HashSet::new();
     for hash in missing {
-        ensure!(sent.insert(hash), "receiver requested duplicate chunk {hash}");
+        ensure!(
+            sent.insert(hash),
+            "receiver requested duplicate chunk {hash}"
+        );
         let descriptor = descriptors
             .get(&hash)
             .with_context(|| format!("receiver requested unknown chunk {hash}"))?;
@@ -380,7 +383,10 @@ async fn push_connected(
 
     match read_frame(&mut receive).await? {
         WireResponse::Complete(receipt) => {
-            ensure!(receipt.file_hash == manifest.file_hash, "receipt file hash mismatch");
+            ensure!(
+                receipt.file_hash == manifest.file_hash,
+                "receipt file hash mismatch"
+            );
             ensure!(
                 receipt.manifest_hash == manifest.manifest_hash(),
                 "receipt manifest hash mismatch"
@@ -444,17 +450,16 @@ impl ProtocolHandler for PushHandler {
 }
 
 impl PushHandler {
-    async fn handle_push(
-        &self,
-        send: &mut SendStream,
-        receive: &mut RecvStream,
-    ) -> Result<()> {
+    async fn handle_push(&self, send: &mut SendStream, receive: &mut RecvStream) -> Result<()> {
         let request: WireRequest = read_frame(receive).await?;
         let (path, manifest) = match request {
             WireRequest::Push { path, manifest } => (path, manifest),
         };
         manifest.validate()?;
-        ensure!(manifest.size <= MAX_FILE_SIZE, "file exceeds protocol size limit");
+        ensure!(
+            manifest.size <= MAX_FILE_SIZE,
+            "file exceeds protocol size limit"
+        );
         ensure!(
             manifest.chunks.len() <= MAX_CHUNKS_PER_FILE,
             "manifest exceeds chunk-count limit"
@@ -686,9 +691,7 @@ mod tests {
             secret_key: SecretKey::generate(),
             destination_root: destination.path().to_path_buf(),
             state_root: state.path().to_path_buf(),
-            peer_policy: PeerPolicy::AllowListed(HashSet::from([
-                SecretKey::generate().public()
-            ])),
+            peer_policy: PeerPolicy::AllowListed(HashSet::from([SecretKey::generate().public()])),
             network_mode: NetworkMode::DirectOnly,
         })
         .await
