@@ -1,4 +1,4 @@
-# DeltaWeave v0.1.0
+# DeltaWeave v0.1.1
 
 This pre-alpha release is a verified one-file P2P delta-transfer foundation.
 It is intended for controlled Windows PC and Synology DSM evaluation, not as
@@ -14,6 +14,16 @@ the only copy of important data.
 - Windows x86-64 and static Synology x86-64/ARM64 packages
 - SHA-256 checksums for every downloadable archive
 
+## v0.1.1 hardening
+
+- Clean Windows logs without raw ANSI escape sequences
+- Immediate rejection of non-allow-listed endpoint IDs
+- Protected separation of receiver data, private state, and identity paths
+- Strict duplicate-chunk and transfer-receipt validation
+- Graceful Docker/Portainer SIGTERM handling
+- Reliable direct-mode startup without intermittent missing-address failures
+- RustSec dependency auditing and runtime checks for both Synology architectures
+
 Run `deltaweave self-test` (or `deltaweave.exe self-test` on Windows) immediately
 after extraction. It validates local QUIC transport, storage, reconstruction,
 integrity checks, and delta reuse without touching user data.
@@ -27,4 +37,4 @@ and hash verification.
 
 Continuous watching, directory reconciliation, bidirectional conflict handling,
 DSM SPK installation, Windows installers/services, and on-demand VFS are planned
-but are not part of v0.1.0.
+but are not part of v0.1.1.

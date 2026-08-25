@@ -10,3 +10,7 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    ignore:
+      # This action intentionally uses the Rust release as its ref. Dependabot
+      # treats future-looking semver refs as action upgrades and opens broken PRs.
+      - dependency-name: dtolnay/rust-toolchain

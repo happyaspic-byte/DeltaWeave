@@ -18,13 +18,15 @@
 ## Defenses in v0.1
 
 - Deny-by-default endpoint allow-list; accepting any authenticated peer requires
-  an explicit flag.
+  an explicit flag. Unauthorized endpoint IDs are closed before stream intake.
 - Strict frame, manifest, chunk-count, file-size, path, and chunk-size limits.
 - Wire-path validation also runs during deserialization, preventing constructor
   bypasses.
 - Parent symlinks are rejected before materialization.
 - Chunk payloads and complete reconstructed files are hash-verified.
 - Existing files are moved to private state trash rather than deleted.
+- Destination and private state roots may not overlap, and the CLI rejects a
+  receiver identity stored beneath the writable destination root.
 - Secret keys are created with owner-only permissions on Unix and insecure
   existing Unix key permissions are rejected.
 

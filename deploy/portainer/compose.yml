@@ -6,6 +6,7 @@ services:
     container_name: deltaweave-receiver
     restart: unless-stopped
     init: true
+    pids_limit: 128
     network_mode: host
     user: "${PUID:?Set PUID to the owner of DELTAWEAVE_DATA_DIR}:${PGID:?Set PGID to the group of DELTAWEAVE_DATA_DIR}"
     read_only: true

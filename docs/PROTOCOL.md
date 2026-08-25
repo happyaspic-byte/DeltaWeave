@@ -63,6 +63,8 @@ unique payload bytes accepted in the session, and number of reused extents.
 The chunking profile travels in the manifest and is validated before allocation.
 The full manifest must fit in one control frame. Limits are protocol guards, not
 promises that every supported platform can materialize the maximum file.
+Descriptors that repeat a content hash must also repeat its exact length; this
+keeps the content-addressed lookup unambiguous before any payload is accepted.
 
 ## Versioning
 
