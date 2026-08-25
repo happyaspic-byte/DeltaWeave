@@ -42,6 +42,27 @@ The scope and acceptance gates for later phases live in [ROADMAP.md](ROADMAP.md)
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and
 [docs/PROTOCOL.md](docs/PROTOCOL.md) for the invariants behind these boundaries.
 
+## Download a test release
+
+The pre-alpha [v0.1.0 release](https://github.com/happyaspic-byte/DeltaWeave/releases/tag/v0.1.0)
+provides ready-to-run packages for:
+
+- Windows x86-64
+- Synology DSM on x86-64
+- Synology DSM on ARM64 (`aarch64`)
+
+Each package includes the executable, license, and Windows-to-Synology test
+guide. After extracting the correct package, run the isolated end-to-end check:
+
+```bash
+deltaweave self-test
+```
+
+It performs two encrypted local transfers and verifies chunk integrity,
+materialization, and delta reuse. See
+[Windows PC ↔ Synology testing](docs/TESTING_WINDOWS_SYNOLOGY.md) for the full
+cross-device procedure and checksum verification.
+
 ## Build and test
 
 DeltaWeave currently pins Rust 1.91.

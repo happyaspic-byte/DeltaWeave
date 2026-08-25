@@ -4,20 +4,21 @@
 
 use std::{
     collections::HashSet,
+    fs,
     net::SocketAddr,
     path::{Path, PathBuf},
     time::Duration,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, Parser, Subcommand};
 use deltaweave_cdc::manifest_from_path;
 use deltaweave_core::{ChunkingProfile, WirePath};
 use deltaweave_net::{
-    NetworkMode, PeerPolicy, PushOptions, ServerConfig, endpoint_addr, load_or_create_identity,
-    push_file, start_server,
+    NetworkMode, PeerPolicy, PushOptions, Server, ServerConfig, TransferReceipt, endpoint_addr,
+    load_or_create_identity, push_file, start_server,
 };
-use iroh::EndpointId;
+use iroh::{EndpointId, SecretKey};
 use serde_json::json;
 use tracing_subscriber::EnvFilter;
 
@@ -43,6 +44,8 @@ enum Command {
     Serve(ServeArgs),
     /// Send one file and transfer only chunks missing at the receiver.
     Push(PushArgs),
+    /// Run an isolated local end-to-end transfer and delta-reuse check.
+    SelfTest,
 }
 
 #[derive(Debug, Args)]
@@ -146,6 +149,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Manifest(args) => print_manifest(args),
         Command::Serve(args) => serve(args).await,
         Command::Push(args) => push(args).await,
+        Command::SelfTest => self_test().await,
     }
 }
 
@@ -226,6 +230,114 @@ async fn push(args: PushArgs) -> Result<()> {
     print_json(&receipt)
 }
 
+async fn self_test() -> Result<()> {
+    let workspace = tempfile::tempdir().context("failed to create self-test workspace")?;
+    let destination = workspace.path().join("received");
+    let state = workspace.path().join("state");
+    let source = workspace.path().join("source.bin");
+    fs::create_dir_all(&destination)?;
+
+    let client_key = SecretKey::generate();
+    let server = start_server(ServerConfig {
+        secret_key: SecretKey::generate(),
+        destination_root: destination.clone(),
+        state_root: state,
+        peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
+        network_mode: NetworkMode::DirectOnly,
+    })
+    .await
+    .context("self-test receiver failed to start")?;
+
+    let outcome = exercise_self_test(&server, client_key, &source, &destination).await;
+    let shutdown = server.shutdown().await;
+    let (first, second, final_size) = match (outcome, shutdown) {
+        (Err(error), _) => return Err(error),
+        (Ok(_), Err(error)) => return Err(error.context("self-test receiver shutdown failed")),
+        (Ok(report), Ok(())) => report,
+    };
+
+    print_json(&json!({
+        "architecture": std::env::consts::ARCH,
+        "final_size": final_size,
+        "first_transfer_bytes": first.transferred_bytes,
+        "operating_system": std::env::consts::OS,
+        "reused_extents": second.reused_extents,
+        "second_transfer_bytes": second.transferred_bytes,
+        "status": "pass",
+        "temporary_data": "cleaned on exit",
+    }))
+}
+
+async fn exercise_self_test(
+    server: &Server,
+    client_key: SecretKey,
+    source: &Path,
+    destination: &Path,
+) -> Result<(TransferReceipt, TransferReceipt, usize)> {
+    let original = self_test_fixture(4 * 1024 * 1024);
+    fs::write(source, &original)?;
+    let remote_path = WirePath::new("self-test/payload.bin")?;
+
+    let first = push_file(PushOptions {
+        secret_key: client_key.clone(),
+        source: source.to_path_buf(),
+        remote_path: remote_path.clone(),
+        remote: server.endpoint_addr(),
+        profile: ChunkingProfile::DEFAULT,
+        network_mode: NetworkMode::DirectOnly,
+    })
+    .await
+    .context("self-test initial transfer failed")?;
+    ensure!(first.transferred_bytes > 0, "initial transfer sent no data");
+    ensure!(
+        fs::read(destination.join(remote_path.as_str()))? == original,
+        "initial reconstructed file differs from its source"
+    );
+
+    let mut modified = original;
+    modified.splice(
+        700_000..700_000,
+        b"DeltaWeave self-test insertion\n".iter().copied(),
+    );
+    fs::write(source, &modified)?;
+    let second = push_file(PushOptions {
+        secret_key: client_key,
+        source: source.to_path_buf(),
+        remote_path: remote_path.clone(),
+        remote: server.endpoint_addr(),
+        profile: ChunkingProfile::DEFAULT,
+        network_mode: NetworkMode::DirectOnly,
+    })
+    .await
+    .context("self-test delta transfer failed")?;
+    ensure!(
+        second.reused_extents > 0,
+        "delta transfer reused no extents"
+    );
+    ensure!(
+        second.transferred_bytes < modified.len() as u64,
+        "delta transfer sent the complete modified file"
+    );
+    ensure!(
+        fs::read(destination.join(remote_path.as_str()))? == modified,
+        "delta reconstructed file differs from its source"
+    );
+
+    Ok((first, second, modified.len()))
+}
+
+fn self_test_fixture(length: usize) -> Vec<u8> {
+    let mut value = 0x243f_6a88_85a3_08d3_u64;
+    (0..length)
+        .map(|index| {
+            value = value
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            (value >> 29) as u8 ^ index as u8
+        })
+        .collect()
+}
+
 const fn network_mode(direct_only: bool) -> NetworkMode {
     if direct_only {
         NetworkMode::DirectOnly
@@ -301,5 +413,12 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn parses_self_test_command() {
+        let cli =
+            Cli::try_parse_from(["deltaweave", "self-test"]).expect("self-test command parses");
+        assert!(matches!(cli.command, Command::SelfTest));
     }
 }
