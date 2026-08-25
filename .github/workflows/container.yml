@@ -1,0 +1,104 @@
+name: Container
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: container-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-image:
+    name: Test ${{ matrix.platform }} image
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            suffix: amd64
+          - platform: linux/arm64
+            suffix: arm64
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - name: Build test image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          platforms: ${{ matrix.platform }}
+          push: false
+          tags: deltaweave:test-${{ matrix.suffix }}
+          cache-from: type=gha,scope=container-${{ matrix.suffix }}
+          cache-to: type=gha,mode=max,scope=container-${{ matrix.suffix }}
+      - name: Verify non-root image metadata
+        env:
+          IMAGE: deltaweave:test-${{ matrix.suffix }}
+        run: |
+          test "$(docker image inspect "$IMAGE" --format '{{.Config.User}}')" = "65532:65532"
+          test "$(docker image inspect "$IMAGE" --format '{{json .Config.Entrypoint}}')" = '["/usr/local/bin/deltaweave"]'
+      - name: Run packaged self-test
+        env:
+          IMAGE: deltaweave:test-${{ matrix.suffix }}
+          PLATFORM: ${{ matrix.platform }}
+        run: docker run --rm --platform "$PLATFORM" "$IMAGE" self-test | tee self-test.json
+      - name: Validate self-test result
+        run: |
+          grep -F '"status": "pass"' self-test.json
+      - name: Validate Portainer Compose
+        if: matrix.platform == 'linux/amd64'
+        env:
+          DELTAWEAVE_ALLOWED_PEER: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          DELTAWEAVE_DATA_DIR: /tmp/deltaweave
+          PGID: "65532"
+          PUID: "65532"
+        run: docker compose -f deploy/portainer/compose.yml config --quiet
+
+  publish-image:
+    name: Publish multi-architecture image
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: test-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Generate image metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/happyaspic-byte/deltaweave
+          tags: |
+            type=raw,value=main
+            type=sha,prefix=sha-,format=long
+      - name: Build and publish
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: |
+            type=gha,scope=container-amd64
+            type=gha,scope=container-arm64
+          cache-to: type=gha,mode=max,scope=container-publish
+          provenance: mode=max
+          sbom: true

@@ -63,6 +63,11 @@ materialization, and delta reuse. See
 [Windows PC ↔ Synology testing](docs/TESTING_WINDOWS_SYNOLOGY.md) for the full
 cross-device procedure and checksum verification.
 
+For a Portainer-managed Synology receiver, an AI operator can follow the
+guardrailed [AI Portainer setup runbook](docs/AI_PORTAINER_SETUP.md). The
+repository includes a hardened Stack definition and CI-tested multi-architecture
+container image for `linux/amd64` and `linux/arm64`.
+
 ## Build and test
 
 DeltaWeave currently pins Rust 1.91.
