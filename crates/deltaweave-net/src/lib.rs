@@ -431,6 +431,7 @@ impl ProtocolHandler for PushHandler {
             )
             .await;
             let _ = send.finish();
+            connection.closed().await;
             return Ok(());
         }
 
@@ -440,11 +441,13 @@ impl ProtocolHandler for PushHandler {
             let message = truncate_error(&error.to_string());
             let _ = write_frame(&mut send, &WireResponse::Error { message }).await;
             let _ = send.finish();
+            connection.closed().await;
             return Err(AcceptError::from_err(std::io::Error::other(
                 error.to_string(),
             )));
         }
         send.finish()?;
+        connection.closed().await;
         Ok(())
     }
 }
