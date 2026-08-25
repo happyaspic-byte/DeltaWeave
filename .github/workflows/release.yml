@@ -1,0 +1,186 @@
+name: Release
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare:
+    name: Prepare release
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ steps.existing.outputs.publish }}
+      sha: ${{ github.event.workflow_run.head_sha }}
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - name: Read workspace version
+        id: version
+        shell: bash
+        run: |
+          version="$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)"
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+      - name: Check for an existing release
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        shell: bash
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  windows:
+    name: Windows x86-64 package
+    needs: prepare
+    if: needs.prepare.outputs.publish == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      - uses: dtolnay/rust-toolchain@1.91.0
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binary
+        run: cargo build --locked --release --target x86_64-pc-windows-msvc -p deltaweave
+      - name: Run packaged-binary self-test
+        shell: pwsh
+        run: .\target\x86_64-pc-windows-msvc\release\deltaweave.exe self-test
+      - name: Package
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          $name = "DeltaWeave-v$env:VERSION-windows-x86_64"
+          $package = Join-Path "dist" $name
+          New-Item -ItemType Directory -Force -Path $package | Out-Null
+          Copy-Item ".\target\x86_64-pc-windows-msvc\release\deltaweave.exe" $package
+          Copy-Item ".\docs\TESTING_WINDOWS_SYNOLOGY.md" (Join-Path $package "TESTING.md")
+          Copy-Item ".\LICENSE" $package
+          Compress-Archive -Path "$package\*" -DestinationPath "dist\$name.zip"
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: windows-x86_64
+          path: dist/*.zip
+          if-no-files-found: error
+
+  synology:
+    name: Synology ${{ matrix.arch }} package
+    needs: prepare
+    if: needs.prepare.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-musl
+          - arch: aarch64
+            target: aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      - uses: dtolnay/rust-toolchain@1.91.0
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install cross
+        run: cargo install cross --locked --version 0.2.5
+      - name: Build static release binary
+        run: cross build --locked --release --target ${{ matrix.target }} -p deltaweave
+      - name: Verify static linkage
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          file "target/$TARGET/release/deltaweave"
+          if readelf -l "target/$TARGET/release/deltaweave" | grep -q 'Requesting program interpreter'; then
+            echo "Synology artifact unexpectedly requires a dynamic interpreter" >&2
+            exit 1
+          fi
+      - name: Run x86-64 packaged-binary self-test
+        if: matrix.arch == 'x86_64'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: target/$TARGET/release/deltaweave self-test
+      - name: Package
+        env:
+          ARCH: ${{ matrix.arch }}
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          name="DeltaWeave-v$VERSION-synology-$ARCH"
+          package="dist/$name"
+          mkdir -p "$package"
+          install -m 0755 "target/$TARGET/release/deltaweave" "$package/deltaweave"
+          install -m 0644 docs/TESTING_WINDOWS_SYNOLOGY.md "$package/TESTING.md"
+          install -m 0644 LICENSE "$package/LICENSE"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: synology-${{ matrix.arch }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: [prepare, windows, synology]
+    if: >-
+      always() &&
+      needs.prepare.outputs.publish == 'true' &&
+      needs.windows.result == 'success' &&
+      needs.synology.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum *.zip *.tar.gz > SHA256SUMS.txt
+      - name: Create pre-alpha release and tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.prepare.outputs.sha }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: >-
+          gh release create "$TAG" dist/*
+          --repo "$GITHUB_REPOSITORY"
+          --target "$SHA"
+          --title "DeltaWeave $TAG (pre-alpha)"
+          --notes-file docs/RELEASE_NOTES.md
+          --prerelease
