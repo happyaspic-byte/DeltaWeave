@@ -1,0 +1,12 @@
+.git
+.github
+.idea
+.vscode
+.deltaweave
+deploy
+docs
+target
+*.key
+*.log
+*.md
+LICENSE
