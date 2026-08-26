@@ -17,6 +17,7 @@ anyhow.workspace = true
 clap.workspace = true
 deltaweave-cdc = { path = "../deltaweave-cdc" }
 deltaweave-core = { path = "../deltaweave-core" }
+deltaweave-index = { path = "../deltaweave-index" }
 deltaweave-net = { path = "../deltaweave-net" }
 iroh.workspace = true
 serde.workspace = true

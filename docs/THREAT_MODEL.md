@@ -15,7 +15,7 @@
 - A remote peer may be malicious even when it can establish an encrypted session.
 - Files already present under the destination may be untrusted.
 
-## Defenses in v0.1
+## Defenses in v0.2
 
 - Deny-by-default endpoint allow-list; accepting any authenticated peer requires
   an explicit flag. Unauthorized endpoint IDs are closed before stream intake.
@@ -29,6 +29,14 @@
   receiver identity stored beneath the writable destination root.
 - Secret keys are created with owner-only permissions on Unix and insecure
   existing Unix key permissions are rejected.
+- Local scans never follow symlinks, verify metadata stability around hashing,
+  and retain prior records when enumeration or reads are uncertain.
+- Cross-platform Unicode/case name collisions are reported without collapsing
+  or overwriting either local record.
+- Watcher events are only optimization hints; periodic scans and polling fallback
+  prevent event loss from becoming authoritative state loss.
+- Each index DB is bound to one canonical root and replica identity, preventing
+  accidental reuse from being interpreted as mass deletion.
 
 ## Known gaps before production
 
@@ -40,10 +48,13 @@
   links, and symlinks are not synchronized.
 - Disk quotas and per-peer concurrency limits are not implemented.
 - Local file mutation while the sender chunks and later reads it can cause a
-  verified transfer failure; snapshot/identity checks are still required.
-- Unicode normalization and case-fold collision handling are not implemented.
-- Continuous reconciliation, signed device membership, tombstones, and rollback
-  protection belong to later protocol phases.
+  verified transfer failure; the new index detects mutation while hashing, but
+  transfer-time snapshot/identity checks are still required.
+- The local index has tombstones, but distributed Merkle reconciliation,
+  tombstone retention/GC, signed device membership, and rollback protection are
+  not implemented.
+- Name collisions are detected but there is not yet a cross-device operator UX
+  or automatic resolution policy.
 
 Operate the receiver with a dedicated unprivileged account and a dedicated empty
 destination. Keep separate backups. Do not expose `--allow-any-authenticated` on

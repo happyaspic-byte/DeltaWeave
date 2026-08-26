@@ -5,6 +5,50 @@ Versioning after its first stable release.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-26
+
+### Added
+
+- Add the `deltaweave-index` crate with persistent redb path records, stable
+  file identity, version vectors, tombstones, Unicode/case collision groups,
+  and bounded concurrent BLAKE3 hashing.
+- Use Unicode 16 full case folding plus NFKC normalization for conservative
+  cross-platform collision keys.
+- Add `scan` and `watch` commands with native watcher hints, adaptive debounce,
+  periodic authoritative scans, and a polling fallback after watcher loss.
+- Add opt-in `scan --include-records` output for operational record/retry
+  inspection without making large listings the default.
+- Extend packaged `self-test` with local indexing, rename correlation, deletion,
+  and restart recovery checks.
+- Add deterministic operation-storm, native watcher, restart, collision,
+  non-portable-name, retry, and Windows sharing-violation coverage.
+
+### Fixed
+
+- Reject additional Windows device-name aliases, including stems with spaces,
+  `CLOCK$`, and COM/LPT superscript-digit forms.
+- Propagate stdout write failures instead of panicking while printing JSON.
+- Preserve prior records beneath unreadable or incompletely enumerated
+  directories instead of converting uncertain observations into deletions.
+- Exclude a root-level index database without accidentally excluding the entire
+  synchronization root.
+- Preserve records when a previously indexed subtree becomes ignored, and reject
+  ignore rules that contain the entire synchronization root.
+- Reject symlink roots and symlinked index databases before opening them.
+- Treat every Windows reparse point as a non-traversable link so junctions and
+  similar directory redirects cannot escape the indexed root.
+- Bind every index database to one canonical root and replica identity so a
+  configuration mistake cannot reinterpret another tree as mass deletion.
+- Require both stable identity and an unchanged content/metadata fingerprint
+  before correlating a rename, preventing inode/file-index reuse from joining
+  unrelated files.
+- Remove retry records for new files that disappear before their first
+  successful hash, while retaining retries beneath genuinely uncertain trees.
+- Keep full reconciliation on a fixed schedule even during continuous watcher
+  activity, while reusing hashes for untouched files between full scans.
+- Avoid rewriting byte-identical path and retry records during no-change scans,
+  reducing redb write amplification on large trees.
+
 ## [0.1.2] - 2026-08-26
 
 ### Fixed

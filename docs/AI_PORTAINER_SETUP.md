@@ -5,9 +5,10 @@
 Docker 사용법을 설명하는 문서가 아니다. 에이전트는 추측으로 값을 만들지 말고 아래
 게이트를 순서대로 통과해야 한다.
 
-> **현재 범위:** DeltaWeave v0.1은 단일 파일 QUIC 델타 전송 pre-alpha다.
-> 폴더 감시, 자동 양방향 동기화, 충돌 해결, DSM SPK 및 VFS는 아직 제공하지 않는다.
-> 중요한 데이터의 유일한 사본으로 사용하지 않는다.
+> **현재 범위:** DeltaWeave v0.2는 단일 파일 QUIC 델타 전송과 영속 로컬
+> 폴더 인덱스/감시를 제공하는 pre-alpha다. 인덱스가 아직 자동 양방향 전송,
+> 충돌 해결, DSM SPK 또는 VFS와 연결되지는 않는다. 중요한 데이터의 유일한
+> 사본으로 사용하지 않는다.
 
 ## 1. 에이전트의 완료 조건
 
@@ -23,6 +24,8 @@ Docker 사용법을 설명하는 문서가 아니다. 에이전트는 추측으�
    `transferred_bytes < 전체 파일 크기`다.
 7. 컨테이너가 privileged 모드, Docker 소켓 마운트 또는 `--allow-any-authenticated`를
    사용하지 않는다.
+8. 수신 폴더의 `scan` 결과가 전송한 파일을 포함하고, 컨테이너 재시작 뒤에도 index
+   레코드와 generation이 유지된다.
 
 ## 2. 절대 준수할 안전 규칙
 
@@ -83,7 +86,12 @@ NAS에서 DeltaWeave를 소유할 기존 DSM 계정을 선택한다. 숫자 UID/
 ```bash
 PUID_VALUE="$(id -u <DSM_USER>)"
 PGID_VALUE="$(id -g <DSM_USER>)"
-sudo install -d -m 0700 -o "$PUID_VALUE" -g "$PGID_VALUE" /volume1/docker/deltaweave
+sudo install -d -m 0700 -o "$PUID_VALUE" -g "$PGID_VALUE" \
+  /volume1/docker/deltaweave \
+  /volume1/docker/deltaweave/config \
+  /volume1/docker/deltaweave/index \
+  /volume1/docker/deltaweave/received \
+  /volume1/docker/deltaweave/state
 ```
 
 위 값을 Portainer 환경변수 `PUID`, `PGID`로 사용한다. 경로가 이미 존재한다면
@@ -193,13 +201,32 @@ sha256sum /volume1/docker/deltaweave/received/validation/sample.bin
 두 번째 receipt의 `reused_extents > 0`, `transferred_bytes < 전체 파일 크기`와 변경 후
 양쪽 SHA-256 일치를 확인한다.
 
+이어서 컨테이너 안의 v0.2 로컬 인덱스로 수신 폴더를 검사한다.
+
+```bash
+docker exec deltaweave-receiver deltaweave scan \
+  --root /data/received \
+  --state /data/index/received.redb \
+  --identity /data/config/receiver.key \
+  --ignore /data/state \
+  --include-records
+```
+
+`report.issues`와 `report.collisions`가 비어 있고 `records`에
+`validation/sample.bin`의 live record가 포함되어야 한다. 컨테이너를 재시작하고
+같은 명령을 다시 실행해
+generation 증가와 레코드 유지도 확인한다. 이 검사는 자동 양방향 동기화를 켜는
+명령이 아니다. 자세한 실패 판정은 [로컬 인덱스 검증서](TESTING_LOCAL_INDEX.md)를
+따른다.
+
 ## 10. 업데이트, 롤백, 백업
 
 - 업데이트: 먼저 `/volume1/docker/deltaweave`를 백업하고 새 이미지를 pull한 뒤 Stack을
   redeploy한다. **볼륨을 제거하지 않는다.**
 - 롤백: 정상 동작했던 `ghcr.io/happyaspic-byte/deltaweave:sha-<COMMIT_SHA>`를
   `DELTAWEAVE_IMAGE`로 지정해 redeploy한다.
-- 최소 백업 대상: `config/receiver.key`, `state/`, `received/`.
+- 최소 백업 대상: `config/receiver.key`, `state/`, `received/`. `index/`는 복구
+  시간을 줄이지만 원본 데이터로부터 다시 만들 수 있다.
 - `main`은 pre-alpha 이동 태그다. 반복 가능한 장기 배포에는 검증한 `sha-...` 태그나
   이미지 digest를 고정한다.
 
@@ -217,6 +244,7 @@ Address: <LAN 또는 Tailscale IP>:<UDP port>
 Self-test: status / reused_extents / transferred bytes
 Cross-device: 최초 전송 PASS/FAIL, SHA-256 일치 PASS/FAIL
 Delta retry: reused_extents / transferred bytes / SHA-256 일치
+Local index: generation / live records / issues / restart 유지 여부
 Persistence: config/state/received 경로 및 백업 여부
 남은 위험 또는 차단 사항: <없음 또는 구체적 오류>
 ```

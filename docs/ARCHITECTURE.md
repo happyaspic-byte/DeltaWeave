@@ -41,13 +41,46 @@ The current symlink-ancestor check blocks ordinary path escapes, but is not an
 `openat2`/handle-relative defense against a hostile local process racing path
 components. That hardening is a pre-production gate.
 
-## Planned state engine
+## v0.2 local index
 
-The next state layer will introduce immutable per-path records containing type,
-content manifest, normalized collision key, replica ID, version vector, and
-tombstone state. A deterministic Merkle search tree will summarize those records.
-Peers will compare root hashes and descend only into mismatched ranges. Watcher
-events remain hints; the index and periodic reconciliation are authoritative.
+`deltaweave-index` stores one versioned record per portable path in redb. A
+record carries entry type, best-effort stable OS identity, size and modification
+fingerprint, complete-file BLAKE3 hash, normalized collision key, version
+vector, generation, and tombstone state.
+
+Collision keys apply per-component NFKC normalization and Unicode 16 full case
+folding. This deliberately prefers a false-positive operator warning over
+silently collapsing two names on a less expressive peer filesystem.
+
+The scanner follows these safety rules:
+
+1. Symbolic links and Windows reparse points are indexed but never traversed.
+2. Regular files are hashed only when their metadata remains unchanged before
+   and after the read.
+3. Locked or mutating files retain their prior record and enter a persistent,
+   capped exponential-backoff queue.
+4. A directory that cannot be enumerated completely is uncertain. Existing
+   records beneath it are preserved rather than inferred as deletions.
+5. Stable identities correlate unambiguous renames. Ambiguous identities fall
+   back to independent create/delete records.
+6. All safe observations, tombstones, retries, generation, and replica counter
+   commit in one redb transaction.
+7. A database is cryptographically bound to one canonical root and replica ID;
+   opening it with a different root or node identity fails before scanning.
+
+Native watcher events are hints, never the source of truth. Normal batches
+trigger a complete namespace walk but only rehash touched paths; fixed-interval
+authoritative scans rehash every file. Ambiguous events or watcher errors force
+an immediate full scan and activate a five-second polling fallback. This keeps
+correctness independent of inotify/ReadDirectoryChangesW event loss.
+Byte-identical path and retry records are not rewritten during no-change scans,
+limiting database write amplification.
+
+## Planned distributed state engine
+
+The next state layer will attach versioned content manifests to local path
+records. A deterministic Merkle search tree will summarize those records. Peers
+will compare root hashes and descend only into mismatched ranges.
 
 Conflict detection will use version-vector causality. Wall-clock time may select
 a display name but must never decide whether edits are concurrent.

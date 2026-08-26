@@ -1,48 +1,53 @@
-# DeltaWeave v0.1.2
+# DeltaWeave v0.2.0
 
-This pre-alpha release is a verified one-file P2P delta-transfer foundation.
-It is intended for controlled Windows PC and Synology DSM evaluation, not as
-the only copy of important data.
+This pre-alpha release adds an authoritative local filesystem index to the
+verified one-file P2P delta-transfer foundation. It is intended for controlled
+Windows PC and Synology DSM evaluation, not as the only copy of important data.
 
-## Included
+## New local-state foundation
 
-- Streaming FastCDC manifests and BLAKE3 chunk/file verification
-- Durable redb metadata and content-addressed chunk storage
-- Authenticated iroh/QUIC transfer with deny-by-default peer allow-listing
-- Missing-chunk-only retransmission and safe materialization
-- `init`, `manifest`, `serve`, `push`, and isolated `self-test` CLI commands
-- Windows x86-64 and static Synology x86-64/ARM64 packages
+- Persistent redb records for files, directories, symlinks, stable OS identity,
+  complete-file BLAKE3 hashes, version vectors, generations, and tombstones
+- `scan` for an authoritative full directory scan
+- `watch` for native event ingestion with adaptive debounce, touched-path
+  rehashing, fixed periodic full verification, and polling fallback
+- Unambiguous rename correlation using NTFS file index or Unix device/inode
+- Unicode-normalized case-collision groups that preserve every local name
+- Persistent capped exponential backoff for locked or mutating files
+- Conservative incomplete-scan handling that never treats an unreadable subtree
+  as confirmed deletion
+
+## Packaged verification
+
+`deltaweave self-test` now validates both major vertical slices:
+
+- two encrypted local transfers, chunk/file integrity, materialization, and
+  delta reuse;
+- initial local indexing, stable-identity rename correlation, deletion
+  tombstones, and index restart recovery.
+
+CI also exercises the native watcher on Linux and Windows. The Windows suite
+holds an exclusive file handle to verify sharing-violation retry and recovery.
+Container and release jobs execute packaged binaries on linux/amd64 and
+linux/arm64.
+
+## Packages
+
+- Windows x86-64 ZIP
+- Static Synology/Linux x86-64 tarball
+- Static Synology/Linux ARM64 tarball
+- Multi-architecture OCI image on GitHub Container Registry
 - SHA-256 checksums for every downloadable archive
 
-## v0.1.2 packaging correction
-
-- Synology tar entries use normalized numeric UID/GID 0 instead of the CI runner
-  account
-- Synology extraction instructions explicitly preserve the installing user's
-  ownership
-
-## v0.1.1 hardening
-
-- Clean Windows logs without raw ANSI escape sequences
-- Immediate rejection of non-allow-listed endpoint IDs
-- Protected separation of receiver data, private state, and identity paths
-- Strict duplicate-chunk and transfer-receipt validation
-- Graceful Docker/Portainer SIGTERM handling
-- iroh 1.1.0 transport update with Rust 1.91 compatibility retained
-- Reliable direct-mode startup without intermittent missing-address failures
-- RustSec dependency auditing and runtime checks for both Synology architectures
-
 Run `deltaweave self-test` (or `deltaweave.exe self-test` on Windows) immediately
-after extraction. It validates local QUIC transport, storage, reconstruction,
-integrity checks, and delta reuse without touching user data.
-
-Follow the complete
+after extraction. Then follow the
 [Windows PC ↔ Synology guide](https://github.com/happyaspic-byte/DeltaWeave/blob/main/docs/TESTING_WINDOWS_SYNOLOGY.md)
-for architecture selection, checksums, firewall notes, cross-device transfer,
-and hash verification.
+and the
+[local-index test guide](https://github.com/happyaspic-byte/DeltaWeave/blob/main/docs/TESTING_LOCAL_INDEX.md).
 
 ## Scope warning
 
-Continuous watching, directory reconciliation, bidirectional conflict handling,
-DSM SPK installation, Windows installers/services, and on-demand VFS are planned
-but are not part of v0.1.2.
+The local index is not yet connected to distributed Merkle reconciliation.
+Automatic bidirectional propagation, deterministic conflict copies, tombstone
+garbage collection, DSM SPK installation, Windows services/installers, and
+on-demand VFS remain future phases.

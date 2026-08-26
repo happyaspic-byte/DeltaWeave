@@ -411,10 +411,7 @@ fn validate_wire_path(value: &str) -> Result<(), WirePathError> {
     }
 
     const ILLEGAL: [char; 9] = ['<', '>', ':', '"', '|', '?', '*', '\0', '\r'];
-    const RESERVED: [&str; 22] = [
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
-    ];
+    const RESERVED_BASE: [&str; 7] = ["CON", "PRN", "AUX", "NUL", "CLOCK$", "CONIN$", "CONOUT$"];
 
     for component in value.split('/') {
         if component.is_empty() || component == "." || component == ".." {
@@ -432,10 +429,24 @@ fn validate_wire_path(value: &str) -> Result<(), WirePathError> {
         {
             return Err(WirePathError::InvalidComponent(component.to_owned()));
         }
-        let stem = component.split('.').next().unwrap_or(component);
-        if RESERVED
+        let stem = component
+            .split('.')
+            .next()
+            .unwrap_or(component)
+            .trim_end_matches([' ', '.']);
+        let upper_stem = stem.to_ascii_uppercase();
+        let numbered_device = ["COM", "LPT"].iter().any(|prefix| {
+            upper_stem.strip_prefix(prefix).is_some_and(|suffix| {
+                matches!(
+                    suffix,
+                    "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                )
+            })
+        });
+        if RESERVED_BASE
             .iter()
             .any(|reserved| stem.eq_ignore_ascii_case(reserved))
+            || numbered_device
         {
             return Err(WirePathError::ReservedName(component.to_owned()));
         }
@@ -500,6 +511,12 @@ impl VersionVector {
     #[must_use]
     pub fn get(&self, replica: ReplicaId) -> u64 {
         self.0.get(&replica).copied().unwrap_or_default()
+    }
+
+    /// Records a replica counter without allowing causal knowledge to move backwards.
+    pub fn observe(&mut self, replica: ReplicaId, counter: u64) {
+        let current = self.0.entry(replica).or_default();
+        *current = (*current).max(counter);
     }
 
     /// Merges all knowledge from another vector.
@@ -629,6 +646,11 @@ mod tests {
         assert!(WirePath::new("../secrets.txt").is_err());
         assert!(WirePath::new("folder\\escape.txt").is_err());
         assert!(WirePath::new("con.txt").is_err());
+        assert!(WirePath::new("CON .txt").is_err());
+        assert!(WirePath::new("COM¹.log").is_err());
+        assert!(WirePath::new("clock$.txt").is_err());
+        assert!(WirePath::new("conout$.txt").is_err());
+        assert!(WirePath::new("com10.txt").is_ok());
     }
 
     #[test]
@@ -652,5 +674,14 @@ mod tests {
         assert_eq!(left.relation(&right), CausalRelation::Concurrent);
         left.merge(&right);
         assert_eq!(left.relation(&right), CausalRelation::After);
+    }
+
+    #[test]
+    fn observing_a_counter_never_moves_backwards() {
+        let replica = ReplicaId(Hash32::digest(b"replica"));
+        let mut vector = VersionVector::default();
+        vector.observe(replica, 7);
+        vector.observe(replica, 3);
+        assert_eq!(vector.get(replica), 7);
     }
 }

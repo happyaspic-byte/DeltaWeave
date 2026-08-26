@@ -5,16 +5,18 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 DeltaWeave is a Rust foundation for authenticated, content-defined P2P file
-synchronization. It combines FastCDC chunking, BLAKE3 integrity, a durable
-content-addressed store, and iroh's encrypted QUIC transport.
+synchronization. It combines an authoritative local filesystem index, FastCDC
+chunking, BLAKE3 integrity, a durable content-addressed store, and iroh's
+encrypted QUIC transport.
 
-> **Project status: pre-alpha.** v0.1 is a verified one-file delta-transfer
-> vertical slice, not yet a background two-way sync product. Do not use it as
-> the only copy of important data.
+> **Project status: pre-alpha.** v0.2 adds a persistent scanner and native
+> watcher to the verified one-file delta-transfer vertical slice. The index is
+> not yet connected to distributed two-way reconciliation. Do not use
+> DeltaWeave as the only copy of important data.
 
 ## What works today
 
-| Capability | v0.1 status |
+| Capability | v0.2 status |
 | --- | --- |
 | Streaming FastCDC manifests | Implemented and unit-tested |
 | Chunk and whole-file BLAKE3 verification | Implemented and unit-tested |
@@ -23,8 +25,12 @@ content-addressed store, and iroh's encrypted QUIC transport.
 | Missing-chunk-only re-transfer | Implemented with insertion/reuse tests |
 | Allow-listed peer authorization | Implemented; deny by default |
 | Safe replacement and recovery journal | Implemented baseline; old content goes to private trash |
-| Continuous filesystem watching | Planned |
-| Merkle tree reconciliation and tombstones | Planned |
+| Persistent local file/directory index | Implemented with restart and operation-storm tests |
+| Native watching and adaptive debounce | Implemented with full-rescan and polling fallbacks |
+| Rename correlation and deletion tombstones | Implemented using stable OS identity where available |
+| Case/Unicode collision detection | Implemented; collisions are reported without overwriting names |
+| Locked/mutating file retry queue | Implemented with persistent exponential backoff |
+| Distributed Merkle reconciliation | Planned |
 | Full two-way conflict handling | Planned |
 | Windows CFAPI / Linux FUSE on-demand files | Planned |
 
@@ -36,31 +42,34 @@ The scope and acceptance gates for later phases live in [ROADMAP.md](ROADMAP.md)
 | --- | --- |
 | `deltaweave-core` | Stable hashes, manifests, portable paths, and version vectors |
 | `deltaweave-cdc` | Streaming FastCDC, BLAKE3 manifests, and delta planning |
+| `deltaweave-index` | Authoritative scans, watcher hints, collision checks, tombstones, and retries |
 | `deltaweave-store` | Verified chunk storage, redb metadata, journaled materialization |
 | `deltaweave-net` | iroh endpoint identity, authorization, and transfer protocol |
-| `deltaweave` | JSON-oriented CLI for identity, manifest, receive, and push |
+| `deltaweave` | JSON CLI for identity, indexing, watching, receive, push, and self-test |
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and
 [docs/PROTOCOL.md](docs/PROTOCOL.md) for the invariants behind these boundaries.
 
 ## Download a test release
 
-The pre-alpha [v0.1.2 release](https://github.com/happyaspic-byte/DeltaWeave/releases/tag/v0.1.2)
+The pre-alpha [v0.2.0 release](https://github.com/happyaspic-byte/DeltaWeave/releases/tag/v0.2.0)
 provides ready-to-run packages for:
 
 - Windows x86-64
 - Synology DSM on x86-64
 - Synology DSM on ARM64 (`aarch64`)
 
-Each package includes the executable, license, and Windows-to-Synology test
-guide. After extracting the correct package, run the isolated end-to-end check:
+Each package includes the executable, license, cross-device test guide, and
+local-index test guide. After extracting the correct package, run the isolated
+end-to-end check:
 
 ```bash
 deltaweave self-test
 ```
 
 It performs two encrypted local transfers and verifies chunk integrity,
-materialization, and delta reuse. See
+materialization, delta reuse, local indexing, rename correlation, tombstones,
+and index restart recovery. See
 [Windows PC ↔ Synology testing](docs/TESTING_WINDOWS_SYNOLOGY.md) for the full
 cross-device procedure and checksum verification.
 
@@ -81,6 +90,35 @@ cargo fmt --all -- --check
 ```
 
 CI repeats the quality gates on Linux and runs the full test suite on Windows.
+
+## Index or watch a folder
+
+Run one authoritative scan. Keep private state and the node identity outside the
+indexed root when practical; paths beneath the root are excluded automatically.
+
+```bash
+deltaweave scan \
+  --root ./sync-root \
+  --state ./private/index.redb \
+  --identity ./private/node.key
+```
+
+For continuous local indexing, native events are debounced and treated as hints.
+Periodic complete scans remain authoritative; watcher loss activates a short
+polling fallback.
+
+```bash
+deltaweave watch \
+  --root ./sync-root \
+  --state ./private/index.redb \
+  --identity ./private/node.key
+```
+
+Both commands emit JSON reports containing changes, retries, and cross-platform
+name collisions. Add `--include-records` to `scan` when an operator needs the
+complete persistent record and retry lists. They do **not** yet send those
+changes to another device. See
+[local-index testing](docs/TESTING_LOCAL_INDEX.md) for safe validation steps.
 
 ## Try a direct local transfer
 
