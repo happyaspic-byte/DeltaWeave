@@ -43,13 +43,17 @@ jobs:
         run: cargo doc --locked --workspace --no-deps --all-features
       - name: Documentation media
         run: |
+          bash -n scripts/verify-release.sh
           test -s docs/assets/deltaweave-hero.webp
           test -s docs/assets/deltaweave-quickstart.gif
           test -s docs/assets/deltaweave-index-lifecycle.gif
+          test -s docs/assets/deltaweave-sync-lifecycle.gif
           test -s docs/assets/deltaweave-self-test.png
           test -s docs/assets/deltaweave-synology-self-test.png
           test -s docs/assets/portainer-flow.svg
           grep -Fq 'docs/assets/deltaweave-quickstart.gif' README.md
+          grep -Fq 'docs/assets/deltaweave-sync-lifecycle.gif' README.md
+          grep -Fq 'docs/QUALITY_REPORT_V0.3.md' README.md
           grep -Fq 'assets/deltaweave-index-lifecycle.gif' docs/TESTING_LOCAL_INDEX.md
           grep -Fq 'assets/portainer-flow.svg' docs/AI_PORTAINER_SETUP.md
       - name: Release build

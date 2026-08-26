@@ -32,6 +32,7 @@ render_terminal() {
   local body="$3"
   local point_size="${4:-24}"
   local line_spacing="${5:-8}"
+  local header="${6:-DeltaWeave v0.2.0  |  verified CLI output}"
 
   convert -size 1280x720 xc:'#07111f' \
     -fill '#111c2d' -stroke '#26364c' -strokewidth 2 \
@@ -40,7 +41,7 @@ render_terminal() {
     -fill '#febc2e' -draw 'circle 100,72 108,72' \
     -fill '#28c840' -draw 'circle 128,72 136,72' \
     -font "$font" -pointsize 22 -fill '#8fa6c2' \
-    -annotate +170+80 'DeltaWeave v0.2.0  |  verified CLI output' \
+    -annotate +170+80 "$header" \
     -pointsize 23 -fill '#2dd4bf' -annotate +72+132 "$section" \
     -pointsize "$point_size" -fill '#e6edf7' -interline-spacing "$line_spacing" \
     -annotate +72+184 "$body" \
@@ -92,6 +93,28 @@ render_terminal "$work_dir/synology-self-test.png" \
   'Synology ARM64 release package  |  verified binary result' \
   $'admin@synology:~$ ./deltaweave self-test\n{\n  "architecture": "aarch64",\n  "operating_system": "linux",\n  "first_transfer_bytes": 4194304,\n  "second_transfer_bytes": 257800,\n  "reused_extents": 16,\n  "index_rename_detected": true,\n  "index_restart_verified": true,\n  "index_tombstones": 2,\n  "status": "pass"\n}'
 
+# Bidirectional sequence: values come from an actual v0.3.0 sync-once CLI run using
+# two independent roots, persistent identities, the direct-only server, and protocol v2.
+render_terminal "$work_dir/sync-before.png" \
+  '전 (BEFORE)  |  Independent Windows and NAS folders' \
+  $'WINDOWS ROOT                         NAS ROOT\n  windows-only.txt   7,886 B           nas-only.txt   3,139 B\n  shared.txt         1,080 B           shared.txt     1,080 B\n\nPS> .\\deltaweave.exe sync-once `\n>> --root C:\\DeltaWeave-Sync `\n>> --peer <NAS_ENDPOINT_ID> `\n>> --direct <NAS_IP:UDP_PORT> --direct-only\n\nBoth private state roots and identities are outside synchronized data.' \
+  20 6 'DeltaWeave v0.3.0  |  verified sync-once output'
+
+render_terminal "$work_dir/sync-during.png" \
+  '중 (DURING)  |  Initial bidirectional reconciliation' \
+  $'{\n  "status": "pass",\n  "merkle_queries": 3,\n  "local_actions": 2,\n  "remote_actions": 2,\n  "pulled_bytes": 3139,\n  "pushed_bytes": 8966,\n  "conflicts": []\n}\n\nWindows now has nas-only.txt.\nNAS now has windows-only.txt.\nA final snapshot proves both Merkle roots are identical.' \
+  21 5 'DeltaWeave v0.3.0  |  verified sync-once output'
+
+render_terminal "$work_dir/sync-after.png" \
+  '후 (AFTER)  |  Concurrent edits preserve both contents' \
+  $'{\n  "status": "pass",\n  "merkle_queries": 2,\n  "local_actions": 2,\n  "remote_actions": 2,\n  "conflicts": [{\n    "path": "shared.txt",\n    "conflict_path": "shared.conflict-7caef0037876.txt",\n    "reason": "concurrent_edit"\n  }]\n}\n\nBoth peers contain the canonical file and the same verified conflict copy.' \
+  20 4 'DeltaWeave v0.3.0  |  verified sync-once output'
+
+render_terminal "$work_dir/sync-result.png" \
+  '결과 (RESULT)  |  Delete propagation and idempotent retry' \
+  $'DELETE PASS\n  local_actions ........ 0\n  remote_actions ....... 1\n  pushed_bytes ......... 0\n  windows-only.txt is absent on both peers\n\nNO-CHANGE RETRY PASS\n  merkle_queries ....... 1\n  local_actions ........ 0\n  remote_actions ....... 0\n  pulled / pushed ...... 0 B / 0 B\n  verified roots ....... identical' \
+  22 7 'DeltaWeave v0.3.0  |  verified sync-once output'
+
 cp "$work_dir/transfer-before.png" "$assets_dir/usage-01-before.png"
 cp "$work_dir/transfer-during.png" "$assets_dir/usage-02-during.png"
 cp "$work_dir/transfer-after.png" "$assets_dir/usage-03-after.png"
@@ -103,6 +126,10 @@ cp "$work_dir/index-after.png" "$assets_dir/index-03-after.png"
 cp "$work_dir/index-result.png" "$assets_dir/index-04-result.png"
 cp "$work_dir/index-after.png" "$assets_dir/deltaweave-index-watch.png"
 cp "$work_dir/synology-self-test.png" "$assets_dir/deltaweave-synology-self-test.png"
+cp "$work_dir/sync-before.png" "$assets_dir/sync-01-before.png"
+cp "$work_dir/sync-during.png" "$assets_dir/sync-02-during.png"
+cp "$work_dir/sync-after.png" "$assets_dir/sync-03-after.png"
+cp "$work_dir/sync-result.png" "$assets_dir/sync-04-result.png"
 
 convert \
   -delay 150 "$work_dir/transfer-before.png" \
@@ -120,9 +147,18 @@ convert \
   -loop 0 -colors 128 -layers Optimize \
   "$assets_dir/deltaweave-index-lifecycle.gif"
 
+convert \
+  -delay 170 "$work_dir/sync-before.png" \
+  -delay 190 "$work_dir/sync-during.png" \
+  -delay 210 "$work_dir/sync-after.png" \
+  -delay 260 "$work_dir/sync-result.png" \
+  -loop 0 -colors 128 -layers Optimize \
+  "$assets_dir/deltaweave-sync-lifecycle.gif"
+
 identify \
   "$assets_dir/deltaweave-self-test.png" \
   "$assets_dir/deltaweave-index-watch.png" \
   "$assets_dir/deltaweave-synology-self-test.png" \
   "$assets_dir/deltaweave-quickstart.gif" \
-  "$assets_dir/deltaweave-index-lifecycle.gif"
+  "$assets_dir/deltaweave-index-lifecycle.gif" \
+  "$assets_dir/deltaweave-sync-lifecycle.gif"

@@ -11,10 +11,11 @@ synchronization. It combines an authoritative local filesystem index, FastCDC
 chunking, BLAKE3 integrity, a durable content-addressed store, and iroh's
 encrypted QUIC transport.
 
-> **Project status: pre-alpha.** v0.2 adds a persistent scanner and native
-> watcher to the verified one-file delta-transfer vertical slice. The index is
-> not yet connected to distributed two-way reconciliation. Do not use
-> DeltaWeave as the only copy of important data.
+> **Project status: pre-alpha field preview.** v0.3 connects the persistent
+> index to deterministic Merkle reconciliation, version-vector conflicts, and
+> verified two-way folder synchronization. Windows/Synology hardware soak,
+> installers/services, symlink materialization, and on-demand VFS are still
+> incomplete. Do not use DeltaWeave as the only copy of important data.
 
 ## Actual usage
 
@@ -29,9 +30,15 @@ the local-index lifecycle, and the Synology ARM64 result. Only the terminal font
 and background are normalized; status values, byte counts, and event counts come
 from verified executions.
 
+The next animation is a separate, actual `sync-once` run: two independent roots
+exchange files, preserve simultaneous edits, propagate a deletion, and finish
+with a one-node/no-action Merkle fast path.
+
+![DeltaWeave 양방향 동기화 전, 중, 후, 결과](docs/assets/deltaweave-sync-lifecycle.gif)
+
 ## What works today
 
-| Capability | v0.2 status |
+| Capability | v0.3 status |
 | --- | --- |
 | Streaming FastCDC manifests | Implemented and unit-tested |
 | Chunk and whole-file BLAKE3 verification | Implemented and unit-tested |
@@ -45,8 +52,12 @@ from verified executions.
 | Rename correlation and deletion tombstones | Implemented using stable OS identity where available |
 | Case/Unicode collision detection | Implemented; collisions are reported without overwriting names |
 | Locked/mutating file retry queue | Implemented with persistent exponential backoff |
-| Distributed Merkle reconciliation | Planned |
-| Full two-way conflict handling | Planned |
+| Distributed Merkle reconciliation | Implemented with partial-subtree queries and final-root verification |
+| Bidirectional folder create/update/delete/rename | Implemented; rename is causal delete/create with chunk reuse |
+| Version-vector conflict handling | Implemented; deterministic winner and portable conflict copy preserve both file contents |
+| Partition/restart convergence | Implemented in three-peer model and two-peer restart integration tests |
+| Continuous retrying synchronization | Implemented via `sync`, with bounded exponential backoff |
+| Symlink/special-file materialization | Safely rejected; indexed but not followed |
 | Windows CFAPI / Linux FUSE on-demand files | Planned |
 
 The scope and acceptance gates for later phases live in [ROADMAP.md](ROADMAP.md).
@@ -58,16 +69,18 @@ The scope and acceptance gates for later phases live in [ROADMAP.md](ROADMAP.md)
 | `deltaweave-core` | Stable hashes, manifests, portable paths, and version vectors |
 | `deltaweave-cdc` | Streaming FastCDC, BLAKE3 manifests, and delta planning |
 | `deltaweave-index` | Authoritative scans, watcher hints, collision checks, tombstones, and retries |
+| `deltaweave-reconcile` | Canonical Merkle trees, causal merge, conflicts, and apply planning |
 | `deltaweave-store` | Verified chunk storage, redb metadata, journaled materialization |
-| `deltaweave-net` | iroh endpoint identity, authorization, and transfer protocol |
-| `deltaweave` | JSON CLI for identity, indexing, watching, receive, push, and self-test |
+| `deltaweave-net` | iroh identity, authorization, Merkle queries, and causal push/pull protocols |
+| `deltaweave-sync` | Retry-safe two-peer orchestration and independent convergence verification |
+| `deltaweave` | JSON CLI for identity, indexing, serving, syncing, diagnostics, and self-test |
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and
 [docs/PROTOCOL.md](docs/PROTOCOL.md) for the invariants behind these boundaries.
 
 ## Download a test release
 
-The pre-alpha [v0.2.1 release](https://github.com/happyaspic-byte/DeltaWeave/releases/tag/v0.2.1)
+The pre-alpha [v0.3.0 release](https://github.com/happyaspic-byte/DeltaWeave/releases/tag/v0.3.0)
 provides ready-to-run packages for:
 
 - Windows x86-64
@@ -82,9 +95,9 @@ end-to-end check:
 deltaweave self-test
 ```
 
-It performs two encrypted local transfers and verifies chunk integrity,
-materialization, delta reuse, local indexing, rename correlation, tombstones,
-and index restart recovery. See
+It performs encrypted delta transfers and additionally verifies bidirectional
+exchange, deterministic conflict copies, deletion propagation, local indexing,
+rename correlation, tombstones, and zero-action restart recovery. See
 [Windows PC ↔ Synology testing](docs/TESTING_WINDOWS_SYNOLOGY.md) for the full
 cross-device procedure and checksum verification.
 
@@ -105,6 +118,9 @@ cargo fmt --all -- --check
 ```
 
 CI repeats the quality gates on Linux and runs the full test suite on Windows.
+Run the same release-oriented checks locally with `./scripts/verify-release.sh`.
+The evidence, deductions, and scoped **90.1/100** score are recorded in the
+[v0.3 quality report](docs/QUALITY_REPORT_V0.3.md).
 
 ## Index or watch a folder
 
@@ -131,8 +147,7 @@ deltaweave watch \
 
 Both commands emit JSON reports containing changes, retries, and cross-platform
 name collisions. Add `--include-records` to `scan` when an operator needs the
-complete persistent record and retry lists. They do **not** yet send those
-changes to another device. See
+complete persistent record and retry lists. See
 [local-index testing](docs/TESTING_LOCAL_INDEX.md) for safe validation steps.
 
 ## Try a direct local transfer
@@ -176,6 +191,30 @@ bytes and reused extents.
 Internet mode uses iroh discovery and encrypted relay fallback. Omit
 `--direct-only`, and supply the relay URLs printed by the receiver when needed.
 
+## Synchronize a Windows folder with Synology
+
+Keep the Synology `serve` command running with the Windows endpoint ID on its
+allow-list. On Windows, use the receiver values printed by `serve`:
+
+```powershell
+.\deltaweave.exe sync-once `
+  --root C:\DeltaWeave-Sync `
+  --state C:\DeltaWeave-Private\state `
+  --identity C:\DeltaWeave-Private\windows.key `
+  --peer <SYNOLOGY_ENDPOINT_ID> `
+  --direct <SYNOLOGY_IP:UDP_PORT> `
+  --direct-only
+```
+
+`sync-once` returns success only after fresh local and remote snapshots have the
+same deterministic Merkle root. Use `sync` with the same arguments for continuous
+operation: native local events trigger a pass after the default 750 ms quiet
+window, while a five-second poll discovers remote-only changes. Watcher startup
+failure falls back to polling, and transient failures retry with exponential backoff.
+Every pass refuses incomplete scans, retry-queued files, cross-platform name
+collisions, stale causal writes, and concurrent records that have not first
+gone through deterministic reconciliation.
+
 ## Security model
 
 - iroh authenticates endpoints cryptographically and encrypts transport traffic.
@@ -184,10 +223,13 @@ Internet mode uses iroh discovery and encrypted relay fallback. Omit
 - Wire paths reject traversal, absolute paths, Windows device names, and invalid
   deserialized values.
 - Existing content is preserved in state trash before replacement.
+- Incoming state must causally dominate the installed record; stale, concurrent,
+  and equal-clock/different-state writes are rejected.
 
 This baseline does not yet defend perfectly against a privileged or racing local
-attacker. Read [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) before exposing a
-receiver or using real data. Report vulnerabilities according to
+attacker and does not materialize links or special files. Read
+[docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) before exposing a receiver or using
+real data. Report vulnerabilities according to
 [SECURITY.md](SECURITY.md).
 
 ## License

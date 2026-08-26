@@ -5,6 +5,37 @@ Versioning after its first stable release.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-26
+
+### Added
+
+- Add canonical Merkle path tries, partial-node snapshot queries, portable sync
+  records, exact causal apply receipts, and deterministic two-snapshot merge.
+- Add `deltaweave-sync` with verified two-way create/update/delete/rename,
+  conflict-copy, file/directory transition, restart, and final-root convergence.
+- Add `sync-once` and continuous `sync` commands with native debounced local
+  wakeups, bounded remote polling, watcher fallback, and capped exponential retry.
+- Expand `self-test` to cover bidirectional exchange, concurrent edits, deletion,
+  and zero-action durable restart.
+- Add actual before/during/after/result synchronization frames and GIF.
+
+### Security
+
+- Reject stale, unmerged-concurrent, and equal-clock/different-state writes.
+- Abort synchronization on incomplete scans, queued retries, or path collisions.
+- Stage every required conflict content hash before namespace mutation and retain
+  remotely replaced/deleted files in private trash.
+
+### Fixed
+
+- Normalize volatile directory mtimes and non-portable readonly semantics to
+  prevent child changes from causing perpetual version-vector churn.
+- Count actual unique transferred bytes when a manifest repeats chunk hashes.
+- Verify readonly state before adopting an exact remote causal record.
+- Treat a bound direct UDP socket as ready when restricted containers cannot use
+  netlink address discovery.
+- Reuse one local iroh endpoint across a complete reconciliation pass.
+
 ## [0.2.1] - 2026-08-26
 
 ### Added

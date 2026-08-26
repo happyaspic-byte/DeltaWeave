@@ -5,10 +5,10 @@
 Docker 사용법을 설명하는 문서가 아니다. 에이전트는 추측으로 값을 만들지 말고 아래
 게이트를 순서대로 통과해야 한다.
 
-> **현재 범위:** DeltaWeave v0.2는 단일 파일 QUIC 델타 전송과 영속 로컬
-> 폴더 인덱스/감시를 제공하는 pre-alpha다. 인덱스가 아직 자동 양방향 전송,
-> 충돌 해결, DSM SPK 또는 VFS와 연결되지는 않는다. 중요한 데이터의 유일한
-> 사본으로 사용하지 않는다.
+> **현재 범위:** DeltaWeave v0.3은 검증된 QUIC 델타 전송, 영속 로컬 인덱스,
+> Merkle 부분 탐색, 버전 벡터, 양방향 동기화와 conflict copy를 제공하는
+> pre-alpha field preview다. DSM SPK, OS 서비스/설치 프로그램, symlink
+> materialization과 VFS는 아직 없다. 중요한 데이터의 유일한 사본으로 사용하지 않는다.
 
 ![Windows에서 Synology Portainer로 배포하고 검증하는 흐름](assets/portainer-flow.svg)
 
@@ -24,13 +24,14 @@ Docker 사용법을 설명하는 문서가 아니다. 에이전트는 추측으�
 3. Portainer Stack의 `deltaweave-receiver`가 재시작 정책과 영속 경로를 사용해 실행 중이다.
 4. 로그에 `"status": "ready"`, 고정된 `endpoint_id`, 하나 이상의
    `direct_addresses`가 출력된다.
-5. Windows에서 NAS로 시험 파일을 보낸 뒤 양쪽 SHA-256이 같다.
-6. 파일을 조금 수정해 다시 보냈을 때 `reused_extents > 0`이고
-   `transferred_bytes < 전체 파일 크기`다.
+5. Windows의 `sync-once`로 Windows→NAS와 NAS→Windows 파일이 모두 전파되고
+   세 Merkle root(`desired/local/remote`)가 같다.
+6. 동시 수정이 두 장비에 같은 conflict copy를 만들고, 삭제가 반대편에 전파되며,
+   마지막 무변경 실행이 양쪽 action/전송 0으로 끝난다.
 7. 컨테이너가 privileged 모드, Docker 소켓 마운트 또는 `--allow-any-authenticated`를
    사용하지 않는다.
-8. 수신 폴더의 `scan` 결과가 전송한 파일을 포함하고, 컨테이너 재시작 뒤에도 index
-   레코드와 generation이 유지된다.
+8. 컨테이너 재시작 뒤 endpoint ID가 유지되고 Windows의 다음 `sync-once`가
+   0-action 또는 필요한 복구 action 후 같은 root로 끝난다.
 
 ## 2. 절대 준수할 안전 규칙
 
@@ -151,7 +152,7 @@ PGID=<DSM_ACCOUNT_GID>
 
 ```dotenv
 DELTAWEAVE_IMAGE=ghcr.io/happyaspic-byte/deltaweave:main
-DELTAWEAVE_LOG_LEVEL=info
+DELTAWEAVE_LOG_LEVEL=warn,deltaweave_net=info,netwatch=error
 ```
 
 Portainer API/MCP를 사용할 수 있으면 동일한 값으로 Git Stack을 생성해도 된다. 단,
@@ -178,9 +179,10 @@ network를 사용하므로 Compose에 port mapping을 추가하지 않는다.
 컨테이너를 한 번 재시작하고 `endpoint_id`가 동일한지 확인한다. 달라졌다면 `/data`
 마운트 또는 쓰기 권한 문제이므로 파일 전송 전에 수정한다.
 
-## 9. Windows에서 NAS로 종단간 시험
+## 9. Windows↔NAS 종단간 양방향 시험
 
-10 MiB 이상의 **복사본 테스트 파일**을 준비하고 아래 값을 실제 로그 출력으로 바꾼다.
+먼저 `push`로 10 MiB 이상의 **복사본 테스트 파일**에 대한 CDC 델타 경로를
+검증해도 된다. 제품 동기화 검증은 별도의 root/state로 다음 명령을 사용한다.
 
 ```powershell
 .\deltaweave.exe push C:\Test\sample.bin `
@@ -210,7 +212,35 @@ sha256sum /volume1/docker/deltaweave/received/validation/sample.bin
 두 번째 receipt의 `reused_extents > 0`, `transferred_bytes < 전체 파일 크기`와 변경 후
 양쪽 SHA-256 일치를 확인한다.
 
-이어서 컨테이너 안의 v0.2 로컬 인덱스로 수신 폴더를 검사한다.
+Windows private state는 동기화 root 밖에 둔다.
+
+```powershell
+New-Item -ItemType Directory -Force C:\DeltaWeave-Sync | Out-Null
+New-Item -ItemType Directory -Force C:\DeltaWeave-Private | Out-Null
+Set-Content C:\DeltaWeave-Sync\windows-only.txt "from Windows"
+
+.\deltaweave.exe sync-once `
+  --root C:\DeltaWeave-Sync `
+  --state C:\DeltaWeave-Private\state `
+  --identity .\data\sender.key `
+  --peer <SYNOLOGY_ENDPOINT_ID> `
+  --direct <SYNOLOGY_IP:UDP_PORT> `
+  --direct-only
+```
+
+NAS의 `/volume1/docker/deltaweave/received/nas-only.txt`에 복사본 파일을 만든 뒤
+같은 명령을 다시 실행한다. 양쪽 전용 파일이 반대편에 나타나고 JSON의
+`desired_root`, `verified_local_root`, `verified_remote_root`가 같아야 한다.
+
+이어 다음 안전 시나리오를 순서대로 수행한다.
+
+1. 같은 `shared.txt`를 한 번 동기화한다.
+2. 다음 sync 전에 Windows/NAS의 내용을 서로 다르게 수정한다.
+3. `sync-once`가 두 장비에 동일한 `.conflict-<hash>` 파일을 만들었는지 확인한다.
+4. Windows 전용 파일을 삭제하고 다시 실행해 NAS에서도 사라졌는지 확인한다.
+5. 한 번 더 실행해 `merkle_queries=1`, 양쪽 action 0, 전송 0인지 확인한다.
+
+그 후에만 컨테이너 안에서 별도 진단 인덱스로 수신 폴더를 검사할 수 있다.
 
 ```bash
 docker exec deltaweave-receiver deltaweave scan \
@@ -221,12 +251,13 @@ docker exec deltaweave-receiver deltaweave scan \
   --include-records
 ```
 
-`report.issues`와 `report.collisions`가 비어 있고 `records`에
-`validation/sample.bin`의 live record가 포함되어야 한다. 컨테이너를 재시작하고
-같은 명령을 다시 실행해
-generation 증가와 레코드 유지도 확인한다. 이 검사는 자동 양방향 동기화를 켜는
-명령이 아니다. 자세한 실패 판정은 [로컬 인덱스 검증서](TESTING_LOCAL_INDEX.md)를
-따른다.
+`report.issues`와 `report.collisions`가 비어 있고 live record가 포함되어야 한다.
+이 `scan`은 읽기 전용 진단용 별도 DB이며 동기화를 실행하는 명령이 아니다. 지속
+동기화는 Windows에서 같은 인자의 `sync --interval-seconds 5`를 사용한다. 로컬
+변경은 기본 750ms debounce 뒤 native watcher가 즉시 깨우며 NAS 전용 변경은 5초
+폴링으로 발견한다. 시작 JSON의 `local_change_detection`이 `native_watcher`인지
+기록하고, `polling_fallback`이면 `watcher_error`도 보고한다. 자세한 실패 판정은
+[로컬 인덱스 검증서](TESTING_LOCAL_INDEX.md)를 따른다.
 
 ## 10. 업데이트, 롤백, 백업
 
@@ -251,7 +282,8 @@ Container: running 여부 / restart 검증
 Receiver ID: 앞 8자...뒤 4자, 재시작 후 동일 여부
 Address: <LAN 또는 Tailscale IP>:<UDP port>
 Self-test: status / reused_extents / transferred bytes
-Cross-device: 최초 전송 PASS/FAIL, SHA-256 일치 PASS/FAIL
+Cross-device: 양방향 파일 PASS/FAIL, 세 Merkle root 일치 PASS/FAIL
+Conflict/delete/no-op: conflict copy / 삭제 전파 / 0-action 재실행
 Delta retry: reused_extents / transferred bytes / SHA-256 일치
 Local index: generation / live records / issues / restart 유지 여부
 Persistence: config/state/received 경로 및 백업 여부

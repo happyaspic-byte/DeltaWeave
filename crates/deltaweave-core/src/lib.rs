@@ -13,6 +13,8 @@ use thiserror::Error;
 
 /// Current on-disk and wire manifest schema.
 pub const MANIFEST_SCHEMA_V1: u16 = 1;
+/// Current distributed path-state schema.
+pub const SYNC_RECORD_SCHEMA_V1: u16 = 1;
 
 /// A BLAKE3 digest used for chunks, files, and manifests.
 #[derive(Clone, Copy, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -513,6 +515,17 @@ impl VersionVector {
         self.0.get(&replica).copied().unwrap_or_default()
     }
 
+    /// Iterates over replica counters in canonical replica-ID order.
+    pub fn iter(&self) -> impl Iterator<Item = (ReplicaId, u64)> + '_ {
+        self.0.iter().map(|(&replica, &counter)| (replica, counter))
+    }
+
+    /// Returns whether this vector contains no causal observations.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
     /// Records a replica counter without allowing causal knowledge to move backwards.
     pub fn observe(&mut self, replica: ReplicaId, counter: u64) {
         let current = self.0.entry(replica).or_default();
@@ -546,6 +559,124 @@ impl VersionVector {
             (true, true) => CausalRelation::Concurrent,
         }
     }
+}
+
+/// Portable filesystem kinds exchanged by distributed reconciliation.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncEntryKind {
+    /// A regular file whose complete content is identified by BLAKE3.
+    File,
+    /// A directory, including an empty directory.
+    Directory,
+    /// A symbolic link or reparse point. It is represented but not materialized by default.
+    Symlink,
+    /// A non-file, non-directory filesystem object.
+    Other,
+}
+
+/// Causal, portable state for one path in a synchronized namespace.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SyncRecord {
+    /// Version of this record encoding and validation contract.
+    pub schema_version: u16,
+    /// Portable path relative to a configured synchronization root.
+    pub path: WirePath,
+    /// Logical filesystem object kind.
+    pub kind: SyncEntryKind,
+    /// Logical byte length for live regular files.
+    pub size: u64,
+    /// Complete BLAKE3 content digest for a live regular file.
+    pub content_hash: Option<Hash32>,
+    /// Whether peers should materialize the object read-only.
+    pub readonly: bool,
+    /// Causal knowledge attached to this path state.
+    pub version: VersionVector,
+    /// A durable deletion marker. Tombstones may retain prior content metadata for recovery.
+    pub tombstone: bool,
+}
+
+impl SyncRecord {
+    /// Validates protocol invariants before a record enters reconciliation or storage.
+    pub fn validate(&self) -> Result<(), SyncRecordError> {
+        if self.schema_version != SYNC_RECORD_SCHEMA_V1 {
+            return Err(SyncRecordError::UnsupportedSchema(self.schema_version));
+        }
+        if self.tombstone {
+            return Ok(());
+        }
+        match self.kind {
+            SyncEntryKind::File if self.content_hash.is_none() => {
+                Err(SyncRecordError::MissingFileHash)
+            }
+            SyncEntryKind::File => Ok(()),
+            SyncEntryKind::Directory | SyncEntryKind::Symlink | SyncEntryKind::Other
+                if self.size != 0 || self.content_hash.is_some() =>
+            {
+                Err(SyncRecordError::UnexpectedContentMetadata)
+            }
+            SyncEntryKind::Directory | SyncEntryKind::Symlink | SyncEntryKind::Other => Ok(()),
+        }
+    }
+
+    /// Returns a stable digest over the complete logical record, including causal history.
+    #[must_use]
+    pub fn logical_hash(&self) -> Hash32 {
+        let mut hasher = blake3::Hasher::new_derive_key("deltaweave sync record v1");
+        update_sized(&mut hasher, self.path.as_str().as_bytes());
+        hasher.update(&[match self.kind {
+            SyncEntryKind::File => 0,
+            SyncEntryKind::Directory => 1,
+            SyncEntryKind::Symlink => 2,
+            SyncEntryKind::Other => 3,
+        }]);
+        hasher.update(&self.size.to_le_bytes());
+        match self.content_hash {
+            Some(hash) => {
+                hasher.update(&[1]);
+                hasher.update(hash.as_bytes());
+            }
+            None => {
+                hasher.update(&[0]);
+            }
+        }
+        hasher.update(&[u8::from(self.readonly), u8::from(self.tombstone)]);
+        for (replica, counter) in self.version.iter() {
+            hasher.update(replica.0.as_bytes());
+            hasher.update(&counter.to_le_bytes());
+        }
+        Hash32::from_bytes(*hasher.finalize().as_bytes())
+    }
+
+    /// Returns whether two records describe the same path state while ignoring causal history.
+    #[must_use]
+    pub fn same_state(&self, other: &Self) -> bool {
+        self.path == other.path
+            && self.kind == other.kind
+            && self.size == other.size
+            && self.content_hash == other.content_hash
+            && self.readonly == other.readonly
+            && self.tombstone == other.tombstone
+    }
+}
+
+fn update_sized(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+}
+
+/// Invalid distributed path state.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum SyncRecordError {
+    /// The encoded record uses an unknown schema.
+    #[error("unsupported sync-record schema {0}")]
+    UnsupportedSchema(u16),
+    /// A live regular file lacks a complete-file digest.
+    #[error("live file record is missing its content hash")]
+    MissingFileHash,
+    /// A non-file record claims regular-file content metadata.
+    #[error("non-file record contains file size or content hash")]
+    UnexpectedContentMetadata,
 }
 
 /// Logical clock failure.
@@ -683,5 +814,44 @@ mod tests {
         vector.observe(replica, 7);
         vector.observe(replica, 3);
         assert_eq!(vector.get(replica), 7);
+    }
+
+    #[test]
+    fn sync_record_hash_is_canonical_and_tracks_causal_state() {
+        let replica = ReplicaId(Hash32::digest(b"replica"));
+        let mut version = VersionVector::default();
+        version.observe(replica, 1);
+        let record = SyncRecord {
+            schema_version: SYNC_RECORD_SCHEMA_V1,
+            path: WirePath::new("folder/file.bin").expect("path is portable"),
+            kind: SyncEntryKind::File,
+            size: 7,
+            content_hash: Some(Hash32::digest(b"content")),
+            readonly: false,
+            version,
+            tombstone: false,
+        };
+        assert_eq!(record.validate(), Ok(()));
+        assert_eq!(record.logical_hash(), record.clone().logical_hash());
+
+        let mut later = record.clone();
+        later.version.increment(replica).expect("clock can advance");
+        assert!(record.same_state(&later));
+        assert_ne!(record.logical_hash(), later.logical_hash());
+    }
+
+    #[test]
+    fn live_sync_file_requires_a_content_hash() {
+        let record = SyncRecord {
+            schema_version: SYNC_RECORD_SCHEMA_V1,
+            path: WirePath::new("file.bin").expect("path is portable"),
+            kind: SyncEntryKind::File,
+            size: 10,
+            content_hash: None,
+            readonly: false,
+            version: VersionVector::default(),
+            tombstone: false,
+        };
+        assert_eq!(record.validate(), Err(SyncRecordError::MissingFileHash));
     }
 }

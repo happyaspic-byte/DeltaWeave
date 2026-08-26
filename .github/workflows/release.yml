@@ -85,6 +85,7 @@ jobs:
           Copy-Item ".\docs\TESTING_LOCAL_INDEX.md" $package
           Copy-Item ".\docs\AI_PORTAINER_SETUP.md" $package
           Copy-Item ".\docs\USAGE_GALLERY.md" $package
+          Copy-Item ".\docs\QUALITY_REPORT_V0.3.md" $package
           Copy-Item ".\docs\assets" $package -Recurse
           Copy-Item ".\LICENSE" $package
           Compress-Archive -Path "$package\*" -DestinationPath "dist\$name.zip"
@@ -157,6 +158,7 @@ jobs:
           install -m 0644 docs/TESTING_LOCAL_INDEX.md "$package/TESTING_LOCAL_INDEX.md"
           install -m 0644 docs/AI_PORTAINER_SETUP.md "$package/AI_PORTAINER_SETUP.md"
           install -m 0644 docs/USAGE_GALLERY.md "$package/USAGE_GALLERY.md"
+          install -m 0644 docs/QUALITY_REPORT_V0.3.md "$package/QUALITY_REPORT_V0.3.md"
           install -d -m 0755 "$package/assets"
           install -m 0644 docs/assets/* "$package/assets/"
           install -m 0644 LICENSE "$package/LICENSE"

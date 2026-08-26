@@ -15,7 +15,7 @@
 - A remote peer may be malicious even when it can establish an encrypted session.
 - Files already present under the destination may be untrusted.
 
-## Defenses in v0.2
+## Defenses in v0.3
 
 - Deny-by-default endpoint allow-list; accepting any authenticated peer requires
   an explicit flag. Unauthorized endpoint IDs are closed before stream intake.
@@ -37,6 +37,14 @@
   prevent event loss from becoming authoritative state loss.
 - Each index DB is bound to one canonical root and replica identity, preventing
   accidental reuse from being interpreted as mass deletion.
+- Remote snapshots are accepted only after rebuilding and matching their Merkle
+  root and record count; unhealthy local or remote scans abort reconciliation.
+- Version vectors reject stale, unmerged-concurrent, and equal-clock divergent
+  writes before namespace replacement.
+- Required conflict contents enter verified CAS before either peer is mutated,
+  and non-empty unknown directories block remote deletion.
+- A post-apply local rescan and fresh remote Merkle snapshot must both equal the
+  desired root before `sync-once` reports success.
 
 ## Known gaps before production
 
@@ -47,14 +55,15 @@
 - Metadata, permissions, ACLs, alternate streams, sparse extents, xattrs, hard
   links, and symlinks are not synchronized.
 - Disk quotas and per-peer concurrency limits are not implemented.
-- Local file mutation while the sender chunks and later reads it can cause a
-  verified transfer failure; the new index detects mutation while hashing, but
-  transfer-time snapshot/identity checks are still required.
-- The local index has tombstones, but distributed Merkle reconciliation,
-  tombstone retention/GC, signed device membership, and rollback protection are
-  not implemented.
+- Local file mutation while the sender chunks and later reads it causes a safe
+  verified transfer failure and retry, but OS snapshot integration is absent.
+- Tombstones participate in distributed Merkle reconciliation, but safe
+  acknowledgement-based retention/GC, signed device membership, and rollback
+  protection across removed devices are not implemented.
 - Name collisions are detected but there is not yet a cross-device operator UX
   or automatic resolution policy.
+- Causal state is implemented for two-peer orchestration; membership changes,
+  malicious history amplification, and multi-peer admission policy are not.
 
 Operate the receiver with a dedicated unprivileged account and a dedicated empty
 destination. Keep separate backups. Do not expose `--allow-any-authenticated` on

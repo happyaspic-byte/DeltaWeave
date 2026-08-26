@@ -1,6 +1,6 @@
 [package]
-name = "deltaweave-store"
-description = "Crash-safe metadata and content-addressed chunk storage for DeltaWeave"
+name = "deltaweave-reconcile"
+description = "Deterministic Merkle reconciliation and conflict resolution for DeltaWeave"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,16 +9,13 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-anyhow.workspace = true
 blake3.workspace = true
-deltaweave-cdc = { path = "../deltaweave-cdc" }
 deltaweave-core = { path = "../deltaweave-core" }
-postcard.workspace = true
-redb.workspace = true
 serde.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

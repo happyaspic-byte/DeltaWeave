@@ -76,11 +76,50 @@ correctness independent of inotify/ReadDirectoryChangesW event loss.
 Byte-identical path and retry records are not rewritten during no-change scans,
 limiting database write amplification.
 
-## Planned distributed state engine
+Continuous `sync` also attaches a recursive native watcher to the client root.
+After a successful pass, a normal local event batch wakes reconciliation after
+the default 750 ms quiet period (bounded by a five-second storm deadline).
+Remote-only changes are still discovered by the configured periodic poll. If
+the watcher cannot start, the same poll remains a correctness-preserving fallback;
+native events only reduce latency and never replace authoritative scanning.
 
-The next state layer will attach versioned content manifests to local path
-records. A deterministic Merkle search tree will summarize those records. Peers
-will compare root hashes and descend only into mismatched ranges.
+## v0.3 distributed state engine
 
-Conflict detection will use version-vector causality. Wall-clock time may select
-a display name but must never decide whether edits are concurrent.
+`deltaweave-reconcile` projects host-specific index rows into portable
+`SyncRecord` values. A canonical component trie hashes the record at each node,
+ordered child names, child hashes, and cardinalities. Peers compare the root and
+request only mismatched node summaries; a one-node query completes an unchanged
+pass.
+
+One `sync-once` pass follows these gates:
+
+1. Authoritatively scan the local root; abort on read issues, retry-queued files,
+   or cross-platform collisions.
+2. Reconstruct and verify the remote tree through `deltaweave/sync/2` partial
+   queries. The receiver applies the same scan-health gate.
+3. Merge each path by version-vector causality. Concurrent identical state
+   merges knowledge; divergent state selects a deterministic winner and retains
+   losing file bytes under a portable `.conflict-<hash>` name.
+4. In a concurrent file-versus-directory conflict, the live directory wins so
+   descendants remain materializable and the file becomes a sibling conflict
+   copy. Causal directory-to-file transitions still win normally.
+5. Stage every required content hash in the local CAS before changing either
+   namespace. This prevents conflict data from being lost when a canonical path
+   is overwritten.
+6. Apply tombstones deepest-first, directories parent-first, and files in path
+   order. Existing non-directory content moves to private trash; non-empty
+   unknown directories block deletion.
+7. Push exact causal records to the remote. The receiver rejects stale,
+   concurrent, or equal-clock/different-state records that skipped merge.
+8. Rescan local state and reconstruct a fresh remote snapshot. Success is
+   reported only when both roots and record counts equal the desired tree.
+
+Directory mtime and read-only flags are deliberately normalized away: child
+updates mutate directory timestamps implicitly and directory write semantics
+are not portable. Regular-file readonly state is retained. Symlinks/reparse
+points and special files remain indexed but are rejected before materialization.
+
+The current orchestrator is two-peer. The merge model is orientation-independent
+for records/conflicts and includes a deterministic three-peer partition test,
+but production multi-peer membership, tombstone acknowledgement/GC, device
+revocation, and protocol migration remain hardening work.

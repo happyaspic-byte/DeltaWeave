@@ -3,7 +3,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fmt,
     fs::{self, OpenOptions},
     io::Write,
@@ -16,7 +16,12 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use deltaweave_cdc::{manifest_from_path, verify_chunk};
-use deltaweave_core::{ChunkingProfile, FileManifest, Hash32, WirePath};
+use deltaweave_core::{
+    CausalRelation, ChunkingProfile, FileManifest, Hash32, ReplicaId, SyncEntryKind, SyncRecord,
+    WirePath,
+};
+use deltaweave_index::{IndexOptions, LocalIndex};
+use deltaweave_reconcile::{MerkleNodeSummary, MerkleTree};
 use deltaweave_store::Store;
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayUrl, SecretKey, TransportAddr, Watcher,
@@ -29,6 +34,8 @@ use tracing::{info, warn};
 
 /// Versioned ALPN identifier for DeltaWeave's initial push protocol.
 pub const ALPN_V1: &[u8] = b"deltaweave/sync/1";
+/// Versioned ALPN identifier for Merkle state reconciliation and bidirectional transfer.
+pub const ALPN_V2: &[u8] = b"deltaweave/sync/2";
 const MAX_CONTROL_FRAME: usize = 16 * 1024 * 1024;
 const MAX_CHUNKS_PER_FILE: usize = 250_000;
 const MAX_FILE_SIZE: u64 = 16 * 1024 * 1024 * 1024 * 1024;
@@ -219,15 +226,40 @@ pub async fn start_server(config: ServerConfig) -> Result<Server> {
         peer_policy,
         network_mode,
     } = config;
+    let replica = ReplicaId(Hash32::digest(secret_key.public().as_bytes()));
     let (destination_root, state_root) = prepare_server_roots(&destination_root, &state_root)?;
     let store = Arc::new(Store::open(&state_root)?);
-    let endpoint = bind_endpoint(secret_key, network_mode, Some(ALPN_V1.to_vec())).await?;
-    let handler = PushHandler {
+    let index = Arc::new(LocalIndex::open(
+        &destination_root,
+        state_root.join("index.redb"),
+        replica,
+        IndexOptions::default(),
+    )?);
+    let apply_lock = Arc::new(tokio::sync::Mutex::new(()));
+    let endpoint = bind_endpoint(
+        secret_key,
+        network_mode,
+        Some(vec![ALPN_V1.to_vec(), ALPN_V2.to_vec()]),
+    )
+    .await?;
+    let push_handler = PushHandler {
+        store: Arc::clone(&store),
+        index: Arc::clone(&index),
+        destination_root: destination_root.clone(),
+        peer_policy: peer_policy.clone(),
+        apply_lock: Arc::clone(&apply_lock),
+    };
+    let sync_handler = SyncHandler {
         store,
+        index,
         destination_root,
         peer_policy,
+        apply_lock,
     };
-    let router = Router::builder(endpoint).accept(ALPN_V1, handler).spawn();
+    let router = Router::builder(endpoint)
+        .accept(ALPN_V1, push_handler)
+        .accept(ALPN_V2, sync_handler)
+        .spawn();
     Ok(Server {
         router,
         network_mode,
@@ -239,7 +271,7 @@ async fn wait_for_direct_address(endpoint: &Endpoint, limit: Duration) -> Result
     let wait = async {
         loop {
             let current = addresses.get();
-            if current.ip_addrs().next().is_some() {
+            if current.ip_addrs().next().is_some() || !endpoint.bound_sockets().is_empty() {
                 return Ok::<(), anyhow::Error>(());
             }
             addresses
@@ -300,15 +332,15 @@ fn prepare_server_roots(destination_root: &Path, state_root: &Path) -> Result<(P
 async fn bind_endpoint(
     secret_key: SecretKey,
     mode: NetworkMode,
-    alpn: Option<Vec<u8>>,
+    alpns: Option<Vec<Vec<u8>>>,
 ) -> Result<Endpoint> {
     let mut builder = match mode {
         NetworkMode::Internet => Endpoint::builder(presets::N0),
         NetworkMode::DirectOnly => Endpoint::builder(presets::Minimal),
     }
     .secret_key(secret_key);
-    if let Some(alpn) = alpn {
-        builder = builder.alpns(vec![alpn]);
+    if let Some(alpns) = alpns {
+        builder = builder.alpns(alpns);
     }
     builder.bind().await.context("failed to bind iroh endpoint")
 }
@@ -362,6 +394,550 @@ pub struct TransferReceipt {
     pub reused_extents: usize,
     /// Final portable destination path.
     pub path: WirePath,
+}
+
+/// Reusable authenticated client configuration for reconciliation protocol calls.
+#[derive(Clone)]
+pub struct SyncClient {
+    /// Persistent local endpoint identity.
+    pub secret_key: SecretKey,
+    /// Complete authenticated remote address.
+    pub remote: EndpointAddr,
+    /// Discovery and relay behavior.
+    pub network_mode: NetworkMode,
+}
+
+/// One reusable local iroh endpoint for a complete reconciliation pass.
+pub struct SyncSession {
+    client: SyncClient,
+    endpoint: Endpoint,
+}
+
+impl fmt::Debug for SyncSession {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SyncSession")
+            .field("client", &self.client)
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for SyncClient {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SyncClient")
+            .field("endpoint_id", &self.secret_key.public())
+            .field("remote", &self.remote)
+            .field("network_mode", &self.network_mode)
+            .finish()
+    }
+}
+
+/// Remote causal snapshot recovered by querying only mismatched Merkle nodes.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RemoteSnapshot {
+    /// Complete reconstructed remote records in path order.
+    pub records: Vec<SyncRecord>,
+    /// Verified remote Merkle root.
+    pub root_hash: Hash32,
+    /// Number of remote records.
+    pub record_count: usize,
+    /// Merkle nodes requested over the network.
+    pub queried_nodes: usize,
+}
+
+/// Receipt for one exact causal record applied by a peer.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SyncApplyReceipt {
+    /// Applied portable path.
+    pub path: WirePath,
+    /// Digest of the exact adopted [`SyncRecord`].
+    pub record_hash: Hash32,
+    /// Unique chunk bytes transferred by this operation.
+    pub transferred_bytes: u64,
+    /// File manifest extents already present in the receiver CAS.
+    pub reused_extents: usize,
+}
+
+/// File manifest and transfer counters returned after pulling content into a local CAS.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PullReceipt {
+    /// Exact remote causal record used for the pull.
+    pub record: SyncRecord,
+    /// Verified FastCDC manifest now available in the local CAS.
+    pub manifest: FileManifest,
+    /// Unique payload bytes received from the remote peer.
+    pub transferred_bytes: u64,
+    /// Manifest extents reused from the local CAS.
+    pub reused_extents: usize,
+}
+
+impl SyncClient {
+    /// Opens one authenticated local endpoint that can serve all calls in a sync pass.
+    pub async fn open_session(&self) -> Result<SyncSession> {
+        let endpoint = bind_endpoint(self.secret_key.clone(), self.network_mode, None).await?;
+        Ok(SyncSession {
+            client: self.clone(),
+            endpoint,
+        })
+    }
+
+    /// Reconstructs the remote snapshot while querying only mismatched Merkle subtrees.
+    pub async fn fetch_snapshot(&self, local: &MerkleTree) -> Result<RemoteSnapshot> {
+        let session = self.open_session().await?;
+        let outcome = session.fetch_snapshot(local).await;
+        session.close().await;
+        outcome
+    }
+
+    async fn fetch_snapshot_connected(
+        &self,
+        endpoint: &Endpoint,
+        local: &MerkleTree,
+    ) -> Result<RemoteSnapshot> {
+        let connection = endpoint
+            .connect(self.remote.clone(), ALPN_V2)
+            .await
+            .context("failed to connect to reconciliation endpoint")?;
+        let (mut send, mut receive) = connection
+            .open_bi()
+            .await
+            .context("open reconciliation stream")?;
+        let mut queue = VecDeque::from([String::new()]);
+        let mut remote_records = BTreeMap::new();
+        let mut root = None;
+        let mut queried_nodes = 0_usize;
+
+        while let Some(prefix) = queue.pop_front() {
+            queried_nodes = queried_nodes
+                .checked_add(1)
+                .context("Merkle query counter overflow")?;
+            ensure!(
+                queried_nodes <= 1_000_000,
+                "remote Merkle tree exceeds query safety limit"
+            );
+            write_frame(
+                &mut send,
+                &SyncWireRequest::QueryNode {
+                    prefix: prefix.clone(),
+                },
+            )
+            .await?;
+            let summary = match read_frame::<SyncWireResponse>(&mut receive).await? {
+                SyncWireResponse::Node { summary } => summary,
+                SyncWireResponse::Error { message } => {
+                    bail!("remote Merkle query failed: {message}")
+                }
+                _ => bail!("remote sent an unexpected Merkle response"),
+            }
+            .with_context(|| format!("remote Merkle prefix {prefix:?} disappeared"))?;
+            ensure!(summary.prefix == prefix, "remote Merkle prefix mismatch");
+            ensure!(
+                summary.record_count <= 1_000_000,
+                "remote snapshot exceeds record safety limit"
+            );
+            if prefix.is_empty() {
+                root = Some((summary.hash, summary.record_count));
+            }
+
+            let local_summary = local.node_summary(&prefix)?;
+            if local_summary.as_ref().is_some_and(|local_summary| {
+                local_summary.hash == summary.hash
+                    && local_summary.record_count == summary.record_count
+            }) {
+                insert_snapshot_records(&mut remote_records, local.records_under(&prefix)?)?;
+                continue;
+            }
+
+            if let Some(record) = summary.record {
+                insert_snapshot_record(&mut remote_records, record)?;
+            }
+            for child in summary.children {
+                let child_prefix = if prefix.is_empty() {
+                    child.name
+                } else {
+                    format!("{prefix}/{}", child.name)
+                };
+                let local_child = local.node_summary(&child_prefix)?;
+                if local_child.as_ref().is_some_and(|local_child| {
+                    local_child.hash == child.hash && local_child.record_count == child.record_count
+                }) {
+                    insert_snapshot_records(
+                        &mut remote_records,
+                        local.records_under(&child_prefix)?,
+                    )?;
+                } else {
+                    queue.push_back(child_prefix);
+                }
+            }
+        }
+
+        write_frame(&mut send, &SyncWireRequest::Finish).await?;
+        match read_frame::<SyncWireResponse>(&mut receive).await? {
+            SyncWireResponse::Finished => {}
+            SyncWireResponse::Error { message } => bail!("remote snapshot failed: {message}"),
+            _ => bail!("remote sent an unexpected snapshot completion"),
+        }
+        send.finish().context("finish snapshot request")?;
+        let (root_hash, record_count) = root.context("remote omitted Merkle root")?;
+        ensure!(
+            remote_records.len() == record_count,
+            "reconstructed remote record count mismatch"
+        );
+        let records: Vec<_> = remote_records.into_values().collect();
+        let verified = MerkleTree::from_records(records.clone())?;
+        ensure!(
+            verified.root_hash() == root_hash,
+            "reconstructed remote Merkle root mismatch"
+        );
+        connection.close(0_u8.into(), b"snapshot complete");
+        Ok(RemoteSnapshot {
+            records,
+            root_hash,
+            record_count,
+            queried_nodes,
+        })
+    }
+
+    /// Pushes one live file and makes the receiver adopt the exact supplied causal record.
+    pub async fn push_record(
+        &self,
+        source: impl AsRef<Path>,
+        record: SyncRecord,
+        profile: ChunkingProfile,
+    ) -> Result<SyncApplyReceipt> {
+        record.validate()?;
+        ensure!(
+            !record.tombstone && record.kind == SyncEntryKind::File,
+            "push_record requires a live file record"
+        );
+        let source = source.as_ref().to_path_buf();
+        ensure!(source.is_file(), "source is not a regular file");
+        let source_for_manifest = source.clone();
+        let manifest =
+            tokio::task::spawn_blocking(move || manifest_from_path(source_for_manifest, profile))
+                .await
+                .context("manifest task failed")??;
+        ensure!(
+            record.size == manifest.size && record.content_hash == Some(manifest.file_hash),
+            "source content does not match causal record"
+        );
+
+        let session = self.open_session().await?;
+        let outcome = session
+            .client
+            .push_record_connected(&session.endpoint, &source, record, manifest)
+            .await;
+        session.close().await;
+        outcome
+    }
+
+    async fn push_record_connected(
+        &self,
+        endpoint: &Endpoint,
+        source_path: &Path,
+        record: SyncRecord,
+        manifest: FileManifest,
+    ) -> Result<SyncApplyReceipt> {
+        let connection = endpoint
+            .connect(self.remote.clone(), ALPN_V2)
+            .await
+            .context("failed to connect for causal file push")?;
+        let (mut send, mut receive) = connection
+            .open_bi()
+            .await
+            .context("open sync push stream")?;
+        write_frame(
+            &mut send,
+            &SyncWireRequest::PushRecord {
+                record: record.clone(),
+                manifest: manifest.clone(),
+            },
+        )
+        .await?;
+        let missing = match read_frame::<SyncWireResponse>(&mut receive).await? {
+            SyncWireResponse::NeedChunks { hashes } => hashes,
+            SyncWireResponse::Error { message } => bail!("remote rejected causal push: {message}"),
+            _ => bail!("remote sent an unexpected causal push response"),
+        };
+        let (sent_bytes, reused_extents) =
+            send_requested_chunks(&mut send, source_path, &manifest, missing).await?;
+        send.finish().context("finish causal file upload")?;
+        let receipt = match read_frame::<SyncWireResponse>(&mut receive).await? {
+            SyncWireResponse::Applied(receipt) => receipt,
+            SyncWireResponse::Error { message } => bail!("remote causal push failed: {message}"),
+            _ => bail!("remote sent an unexpected causal push completion"),
+        };
+        ensure!(
+            receipt.path == record.path,
+            "causal push receipt path mismatch"
+        );
+        ensure!(
+            receipt.record_hash == record.logical_hash(),
+            "causal push receipt record mismatch"
+        );
+        ensure!(
+            receipt.transferred_bytes == sent_bytes && receipt.reused_extents == reused_extents,
+            "causal push receipt counters mismatch"
+        );
+        connection.close(0_u8.into(), b"causal push complete");
+        Ok(receipt)
+    }
+
+    /// Pulls one exact remote live-file record into `store` without publishing a path yet.
+    pub async fn pull_record(&self, record: SyncRecord, store: Arc<Store>) -> Result<PullReceipt> {
+        record.validate()?;
+        ensure!(
+            !record.tombstone && record.kind == SyncEntryKind::File,
+            "pull_record requires a live file record"
+        );
+        let session = self.open_session().await?;
+        let outcome = session.pull_record(record, store).await;
+        session.close().await;
+        outcome
+    }
+
+    async fn pull_record_connected(
+        &self,
+        endpoint: &Endpoint,
+        expected: SyncRecord,
+        store: Arc<Store>,
+    ) -> Result<PullReceipt> {
+        let connection = endpoint
+            .connect(self.remote.clone(), ALPN_V2)
+            .await
+            .context("failed to connect for causal file pull")?;
+        let (mut send, mut receive) = connection
+            .open_bi()
+            .await
+            .context("open sync pull stream")?;
+        write_frame(
+            &mut send,
+            &SyncWireRequest::PullRecord {
+                record: expected.clone(),
+            },
+        )
+        .await?;
+        let (record, manifest) = match read_frame::<SyncWireResponse>(&mut receive).await? {
+            SyncWireResponse::PullManifest { record, manifest } => (record, manifest),
+            SyncWireResponse::Error { message } => bail!("remote rejected causal pull: {message}"),
+            _ => bail!("remote sent an unexpected causal pull response"),
+        };
+        ensure!(record == expected, "remote path changed after snapshot");
+        manifest.validate()?;
+        ensure!(
+            manifest.size == record.size && Some(manifest.file_hash) == record.content_hash,
+            "remote pull manifest does not match causal record"
+        );
+        let inventory_store = Arc::clone(&store);
+        let inventory_manifest = manifest.clone();
+        let missing = tokio::task::spawn_blocking(move || {
+            inventory_store.missing_chunks(&inventory_manifest)
+        })
+        .await
+        .context("local chunk inventory task failed")?;
+        let missing_set: HashSet<_> = missing.iter().copied().collect();
+        let reused_extents = manifest
+            .chunks
+            .iter()
+            .filter(|chunk| !missing_set.contains(&chunk.hash))
+            .count();
+        write_frame(
+            &mut send,
+            &SyncWireRequest::NeedChunks {
+                hashes: missing.clone(),
+            },
+        )
+        .await?;
+        send.finish().context("finish causal pull request")?;
+        let descriptors: HashMap<_, _> = manifest
+            .chunks
+            .iter()
+            .map(|chunk| (chunk.hash, chunk.clone()))
+            .collect();
+        let mut transferred_bytes = 0_u64;
+        for expected_hash in missing {
+            let header: ChunkHeader = read_frame(&mut receive).await?;
+            ensure!(
+                header.hash == expected_hash,
+                "remote sent an out-of-order chunk"
+            );
+            let descriptor = descriptors
+                .get(&header.hash)
+                .context("remote sent a chunk absent from its manifest")?;
+            ensure!(
+                header.length == descriptor.length,
+                "remote chunk length mismatch"
+            );
+            let mut bytes = vec![0_u8; header.length as usize];
+            receive.read_exact(&mut bytes).await?;
+            verify_chunk(descriptor, &bytes)?;
+            let chunk_store = Arc::clone(&store);
+            tokio::task::spawn_blocking(move || {
+                chunk_store.chunks().put_verified(header.hash, &bytes)
+            })
+            .await
+            .context("local chunk-store task failed")??;
+            transferred_bytes = transferred_bytes
+                .checked_add(u64::from(header.length))
+                .context("pulled-byte counter overflow")?;
+        }
+        let receipt = match read_frame::<SyncWireResponse>(&mut receive).await? {
+            SyncWireResponse::Applied(receipt) => receipt,
+            SyncWireResponse::Error { message } => bail!("remote causal pull failed: {message}"),
+            _ => bail!("remote sent an unexpected causal pull completion"),
+        };
+        ensure!(
+            receipt.record_hash == record.logical_hash()
+                && receipt.transferred_bytes == transferred_bytes
+                && receipt.reused_extents == reused_extents,
+            "causal pull receipt mismatch"
+        );
+        connection.close(0_u8.into(), b"causal pull complete");
+        Ok(PullReceipt {
+            record,
+            manifest,
+            transferred_bytes,
+            reused_extents,
+        })
+    }
+
+    /// Applies a directory or tombstone record without transferring file content.
+    pub async fn apply_metadata(&self, record: SyncRecord) -> Result<SyncApplyReceipt> {
+        let session = self.open_session().await?;
+        let outcome = session.apply_metadata(record).await;
+        session.close().await;
+        outcome
+    }
+
+    async fn apply_metadata_connected(
+        &self,
+        endpoint: &Endpoint,
+        record: SyncRecord,
+    ) -> Result<SyncApplyReceipt> {
+        record.validate()?;
+        ensure!(
+            record.tombstone || record.kind == SyncEntryKind::Directory,
+            "metadata apply supports only directories and tombstones"
+        );
+        let connection = endpoint
+            .connect(self.remote.clone(), ALPN_V2)
+            .await
+            .context("failed to connect for metadata apply")?;
+        let outcome = async {
+            let (mut send, mut receive) =
+                connection.open_bi().await.context("open metadata stream")?;
+            write_frame(
+                &mut send,
+                &SyncWireRequest::ApplyMetadata {
+                    record: record.clone(),
+                },
+            )
+            .await?;
+            send.finish().context("finish metadata request")?;
+            match read_frame::<SyncWireResponse>(&mut receive).await? {
+                SyncWireResponse::Applied(receipt) => {
+                    ensure!(
+                        receipt.path == record.path && receipt.record_hash == record.logical_hash(),
+                        "metadata receipt mismatch"
+                    );
+                    Ok(receipt)
+                }
+                SyncWireResponse::Error { message } => {
+                    bail!("remote metadata apply failed: {message}")
+                }
+                _ => bail!("remote sent an unexpected metadata response"),
+            }
+        }
+        .await;
+        connection.close(0_u8.into(), b"metadata complete");
+        outcome
+    }
+}
+
+impl SyncSession {
+    /// Reconstructs the remote snapshot through this reusable endpoint.
+    pub async fn fetch_snapshot(&self, local: &MerkleTree) -> Result<RemoteSnapshot> {
+        self.client
+            .fetch_snapshot_connected(&self.endpoint, local)
+            .await
+    }
+
+    /// Pushes one exact live-file record through this reusable endpoint.
+    pub async fn push_record(
+        &self,
+        source: impl AsRef<Path>,
+        record: SyncRecord,
+        profile: ChunkingProfile,
+    ) -> Result<SyncApplyReceipt> {
+        record.validate()?;
+        ensure!(
+            !record.tombstone && record.kind == SyncEntryKind::File,
+            "push_record requires a live file record"
+        );
+        let source = source.as_ref().to_path_buf();
+        ensure!(source.is_file(), "source is not a regular file");
+        let source_for_manifest = source.clone();
+        let manifest =
+            tokio::task::spawn_blocking(move || manifest_from_path(source_for_manifest, profile))
+                .await
+                .context("manifest task failed")??;
+        ensure!(
+            record.size == manifest.size && record.content_hash == Some(manifest.file_hash),
+            "source content does not match causal record"
+        );
+        self.client
+            .push_record_connected(&self.endpoint, &source, record, manifest)
+            .await
+    }
+
+    /// Pulls one exact live-file record through this reusable endpoint.
+    pub async fn pull_record(&self, record: SyncRecord, store: Arc<Store>) -> Result<PullReceipt> {
+        record.validate()?;
+        ensure!(
+            !record.tombstone && record.kind == SyncEntryKind::File,
+            "pull_record requires a live file record"
+        );
+        self.client
+            .pull_record_connected(&self.endpoint, record, store)
+            .await
+    }
+
+    /// Applies a directory or tombstone record through this reusable endpoint.
+    pub async fn apply_metadata(&self, record: SyncRecord) -> Result<SyncApplyReceipt> {
+        self.client
+            .apply_metadata_connected(&self.endpoint, record)
+            .await
+    }
+
+    /// Gracefully closes the reusable local endpoint.
+    pub async fn close(self) {
+        self.endpoint.close().await;
+    }
+}
+
+fn insert_snapshot_records(
+    records: &mut BTreeMap<WirePath, SyncRecord>,
+    incoming: impl IntoIterator<Item = SyncRecord>,
+) -> Result<()> {
+    for record in incoming {
+        insert_snapshot_record(records, record)?;
+    }
+    Ok(())
+}
+
+fn insert_snapshot_record(
+    records: &mut BTreeMap<WirePath, SyncRecord>,
+    record: SyncRecord,
+) -> Result<()> {
+    record.validate()?;
+    if let Some(existing) = records.insert(record.path.clone(), record.clone()) {
+        ensure!(
+            existing == record,
+            "remote snapshot repeated a path inconsistently"
+        );
+    }
+    Ok(())
 }
 
 /// Sends one file, transmitting only chunks the receiver reports missing.
@@ -495,11 +1071,62 @@ async fn push_connected(
     }
 }
 
+async fn send_requested_chunks(
+    send: &mut SendStream,
+    source_path: &Path,
+    manifest: &FileManifest,
+    missing: Vec<Hash32>,
+) -> Result<(u64, usize)> {
+    let descriptors: HashMap<_, _> = manifest
+        .chunks
+        .iter()
+        .map(|chunk| (chunk.hash, chunk.clone()))
+        .collect();
+    let missing_set: HashSet<_> = missing.iter().copied().collect();
+    ensure!(
+        missing_set.len() == missing.len(),
+        "receiver requested duplicate chunks"
+    );
+    let reused_extents = manifest
+        .chunks
+        .iter()
+        .filter(|chunk| !missing_set.contains(&chunk.hash))
+        .count();
+    let mut source = tokio::fs::File::open(source_path).await?;
+    let mut sent_bytes = 0_u64;
+    for hash in missing {
+        let descriptor = descriptors
+            .get(&hash)
+            .with_context(|| format!("receiver requested unknown chunk {hash}"))?;
+        let mut bytes = vec![0_u8; descriptor.length as usize];
+        source
+            .seek(std::io::SeekFrom::Start(descriptor.offset))
+            .await?;
+        source.read_exact(&mut bytes).await?;
+        verify_chunk(descriptor, &bytes)?;
+        write_frame(
+            send,
+            &ChunkHeader {
+                hash,
+                length: descriptor.length,
+            },
+        )
+        .await?;
+        send.write_all(&bytes).await?;
+        sent_bytes = sent_bytes
+            .checked_add(u64::from(descriptor.length))
+            .context("sent-byte counter overflow")?;
+    }
+    Ok((sent_bytes, reused_extents))
+}
+
 #[derive(Clone)]
 struct PushHandler {
     store: Arc<Store>,
+    index: Arc<LocalIndex>,
     destination_root: PathBuf,
     peer_policy: PeerPolicy,
+    apply_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl fmt::Debug for PushHandler {
@@ -613,15 +1240,32 @@ impl PushHandler {
                 .context("transferred-byte counter overflow")?;
         }
 
+        let _apply_guard = self.apply_lock.lock().await;
         let store = Arc::clone(&self.store);
         let root = self.destination_root.clone();
         let materialize_manifest = manifest.clone();
         let materialize_path = path.clone();
         tokio::task::spawn_blocking(move || {
+            prepare_destination_kind(
+                &store,
+                &materialize_path,
+                &root,
+                SyncEntryKind::File,
+                materialize_manifest.manifest_hash(),
+            )?;
             store.materialize(&materialize_manifest, &materialize_path, root)
         })
         .await
         .context("materialization task failed")??;
+
+        let index = Arc::clone(&self.index);
+        tokio::task::spawn_blocking(move || {
+            let report = index.scan()?;
+            ensure_index_report_safe(&report)?;
+            Ok::<_, anyhow::Error>(report)
+        })
+        .await
+        .context("receiver index task failed")??;
 
         write_frame(
             send,
@@ -636,6 +1280,477 @@ impl PushHandler {
         .await?;
         Ok(())
     }
+}
+
+#[derive(Clone)]
+struct SyncHandler {
+    store: Arc<Store>,
+    index: Arc<LocalIndex>,
+    destination_root: PathBuf,
+    peer_policy: PeerPolicy,
+    apply_lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl fmt::Debug for SyncHandler {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SyncHandler")
+            .field("destination_root", &self.destination_root)
+            .field("peer_policy", &self.peer_policy)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ProtocolHandler for SyncHandler {
+    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        let peer = connection.remote_id();
+        if !self.peer_policy.allows(peer) {
+            warn!(%peer, "rejected unauthorized DeltaWeave reconciliation peer");
+            connection.close(0_u8.into(), b"endpoint ID is not allow-listed");
+            return Ok(());
+        }
+
+        let (mut send, mut receive) = connection.accept_bi().await?;
+        info!(%peer, "accepted DeltaWeave reconciliation peer");
+        let outcome = async {
+            match read_frame::<SyncWireRequest>(&mut receive).await? {
+                request @ SyncWireRequest::QueryNode { .. } => {
+                    self.handle_query_session(request, &mut send, &mut receive)
+                        .await
+                }
+                SyncWireRequest::PullRecord { record } => {
+                    self.handle_pull(record, &mut send, &mut receive).await
+                }
+                SyncWireRequest::PushRecord { record, manifest } => {
+                    self.handle_push_record(record, manifest, &mut send, &mut receive)
+                        .await
+                }
+                SyncWireRequest::ApplyMetadata { record } => {
+                    self.handle_metadata(record, &mut send).await
+                }
+                SyncWireRequest::NeedChunks { .. } | SyncWireRequest::Finish => {
+                    bail!("unexpected reconciliation session message")
+                }
+            }
+        }
+        .await;
+        if let Err(error) = outcome {
+            warn!(%peer, error = %error, "DeltaWeave reconciliation operation failed");
+            let message = truncate_error(&error.to_string());
+            let _ = write_frame(&mut send, &SyncWireResponse::Error { message }).await;
+            let _ = send.finish();
+            connection.closed().await;
+            return Err(AcceptError::from_err(std::io::Error::other(
+                error.to_string(),
+            )));
+        }
+        send.finish()?;
+        connection.closed().await;
+        Ok(())
+    }
+}
+
+impl SyncHandler {
+    async fn handle_query_session(
+        &self,
+        first: SyncWireRequest,
+        send: &mut SendStream,
+        receive: &mut RecvStream,
+    ) -> Result<()> {
+        let index = Arc::clone(&self.index);
+        let records = tokio::task::spawn_blocking(move || {
+            let report = index.scan()?;
+            ensure_index_report_safe(&report)?;
+            index.sync_records()
+        })
+        .await
+        .context("snapshot index task failed")??;
+        ensure!(
+            records.len() <= 1_000_000,
+            "snapshot exceeds record safety limit"
+        );
+        let tree = MerkleTree::from_records(records)?;
+        let mut request = first;
+        loop {
+            match request {
+                SyncWireRequest::QueryNode { prefix } => {
+                    let summary = tree.node_summary(&prefix)?;
+                    write_frame(send, &SyncWireResponse::Node { summary }).await?;
+                }
+                SyncWireRequest::Finish => {
+                    write_frame(send, &SyncWireResponse::Finished).await?;
+                    return Ok(());
+                }
+                _ => bail!("only Merkle queries are valid in a snapshot session"),
+            }
+            request = read_frame(receive).await?;
+        }
+    }
+
+    async fn handle_pull(
+        &self,
+        expected: SyncRecord,
+        send: &mut SendStream,
+        receive: &mut RecvStream,
+    ) -> Result<()> {
+        expected.validate()?;
+        ensure!(
+            !expected.tombstone && expected.kind == SyncEntryKind::File,
+            "pull requires a live file record"
+        );
+        let index = Arc::clone(&self.index);
+        let path = expected.path.clone();
+        let current = tokio::task::spawn_blocking(move || {
+            let report = index.scan()?;
+            ensure_index_report_safe(&report)?;
+            Ok::<_, anyhow::Error>(index.get(&path)?.map(|record| record.to_sync_record()))
+        })
+        .await
+        .context("pull index task failed")??
+        .context("requested path is absent")?;
+        ensure!(current == expected, "requested path changed after snapshot");
+
+        let source = sync_local_path(&self.destination_root, &expected.path);
+        let source_for_manifest = source.clone();
+        let manifest = tokio::task::spawn_blocking(move || {
+            manifest_from_path(source_for_manifest, ChunkingProfile::DEFAULT)
+        })
+        .await
+        .context("pull manifest task failed")??;
+        ensure!(
+            manifest.size == expected.size && Some(manifest.file_hash) == expected.content_hash,
+            "indexed file changed while preparing pull"
+        );
+        write_frame(
+            send,
+            &SyncWireResponse::PullManifest {
+                record: expected.clone(),
+                manifest: manifest.clone(),
+            },
+        )
+        .await?;
+        let missing = match read_frame::<SyncWireRequest>(receive).await? {
+            SyncWireRequest::NeedChunks { hashes } => hashes,
+            _ => bail!("pull client did not send a chunk request"),
+        };
+        let (transferred_bytes, reused_extents) =
+            send_requested_chunks(send, &source, &manifest, missing).await?;
+        write_frame(
+            send,
+            &SyncWireResponse::Applied(SyncApplyReceipt {
+                path: expected.path.clone(),
+                record_hash: expected.logical_hash(),
+                transferred_bytes,
+                reused_extents,
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn handle_push_record(
+        &self,
+        record: SyncRecord,
+        manifest: FileManifest,
+        send: &mut SendStream,
+        receive: &mut RecvStream,
+    ) -> Result<()> {
+        record.validate()?;
+        manifest.validate()?;
+        ensure!(
+            !record.tombstone && record.kind == SyncEntryKind::File,
+            "causal push requires a live file record"
+        );
+        ensure!(
+            manifest.size == record.size && Some(manifest.file_hash) == record.content_hash,
+            "causal push manifest does not match record"
+        );
+        ensure!(
+            manifest.size <= MAX_FILE_SIZE,
+            "file exceeds protocol size limit"
+        );
+        ensure!(
+            manifest.chunks.len() <= MAX_CHUNKS_PER_FILE,
+            "manifest exceeds chunk-count limit"
+        );
+
+        let inventory_store = Arc::clone(&self.store);
+        let inventory_manifest = manifest.clone();
+        let missing = tokio::task::spawn_blocking(move || {
+            inventory_store.missing_chunks(&inventory_manifest)
+        })
+        .await
+        .context("chunk inventory task failed")?;
+        let missing_set: HashSet<_> = missing.iter().copied().collect();
+        let reused_extents = manifest
+            .chunks
+            .iter()
+            .filter(|chunk| !missing_set.contains(&chunk.hash))
+            .count();
+        write_frame(
+            send,
+            &SyncWireResponse::NeedChunks {
+                hashes: missing.clone(),
+            },
+        )
+        .await?;
+
+        let transferred_bytes = receive_chunks(&self.store, receive, &manifest, missing).await?;
+        let _apply_guard = self.apply_lock.lock().await;
+        let index = Arc::clone(&self.index);
+        let candidate = record.clone();
+        tokio::task::spawn_blocking(move || ensure_causally_applicable(&index, &candidate))
+            .await
+            .context("causal precondition task failed")??;
+        let store = Arc::clone(&self.store);
+        let root = self.destination_root.clone();
+        let path = record.path.clone();
+        let operation_hash = record.logical_hash();
+        let materialize_manifest = manifest;
+        tokio::task::spawn_blocking(move || {
+            prepare_destination_kind(&store, &path, &root, SyncEntryKind::File, operation_hash)?;
+            store.materialize(&materialize_manifest, &path, root)
+        })
+        .await
+        .context("causal materialization task failed")??;
+        let installed = sync_local_path(&self.destination_root, &record.path);
+        apply_readonly(&installed, record.readonly)?;
+        let index = Arc::clone(&self.index);
+        let adopted = record.clone();
+        tokio::task::spawn_blocking(move || index.adopt_verified_record(&adopted))
+            .await
+            .context("causal index adoption task failed")??;
+        write_frame(
+            send,
+            &SyncWireResponse::Applied(SyncApplyReceipt {
+                path: record.path.clone(),
+                record_hash: record.logical_hash(),
+                transferred_bytes,
+                reused_extents,
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn handle_metadata(&self, record: SyncRecord, send: &mut SendStream) -> Result<()> {
+        record.validate()?;
+        ensure!(
+            record.tombstone || record.kind == SyncEntryKind::Directory,
+            "metadata apply supports only directories and tombstones"
+        );
+        let _apply_guard = self.apply_lock.lock().await;
+        let index = Arc::clone(&self.index);
+        let candidate = record.clone();
+        tokio::task::spawn_blocking(move || ensure_causally_applicable(&index, &candidate))
+            .await
+            .context("metadata causal precondition task failed")??;
+        let store = Arc::clone(&self.store);
+        let root = self.destination_root.clone();
+        let apply_record = record.clone();
+        tokio::task::spawn_blocking(move || {
+            if apply_record.tombstone {
+                store.remove_path(&apply_record.path, root, apply_record.logical_hash())?;
+            } else {
+                prepare_destination_kind(
+                    &store,
+                    &apply_record.path,
+                    &root,
+                    SyncEntryKind::Directory,
+                    apply_record.logical_hash(),
+                )?;
+                let directory = store.materialize_directory(&apply_record.path, root)?;
+                apply_readonly(&directory, apply_record.readonly)?;
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .context("metadata filesystem task failed")??;
+        let index = Arc::clone(&self.index);
+        let adopted = record.clone();
+        tokio::task::spawn_blocking(move || index.adopt_verified_record(&adopted))
+            .await
+            .context("metadata index adoption task failed")??;
+        write_frame(
+            send,
+            &SyncWireResponse::Applied(SyncApplyReceipt {
+                path: record.path.clone(),
+                record_hash: record.logical_hash(),
+                transferred_bytes: 0,
+                reused_extents: 0,
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+}
+
+fn ensure_causally_applicable(index: &LocalIndex, incoming: &SyncRecord) -> Result<()> {
+    let report = index.scan()?;
+    ensure_index_report_safe(&report)?;
+    let Some(current) = index
+        .get(&incoming.path)?
+        .map(|record| record.to_sync_record())
+    else {
+        return Ok(());
+    };
+    match current.version.relation(&incoming.version) {
+        CausalRelation::Before => Ok(()),
+        CausalRelation::Equal if current.same_state(incoming) => Ok(()),
+        CausalRelation::Equal => {
+            bail!("incoming record reuses an existing causal version for different state")
+        }
+        CausalRelation::After => bail!("incoming record is causally stale"),
+        CausalRelation::Concurrent => {
+            bail!("incoming record is concurrent; reconcile it before applying")
+        }
+    }
+}
+
+fn ensure_index_report_safe(report: &deltaweave_index::ScanReport) -> Result<()> {
+    ensure!(
+        report.collisions.is_empty(),
+        "filesystem scan has {} cross-platform path collision(s)",
+        report.collisions.len()
+    );
+    ensure!(
+        report.issues.is_empty() && report.retries_queued == 0,
+        "filesystem scan is incomplete: {} issue(s), {} retry/retries queued",
+        report.issues.len(),
+        report.retries_queued
+    );
+    Ok(())
+}
+
+fn prepare_destination_kind(
+    store: &Store,
+    path: &WirePath,
+    root: &Path,
+    desired: SyncEntryKind,
+    operation_hash: Hash32,
+) -> Result<()> {
+    let destination = sync_local_path(root, path);
+    let metadata = match fs::symlink_metadata(&destination) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let already_compatible = match desired {
+        SyncEntryKind::File => metadata.is_file() && !metadata.file_type().is_symlink(),
+        SyncEntryKind::Directory => metadata.is_dir() && !metadata.file_type().is_symlink(),
+        SyncEntryKind::Symlink | SyncEntryKind::Other => false,
+    };
+    if !already_compatible {
+        store.remove_path(path, root, operation_hash)?;
+    }
+    Ok(())
+}
+
+async fn receive_chunks(
+    store: &Arc<Store>,
+    receive: &mut RecvStream,
+    manifest: &FileManifest,
+    missing: Vec<Hash32>,
+) -> Result<u64> {
+    let descriptor_by_hash: HashMap<_, _> = manifest
+        .chunks
+        .iter()
+        .map(|chunk| (chunk.hash, chunk.clone()))
+        .collect();
+    let mut transferred_bytes = 0_u64;
+    for expected_hash in missing {
+        let header: ChunkHeader = read_frame(receive).await?;
+        ensure!(
+            header.hash == expected_hash,
+            "out-of-order chunk: expected {expected_hash}, got {}",
+            header.hash
+        );
+        let descriptor = descriptor_by_hash
+            .get(&header.hash)
+            .context("requested hash disappeared from manifest")?;
+        ensure!(header.length == descriptor.length, "chunk length mismatch");
+        ensure!(
+            header.length <= manifest.profile.max_size,
+            "chunk exceeds configured maximum"
+        );
+        transferred_bytes = transferred_bytes
+            .checked_add(u64::from(header.length))
+            .context("transfer byte count overflow")?;
+        let mut bytes = vec![0_u8; header.length as usize];
+        receive.read_exact(&mut bytes).await?;
+        verify_chunk(descriptor, &bytes)?;
+        let chunk_store = Arc::clone(store);
+        tokio::task::spawn_blocking(move || chunk_store.chunks().put_verified(header.hash, &bytes))
+            .await
+            .context("chunk-store task failed")??;
+    }
+    Ok(transferred_bytes)
+}
+
+fn sync_local_path(root: &Path, path: &WirePath) -> PathBuf {
+    let mut local = root.to_path_buf();
+    for component in path.components() {
+        local.push(component);
+    }
+    local
+}
+
+fn apply_readonly(path: &Path, readonly: bool) -> Result<()> {
+    let mut permissions = fs::symlink_metadata(path)?.permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = permissions.mode();
+        permissions.set_mode(if readonly {
+            mode & !0o222
+        } else {
+            mode | 0o200
+        });
+    }
+    #[cfg(not(unix))]
+    permissions.set_readonly(readonly);
+    fs::set_permissions(path, permissions)?;
+    Ok(())
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+enum SyncWireRequest {
+    QueryNode {
+        prefix: String,
+    },
+    PullRecord {
+        record: SyncRecord,
+    },
+    PushRecord {
+        record: SyncRecord,
+        manifest: FileManifest,
+    },
+    ApplyMetadata {
+        record: SyncRecord,
+    },
+    NeedChunks {
+        hashes: Vec<Hash32>,
+    },
+    Finish,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+enum SyncWireResponse {
+    Node {
+        summary: Option<MerkleNodeSummary>,
+    },
+    PullManifest {
+        record: SyncRecord,
+        manifest: FileManifest,
+    },
+    NeedChunks {
+        hashes: Vec<Hash32>,
+    },
+    Applied(SyncApplyReceipt),
+    Finished,
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -699,6 +1814,7 @@ fn truncate_error(message: &str) -> String {
 mod tests {
     use std::{collections::HashSet, fs};
 
+    use deltaweave_core::{SYNC_RECORD_SCHEMA_V1, VersionVector};
     use tempfile::TempDir;
 
     use super::*;
@@ -713,6 +1829,26 @@ mod tests {
                 (value >> 29) as u8 ^ index as u8
             })
             .collect()
+    }
+
+    fn version(label: &[u8], counter: u64) -> VersionVector {
+        let replica = ReplicaId(Hash32::digest(label));
+        let mut version = VersionVector::default();
+        version.observe(replica, counter);
+        version
+    }
+
+    fn file_record(path: &str, bytes: &[u8], label: &[u8], counter: u64) -> SyncRecord {
+        SyncRecord {
+            schema_version: SYNC_RECORD_SCHEMA_V1,
+            path: WirePath::new(path).expect("test path is portable"),
+            kind: SyncEntryKind::File,
+            size: bytes.len() as u64,
+            content_hash: Some(Hash32::digest(bytes)),
+            readonly: false,
+            version: version(label, counter),
+            tombstone: false,
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -824,6 +1960,24 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[tokio::test]
+    async fn direct_server_is_ready_from_its_bound_socket_without_netlink_discovery() {
+        let state = TempDir::new().expect("state directory can be created");
+        let destination = TempDir::new().expect("destination can be created");
+        let server = start_server(ServerConfig {
+            secret_key: SecretKey::generate(),
+            destination_root: destination.path().to_path_buf(),
+            state_root: state.path().to_path_buf(),
+            peer_policy: PeerPolicy::AllowListed(HashSet::new()),
+            network_mode: NetworkMode::DirectOnly,
+        })
+        .await
+        .expect("server can start");
+        assert!(server.wait_online(Duration::from_millis(250)).await);
+        assert!(!server.address_info().direct_addresses.is_empty());
+        server.shutdown().await.expect("server shuts down");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unauthorized_peer_is_rejected() {
         let state = TempDir::new().expect("state directory can be created");
@@ -851,6 +2005,191 @@ mod tests {
         .await;
         assert!(result.is_err());
         assert!(!destination.path().join("rejected.bin").exists());
+
+        let empty =
+            MerkleTree::from_records(Vec::<SyncRecord>::new()).expect("empty Merkle tree is valid");
+        let reconciliation = SyncClient {
+            secret_key: SecretKey::generate(),
+            remote: server.endpoint_addr(),
+            network_mode: NetworkMode::DirectOnly,
+        }
+        .fetch_snapshot(&empty)
+        .await;
+        assert!(reconciliation.is_err());
+        server.shutdown().await.expect("server shuts down");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reconciliation_v2_covers_snapshot_delta_pull_causal_push_and_metadata() {
+        let server_state = TempDir::new().expect("server state can be created");
+        let server_root = TempDir::new().expect("server root can be created");
+        let client_state = TempDir::new().expect("client state can be created");
+        let client_root = TempDir::new().expect("client root can be created");
+        let sources = TempDir::new().expect("source directory can be created");
+        fs::create_dir(server_root.path().join("seed")).expect("seed folder can be created");
+        let seed = fixture(2 * 1024 * 1024 + 97);
+        fs::write(server_root.path().join("seed/remote.bin"), &seed)
+            .expect("seed file can be written");
+
+        let client_key = SecretKey::generate();
+        let server = start_server(ServerConfig {
+            secret_key: SecretKey::generate(),
+            destination_root: server_root.path().to_path_buf(),
+            state_root: server_state.path().to_path_buf(),
+            peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
+            network_mode: NetworkMode::DirectOnly,
+        })
+        .await
+        .expect("server can start");
+        let client = SyncClient {
+            secret_key: client_key,
+            remote: server.endpoint_addr(),
+            network_mode: NetworkMode::DirectOnly,
+        };
+
+        let empty =
+            MerkleTree::from_records(Vec::<SyncRecord>::new()).expect("empty Merkle tree is valid");
+        let initial = client
+            .fetch_snapshot(&empty)
+            .await
+            .expect("remote snapshot can be reconstructed");
+        assert!(initial.queried_nodes >= 3);
+        assert!(initial.record_count >= 2);
+        let initial_tree = MerkleTree::from_records(initial.records.clone())
+            .expect("remote records remain a valid tree");
+        let unchanged = client
+            .fetch_snapshot(&initial_tree)
+            .await
+            .expect("unchanged root can use the constant-size fast path");
+        assert_eq!(unchanged.queried_nodes, 1);
+        assert_eq!(unchanged.root_hash, initial.root_hash);
+
+        let remote_file = initial
+            .records
+            .iter()
+            .find(|record| record.path.as_str() == "seed/remote.bin")
+            .cloned()
+            .expect("snapshot contains the seeded file");
+        let local_store =
+            Arc::new(Store::open(client_state.path()).expect("client content store can be opened"));
+        let first_pull = client
+            .pull_record(remote_file.clone(), Arc::clone(&local_store))
+            .await
+            .expect("first causal pull succeeds");
+        assert!(first_pull.transferred_bytes > 0);
+        local_store
+            .materialize(&first_pull.manifest, &remote_file.path, client_root.path())
+            .expect("pulled content can be atomically materialized");
+        assert_eq!(
+            fs::read(client_root.path().join("seed/remote.bin"))
+                .expect("materialized pull can be read"),
+            seed
+        );
+        let second_pull = client
+            .pull_record(remote_file, Arc::clone(&local_store))
+            .await
+            .expect("repeated causal pull succeeds");
+        assert_eq!(second_pull.transferred_bytes, 0);
+        assert_eq!(
+            second_pull.reused_extents,
+            second_pull.manifest.chunks.len()
+        );
+
+        let first_bytes = fixture(2 * 1024 * 1024 + 211);
+        let first_source = sources.path().join("first.bin");
+        fs::write(&first_source, &first_bytes).expect("first source can be written");
+        let first_record = file_record("shared/outgoing.bin", &first_bytes, b"client-a", 1);
+        let first_push = client
+            .push_record(
+                &first_source,
+                first_record.clone(),
+                ChunkingProfile::DEFAULT,
+            )
+            .await
+            .expect("first causal push succeeds");
+        assert!(first_push.transferred_bytes > 0);
+        let repeated = client
+            .push_record(
+                &first_source,
+                first_record.clone(),
+                ChunkingProfile::DEFAULT,
+            )
+            .await
+            .expect("idempotent causal push succeeds");
+        assert_eq!(repeated.transferred_bytes, 0);
+
+        let divergent_bytes = b"same clock, different state".to_vec();
+        let divergent_source = sources.path().join("divergent.bin");
+        fs::write(&divergent_source, &divergent_bytes).expect("divergent source can be written");
+        let equivocation = file_record("shared/outgoing.bin", &divergent_bytes, b"client-a", 1);
+        assert!(
+            client
+                .push_record(&divergent_source, equivocation, ChunkingProfile::DEFAULT)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(server_root.path().join("shared/outgoing.bin"))
+                .expect("server file survives rejected equivocation"),
+            first_bytes
+        );
+
+        let second_bytes = fixture(2 * 1024 * 1024 + 307);
+        let second_source = sources.path().join("second.bin");
+        fs::write(&second_source, &second_bytes).expect("second source can be written");
+        let second_record = file_record("shared/outgoing.bin", &second_bytes, b"client-a", 2);
+        client
+            .push_record(&second_source, second_record, ChunkingProfile::DEFAULT)
+            .await
+            .expect("causally newer push succeeds");
+        assert!(
+            client
+                .push_record(&first_source, first_record, ChunkingProfile::DEFAULT)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(server_root.path().join("shared/outgoing.bin"))
+                .expect("server file survives rejected stale push"),
+            second_bytes
+        );
+
+        let directory = SyncRecord {
+            schema_version: SYNC_RECORD_SCHEMA_V1,
+            path: WirePath::new("empty-folder").expect("directory path is portable"),
+            kind: SyncEntryKind::Directory,
+            size: 0,
+            content_hash: None,
+            readonly: false,
+            version: version(b"client-a", 1),
+            tombstone: false,
+        };
+        client
+            .apply_metadata(directory.clone())
+            .await
+            .expect("directory metadata can be applied");
+        assert!(server_root.path().join("empty-folder").is_dir());
+        let tombstone = SyncRecord {
+            version: version(b"client-a", 2),
+            tombstone: true,
+            ..directory.clone()
+        };
+        client
+            .apply_metadata(tombstone.clone())
+            .await
+            .expect("directory tombstone can be applied");
+        assert!(!server_root.path().join("empty-folder").exists());
+        assert!(client.apply_metadata(directory).await.is_err());
+
+        let final_snapshot = client
+            .fetch_snapshot(&empty)
+            .await
+            .expect("final snapshot can be verified");
+        assert!(final_snapshot.records.contains(&tombstone));
+        assert!(final_snapshot.records.iter().any(|record| {
+            record.path.as_str() == "shared/outgoing.bin"
+                && record.content_hash == Some(Hash32::digest(&second_bytes))
+        }));
         server.shutdown().await.expect("server shuts down");
     }
 }

@@ -11,8 +11,10 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result, bail};
-use deltaweave_core::{Hash32, ReplicaId, VersionVector, WirePath};
+use anyhow::{Context, Result, bail, ensure};
+use deltaweave_core::{
+    Hash32, ReplicaId, SYNC_RECORD_SCHEMA_V1, SyncEntryKind, SyncRecord, VersionVector, WirePath,
+};
 use icu_casemap::CaseMapper;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
@@ -70,9 +72,11 @@ pub struct PathRecord {
     pub identity: Option<FileIdentity>,
     /// File length, or zero for non-files.
     pub size: u64,
-    /// Last modification time as nanoseconds since the Unix epoch when available.
+    /// Regular-file modification time as nanoseconds since the Unix epoch when available.
+    /// Directory timestamps are normalized away because child updates mutate them implicitly.
     pub modified_ns: Option<u128>,
-    /// Whether the local object was read-only when scanned.
+    /// Whether a regular file was read-only when scanned. Directory write semantics are not
+    /// portable and are intentionally normalized to writable for safe child synchronization.
     pub readonly: bool,
     /// Complete-file digest for regular files.
     pub content_hash: Option<Hash32>,
@@ -82,6 +86,34 @@ pub struct PathRecord {
     pub tombstone: bool,
     /// Scan generation that last changed this record.
     pub generation: u64,
+}
+
+impl PathRecord {
+    /// Projects host-specific index metadata into the portable distributed state model.
+    #[must_use]
+    pub fn to_sync_record(&self) -> SyncRecord {
+        SyncRecord {
+            schema_version: SYNC_RECORD_SCHEMA_V1,
+            path: self.path.clone(),
+            kind: self.kind.into(),
+            size: self.size,
+            content_hash: self.content_hash,
+            readonly: self.readonly,
+            version: self.version.clone(),
+            tombstone: self.tombstone,
+        }
+    }
+}
+
+impl From<EntryKind> for SyncEntryKind {
+    fn from(value: EntryKind) -> Self {
+        match value {
+            EntryKind::File => Self::File,
+            EntryKind::Directory => Self::Directory,
+            EntryKind::Symlink => Self::Symlink,
+            EntryKind::Other => Self::Other,
+        }
+    }
 }
 
 /// One persistent exponential-backoff retry.
@@ -422,6 +454,15 @@ impl LocalIndex {
         Ok(self.records_map()?.into_values().collect())
     }
 
+    /// Returns the complete portable causal snapshot used by peer reconciliation.
+    pub fn sync_records(&self) -> Result<Vec<SyncRecord>> {
+        Ok(self
+            .records_map()?
+            .into_values()
+            .map(|record| record.to_sync_record())
+            .collect())
+    }
+
     /// Returns all persistent retries sorted by portable path.
     pub fn retries(&self) -> Result<Vec<RetryRecord>> {
         Ok(self.retries_map()?.into_values().collect())
@@ -437,6 +478,110 @@ impl LocalIndex {
         encoded
             .map(|bytes| postcard::from_bytes(&bytes).context("invalid path record in index DB"))
             .transpose()
+    }
+
+    /// Adopts a verified filesystem state with the exact causal version received from peers.
+    ///
+    /// The caller must materialize or delete the local object first. This method re-inspects and
+    /// hashes live files before atomically updating the index, preventing a remote version from
+    /// being attached to bytes that were not actually installed.
+    pub fn adopt_verified_record(&self, record: &SyncRecord) -> Result<()> {
+        record.validate()?;
+        let generation = self
+            .metadata_value(GENERATION_KEY)?
+            .checked_add(1)
+            .context("index generation overflow")?;
+        let mut records = self.records_map()?;
+        let mut retries = self.retries_map()?;
+        let local_path = local_path(&self.root, &record.path);
+
+        let adopted = if record.tombstone {
+            ensure!(
+                fs::symlink_metadata(&local_path)
+                    .is_err_and(|error| { error.kind() == std::io::ErrorKind::NotFound }),
+                "cannot adopt tombstone while local object still exists at {}",
+                local_path.display()
+            );
+            let mut path_record = records.get(&record.path).cloned().unwrap_or(PathRecord {
+                schema_version: INDEX_SCHEMA_V1,
+                path: record.path.clone(),
+                collision_key: collision_key(&record.path),
+                kind: sync_entry_kind(record.kind),
+                identity: None,
+                size: record.size,
+                modified_ns: None,
+                readonly: record.readonly,
+                content_hash: record.content_hash,
+                version: record.version.clone(),
+                tombstone: true,
+                generation,
+            });
+            path_record.kind = sync_entry_kind(record.kind);
+            path_record.size = record.size;
+            path_record.readonly = record.readonly;
+            path_record.content_hash = record.content_hash;
+            path_record.version = record.version.clone();
+            path_record.tombstone = true;
+            path_record.generation = generation;
+            path_record
+        } else {
+            let metadata = fs::symlink_metadata(&local_path).with_context(|| {
+                format!(
+                    "failed to inspect materialized remote path {}",
+                    local_path.display()
+                )
+            })?;
+            let kind = entry_kind(&metadata);
+            ensure!(
+                kind == sync_entry_kind(record.kind),
+                "materialized kind at {} does not match remote record",
+                local_path.display()
+            );
+            let fingerprint = metadata_fingerprint(&local_path, &metadata, kind);
+            ensure!(
+                fingerprint.readonly == record.readonly,
+                "materialized permissions at {} do not match remote record",
+                local_path.display()
+            );
+            let content_hash = if kind == EntryKind::File {
+                let hash = hash_stable_file(&local_path, fingerprint).map_err(|failure| {
+                    anyhow::anyhow!(
+                        "failed to verify materialized remote file {}: {}",
+                        local_path.display(),
+                        failure.message
+                    )
+                })?;
+                ensure!(
+                    fingerprint.size == record.size && Some(hash) == record.content_hash,
+                    "materialized content at {} does not match remote record",
+                    local_path.display()
+                );
+                Some(hash)
+            } else {
+                None
+            };
+            PathRecord {
+                schema_version: INDEX_SCHEMA_V1,
+                path: record.path.clone(),
+                collision_key: collision_key(&record.path),
+                kind,
+                identity: fingerprint.identity,
+                size: fingerprint.size,
+                modified_ns: fingerprint.modified_ns,
+                readonly: fingerprint.readonly,
+                content_hash,
+                version: record.version.clone(),
+                tombstone: false,
+                generation,
+            }
+        };
+
+        records.insert(record.path.clone(), adopted);
+        retries.remove(&record.path);
+        let replica_counter = self
+            .metadata_value(REPLICA_COUNTER_KEY)?
+            .max(record.version.get(self.replica));
+        self.commit_state(&records, &retries, generation, replica_counter)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -997,6 +1142,23 @@ fn portable_path(root: &Path, path: &Path) -> std::result::Result<WirePath, Stri
     WirePath::new(components.join("/")).map_err(|error| error.to_string())
 }
 
+fn local_path(root: &Path, path: &WirePath) -> PathBuf {
+    let mut local = root.to_path_buf();
+    for component in path.components() {
+        local.push(component);
+    }
+    local
+}
+
+const fn sync_entry_kind(kind: SyncEntryKind) -> EntryKind {
+    match kind {
+        SyncEntryKind::File => EntryKind::File,
+        SyncEntryKind::Directory => EntryKind::Directory,
+        SyncEntryKind::Symlink => EntryKind::Symlink,
+        SyncEntryKind::Other => EntryKind::Other,
+    }
+}
+
 fn entry_kind(metadata: &Metadata) -> EntryKind {
     let file_type = metadata.file_type();
     if file_type.is_symlink() || is_windows_reparse_point(metadata) {
@@ -1031,8 +1193,10 @@ fn metadata_fingerprint(path: &Path, metadata: &Metadata, kind: EntryKind) -> Me
         } else {
             0
         },
-        modified_ns: modified_ns(metadata),
-        readonly: metadata.permissions().readonly(),
+        modified_ns: (kind == EntryKind::File)
+            .then(|| modified_ns(metadata))
+            .flatten(),
+        readonly: kind == EntryKind::File && metadata.permissions().readonly(),
     }
 }
 
@@ -1546,6 +1710,123 @@ mod tests {
         drop(index);
         let reopened = open_index(root.path(), state.path(), 2_000);
         assert_eq!(reopened.records().expect("records load").len(), 2);
+    }
+
+    #[test]
+    fn child_updates_do_not_create_directory_metadata_churn() {
+        let root = TempDir::new().expect("root can be created");
+        let state = TempDir::new().expect("state can be created");
+        fs::create_dir(root.path().join("docs")).expect("directory can be created");
+        fs::write(root.path().join("docs/first.txt"), b"first")
+            .expect("first child can be written");
+        let index = open_index(root.path(), state.path(), 1_000);
+        index.scan().expect("initial scan succeeds");
+        let directory = WirePath::new("docs").expect("path is portable");
+        let before = index
+            .get(&directory)
+            .expect("record can be read")
+            .expect("directory is indexed");
+
+        fs::write(root.path().join("docs/second.txt"), b"second")
+            .expect("second child can be written");
+        let report = index.scan().expect("child update scan succeeds");
+        let after = index
+            .get(&directory)
+            .expect("record can be read")
+            .expect("directory remains indexed");
+        assert_eq!(before.version, after.version);
+        assert_eq!(before.modified_ns, None);
+        assert_eq!(after.modified_ns, None);
+        assert!(report.changes.iter().all(|change| {
+            !matches!(change, ScanChange::Modified { path } if path == &directory)
+        }));
+    }
+
+    #[test]
+    fn verified_remote_version_survives_the_next_authoritative_scan() {
+        let root = TempDir::new().expect("root can be created");
+        let state = TempDir::new().expect("state can be created");
+        fs::write(root.path().join("report.txt"), b"before").expect("file can be written");
+        let index = open_index(root.path(), state.path(), 1_000);
+        index.scan().expect("initial scan succeeds");
+
+        let path = WirePath::new("report.txt").expect("path is portable");
+        let mut remote = index
+            .get(&path)
+            .expect("record can be read")
+            .expect("record exists")
+            .to_sync_record();
+        let remote_replica = ReplicaId(Hash32::digest(b"remote replica"));
+        remote.version.observe(remote_replica, 7);
+        remote.size = b"after".len() as u64;
+        remote.content_hash = Some(Hash32::digest(b"after"));
+        fs::write(root.path().join("report.txt"), b"after").expect("remote bytes are installed");
+
+        index
+            .adopt_verified_record(&remote)
+            .expect("verified remote record can be adopted");
+        assert_eq!(
+            index
+                .get(&path)
+                .expect("record can be read")
+                .expect("record exists")
+                .version,
+            remote.version
+        );
+        let scan = index.scan().expect("authoritative scan succeeds");
+        assert!(scan.changes.is_empty());
+        assert_eq!(scan.unchanged, 1);
+        assert_eq!(index.sync_records().expect("snapshot loads"), vec![remote]);
+    }
+
+    #[test]
+    fn remote_tombstone_requires_deletion_and_persists_exact_clock() {
+        let root = TempDir::new().expect("root can be created");
+        let state = TempDir::new().expect("state can be created");
+        fs::write(root.path().join("gone.txt"), b"content").expect("file can be written");
+        let index = open_index(root.path(), state.path(), 1_000);
+        index.scan().expect("initial scan succeeds");
+        let path = WirePath::new("gone.txt").expect("path is portable");
+        let mut tombstone = index
+            .get(&path)
+            .expect("record can be read")
+            .expect("record exists")
+            .to_sync_record();
+        tombstone
+            .version
+            .increment(ReplicaId(Hash32::digest(b"remote replica")))
+            .expect("clock can advance");
+        tombstone.tombstone = true;
+
+        assert!(index.adopt_verified_record(&tombstone).is_err());
+        fs::remove_file(root.path().join("gone.txt")).expect("file can be deleted");
+        index
+            .adopt_verified_record(&tombstone)
+            .expect("tombstone can be adopted after deletion");
+        assert_eq!(
+            index.sync_records().expect("snapshot loads"),
+            vec![tombstone]
+        );
+    }
+
+    #[test]
+    fn remote_record_is_rejected_when_installed_content_does_not_match() {
+        let root = TempDir::new().expect("root can be created");
+        let state = TempDir::new().expect("state can be created");
+        fs::write(root.path().join("report.txt"), b"before").expect("file can be written");
+        let index = open_index(root.path(), state.path(), 1_000);
+        index.scan().expect("initial scan succeeds");
+        let path = WirePath::new("report.txt").expect("path is portable");
+        let mut remote = index
+            .get(&path)
+            .expect("record can be read")
+            .expect("record exists")
+            .to_sync_record();
+        remote.size = b"claimed".len() as u64;
+        remote.content_hash = Some(Hash32::digest(b"claimed"));
+        fs::write(root.path().join("report.txt"), b"different").expect("file can be written");
+
+        assert!(index.adopt_verified_record(&remote).is_err());
     }
 
     #[test]

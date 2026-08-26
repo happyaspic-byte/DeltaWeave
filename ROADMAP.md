@@ -33,16 +33,22 @@ Synology binaries run the index restart self-test under both supported CPU
 architectures. A long-running Windows/Synology hardware soak remains a field
 validation gate, not a claim of distributed synchronization.
 
-## v0.3 — Distributed reconciliation
+## v0.3 — Distributed reconciliation (implemented; hardware soak ongoing)
 
 - Deterministic Merkle search tree over versioned path records
-- Range-diff protocol, persistent replica IDs, version vectors, and tombstone GC
+- Partial-subtree query protocol, persistent replica IDs, version vectors, and durable tombstones
 - Bidirectional create/update/delete/rename propagation
 - Deterministic conflict copies without using wall clocks for causality
 - Partition/reconnect and multi-peer convergence simulation
+- Final local/remote root verification and retry-safe continuous CLI orchestration
+- Native local-change wakeups with 750 ms debounce and polling fallback; periodic
+  remote polling remains the bounded discovery path for NAS-side changes
 
-Exit gate: property-based model tests converge across partitions and reordered,
-duplicated, or interrupted messages without full rescans.
+The deterministic three-peer partition model, two-peer create/update/delete,
+file/directory transition, conflict, restart, stale-write rejection, and
+zero-transfer retry tests run in CI. Long-running Windows/Synology hardware
+soak, randomized message interruption, and safe tombstone garbage collection
+remain field/hardening gates rather than completed claims.
 
 ## v0.4 — Operations and hardening
 
