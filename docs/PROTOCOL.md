@@ -1,4 +1,4 @@
-# DeltaWeave Transfer Protocol v1
+# DeltaWeave Transfer and Reconciliation Protocols
 
 This document describes the pre-alpha one-file push protocol implemented by
 `deltaweave-net`. It is deliberately small and will not be changed compatibly
@@ -71,3 +71,50 @@ keeps the content-addressed lookup unambiguous before any payload is accepted.
 Any incompatible message, hashing, framing, or semantic change requires a new
 ALPN such as `deltaweave/sync/2`. Unknown manifest schema and chunking profile
 versions are rejected rather than guessed.
+
+## Reconciliation protocol v2
+
+ALPN `deltaweave/sync/2` reuses the authenticated endpoint allow-list, frame
+limit, manifest validation, and chunk verification rules above. Each operation
+uses one bidirectional stream; a client may reuse its local iroh endpoint across
+all operations in a reconciliation pass.
+
+### Merkle snapshot
+
+1. Client sends `QueryNode { prefix: "" }`.
+2. Receiver performs one authoritative scan and rejects the session if it has
+   collisions, incomplete reads, or queued retries.
+3. Receiver returns the node hash/cardinality, optional exact-path record, and
+   ordered immediate-child summaries.
+4. Client reuses locally matching subtrees and queues only mismatched child
+   prefixes. Every reconstructed record is schema/path validated.
+5. Client sends `Finish`, rebuilds the complete remote tree locally, and rejects
+   any root or record-count mismatch.
+
+An unchanged namespace therefore exchanges one node summary rather than the
+complete record set.
+
+### Exact causal content operations
+
+- `PullRecord { record }` returns a manifest only if the receiver's freshly
+  scanned exact record still matches. The client requests missing unique chunks,
+  verifies each chunk, and stores them without publishing a path.
+- `PushRecord { record, manifest }` transfers missing chunks first. Under the
+  receiver apply lock, a fresh scan must show that the candidate causally
+  dominates the current record (or is an identical idempotent retry). The file
+  is then atomically materialized and the exact version vector is adopted.
+- `ApplyMetadata { record }` applies a live directory or tombstone under the
+  same causal precondition. Non-file deletions are preserved in private trash;
+  directories are removed only when empty.
+
+`After` (stale incoming), `Concurrent`, and equal-clock/different-state
+preconditions are rejected. Conflict resolution happens in the deterministic
+state engine and produces a version vector that dominates both inputs before
+either peer applies it.
+
+### Completion receipts
+
+Every v2 mutation receipt binds the portable path, logical record hash, unique
+payload bytes, and reused extent count. `sync-once` does not treat receipts alone
+as convergence proof: it independently rescans local state and fetches a new
+remote Merkle root after all actions.

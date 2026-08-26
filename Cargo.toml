@@ -4,13 +4,15 @@ members = [
     "crates/deltaweave-core",
     "crates/deltaweave-cdc",
     "crates/deltaweave-index",
+    "crates/deltaweave-reconcile",
     "crates/deltaweave-store",
     "crates/deltaweave-net",
+    "crates/deltaweave-sync",
     "crates/deltaweave-cli",
 ]
 
 [workspace.package]
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.91"
 authors = ["DeltaWeave contributors"]

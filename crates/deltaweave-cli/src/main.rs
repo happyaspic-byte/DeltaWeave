@@ -17,9 +17,10 @@ use deltaweave_cdc::manifest_from_path;
 use deltaweave_core::{ChunkingProfile, Hash32, ReplicaId, WirePath};
 use deltaweave_index::{IndexOptions, LocalIndex, ScanChange, WatchService};
 use deltaweave_net::{
-    NetworkMode, PeerPolicy, PushOptions, Server, ServerConfig, TransferReceipt, endpoint_addr,
-    load_or_create_identity, push_file, start_server,
+    NetworkMode, PeerPolicy, PushOptions, Server, ServerConfig, SyncClient, TransferReceipt,
+    endpoint_addr, load_or_create_identity, push_file, start_server,
 };
+use deltaweave_sync::{SyncConfig, SyncEngine};
 use iroh::{EndpointId, SecretKey};
 use serde_json::json;
 use tracing_subscriber::EnvFilter;
@@ -28,7 +29,7 @@ use tracing_subscriber::EnvFilter;
 #[command(
     name = "deltaweave",
     version,
-    about = "Authenticated, content-defined P2P file transfer",
+    about = "Authenticated, content-defined bidirectional P2P file synchronization",
     long_about = None
 )]
 struct Cli {
@@ -50,6 +51,10 @@ enum Command {
     Scan(ScanArgs),
     /// Continuously index a directory using native watcher hints and periodic reconciliation.
     Watch(WatchArgs),
+    /// Reconcile a local folder with a peer once and verify both Merkle roots.
+    SyncOnce(SyncTargetArgs),
+    /// Continuously reconcile a local folder with retry/backoff until stopped.
+    Sync(SyncArgs),
     /// Run an isolated local end-to-end transfer and delta-reuse check.
     SelfTest,
 }
@@ -189,6 +194,51 @@ struct IndexArgs {
     ignored_paths: Vec<PathBuf>,
 }
 
+#[derive(Debug, Args)]
+struct SyncTargetArgs {
+    /// Local folder participating in bidirectional synchronization.
+    #[arg(long)]
+    root: PathBuf,
+    /// Private local index, CAS, journal, and recovery directory outside `root`.
+    #[arg(long, default_value = ".deltaweave/sync-state")]
+    state: PathBuf,
+    /// Persistent local endpoint identity outside `root`.
+    #[arg(long, default_value = ".deltaweave/identity.key")]
+    identity: PathBuf,
+    /// Remote receiver endpoint ID.
+    #[arg(long)]
+    peer: String,
+    /// Remote direct UDP address; repeat when multiple addresses are advertised.
+    #[arg(long = "direct")]
+    direct_addresses: Vec<SocketAddr>,
+    /// Remote relay URL; repeat when multiple relays are advertised.
+    #[arg(long = "relay")]
+    relay_urls: Vec<String>,
+    /// Disable discovery and relay services; use supplied direct addresses only.
+    #[arg(long)]
+    direct_only: bool,
+    #[command(flatten)]
+    chunking: ChunkingArgs,
+}
+
+#[derive(Debug, Args)]
+struct SyncArgs {
+    #[command(flatten)]
+    target: SyncTargetArgs,
+    /// Maximum delay between successful reconciliation passes (also polls remote changes).
+    #[arg(long, default_value_t = 5)]
+    interval_seconds: u64,
+    /// Quiet period after the latest local filesystem event.
+    #[arg(long, default_value_t = 750)]
+    debounce_ms: u64,
+    /// Maximum time a local event storm may postpone synchronization.
+    #[arg(long, default_value_t = 5_000)]
+    max_debounce_ms: u64,
+    /// Maximum exponential retry delay after failures.
+    #[arg(long, default_value_t = 300)]
+    max_backoff_seconds: u64,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
@@ -203,6 +253,8 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Push(args) => push(args).await,
         Command::Scan(args) => scan(args),
         Command::Watch(args) => watch(args).await,
+        Command::SyncOnce(args) => sync_once(args).await,
+        Command::Sync(args) => sync_forever(args).await,
         Command::SelfTest => self_test().await,
     }
 }
@@ -325,6 +377,130 @@ async fn push(args: PushArgs) -> Result<()> {
     })
     .await?;
     print_json(&receipt)
+}
+
+fn open_sync_engine(args: SyncTargetArgs) -> Result<SyncEngine> {
+    if args.direct_only && args.direct_addresses.is_empty() {
+        bail!("--direct-only requires at least one --direct address");
+    }
+    let identity = load_or_create_identity(&args.identity)?;
+    ensure_identity_outside_destination(&args.identity, &args.root)?;
+    let profile = args.chunking.profile()?;
+    let remote = endpoint_addr(&args.peer, &args.direct_addresses, &args.relay_urls)?;
+    let replica = ReplicaId(Hash32::digest(identity.endpoint_id().as_bytes()));
+    SyncEngine::open(SyncConfig {
+        root: args.root,
+        state_root: args.state,
+        replica,
+        client: SyncClient {
+            secret_key: identity.secret_key,
+            remote,
+            network_mode: network_mode(args.direct_only),
+        },
+        profile,
+        ignored_paths: Vec::new(),
+    })
+}
+
+async fn sync_once(args: SyncTargetArgs) -> Result<()> {
+    let engine = open_sync_engine(args)?;
+    print_json(&engine.sync_once().await?)
+}
+
+async fn sync_forever(args: SyncArgs) -> Result<()> {
+    ensure!(
+        args.interval_seconds > 0,
+        "--interval-seconds must be greater than zero"
+    );
+    ensure!(
+        args.max_backoff_seconds > 0,
+        "--max-backoff-seconds must be greater than zero"
+    );
+    ensure!(
+        args.debounce_ms > 0,
+        "--debounce-ms must be greater than zero"
+    );
+    ensure!(
+        args.max_debounce_ms >= args.debounce_ms,
+        "--max-debounce-ms must be at least --debounce-ms"
+    );
+    let interval = Duration::from_secs(args.interval_seconds);
+    let maximum_backoff = Duration::from_secs(args.max_backoff_seconds);
+    let root = args.target.root.clone();
+    let debounce = Duration::from_millis(args.debounce_ms);
+    let maximum_debounce = Duration::from_millis(args.max_debounce_ms);
+    let engine = open_sync_engine(args.target)?;
+    let watcher_result = WatchService::new(&root, &[], debounce, maximum_debounce);
+    let (mut watcher, watcher_error) = match watcher_result {
+        Ok(watcher) => (Some(watcher), None),
+        Err(error) => (None, Some(error.to_string())),
+    };
+    print_json(&json!({
+        "event": "sync_started",
+        "local_change_detection": if watcher.is_some() { "native_watcher" } else { "polling_fallback" },
+        "remote_poll_seconds": interval.as_secs(),
+        "watcher_error": watcher_error,
+    }))?;
+    let shutdown = wait_for_shutdown_signal();
+    tokio::pin!(shutdown);
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        let (delay, watch_for_local_changes) = tokio::select! {
+            result = &mut shutdown => {
+                result?;
+                print_json(&json!({"event": "shutdown", "status": "stopped"}))?;
+                return Ok(());
+            }
+            result = engine.sync_once() => {
+                match result {
+                    Ok(report) => {
+                        print_json(&json!({"event": "sync", "report": report}))?;
+                        backoff = Duration::from_secs(1);
+                        (interval, true)
+                    }
+                    Err(error) => {
+                        print_json(&json!({
+                            "event": "sync_error",
+                            "error": error.to_string(),
+                            "retry_in_seconds": backoff.as_secs(),
+                            "status": "retrying",
+                        }))?;
+                        let delay = backoff;
+                        backoff = backoff.saturating_mul(2).min(maximum_backoff);
+                        (delay, false)
+                    }
+                }
+            }
+        };
+        let waiting_since = Instant::now();
+        loop {
+            let remaining = delay.saturating_sub(waiting_since.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+            tokio::select! {
+                result = &mut shutdown => {
+                    result?;
+                    print_json(&json!({"event": "shutdown", "status": "stopped"}))?;
+                    return Ok(());
+                }
+                _ = tokio::time::sleep(remaining.min(Duration::from_millis(100))) => {}
+            }
+            if watch_for_local_changes
+                && let Some(trigger) = watcher
+                    .as_mut()
+                    .and_then(|watcher| watcher.poll(Instant::now()))
+            {
+                print_json(&json!({
+                    "event": "local_change",
+                    "native_events": trigger.event_count,
+                    "rescan_required": trigger.rescan_required,
+                    "status": "synchronizing",
+                }))?;
+                break;
+            }
+        }
+    }
 }
 
 fn scan(args: ScanArgs) -> Result<()> {
@@ -470,9 +646,16 @@ async fn self_test() -> Result<()> {
     .await
     .context("self-test receiver failed to start")?;
 
-    let outcome = exercise_self_test(&server, client_key, &source, &destination).await;
+    let outcome = async {
+        let transfer =
+            exercise_self_test(&server, client_key.clone(), &source, &destination).await?;
+        let synchronization =
+            exercise_sync_self_test(workspace.path(), &server, client_key, &destination).await?;
+        Ok::<_, anyhow::Error>((transfer, synchronization))
+    }
+    .await;
     let shutdown = server.shutdown().await;
-    let (first, second, final_size) = match (outcome, shutdown) {
+    let ((first, second, final_size), synchronization) = match (outcome, shutdown) {
         (Err(error), _) => return Err(error),
         (Ok(_), Err(error)) => return Err(error.context("self-test receiver shutdown failed")),
         (Ok(report), Ok(())) => report,
@@ -491,6 +674,11 @@ async fn self_test() -> Result<()> {
         "reused_extents": second.reused_extents,
         "second_transfer_bytes": second.transferred_bytes,
         "status": "pass",
+        "sync_bidirectional_verified": synchronization.bidirectional_verified,
+        "sync_conflicts_preserved": synchronization.conflicts_preserved,
+        "sync_delete_verified": synchronization.delete_verified,
+        "sync_restart_actions": synchronization.restart_actions,
+        "sync_verified_root": synchronization.verified_root,
         "temporary_data": "cleaned on exit",
     }))
 }
@@ -500,6 +688,114 @@ struct IndexSelfTestReport {
     rename_detected: bool,
     restart_verified: bool,
     tombstones: usize,
+}
+
+struct SyncSelfTestReport {
+    bidirectional_verified: bool,
+    conflicts_preserved: usize,
+    delete_verified: bool,
+    restart_actions: usize,
+    verified_root: Hash32,
+}
+
+async fn exercise_sync_self_test(
+    workspace: &Path,
+    server: &Server,
+    client_key: SecretKey,
+    remote_root: &Path,
+) -> Result<SyncSelfTestReport> {
+    let local_root = workspace.join("sync-local");
+    let local_state = workspace.join("sync-local-state");
+    fs::create_dir_all(local_root.join("bidirectional"))?;
+    fs::create_dir_all(remote_root.join("bidirectional"))?;
+    fs::write(
+        local_root.join("bidirectional/local.txt"),
+        b"from local self-test",
+    )?;
+    fs::write(
+        remote_root.join("bidirectional/remote.txt"),
+        b"from remote self-test",
+    )?;
+    fs::write(local_root.join("bidirectional/shared.txt"), b"common")?;
+    fs::write(remote_root.join("bidirectional/shared.txt"), b"common")?;
+
+    let config = SyncConfig {
+        root: local_root.clone(),
+        state_root: local_state,
+        replica: ReplicaId(Hash32::digest(client_key.public().as_bytes())),
+        client: SyncClient {
+            secret_key: client_key,
+            remote: server.endpoint_addr(),
+            network_mode: NetworkMode::DirectOnly,
+        },
+        profile: ChunkingProfile::DEFAULT,
+        ignored_paths: Vec::new(),
+    };
+    let engine = SyncEngine::open(config.clone())?;
+    let initial = engine
+        .sync_once()
+        .await
+        .context("self-test bidirectional initial merge failed")?;
+    let bidirectional_verified = local_root.join("bidirectional/remote.txt").is_file()
+        && remote_root.join("bidirectional/local.txt").is_file()
+        && initial.verified_local_root == initial.verified_remote_root;
+    ensure!(
+        bidirectional_verified,
+        "self-test did not exchange files in both directions"
+    );
+
+    fs::write(
+        local_root.join("bidirectional/shared.txt"),
+        b"local concurrent edit",
+    )?;
+    fs::write(
+        remote_root.join("bidirectional/shared.txt"),
+        b"remote concurrent edit",
+    )?;
+    let conflict = engine
+        .sync_once()
+        .await
+        .context("self-test conflict reconciliation failed")?;
+    ensure!(
+        conflict.conflicts.len() == 1
+            && conflict.conflicts[0]
+                .conflict_path
+                .as_ref()
+                .is_some_and(|path| {
+                    local_root.join(path.as_str()).is_file()
+                        && remote_root.join(path.as_str()).is_file()
+                }),
+        "self-test did not preserve both concurrent edits"
+    );
+
+    fs::remove_file(local_root.join("bidirectional/local.txt"))?;
+    let deletion = engine
+        .sync_once()
+        .await
+        .context("self-test deletion reconciliation failed")?;
+    let delete_verified = !remote_root.join("bidirectional/local.txt").exists()
+        && deletion.verified_local_root == deletion.verified_remote_root;
+    ensure!(delete_verified, "self-test deletion did not converge");
+    let verified_root = deletion.verified_local_root;
+
+    drop(engine);
+    let restarted = SyncEngine::open(config)?;
+    let restart = restarted
+        .sync_once()
+        .await
+        .context("self-test restart reconciliation failed")?;
+    let restart_actions = restart.local_actions.saturating_add(restart.remote_actions);
+    ensure!(
+        restart_actions == 0 && restart.verified_local_root == verified_root,
+        "self-test durable restart was not an idempotent no-op"
+    );
+    Ok(SyncSelfTestReport {
+        bidirectional_verified,
+        conflicts_preserved: conflict.conflicts.len(),
+        delete_verified,
+        restart_actions,
+        verified_root,
+    })
 }
 
 fn exercise_index_self_test(workspace: &Path) -> Result<IndexSelfTestReport> {
@@ -642,7 +938,8 @@ const fn network_mode(direct_only: bool) -> NetworkMode {
 }
 
 fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn,netwatch=error"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
@@ -741,6 +1038,39 @@ mod tests {
             panic!("scan command expected");
         };
         assert!(args.include_records);
+    }
+
+    #[test]
+    fn parses_one_shot_and_continuous_sync_commands() {
+        let once = Cli::try_parse_from([
+            "deltaweave",
+            "sync-once",
+            "--root",
+            "data",
+            "--peer",
+            "peer-id",
+        ])
+        .expect("sync-once command parses");
+        assert!(matches!(once.command, Command::SyncOnce(_)));
+
+        let continuous = Cli::try_parse_from([
+            "deltaweave",
+            "sync",
+            "--root",
+            "data",
+            "--peer",
+            "peer-id",
+            "--interval-seconds",
+            "2",
+        ])
+        .expect("continuous sync command parses");
+        let Command::Sync(args) = continuous.command else {
+            panic!("sync command expected");
+        };
+        assert_eq!(args.interval_seconds, 2);
+        assert_eq!(args.debounce_ms, 750);
+        assert_eq!(args.max_debounce_ms, 5_000);
+        assert_eq!(args.max_backoff_seconds, 300);
     }
 
     #[test]

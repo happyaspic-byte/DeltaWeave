@@ -603,7 +603,7 @@ dependencies = [
 
 [[package]]
 name = "deltaweave"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -611,6 +611,7 @@ dependencies = [
  "deltaweave-core",
  "deltaweave-index",
  "deltaweave-net",
+ "deltaweave-sync",
  "iroh",
  "serde",
  "serde_json",
@@ -621,7 +622,7 @@ dependencies = [
 
 [[package]]
 name = "deltaweave-cdc"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "blake3",
  "deltaweave-core",
@@ -632,7 +633,7 @@ dependencies = [
 
 [[package]]
 name = "deltaweave-core"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "blake3",
  "hex",
@@ -643,7 +644,7 @@ dependencies = [
 
 [[package]]
 name = "deltaweave-index"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -661,11 +662,13 @@ dependencies = [
 
 [[package]]
 name = "deltaweave-net"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "deltaweave-cdc",
  "deltaweave-core",
+ "deltaweave-index",
+ "deltaweave-reconcile",
  "deltaweave-store",
  "hex",
  "iroh",
@@ -677,8 +680,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "deltaweave-reconcile"
+version = "0.3.0"
+dependencies = [
+ "blake3",
+ "deltaweave-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "deltaweave-store"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -688,6 +702,22 @@ dependencies = [
  "redb",
  "serde",
  "tempfile",
+]
+
+[[package]]
+name = "deltaweave-sync"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "deltaweave-core",
+ "deltaweave-index",
+ "deltaweave-net",
+ "deltaweave-reconcile",
+ "deltaweave-store",
+ "iroh",
+ "serde",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

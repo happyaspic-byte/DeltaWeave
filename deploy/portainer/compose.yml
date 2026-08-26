@@ -17,7 +17,7 @@ services:
     security_opt:
       - no-new-privileges:true
     environment:
-      RUST_LOG: ${DELTAWEAVE_LOG_LEVEL:-info}
+      RUST_LOG: ${DELTAWEAVE_LOG_LEVEL:-warn,deltaweave_net=info,netwatch=error}
     command:
       - serve
       - --root

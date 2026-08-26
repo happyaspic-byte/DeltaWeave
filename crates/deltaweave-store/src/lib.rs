@@ -14,7 +14,8 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use deltaweave_core::{FileManifest, Hash32, WirePath};
+use deltaweave_cdc::{manifest_from_path, read_chunk};
+use deltaweave_core::{ChunkingProfile, FileManifest, Hash32, WirePath};
 use redb::{Database, ReadableDatabase, TableDefinition};
 use serde::{Deserialize, Serialize};
 
@@ -295,6 +296,25 @@ impl Store {
             .collect()
     }
 
+    /// Chunks and verifies a local file into the durable CAS, returning its manifest.
+    ///
+    /// Every manifest extent is read and reverified before this succeeds. If the source mutates
+    /// between manifest construction and ingestion, a length or digest mismatch aborts the call.
+    pub fn ingest_file(
+        &self,
+        source: impl AsRef<Path>,
+        profile: ChunkingProfile,
+    ) -> Result<FileManifest> {
+        let source = source.as_ref();
+        let manifest = manifest_from_path(source, profile)?;
+        let mut file = File::open(source)?;
+        for descriptor in &manifest.chunks {
+            let bytes = read_chunk(&mut file, descriptor)?;
+            self.chunks.put_verified(descriptor.hash, &bytes)?;
+        }
+        Ok(manifest)
+    }
+
     /// Materializes a verified manifest beneath `destination_root`.
     pub fn materialize(
         &self,
@@ -310,13 +330,21 @@ impl Store {
         let destination_root = destination_root.as_ref();
         fs::create_dir_all(destination_root)?;
         let destination = checked_destination(destination_root, path)?;
-        if destination.is_dir() {
+        let existing = fs::symlink_metadata(&destination).ok();
+        if existing
+            .as_ref()
+            .is_some_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+        {
             bail!(
                 "refusing to replace destination directory {} with a file",
                 destination.display()
             );
         }
-        if destination.is_file() && hash_file(&destination)? == manifest.file_hash {
+        if existing
+            .as_ref()
+            .is_some_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+            && hash_file(&destination)? == manifest.file_hash
+        {
             let operation = committed_operation(path, manifest);
             self.metadata.put_manifest(path, manifest)?;
             self.metadata.put_operation(&operation)?;
@@ -416,6 +444,95 @@ impl Store {
             already_current: false,
         })
     }
+
+    /// Creates one real directory beneath the destination root without traversing symlinks.
+    pub fn materialize_directory(
+        &self,
+        path: &WirePath,
+        destination_root: impl AsRef<Path>,
+    ) -> Result<PathBuf> {
+        let _guard = self
+            .materialize_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("materialization lock is poisoned"))?;
+        let destination_root = destination_root.as_ref();
+        fs::create_dir_all(destination_root)?;
+        let destination = checked_destination(destination_root, path)?;
+        match fs::symlink_metadata(&destination) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                bail!(
+                    "refusing to replace non-directory {} with a directory",
+                    destination.display()
+                );
+            }
+            Ok(_) => return Ok(destination),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        fs::create_dir_all(&destination)?;
+        sync_directory(destination.parent())?;
+        Ok(destination)
+    }
+
+    /// Removes one path idempotently, preserving non-directory content in private trash.
+    ///
+    /// Directories are removed only when empty, so an unindexed or concurrently created child is
+    /// never deleted recursively by remote state.
+    pub fn remove_path(
+        &self,
+        path: &WirePath,
+        destination_root: impl AsRef<Path>,
+        tombstone_hash: Hash32,
+    ) -> Result<RemoveOutcome> {
+        let _guard = self
+            .materialize_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("materialization lock is poisoned"))?;
+        let destination_root = destination_root.as_ref();
+        fs::create_dir_all(destination_root)?;
+        let destination = checked_destination(destination_root, path)?;
+        let metadata = match fs::symlink_metadata(&destination) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(RemoveOutcome {
+                    destination,
+                    removed: false,
+                    preserved_in_trash: false,
+                    preserved_path: None,
+                });
+            }
+            Err(error) => return Err(error.into()),
+        };
+
+        let preserved_path = if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            fs::remove_dir(&destination).with_context(|| {
+                format!(
+                    "refusing to remove non-empty or unavailable directory {}",
+                    destination.display()
+                )
+            })?;
+            None
+        } else {
+            let backup = self.chunks.trash_path(path, tombstone_hash);
+            if let Some(parent) = backup.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::rename(&destination, &backup).with_context(|| {
+                format!(
+                    "failed to preserve deleted {} in trash",
+                    destination.display()
+                )
+            })?;
+            Some(backup)
+        };
+        sync_directory(destination.parent())?;
+        Ok(RemoveOutcome {
+            destination,
+            removed: true,
+            preserved_in_trash: preserved_path.is_some(),
+            preserved_path,
+        })
+    }
 }
 
 /// Result of safely materializing one file.
@@ -429,6 +546,19 @@ pub struct MaterializeOutcome {
     pub replaced_existing: bool,
     /// Whether the destination already contained the requested content.
     pub already_current: bool,
+}
+
+/// Result of an idempotent path deletion.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemoveOutcome {
+    /// Final local path that is now absent.
+    pub destination: PathBuf,
+    /// Whether an object existed and was removed.
+    pub removed: bool,
+    /// Whether non-directory content was moved into private trash.
+    pub preserved_in_trash: bool,
+    /// Private recovery path when content was preserved.
+    pub preserved_path: Option<PathBuf>,
 }
 
 fn checked_destination(root: &Path, path: &WirePath) -> Result<PathBuf> {
@@ -637,6 +767,72 @@ mod tests {
             .expect("test can corrupt cached chunk");
 
         assert!(store.missing_chunks(&manifest).contains(&first.hash));
+    }
+
+    #[test]
+    fn ingest_file_populates_every_manifest_chunk() {
+        let state = TempDir::new().expect("state directory can be created");
+        let source = state.path().join("source.bin");
+        let bytes = fixture(2 * 1024 * 1024 + 31);
+        fs::write(&source, &bytes).expect("source can be written");
+        let store = Store::open(state.path().join("private")).expect("store can open");
+        let manifest = store
+            .ingest_file(&source, ChunkingProfile::DEFAULT)
+            .expect("file can be ingested");
+        assert_eq!(manifest.file_hash, Hash32::digest(&bytes));
+        assert!(store.missing_chunks(&manifest).is_empty());
+    }
+
+    #[test]
+    fn deletion_is_idempotent_and_preserves_file_content() {
+        let state = TempDir::new().expect("state directory can be created");
+        let destination = TempDir::new().expect("destination can be created");
+        let path = WirePath::new("folder/file.txt").expect("path is portable");
+        fs::create_dir(destination.path().join("folder")).expect("folder can be created");
+        fs::write(destination.path().join(path.as_str()), b"important")
+            .expect("file can be written");
+        let store = Store::open(state.path()).expect("store can open");
+        let tombstone = Hash32::digest(b"tombstone");
+
+        let first = store
+            .remove_path(&path, destination.path(), tombstone)
+            .expect("file can be removed");
+        assert!(first.removed);
+        assert!(first.preserved_in_trash);
+        assert!(!first.destination.exists());
+        assert_eq!(
+            fs::read(
+                first
+                    .preserved_path
+                    .as_ref()
+                    .expect("preserved deletion exposes its recovery path")
+            )
+            .expect("trash content can be read"),
+            b"important"
+        );
+
+        let second = store
+            .remove_path(&path, destination.path(), tombstone)
+            .expect("missing path deletion is idempotent");
+        assert!(!second.removed);
+        assert!(second.preserved_path.is_none());
+    }
+
+    #[test]
+    fn remote_directory_delete_never_removes_unknown_children() {
+        let state = TempDir::new().expect("state directory can be created");
+        let destination = TempDir::new().expect("destination can be created");
+        let path = WirePath::new("folder").expect("path is portable");
+        fs::create_dir(destination.path().join(path.as_str())).expect("folder can be created");
+        fs::write(destination.path().join("folder/unindexed.txt"), b"keep")
+            .expect("child can be written");
+        let store = Store::open(state.path()).expect("store can open");
+        assert!(
+            store
+                .remove_path(&path, destination.path(), Hash32::digest(b"delete"))
+                .is_err()
+        );
+        assert!(destination.path().join("folder/unindexed.txt").exists());
     }
 
     #[cfg(unix)]

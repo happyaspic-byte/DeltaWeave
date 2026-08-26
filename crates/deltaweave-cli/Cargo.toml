@@ -19,6 +19,7 @@ deltaweave-cdc = { path = "../deltaweave-cdc" }
 deltaweave-core = { path = "../deltaweave-core" }
 deltaweave-index = { path = "../deltaweave-index" }
 deltaweave-net = { path = "../deltaweave-net" }
+deltaweave-sync = { path = "../deltaweave-sync" }
 iroh.workspace = true
 serde.workspace = true
 serde_json.workspace = true

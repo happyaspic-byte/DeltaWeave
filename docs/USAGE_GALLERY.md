@@ -1,13 +1,14 @@
 # DeltaWeave 실제 사용 화면
 
 이 문서는 DeltaWeave를 실행했을 때 보이는 화면을 **전·중·후·결과** 순서로
-보여 준다. 터미널의 배경과 글꼴만 문서용으로 통일했으며 다음 데이터는 실제
-v0.2.0 검증 실행에서 가져왔다.
+보여 준다. 터미널의 배경과 글꼴만 문서용으로 통일했으며 값은 실제 검증
+실행에서 가져왔다.
 
 - Windows x86-64 릴리스 바이너리의 peer 접속 로그와 `self-test` JSON
 - Synology/Linux ARM64 릴리스 바이너리의 `self-test` JSON
 - 실제 세 파일 authoritative scan 결과
 - 실제 native watcher가 새 파일을 감지한 이벤트
+- v0.3 `sync-once`의 양방향 병합·동시 수정·삭제·무변경 재시도 JSON
 
 endpoint ID는 테스트 때 생성된 일회성 ID의 짧은 표시값만 사용한다. 실제 사용자
 파일, 비밀키, 운영 NAS 주소는 포함하지 않는다.
@@ -41,7 +42,31 @@ endpoint ID는 테스트 때 생성된 일회성 ID의 짧은 표시값만 사�
 이 검증에서는 첫 전송 4,194,304바이트 대비 두 번째 전송이 257,800바이트였고,
 16개 extent를 재사용했다.
 
-## 2. 로컬 인덱스와 watcher
+## 2. 양방향 폴더 동기화
+
+![양방향 동기화 전, 중, 후, 결과 애니메이션](assets/deltaweave-sync-lifecycle.gif)
+
+### 전: 서로 다른 Windows/NAS 파일
+
+![양방향 동기화 실행 전](assets/sync-01-before.png)
+
+### 중: 최초 양방향 병합과 루트 검증
+
+![양방향 동기화 실행 중](assets/sync-02-during.png)
+
+### 후: 양쪽 동시 수정과 conflict copy
+
+![양방향 동기화 실행 후](assets/sync-03-after.png)
+
+### 결과: 삭제 전파와 0-action 재실행
+
+![양방향 동기화 최종 결과](assets/sync-04-result.png)
+
+이 화면의 `merkle_queries`, action 수, 전송 바이트, conflict 파일명은 두 개의
+독립 루트와 영속 키를 사용한 실제 direct-only CLI 실행 결과다. 마지막 실행은
+`merkle_queries=1`, 양쪽 action 0, 전송 0바이트로 끝났다.
+
+## 3. 로컬 인덱스와 watcher
 
 ![로컬 인덱스 전, 중, 후, 결과 애니메이션](assets/deltaweave-index-lifecycle.gif)
 
@@ -64,14 +89,14 @@ endpoint ID는 테스트 때 생성된 일회성 ID의 짧은 표시값만 사�
 정상 결과는 `issues=[]`, `collisions=[]`, `retries_queued=0`이며 watcher 화면의
 `watcher_degraded=false`도 확인한다.
 
-## 3. Synology ARM64 패키지
+## 4. Synology ARM64 패키지
 
 ![Synology ARM64 실제 자체 테스트 결과](assets/deltaweave-synology-self-test.png)
 
 이 화면은 릴리스 워크플로가 ARM64 정적 바이너리를 QEMU에서 직접 실행한 결과다.
 실제 NAS에서는 SSH 터미널에서 같은 `./deltaweave self-test` 명령을 사용한다.
 
-## 4. Portainer 배포 흐름
+## 5. Portainer 배포 흐름
 
 ![Windows에서 Synology Portainer로 배포하고 검증하는 흐름](assets/portainer-flow.svg)
 
