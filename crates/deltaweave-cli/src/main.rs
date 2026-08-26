@@ -5,15 +5,17 @@
 use std::{
     collections::HashSet,
     fs,
+    io::Write,
     net::SocketAddr,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, Parser, Subcommand};
 use deltaweave_cdc::manifest_from_path;
-use deltaweave_core::{ChunkingProfile, WirePath};
+use deltaweave_core::{ChunkingProfile, Hash32, ReplicaId, WirePath};
+use deltaweave_index::{IndexOptions, LocalIndex, ScanChange, WatchService};
 use deltaweave_net::{
     NetworkMode, PeerPolicy, PushOptions, Server, ServerConfig, TransferReceipt, endpoint_addr,
     load_or_create_identity, push_file, start_server,
@@ -44,6 +46,10 @@ enum Command {
     Serve(ServeArgs),
     /// Send one file and transfer only chunks missing at the receiver.
     Push(PushArgs),
+    /// Build or refresh the authoritative local directory index once.
+    Scan(ScanArgs),
+    /// Continuously index a directory using native watcher hints and periodic reconciliation.
+    Watch(WatchArgs),
     /// Run an isolated local end-to-end transfer and delta-reuse check.
     SelfTest,
 }
@@ -137,6 +143,52 @@ struct PushArgs {
     chunking: ChunkingArgs,
 }
 
+#[derive(Debug, Args)]
+struct ScanArgs {
+    #[command(flatten)]
+    index: IndexArgs,
+    /// Include every persistent path and retry record in the JSON response.
+    #[arg(long)]
+    include_records: bool,
+}
+
+#[derive(Debug, Args)]
+struct WatchArgs {
+    #[command(flatten)]
+    index: IndexArgs,
+    /// Quiet period after the latest filesystem event.
+    #[arg(long, default_value_t = 750)]
+    debounce_ms: u64,
+    /// Maximum time an event storm may postpone a scan.
+    #[arg(long, default_value_t = 5_000)]
+    max_debounce_ms: u64,
+    /// Safety-net full rescan interval in seconds.
+    #[arg(long, default_value_t = 600)]
+    rescan_seconds: u64,
+    /// Full-scan interval when native watching is unavailable or reports loss.
+    #[arg(long, default_value_t = 5)]
+    poll_fallback_seconds: u64,
+}
+
+#[derive(Debug, Args)]
+struct IndexArgs {
+    /// Directory whose local state is indexed.
+    #[arg(long)]
+    root: PathBuf,
+    /// Private redb index file. If beneath root, its parent is excluded automatically.
+    #[arg(long, default_value = ".deltaweave/index.redb")]
+    state: PathBuf,
+    /// Persistent node identity used to derive a stable replica ID.
+    #[arg(long, default_value = ".deltaweave/identity.key")]
+    identity: PathBuf,
+    /// Maximum simultaneous file hashers; defaults to available CPUs capped at eight.
+    #[arg(long)]
+    hash_workers: Option<usize>,
+    /// Path to exclude from indexing; repeat for multiple paths.
+    #[arg(long = "ignore")]
+    ignored_paths: Vec<PathBuf>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
@@ -149,6 +201,8 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Manifest(args) => print_manifest(args),
         Command::Serve(args) => serve(args).await,
         Command::Push(args) => push(args).await,
+        Command::Scan(args) => scan(args),
+        Command::Watch(args) => watch(args).await,
         Command::SelfTest => self_test().await,
     }
 }
@@ -273,6 +327,131 @@ async fn push(args: PushArgs) -> Result<()> {
     print_json(&receipt)
 }
 
+fn scan(args: ScanArgs) -> Result<()> {
+    let index = open_index(args.index)?;
+    let report = index.scan()?;
+    if args.include_records {
+        print_json(&json!({
+            "records": index.records()?,
+            "report": report,
+            "retries": index.retries()?,
+        }))
+    } else {
+        print_json(&report)
+    }
+}
+
+async fn watch(args: WatchArgs) -> Result<()> {
+    ensure!(
+        args.debounce_ms > 0,
+        "--debounce-ms must be greater than zero"
+    );
+    ensure!(
+        args.max_debounce_ms >= args.debounce_ms,
+        "--max-debounce-ms must be at least --debounce-ms"
+    );
+    ensure!(
+        args.rescan_seconds > 0,
+        "--rescan-seconds must be greater than zero"
+    );
+    ensure!(
+        args.poll_fallback_seconds > 0,
+        "--poll-fallback-seconds must be greater than zero"
+    );
+
+    let index = open_index(args.index)?;
+    let debounce = Duration::from_millis(args.debounce_ms);
+    let maximum_delay = Duration::from_millis(args.max_debounce_ms);
+    let rescan_interval = Duration::from_secs(args.rescan_seconds);
+    let fallback_interval = Duration::from_secs(args.poll_fallback_seconds);
+    let (mut watcher, watcher_error) =
+        match WatchService::new(index.root(), index.ignored_paths(), debounce, maximum_delay) {
+            Ok(watcher) => (Some(watcher), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+    print_json(&json!({
+        "event": "initial_scan",
+        "report": index.scan()?,
+        "root": display_path(index.root()),
+        "status": if watcher.is_some() { "watching" } else { "polling_fallback" },
+        "watcher_error": watcher_error,
+    }))?;
+
+    let started = Instant::now();
+    let mut next_periodic = started + rescan_interval;
+    let mut next_fallback = started + fallback_interval;
+    let mut watcher_degraded = watcher.is_none();
+    let shutdown = wait_for_shutdown_signal();
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            result = &mut shutdown => {
+                result?;
+                print_json(&json!({"event": "shutdown", "status": "stopped"}))?;
+                return Ok(());
+            }
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                let now = Instant::now();
+                let trigger = watcher.as_mut().and_then(|watcher| watcher.poll(now));
+                if trigger.as_ref().is_some_and(|value| value.rescan_required) {
+                    watcher_degraded = true;
+                }
+                let periodic = now >= next_periodic;
+                let fallback = watcher_degraded && now >= next_fallback;
+                if trigger.is_none() && !periodic && !fallback {
+                    continue;
+                }
+                let authoritative = periodic
+                    || fallback
+                    || trigger.as_ref().is_some_and(|value| value.rescan_required);
+                let report = if authoritative {
+                    index.scan()?
+                } else {
+                    index.scan_incremental(
+                        trigger
+                            .as_ref()
+                            .map_or(&[][..], |value| value.changed_paths.as_slice()),
+                    )?
+                };
+                print_json(&json!({
+                    "event": if periodic {
+                        "periodic_scan"
+                    } else if fallback {
+                        "fallback_scan"
+                    } else {
+                        "watch_scan"
+                    },
+                    "native_events": trigger.as_ref().map_or(0, |value| value.event_count),
+                    "report": report,
+                    "rescan_required": authoritative,
+                    "watcher_degraded": watcher_degraded,
+                }))?;
+                if periodic {
+                    next_periodic = now + rescan_interval;
+                }
+                if fallback {
+                    next_fallback = now + fallback_interval;
+                }
+            }
+        }
+    }
+}
+
+fn open_index(mut args: IndexArgs) -> Result<LocalIndex> {
+    let identity = load_or_create_identity(&args.identity)?;
+    let replica = ReplicaId(Hash32::digest(identity.endpoint_id().as_bytes()));
+    args.ignored_paths.push(args.identity.clone());
+    let mut options = IndexOptions {
+        ignored_paths: args.ignored_paths,
+        ..IndexOptions::default()
+    };
+    if let Some(workers) = args.hash_workers {
+        ensure!(workers > 0, "--hash-workers must be greater than zero");
+        options.hash_workers = workers;
+    }
+    LocalIndex::open(args.root, args.state, replica, options)
+}
+
 async fn self_test() -> Result<()> {
     let workspace = tempfile::tempdir().context("failed to create self-test workspace")?;
     let destination = workspace.path().join("received");
@@ -298,17 +477,90 @@ async fn self_test() -> Result<()> {
         (Ok(_), Err(error)) => return Err(error.context("self-test receiver shutdown failed")),
         (Ok(report), Ok(())) => report,
     };
+    let index = exercise_index_self_test(workspace.path())?;
 
     print_json(&json!({
         "architecture": std::env::consts::ARCH,
         "final_size": final_size,
         "first_transfer_bytes": first.transferred_bytes,
+        "index_initial_records": index.initial_records,
+        "index_rename_detected": index.rename_detected,
+        "index_restart_verified": index.restart_verified,
+        "index_tombstones": index.tombstones,
         "operating_system": std::env::consts::OS,
         "reused_extents": second.reused_extents,
         "second_transfer_bytes": second.transferred_bytes,
         "status": "pass",
         "temporary_data": "cleaned on exit",
     }))
+}
+
+struct IndexSelfTestReport {
+    initial_records: usize,
+    rename_detected: bool,
+    restart_verified: bool,
+    tombstones: usize,
+}
+
+fn exercise_index_self_test(workspace: &Path) -> Result<IndexSelfTestReport> {
+    let root = workspace.join("index-root");
+    let state = workspace.join("index-state/index.redb");
+    fs::create_dir_all(&root)?;
+    let original = root.join("before.bin");
+    let renamed = root.join("after.bin");
+    fs::write(&original, b"local index self-test")?;
+    let replica = ReplicaId(Hash32::digest(b"deltaweave packaged self-test replica"));
+    let index = LocalIndex::open(&root, &state, replica, IndexOptions::default())?;
+    let initial = index
+        .scan()
+        .context("self-test initial index scan failed")?;
+    ensure!(
+        initial.live_records == 1,
+        "self-test indexed an unexpected path count"
+    );
+    ensure!(
+        initial.files_hashed == 1,
+        "self-test did not hash its fixture"
+    );
+
+    fs::rename(&original, &renamed)?;
+    let rename = index.scan().context("self-test rename scan failed")?;
+    let rename_detected = rename.changes.iter().any(|change| {
+        matches!(
+            change,
+            ScanChange::Renamed { from, to }
+                if from.as_str() == "before.bin" && to.as_str() == "after.bin"
+        )
+    });
+    ensure!(
+        rename_detected,
+        "self-test failed to correlate a stable-identity rename"
+    );
+
+    fs::remove_file(&renamed)?;
+    let deleted = index.scan().context("self-test deletion scan failed")?;
+    ensure!(
+        deleted.tombstones == 2,
+        "self-test did not preserve rename/delete tombstones"
+    );
+    drop(index);
+
+    let reopened = LocalIndex::open(&root, &state, replica, IndexOptions::default())?;
+    let records = reopened
+        .records()
+        .context("self-test index restart failed")?;
+    let restart_verified = records.len() == 2 && records.iter().all(|record| record.tombstone);
+    ensure!(
+        restart_verified,
+        "self-test index state did not survive restart"
+    );
+
+    Ok(IndexSelfTestReport {
+        initial_records: initial.live_records,
+        rename_detected,
+        restart_verified,
+        tombstones: deleted.tombstones,
+    })
 }
 
 async fn exercise_self_test(
@@ -399,8 +651,9 @@ fn init_tracing() {
 }
 
 fn print_json(value: &impl serde::Serialize) -> Result<()> {
-    serde_json::to_writer_pretty(std::io::stdout().lock(), value)?;
-    println!();
+    let mut stdout = std::io::stdout().lock();
+    serde_json::to_writer_pretty(&mut stdout, value)?;
+    writeln!(stdout)?;
     Ok(())
 }
 
@@ -464,6 +717,30 @@ mod tests {
         let cli =
             Cli::try_parse_from(["deltaweave", "self-test"]).expect("self-test command parses");
         assert!(matches!(cli.command, Command::SelfTest));
+    }
+
+    #[test]
+    fn parses_scan_and_watch_safety_defaults() {
+        let scan = Cli::try_parse_from(["deltaweave", "scan", "--root", "data"])
+            .expect("scan command parses");
+        assert!(matches!(scan.command, Command::Scan(_)));
+
+        let watch = Cli::try_parse_from(["deltaweave", "watch", "--root", "data"])
+            .expect("watch command parses");
+        let Command::Watch(args) = watch.command else {
+            panic!("watch command expected");
+        };
+        assert_eq!(args.debounce_ms, 750);
+        assert_eq!(args.rescan_seconds, 600);
+        assert_eq!(args.poll_fallback_seconds, 5);
+
+        let scan =
+            Cli::try_parse_from(["deltaweave", "scan", "--root", "data", "--include-records"])
+                .expect("detailed scan command parses");
+        let Command::Scan(args) = scan.command else {
+            panic!("scan command expected");
+        };
+        assert!(args.include_records);
     }
 
     #[test]

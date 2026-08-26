@@ -15,7 +15,7 @@ preceding phase passes correctness, crash-recovery, and cross-platform tests.
 Exit gate: Linux and Windows CI pass format, lint, docs, unit, and integration
 tests from a clean checkout.
 
-## v0.2 — Authoritative local index
+## v0.2 — Authoritative local index (implemented; hardware validation ongoing)
 
 - Initial scanner with stable file identity where each OS exposes it
 - Normalized Unicode/case collision keys and explicit collision records
@@ -25,6 +25,13 @@ tests from a clean checkout.
 
 Exit gate: randomized filesystem-operation tests converge after watcher loss,
 rename storms, process restart, locked files, and case-collision fixtures.
+
+The implementation and deterministic operation-storm model are in the main
+branch. Linux and Windows CI exercise native watching; Windows additionally
+holds an exclusive file handle to verify durable retry and recovery. Packaged
+Synology binaries run the index restart self-test under both supported CPU
+architectures. A long-running Windows/Synology hardware soak remains a field
+validation gate, not a claim of distributed synchronization.
 
 ## v0.3 — Distributed reconciliation
 
