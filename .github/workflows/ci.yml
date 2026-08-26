@@ -41,6 +41,17 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --locked --workspace --no-deps --all-features
+      - name: Documentation media
+        run: |
+          test -s docs/assets/deltaweave-hero.webp
+          test -s docs/assets/deltaweave-quickstart.gif
+          test -s docs/assets/deltaweave-index-lifecycle.gif
+          test -s docs/assets/deltaweave-self-test.png
+          test -s docs/assets/deltaweave-synology-self-test.png
+          test -s docs/assets/portainer-flow.svg
+          grep -Fq 'docs/assets/deltaweave-quickstart.gif' README.md
+          grep -Fq 'assets/deltaweave-index-lifecycle.gif' docs/TESTING_LOCAL_INDEX.md
+          grep -Fq 'assets/portainer-flow.svg' docs/AI_PORTAINER_SETUP.md
       - name: Release build
         run: cargo build --locked --workspace --release --all-features
 

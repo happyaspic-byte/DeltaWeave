@@ -4,6 +4,8 @@
 [![Security](https://github.com/happyaspic-byte/DeltaWeave/actions/workflows/security.yml/badge.svg)](https://github.com/happyaspic-byte/DeltaWeave/actions/workflows/security.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
+![DeltaWeave connects a Windows PC and NAS with verified encrypted chunk transfer](docs/assets/deltaweave-hero.webp)
+
 DeltaWeave is a Rust foundation for authenticated, content-defined P2P file
 synchronization. It combines an authoritative local filesystem index, FastCDC
 chunking, BLAKE3 integrity, a durable content-addressed store, and iroh's
@@ -13,6 +15,19 @@ encrypted QUIC transport.
 > watcher to the verified one-file delta-transfer vertical slice. The index is
 > not yet connected to distributed two-way reconciliation. Do not use
 > DeltaWeave as the only copy of important data.
+
+## Actual usage
+
+This GIF reconstructs the actual peer-accept logs and JSON result from the
+v0.2.0 Windows release job in a readable terminal. It shows package verification
+as **before → during → after → result**.
+
+![DeltaWeave 실제 실행 전, 중, 후, 결과](docs/assets/deltaweave-quickstart.gif)
+
+The [verified usage gallery](docs/USAGE_GALLERY.md) includes full-size frames,
+the local-index lifecycle, and the Synology ARM64 result. Only the terminal font
+and background are normalized; status values, byte counts, and event counts come
+from verified executions.
 
 ## What works today
 
@@ -52,7 +67,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and
 
 ## Download a test release
 
-The pre-alpha [v0.2.0 release](https://github.com/happyaspic-byte/DeltaWeave/releases/tag/v0.2.0)
+The pre-alpha [v0.2.1 release](https://github.com/happyaspic-byte/DeltaWeave/releases/tag/v0.2.1)
 provides ready-to-run packages for:
 
 - Windows x86-64

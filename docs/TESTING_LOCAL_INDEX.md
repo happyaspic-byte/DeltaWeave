@@ -4,6 +4,21 @@
 절차다. v0.2의 인덱스는 로컬 변경을 안전하게 기록하지만 아직 다른 장비로 자동
 전송하지 않는다. 반드시 복사본 테스트 디렉터리를 사용한다.
 
+## 실제 실행 화면: 전·중·후·결과
+
+아래 GIF는 실제 세 파일 스캔과 native watcher 파일 생성 이벤트를 순서대로
+보여 준다. 터미널 스타일만 통일했으며 `generation`, record 수, 이벤트 수,
+`issues` 값은 v0.2.0 바이너리를 직접 실행해 얻었다.
+
+![로컬 인덱스 실행 전, 중, 후, 결과](assets/deltaweave-index-lifecycle.gif)
+
+각 프레임을 확대해서 보려면 [실제 사용 화면 갤러리](USAGE_GALLERY.md)를 연다.
+
+- 전: 시험 root와 private state를 분리한다.
+- 중: 초기 스캔 후 `status=watching`을 확인한다.
+- 후: 파일 생성이 `native_events`와 `watch_scan`으로 기록된다.
+- 결과: authoritative scan의 `issues`, `collisions`, retry가 비어 있다.
+
 ## 합격 기준
 
 - 최초 스캔이 파일·디렉터리 수와 `files_hashed`를 정확히 보고한다.
@@ -71,6 +86,8 @@ watcher 장애 시 5초 폴링이다.
 
 `watch_scan` JSON이 출력되고 `native_events`가 0보다 커야 한다. 종료는
 `Ctrl+C`를 사용한다.
+
+![native watcher 실제 파일 생성 감지 결과](assets/deltaweave-index-watch.png)
 
 ## Synology 또는 Linux
 
