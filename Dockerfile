@@ -34,7 +34,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 
 FROM debian:bookworm-slim AS runtime
 
-ARG DELTAWEAVE_VERSION=0.1.1
+ARG DELTAWEAVE_VERSION=0.1.2
 
 LABEL org.opencontainers.image.title="DeltaWeave" \
       org.opencontainers.image.description="Authenticated content-defined P2P file transfer" \

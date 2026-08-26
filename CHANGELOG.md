@@ -5,6 +5,15 @@ Versioning after its first stable release.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-08-26
+
+### Fixed
+
+- Normalize Synology archive entries to numeric UID/GID 0 instead of leaking
+  the GitHub runner's UID/GID 1001 into release packages.
+- Extract Synology packages with `--no-same-owner` in the operator guide so
+  installation never attempts to restore archive ownership.
+
 ## [0.1.1] - 2026-08-26
 
 ### Security

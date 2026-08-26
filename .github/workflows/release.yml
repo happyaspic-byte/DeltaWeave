@@ -151,7 +151,21 @@ jobs:
           install -m 0755 "target/$TARGET/release/deltaweave" "$package/deltaweave"
           install -m 0644 docs/TESTING_WINDOWS_SYNOLOGY.md "$package/TESTING.md"
           install -m 0644 LICENSE "$package/LICENSE"
-          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          tar --sort=name --owner=0 --group=0 --numeric-owner \
+            -C dist -czf "dist/$name.tar.gz" "$name"
+      - name: Verify archive ownership
+        env:
+          ARCH: ${{ matrix.arch }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          archive="dist/DeltaWeave-v$VERSION-synology-$ARCH.tar.gz"
+          tar --numeric-owner -tvzf "$archive" | awk '
+            $2 != "0/0" {
+              print "unexpected archive owner: " $0 > "/dev/stderr"
+              invalid = 1
+            }
+            END { exit invalid }
+          '
       - uses: actions/upload-artifact@v7.0.1
         with:
           name: synology-${{ matrix.arch }}
