@@ -5,6 +5,19 @@ Versioning after its first stable release.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-08-26
+
+### Added
+
+- Add a GitHub hero image and two compact animated usage demonstrations.
+- Add a verified usage gallery with Windows, Synology ARM64, scan, and native
+  watcher screens organized as before, during, after, and result stages.
+- Add a visual Windows-to-Portainer-to-Synology deployment flow to the AI
+  operator runbook.
+- Package all usage images, the gallery, and the AI Portainer runbook with every
+  Windows and Synology release archive.
+- Validate required documentation media in Linux CI.
+
 ## [0.2.0] - 2026-08-26
 
 ### Added

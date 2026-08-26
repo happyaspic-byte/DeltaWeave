@@ -10,6 +10,11 @@ Docker 사용법을 설명하는 문서가 아니다. 에이전트는 추측으�
 > 충돌 해결, DSM SPK 또는 VFS와 연결되지는 않는다. 중요한 데이터의 유일한
 > 사본으로 사용하지 않는다.
 
+![Windows에서 Synology Portainer로 배포하고 검증하는 흐름](assets/portainer-flow.svg)
+
+실제 Windows·Synology·watcher 출력은
+[실제 사용 화면 갤러리](USAGE_GALLERY.md)에서 전·중·후·결과 순서로 확인한다.
+
 ## 1. 에이전트의 완료 조건
 
 다음 항목을 모두 증거와 함께 보고해야 설치 완료로 간주한다.
@@ -78,6 +83,8 @@ cd C:\DeltaWeave
 `self-test`의 `status`가 `pass`인지 확인하고 `init` JSON의 `endpoint_id`만
 `DELTAWEAVE_ALLOWED_PEER`로 기록한다. `sender.key` 내용은 읽거나 전송하지 않는다.
 
+![Windows x86-64 실제 self-test 결과](assets/deltaweave-self-test.png)
+
 ## 5. NAS 영속 디렉터리 준비
 
 NAS에서 DeltaWeave를 소유할 기존 DSM 계정을 선택한다. 숫자 UID/GID를 확인한 뒤
@@ -117,6 +124,8 @@ docker run --rm ghcr.io/happyaspic-byte/deltaweave:main self-test
 ```
 
 반드시 `"status": "pass"`를 확인한다. NAS CPU에 맞는 이미지가 manifest에서 자동 선택된다.
+
+![Synology ARM64 실제 self-test 결과](assets/deltaweave-synology-self-test.png)
 
 ## 7. Portainer Stack 배포
 

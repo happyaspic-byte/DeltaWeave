@@ -1,14 +1,25 @@
 # Windows PC ↔ Synology DSM 릴리즈 테스트
 
-이 문서는 DeltaWeave v0.2.0 바이너리를 Windows PC와 Synology NAS에서
-검증하는 절차입니다. v0.2.0은 단일 파일 델타 전송과 로컬 인덱스를 검증하기
+이 문서는 DeltaWeave v0.2.1 바이너리를 Windows PC와 Synology NAS에서
+검증하는 절차입니다. v0.2.1은 단일 파일 델타 전송과 로컬 인덱스를 검증하기
 위한 pre-alpha이며, 중요한 데이터의 유일한 사본으로 사용하면 안 됩니다.
+
+## 실제 실행 화면: 전·중·후·결과
+
+아래 화면은 Windows 릴리스 바이너리의 실제 peer 접속 로그와 `self-test` 결과를
+문서용 터미널로 재현한 것이다. 화면의 값은 예시로 만든 성공값이 아니라 릴리스
+검증에서 얻은 값이다.
+
+![Windows 자체 테스트 전, 중, 후, 결과](assets/deltaweave-quickstart.gif)
+
+각 단계의 큰 정적 화면과 Synology ARM64 결과는
+[실제 사용 화면 갤러리](USAGE_GALLERY.md)에서 확인한다.
 
 ## 1. 패키지 선택
 
 Windows PC에서는 다음 파일을 받습니다.
 
-- `DeltaWeave-v0.2.0-windows-x86_64.zip`
+- `DeltaWeave-v0.2.1-windows-x86_64.zip`
 
 Synology에 SSH로 접속하고 CPU 아키텍처를 확인합니다.
 
@@ -18,11 +29,11 @@ uname -m
 
 | 출력 | 받을 패키지 |
 | --- | --- |
-| `x86_64` | `DeltaWeave-v0.2.0-synology-x86_64.tar.gz` |
-| `aarch64` | `DeltaWeave-v0.2.0-synology-aarch64.tar.gz` |
-| `armv7l` 등 | v0.2.0 미지원 |
+| `x86_64` | `DeltaWeave-v0.2.1-synology-x86_64.tar.gz` |
+| `aarch64` | `DeltaWeave-v0.2.1-synology-aarch64.tar.gz` |
+| `armv7l` 등 | v0.2.1 미지원 |
 
-모든 파일은 [GitHub Releases](https://github.com/happyaspic-byte/DeltaWeave/releases/tag/v0.2.0)에서
+모든 파일은 [GitHub Releases](https://github.com/happyaspic-byte/DeltaWeave/releases/tag/v0.2.1)에서
 다운로드합니다.
 
 ## 2. 다운로드 무결성 확인
@@ -32,13 +43,13 @@ uname -m
 Windows PowerShell:
 
 ```powershell
-Get-FileHash .\DeltaWeave-v0.2.0-windows-x86_64.zip -Algorithm SHA256
+Get-FileHash .\DeltaWeave-v0.2.1-windows-x86_64.zip -Algorithm SHA256
 ```
 
 Synology SSH:
 
 ```bash
-sha256sum DeltaWeave-v0.2.0-synology-*.tar.gz
+sha256sum DeltaWeave-v0.2.1-synology-*.tar.gz
 ```
 
 계산된 값이 `SHA256SUMS.txt`와 정확히 같아야 합니다.
@@ -48,7 +59,7 @@ sha256sum DeltaWeave-v0.2.0-synology-*.tar.gz
 Windows PowerShell:
 
 ```powershell
-Expand-Archive .\DeltaWeave-v0.2.0-windows-x86_64.zip -DestinationPath C:\DeltaWeave
+Expand-Archive .\DeltaWeave-v0.2.1-windows-x86_64.zip -DestinationPath C:\DeltaWeave
 cd C:\DeltaWeave
 .\deltaweave.exe self-test
 ```
@@ -57,7 +68,7 @@ Synology SSH에서는 NAS 아키텍처에 맞는 파일명을 사용합니다.
 
 ```bash
 mkdir -p /volume1/DeltaWeave
-tar --no-same-owner -xzf DeltaWeave-v0.2.0-synology-x86_64.tar.gz \
+tar --no-same-owner -xzf DeltaWeave-v0.2.1-synology-x86_64.tar.gz \
   -C /volume1/DeltaWeave --strip-components=1
 cd /volume1/DeltaWeave
 chmod 755 ./deltaweave
@@ -71,13 +82,21 @@ chmod 755 ./deltaweave
   "index_rename_detected": true,
   "index_restart_verified": true,
   "status": "pass",
-  "reused_extents": 1,
-  "second_transfer_bytes": 123456
+  "reused_extents": 16,
+  "second_transfer_bytes": 257800
 }
 ```
 
 수치는 장비와 청킹 결과에 따라 달라지며 `status`가 `pass`,
 `reused_extents`가 0보다 크고 두 index 검증 값이 `true`면 성공입니다.
+
+Windows 실제 결과:
+
+![Windows x86-64 자체 테스트 결과](assets/deltaweave-self-test.png)
+
+Synology ARM64 실제 결과:
+
+![Synology ARM64 자체 테스트 결과](assets/deltaweave-synology-self-test.png)
 
 ## 4. Windows 송신자 키 생성
 
@@ -174,7 +193,7 @@ sha256sum /volume1/DeltaWeave/received/validation/sample.bin
 | 연결 실패 | IP 도달성, Windows/DSM 방화벽, 출력된 UDP 포트 확인 |
 | 키 권한 오류 | Synology에서 `chmod 600 sender.key receiver.key` 실행 |
 
-테스트 종료는 Synology 수신기 터미널에서 `Ctrl+C`를 누릅니다. v0.2.0에는
+테스트 종료는 Synology 수신기 터미널에서 `Ctrl+C`를 누릅니다. v0.2.1에는
 로컬 `scan`·`watch`가 포함되지만, 아직 완전한 양방향 동기화, DSM SPK,
 Windows 설치 프로그램 또는 VFS는 포함되지 않습니다. 로컬 인덱스는
 [별도 검증 절차](TESTING_LOCAL_INDEX.md)를 따릅니다.

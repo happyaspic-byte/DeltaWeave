@@ -1,8 +1,23 @@
-# DeltaWeave v0.2.0
+# DeltaWeave v0.2.1
 
-This pre-alpha release adds an authoritative local filesystem index to the
-verified one-file P2P delta-transfer foundation. It is intended for controlled
-Windows PC and Synology DSM evaluation, not as the only copy of important data.
+This pre-alpha documentation patch makes the verified v0.2 local-index and P2P
+delta-transfer foundation easier to evaluate on Windows and Synology DSM. It is
+intended for controlled testing, not as the only copy of important data.
+
+## Visual setup and verification
+
+- Add a wide GitHub project header and compact animated quick-start
+- Show real Windows release logs and JSON as before, during, after, and result
+  screens
+- Show a real three-file scan and native watcher event in the same four stages
+- Add the actual Synology ARM64 packaged-binary self-test result
+- Add a Windows-to-Portainer-to-Synology deployment flow
+- Include the full visual gallery, images, GIFs, and AI Portainer runbook inside
+  every downloadable archive
+
+The terminal styling is normalized for readability. Runtime values come from
+the v0.2.0 release workflow and direct v0.2.0 scan/watcher executions; no user
+data or persistent endpoint secrets are present.
 
 ## New local-state foundation
 

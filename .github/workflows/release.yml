@@ -83,6 +83,9 @@ jobs:
           Copy-Item ".\target\x86_64-pc-windows-msvc\release\deltaweave.exe" $package
           Copy-Item ".\docs\TESTING_WINDOWS_SYNOLOGY.md" (Join-Path $package "TESTING.md")
           Copy-Item ".\docs\TESTING_LOCAL_INDEX.md" $package
+          Copy-Item ".\docs\AI_PORTAINER_SETUP.md" $package
+          Copy-Item ".\docs\USAGE_GALLERY.md" $package
+          Copy-Item ".\docs\assets" $package -Recurse
           Copy-Item ".\LICENSE" $package
           Compress-Archive -Path "$package\*" -DestinationPath "dist\$name.zip"
       - uses: actions/upload-artifact@v7.0.1
@@ -152,6 +155,10 @@ jobs:
           install -m 0755 "target/$TARGET/release/deltaweave" "$package/deltaweave"
           install -m 0644 docs/TESTING_WINDOWS_SYNOLOGY.md "$package/TESTING.md"
           install -m 0644 docs/TESTING_LOCAL_INDEX.md "$package/TESTING_LOCAL_INDEX.md"
+          install -m 0644 docs/AI_PORTAINER_SETUP.md "$package/AI_PORTAINER_SETUP.md"
+          install -m 0644 docs/USAGE_GALLERY.md "$package/USAGE_GALLERY.md"
+          install -d -m 0755 "$package/assets"
+          install -m 0644 docs/assets/* "$package/assets/"
           install -m 0644 LICENSE "$package/LICENSE"
           tar --sort=name --owner=0 --group=0 --numeric-owner \
             -C dist -czf "dist/$name.tar.gz" "$name"
