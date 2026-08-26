@@ -1,14 +1,14 @@
 # Windows PC ↔ Synology DSM 릴리즈 테스트
 
-이 문서는 DeltaWeave v0.1.1 바이너리를 Windows PC와 Synology NAS에서
-검증하는 절차입니다. v0.1.1은 단일 파일 델타 전송을 검증하기 위한
+이 문서는 DeltaWeave v0.1.2 바이너리를 Windows PC와 Synology NAS에서
+검증하는 절차입니다. v0.1.2는 단일 파일 델타 전송을 검증하기 위한
 pre-alpha이며, 중요한 데이터의 유일한 사본으로 사용하면 안 됩니다.
 
 ## 1. 패키지 선택
 
 Windows PC에서는 다음 파일을 받습니다.
 
-- `DeltaWeave-v0.1.1-windows-x86_64.zip`
+- `DeltaWeave-v0.1.2-windows-x86_64.zip`
 
 Synology에 SSH로 접속하고 CPU 아키텍처를 확인합니다.
 
@@ -18,11 +18,11 @@ uname -m
 
 | 출력 | 받을 패키지 |
 | --- | --- |
-| `x86_64` | `DeltaWeave-v0.1.1-synology-x86_64.tar.gz` |
-| `aarch64` | `DeltaWeave-v0.1.1-synology-aarch64.tar.gz` |
-| `armv7l` 등 | v0.1.1 미지원 |
+| `x86_64` | `DeltaWeave-v0.1.2-synology-x86_64.tar.gz` |
+| `aarch64` | `DeltaWeave-v0.1.2-synology-aarch64.tar.gz` |
+| `armv7l` 등 | v0.1.2 미지원 |
 
-모든 파일은 [GitHub Releases](https://github.com/happyaspic-byte/DeltaWeave/releases/tag/v0.1.1)에서
+모든 파일은 [GitHub Releases](https://github.com/happyaspic-byte/DeltaWeave/releases/tag/v0.1.2)에서
 다운로드합니다.
 
 ## 2. 다운로드 무결성 확인
@@ -32,13 +32,13 @@ uname -m
 Windows PowerShell:
 
 ```powershell
-Get-FileHash .\DeltaWeave-v0.1.1-windows-x86_64.zip -Algorithm SHA256
+Get-FileHash .\DeltaWeave-v0.1.2-windows-x86_64.zip -Algorithm SHA256
 ```
 
 Synology SSH:
 
 ```bash
-sha256sum DeltaWeave-v0.1.1-synology-*.tar.gz
+sha256sum DeltaWeave-v0.1.2-synology-*.tar.gz
 ```
 
 계산된 값이 `SHA256SUMS.txt`와 정확히 같아야 합니다.
@@ -48,7 +48,7 @@ sha256sum DeltaWeave-v0.1.1-synology-*.tar.gz
 Windows PowerShell:
 
 ```powershell
-Expand-Archive .\DeltaWeave-v0.1.1-windows-x86_64.zip -DestinationPath C:\DeltaWeave
+Expand-Archive .\DeltaWeave-v0.1.2-windows-x86_64.zip -DestinationPath C:\DeltaWeave
 cd C:\DeltaWeave
 .\deltaweave.exe self-test
 ```
@@ -57,7 +57,7 @@ Synology SSH에서는 NAS 아키텍처에 맞는 파일명을 사용합니다.
 
 ```bash
 mkdir -p /volume1/DeltaWeave
-tar -xzf DeltaWeave-v0.1.1-synology-x86_64.tar.gz \
+tar --no-same-owner -xzf DeltaWeave-v0.1.2-synology-x86_64.tar.gz \
   -C /volume1/DeltaWeave --strip-components=1
 cd /volume1/DeltaWeave
 chmod 755 ./deltaweave
@@ -172,6 +172,6 @@ sha256sum /volume1/DeltaWeave/received/validation/sample.bin
 | 연결 실패 | IP 도달성, Windows/DSM 방화벽, 출력된 UDP 포트 확인 |
 | 키 권한 오류 | Synology에서 `chmod 600 sender.key receiver.key` 실행 |
 
-테스트 종료는 Synology 수신기 터미널에서 `Ctrl+C`를 누릅니다. v0.1.1에는
+테스트 종료는 Synology 수신기 터미널에서 `Ctrl+C`를 누릅니다. v0.1.2에는
 아직 백그라운드 서비스, 폴더 실시간 감시, 완전한 양방향 동기화, DSM SPK,
 Windows 설치 프로그램 또는 VFS가 포함되지 않습니다.

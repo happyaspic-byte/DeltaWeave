@@ -603,7 +603,7 @@ dependencies = [
 
 [[package]]
 name = "deltaweave"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -620,7 +620,7 @@ dependencies = [
 
 [[package]]
 name = "deltaweave-cdc"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "blake3",
  "deltaweave-core",
@@ -631,7 +631,7 @@ dependencies = [
 
 [[package]]
 name = "deltaweave-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "blake3",
  "hex",
@@ -642,7 +642,7 @@ dependencies = [
 
 [[package]]
 name = "deltaweave-net"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "deltaweave-cdc",
@@ -659,7 +659,7 @@ dependencies = [
 
 [[package]]
 name = "deltaweave-store"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "blake3",

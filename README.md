@@ -45,7 +45,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and
 
 ## Download a test release
 
-The pre-alpha [v0.1.1 release](https://github.com/happyaspic-byte/DeltaWeave/releases/tag/v0.1.1)
+The pre-alpha [v0.1.2 release](https://github.com/happyaspic-byte/DeltaWeave/releases/tag/v0.1.2)
 provides ready-to-run packages for:
 
 - Windows x86-64

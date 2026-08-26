@@ -1,4 +1,4 @@
-# DeltaWeave v0.1.1
+# DeltaWeave v0.1.2
 
 This pre-alpha release is a verified one-file P2P delta-transfer foundation.
 It is intended for controlled Windows PC and Synology DSM evaluation, not as
@@ -13,6 +13,13 @@ the only copy of important data.
 - `init`, `manifest`, `serve`, `push`, and isolated `self-test` CLI commands
 - Windows x86-64 and static Synology x86-64/ARM64 packages
 - SHA-256 checksums for every downloadable archive
+
+## v0.1.2 packaging correction
+
+- Synology tar entries use normalized numeric UID/GID 0 instead of the CI runner
+  account
+- Synology extraction instructions explicitly preserve the installing user's
+  ownership
 
 ## v0.1.1 hardening
 
@@ -38,4 +45,4 @@ and hash verification.
 
 Continuous watching, directory reconciliation, bidirectional conflict handling,
 DSM SPK installation, Windows installers/services, and on-demand VFS are planned
-but are not part of v0.1.1.
+but are not part of v0.1.2.
