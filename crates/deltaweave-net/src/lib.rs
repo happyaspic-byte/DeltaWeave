@@ -23,6 +23,7 @@ use deltaweave_core::{
 use deltaweave_index::{IndexOptions, LocalIndex};
 use deltaweave_reconcile::{MerkleNodeSummary, MerkleTree};
 use deltaweave_store::Store;
+use deltaweave_swarm::{PeerAvailability, SchedulerLimits, schedule_chunks};
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayUrl, SecretKey, TransportAddr, Watcher,
     endpoint::{Connection, RecvStream, SendStream, presets},
@@ -2085,6 +2086,8 @@ pub struct SwarmFillReceipt {
     pub transferred_chunks: usize,
     /// Verified payload bytes received from source peers.
     pub transferred_bytes: u64,
+    /// Number of peers that delivered at least one verified chunk.
+    pub sources_used: usize,
 }
 
 /// Requests verified CAS chunks from an authorized swarm peer.
@@ -2174,25 +2177,89 @@ pub async fn swarm_fill_chunks(
     let mut remaining: HashSet<_> = hashes.iter().copied().collect();
     let mut payloads = Vec::new();
     let mut transferred_bytes = 0_u64;
-    for source in sources {
-        if remaining.is_empty() {
-            break;
+    let mut used_sources = HashSet::new();
+    while !remaining.is_empty() {
+        let remaining_vec: Vec<_> = remaining.iter().copied().collect();
+        let mut peers = Vec::new();
+        for source in &sources {
+            let bits = swarm_availability(
+                secret_key.clone(),
+                source.clone(),
+                mode,
+                remaining_vec.clone(),
+            )
+            .await?;
+            ensure!(
+                bits.len() == remaining_vec.len(),
+                "swarm availability bitmap length mismatch"
+            );
+            let available = remaining_vec
+                .iter()
+                .zip(bits)
+                .filter_map(|(hash, present)| present.then_some(*hash))
+                .collect();
+            peers.push(PeerAvailability {
+                id: Hash32::digest(source.id.as_bytes()),
+                available,
+                rtt_ms: 1,
+                queued_bytes: 0,
+                goodput_bytes_per_second: 10 * 1024 * 1024,
+                failure_penalty: 0,
+            });
         }
-        let assigned: Vec<_> = remaining.iter().copied().collect();
-        let fetch = swarm_get_chunks(secret_key.clone(), source, mode, assigned).await?;
-        for (hash, bytes) in fetch.chunks {
-            remaining.remove(&hash);
-            transferred_bytes = transferred_bytes
-                .checked_add(bytes.len() as u64)
-                .context("swarm transferred-byte counter overflow")?;
-            payloads.push((hash, bytes));
+        let assignments = schedule_chunks(
+            &remaining_vec,
+            &peers,
+            SchedulerLimits {
+                max_sources: sources.len().min(8),
+                max_chunks_per_peer: SWARM_MAX_WANT,
+                max_assignments: remaining_vec.len(),
+            },
+        );
+        ensure!(
+            !assignments.is_empty(),
+            "swarm sources lack {} assigned chunk(s)",
+            remaining.len()
+        );
+        let mut grouped: BTreeMap<Hash32, Vec<Hash32>> = BTreeMap::new();
+        for assignment in assignments {
+            grouped
+                .entry(assignment.peer)
+                .or_default()
+                .push(assignment.hash);
         }
+        let mut requests = Vec::new();
+        for (peer_id, assigned) in grouped {
+            let source = sources
+                .iter()
+                .find(|source| Hash32::digest(source.id.as_bytes()) == peer_id)
+                .context("scheduled swarm peer disappeared")?
+                .clone();
+            let key = secret_key.clone();
+            requests.push(tokio::spawn(async move {
+                let fetch = swarm_get_chunks(key, source, mode, assigned).await?;
+                Ok::<_, anyhow::Error>((peer_id, fetch))
+            }));
+        }
+        let previous = remaining.len();
+        for request in requests {
+            let (peer_id, fetch) = request.await.context("swarm source task failed")??;
+            if !fetch.chunks.is_empty() {
+                used_sources.insert(peer_id);
+            }
+            for (hash, bytes) in fetch.chunks {
+                remaining.remove(&hash);
+                transferred_bytes = transferred_bytes
+                    .checked_add(bytes.len() as u64)
+                    .context("swarm transferred-byte counter overflow")?;
+                payloads.push((hash, bytes));
+            }
+        }
+        ensure!(
+            remaining.len() < previous,
+            "swarm fill made no progress against remaining chunks"
+        );
     }
-    ensure!(
-        remaining.is_empty(),
-        "swarm sources lack {} assigned chunk(s)",
-        remaining.len()
-    );
     let installed = payloads.len();
     let chunk_store = Arc::clone(&store);
     tokio::task::spawn_blocking(move || chunk_store.chunks().put_verified_batch(payloads))
@@ -2207,6 +2274,7 @@ pub async fn swarm_fill_chunks(
     Ok(SwarmFillReceipt {
         transferred_chunks: installed,
         transferred_bytes,
+        sources_used: used_sources.len(),
     })
 }
 
@@ -2600,6 +2668,7 @@ mod tests {
         .expect("two-source swarm fill succeeds");
 
         assert_eq!(result.transferred_chunks, 2);
+        assert_eq!(result.sources_used, 2);
         assert_eq!(
             result.transferred_bytes,
             (first.len() + second.len()) as u64

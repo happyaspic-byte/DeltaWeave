@@ -670,6 +670,7 @@ dependencies = [
  "deltaweave-index",
  "deltaweave-reconcile",
  "deltaweave-store",
+ "deltaweave-swarm",
  "hex",
  "iroh",
  "postcard",
