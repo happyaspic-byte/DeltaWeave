@@ -1672,14 +1672,11 @@ impl ChunkWritePipeline {
         if !self.pending.is_empty() {
             self.flush_pending().await?;
         }
-        while let Some(task) = self.inflight.pop() {
-            task.await.context("chunk-store task failed")??;
-        }
-        Ok(())
+        drain_chunk_tasks(self.inflight).await
     }
 
     async fn flush_pending(&mut self) -> Result<()> {
-        while self.inflight.len() >= self.max_inflight {
+        if self.inflight.len() >= self.max_inflight {
             let task = self.inflight.remove(0);
             task.await.context("chunk-store task failed")??;
         }
@@ -1690,6 +1687,24 @@ impl ChunkWritePipeline {
         }));
         Ok(())
     }
+}
+
+async fn drain_chunk_tasks(tasks: Vec<tokio::task::JoinHandle<Result<usize>>>) -> Result<()> {
+    let mut first_error = None;
+    for task in tasks {
+        match task.await.context("chunk-store task failed") {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) | Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+    }
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+    Ok(())
 }
 
 async fn receive_chunks(
@@ -1894,6 +1909,23 @@ mod tests {
             version: version(label, counter),
             tombstone: false,
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn chunk_writer_drain_waits_for_all_tasks_after_first_error() {
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let delayed_completed = Arc::clone(&completed);
+        let failed = tokio::task::spawn_blocking(|| bail!("expected writer failure"));
+        let delayed = tokio::task::spawn_blocking(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            delayed_completed.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(1)
+        });
+
+        let result = drain_chunk_tasks(vec![delayed, failed]).await;
+
+        assert!(result.is_err());
+        assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

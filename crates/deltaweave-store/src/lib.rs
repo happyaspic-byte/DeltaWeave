@@ -77,6 +77,14 @@ impl ChunkStore {
         &self,
         chunks: impl IntoIterator<Item = (Hash32, Vec<u8>)>,
     ) -> Result<usize> {
+        self.put_verified_batch_with_sync(chunks, |parent| sync_directory(Some(parent)))
+    }
+
+    fn put_verified_batch_with_sync(
+        &self,
+        chunks: impl IntoIterator<Item = (Hash32, Vec<u8>)>,
+        mut sync_parent: impl FnMut(&Path) -> Result<()>,
+    ) -> Result<usize> {
         let chunks: Vec<_> = chunks.into_iter().collect();
         for (hash, bytes) in &chunks {
             let actual = Hash32::digest(bytes);
@@ -87,14 +95,25 @@ impl ChunkStore {
 
         let mut written = 0_usize;
         let mut parents = std::collections::BTreeSet::new();
+        let mut install_error = None;
         for (hash, bytes) in chunks {
-            if let Some(parent) = self.install_verified_chunk(hash, &bytes)? {
-                parents.insert(parent);
-                written += 1;
+            match self.install_verified_chunk(hash, &bytes) {
+                Ok(Some(parent)) => {
+                    parents.insert(parent);
+                    written += 1;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    install_error = Some(error);
+                    break;
+                }
             }
         }
         for parent in parents {
-            sync_directory(Some(&parent))?;
+            sync_parent(&parent)?;
+        }
+        if let Some(error) = install_error {
+            return Err(error);
         }
         Ok(written)
     }
@@ -726,6 +745,41 @@ mod tests {
                 bytes
             );
         }
+    }
+
+    #[test]
+    fn chunk_store_batch_syncs_installed_parents_before_returning_later_error() {
+        let temp = TempDir::new().expect("temporary directory can be created");
+        let store = ChunkStore::open(temp.path()).expect("chunk store can open");
+        let first = fixture(64 * 1024);
+        let first_hash = Hash32::digest(&first);
+        let mut second = fixture(64 * 1024 + 1);
+        let second_hash = loop {
+            let hash = Hash32::digest(&second);
+            if hash.to_hex()[..2] != first_hash.to_hex()[..2] {
+                break hash;
+            }
+            second.push(1);
+        };
+        let blocked_parent = store
+            .chunk_path(second_hash)
+            .parent()
+            .expect("chunk path has a parent")
+            .to_path_buf();
+        fs::write(&blocked_parent, b"not a directory").expect("blocked parent can be created");
+        let mut synced = Vec::new();
+
+        let result = store.put_verified_batch_with_sync(
+            vec![(first_hash, first), (second_hash, second)],
+            |parent| {
+                synced.push(parent.to_path_buf());
+                Ok(())
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(store.contains(first_hash));
+        assert_eq!(synced, vec![store.chunk_path(first_hash).parent().unwrap()]);
     }
 
     #[test]
