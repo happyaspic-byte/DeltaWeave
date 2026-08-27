@@ -14,7 +14,7 @@ use deltaweave_core::{
     ChunkingProfile, FileManifest, Hash32, ReplicaId, SyncEntryKind, SyncRecord, WirePath,
 };
 use deltaweave_index::{IndexOptions, LocalIndex, ScanReport};
-use deltaweave_net::{PullReceipt, SyncApplyReceipt, SyncClient, SyncSession, swarm_fill_chunks};
+use deltaweave_net::{PullReceipt, SyncApplyReceipt, SyncClient, SyncSession};
 use deltaweave_reconcile::{
     ApplyAction, ConflictRecord, MerkleTree, actions_to_reach, merge_snapshots,
 };
@@ -83,6 +83,8 @@ pub struct SyncReport {
     pub pushed_bytes: u64,
     /// Manifest extents reused across pull and push operations.
     pub reused_extents: usize,
+    /// Number of distinct V3 swarm sources that delivered at least one CAS chunk.
+    pub swarm_sources_used: usize,
     /// Deterministic conflict decisions, including preserved conflict-copy paths.
     pub conflicts: Vec<ConflictRecord>,
 }
@@ -93,6 +95,7 @@ struct StageStats {
     remote_files: usize,
     pulled_bytes: u64,
     reused_extents: usize,
+    swarm_sources_used: usize,
 }
 
 #[derive(Default)]
@@ -227,6 +230,7 @@ impl SyncEngine {
             reused_extents: stage_stats
                 .reused_extents
                 .saturating_add(remote_stats.reused_extents),
+            swarm_sources_used: stage_stats.swarm_sources_used,
             conflicts: merged.conflicts,
         })
     }
@@ -269,12 +273,15 @@ impl SyncEngine {
             let source = remote_sources
                 .get(&hash)
                 .with_context(|| format!("no peer retains required content {hash}"))?;
-            let PullReceipt {
-                manifest,
-                transferred_bytes,
-                reused_extents,
-                ..
-            } = self.stage_remote_file(session, (*source).clone()).await?;
+            let (
+                PullReceipt {
+                    manifest,
+                    transferred_bytes,
+                    reused_extents,
+                    ..
+                },
+                swarm_sources_used,
+            ) = self.stage_remote_file(session, (*source).clone()).await?;
             ensure!(
                 manifest.file_hash == hash,
                 "remote source returned different content"
@@ -286,6 +293,7 @@ impl SyncEngine {
                 .checked_add(transferred_bytes)
                 .context("pulled-byte counter overflow")?;
             stats.reused_extents = stats.reused_extents.saturating_add(reused_extents);
+            stats.swarm_sources_used = stats.swarm_sources_used.max(swarm_sources_used);
         }
         Ok((manifests, stats))
     }
@@ -294,30 +302,33 @@ impl SyncEngine {
         &self,
         session: &SyncSession,
         record: SyncRecord,
-    ) -> Result<PullReceipt> {
+    ) -> Result<(PullReceipt, usize)> {
         if self.swarm_sources.is_empty() {
-            return session.pull_record(record, Arc::clone(&self.store)).await;
+            let receipt = session.pull_record(record, Arc::clone(&self.store)).await?;
+            return Ok((receipt, 0));
         }
 
         let manifest_receipt = session.pull_manifest(record.clone()).await?;
         let missing = self.store.missing_chunks(&manifest_receipt.manifest);
         if missing.is_empty() {
-            return Ok(PullReceipt {
-                record,
-                manifest: manifest_receipt.manifest,
-                transferred_bytes: 0,
-                reused_extents: manifest_receipt.reused_extents,
-            });
+            return Ok((
+                PullReceipt {
+                    record,
+                    manifest: manifest_receipt.manifest,
+                    transferred_bytes: 0,
+                    reused_extents: manifest_receipt.reused_extents,
+                },
+                0,
+            ));
         }
 
-        let swarm_outcome = swarm_fill_chunks(
-            self.client.secret_key.clone(),
-            self.swarm_sources.clone(),
-            self.client.network_mode,
-            Arc::clone(&self.store),
-            missing.clone(),
-        )
-        .await;
+        let swarm_outcome = session
+            .swarm_fill_chunks(
+                self.swarm_sources.clone(),
+                Arc::clone(&self.store),
+                missing.clone(),
+            )
+            .await;
 
         if let Ok(receipt) = swarm_outcome {
             let still_missing = self.store.missing_chunks(&manifest_receipt.manifest);
@@ -329,16 +340,20 @@ impl SyncEngine {
                     .iter()
                     .filter(|chunk| !missing_set.contains(&chunk.hash))
                     .count();
-                return Ok(PullReceipt {
-                    record,
-                    manifest: manifest_receipt.manifest,
-                    transferred_bytes: receipt.transferred_bytes,
-                    reused_extents,
-                });
+                return Ok((
+                    PullReceipt {
+                        record,
+                        manifest: manifest_receipt.manifest,
+                        transferred_bytes: receipt.transferred_bytes,
+                        reused_extents,
+                    },
+                    receipt.sources_used,
+                ));
             }
         }
 
-        session.pull_record(record, Arc::clone(&self.store)).await
+        let fallback_receipt = session.pull_record(record, Arc::clone(&self.store)).await?;
+        Ok((fallback_receipt, 0))
     }
 
     fn apply_local(
@@ -779,6 +794,7 @@ mod tests {
         assert_eq!(report.status, "pass");
         assert_eq!(report.pulled_remote_files, 1);
         assert!(report.pulled_bytes > 0);
+        assert_eq!(report.swarm_sources_used, 2);
         assert_eq!(report.verified_local_root, report.verified_remote_root);
 
         let local_file = local_root.path().join("swarm_synced.bin");
@@ -791,5 +807,75 @@ mod tests {
         for (server, _, _) in swarm_servers {
             server.shutdown().await.expect("swarm source shut down");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sync_once_falls_back_to_v2_when_swarm_sources_are_unavailable() {
+        let local_root = TempDir::new().expect("local root can be created");
+        let local_state = TempDir::new().expect("local state can be created");
+        let remote_root = TempDir::new().expect("remote root can be created");
+        let remote_state = TempDir::new().expect("remote state can be created");
+        let payload: Vec<u8> = (0..512 * 1024)
+            .map(|index| ((index * 17) ^ (index >> 3)) as u8)
+            .collect();
+        let expected_hash = Hash32::digest(&payload);
+        fs::write(remote_root.path().join("fallback.bin"), &payload)
+            .expect("remote seed file can be written");
+
+        let client_key = SecretKey::generate();
+        let auth_server = start_server(ServerConfig {
+            secret_key: SecretKey::generate(),
+            destination_root: remote_root.path().to_path_buf(),
+            state_root: remote_state.path().to_path_buf(),
+            peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
+            network_mode: NetworkMode::DirectOnly,
+        })
+        .await
+        .expect("authoritative server starts");
+
+        let swarm_state = TempDir::new().expect("swarm state can be created");
+        let swarm_dest = TempDir::new().expect("swarm dest can be created");
+        let swarm_server = start_server(ServerConfig {
+            secret_key: SecretKey::generate(),
+            destination_root: swarm_dest.path().to_path_buf(),
+            state_root: swarm_state.path().to_path_buf(),
+            peer_policy: PeerPolicy::AllowListed(HashSet::from([SecretKey::generate().public()])),
+            network_mode: NetworkMode::DirectOnly,
+        })
+        .await
+        .expect("unauthorized swarm source starts");
+
+        let config = SyncConfig {
+            root: local_root.path().to_path_buf(),
+            state_root: local_state.path().to_path_buf(),
+            replica: replica(&client_key),
+            client: SyncClient {
+                secret_key: client_key.clone(),
+                remote: auth_server.endpoint_addr(),
+                network_mode: NetworkMode::DirectOnly,
+            },
+            swarm_sources: vec![swarm_server.endpoint_addr()],
+            profile: ChunkingProfile::DEFAULT,
+            ignored_paths: Vec::new(),
+        };
+        let engine = SyncEngine::open(config).expect("sync engine opens");
+        let report = engine
+            .sync_once()
+            .await
+            .expect("sync_once falls back to v2");
+        assert_eq!(report.status, "pass");
+        assert_eq!(report.swarm_sources_used, 0);
+        assert_eq!(report.pulled_remote_files, 1);
+        assert_eq!(
+            Hash32::digest(
+                &fs::read(local_root.path().join("fallback.bin")).expect("file readable")
+            ),
+            expected_hash
+        );
+        auth_server.shutdown().await.expect("auth server shut down");
+        swarm_server
+            .shutdown()
+            .await
+            .expect("swarm source shut down");
     }
 }
