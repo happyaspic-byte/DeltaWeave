@@ -1842,6 +1842,7 @@ struct ChunkHeader {
 const SWARM_PROTOCOL_VERSION: u16 = 3;
 const SWARM_MAX_INFLIGHT: u16 = 64;
 const SWARM_MAX_WANT: usize = 64;
+const SWARM_MAX_AVAILABILITY: usize = 4096;
 
 /// Result of an authorized swarm Hello handshake.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1864,6 +1865,7 @@ pub struct SwarmChunkFetch {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 enum SwarmWireRequest {
     Hello { protocol_version: u16 },
+    Availability { hashes: Vec<Hash32> },
     GetChunks { hashes: Vec<Hash32> },
 }
 
@@ -1872,6 +1874,9 @@ enum SwarmWireResponse {
     HelloOk {
         protocol_version: u16,
         max_inflight: u16,
+    },
+    Availability {
+        bits: Vec<bool>,
     },
     Chunks {
         present: Vec<Hash32>,
@@ -1923,8 +1928,28 @@ impl SwarmHandler {
                 )
                 .await
             }
+            SwarmWireRequest::Availability { hashes } => {
+                self.serve_availability(send, hashes).await
+            }
             SwarmWireRequest::GetChunks { hashes } => self.serve_chunks(send, hashes).await,
         }
+    }
+
+    async fn serve_availability(&self, send: &mut SendStream, hashes: Vec<Hash32>) -> Result<()> {
+        ensure!(
+            hashes.len() <= SWARM_MAX_AVAILABILITY,
+            "swarm availability request exceeds {SWARM_MAX_AVAILABILITY} hashes"
+        );
+        let store = Arc::clone(&self.store);
+        let bits = tokio::task::spawn_blocking(move || {
+            hashes
+                .into_iter()
+                .map(|hash| store.chunks().contains(hash))
+                .collect::<Vec<_>>()
+        })
+        .await
+        .context("swarm availability task failed")?;
+        write_frame(send, &SwarmWireResponse::Availability { bits }).await
     }
 
     async fn serve_chunks(&self, send: &mut SendStream, hashes: Vec<Hash32>) -> Result<()> {
@@ -2014,7 +2039,42 @@ pub async fn swarm_hello(
             protocol_version,
             max_inflight,
         }),
-        SwarmWireResponse::Chunks { .. } => bail!("swarm peer sent chunks during hello"),
+        SwarmWireResponse::Chunks { .. } | SwarmWireResponse::Availability { .. } => {
+            bail!("swarm peer sent a data response during hello")
+        }
+    }
+}
+
+/// Queries which requested hashes already exist in an authorized swarm peer CAS.
+pub async fn swarm_availability(
+    secret_key: SecretKey,
+    remote: EndpointAddr,
+    mode: NetworkMode,
+    hashes: Vec<Hash32>,
+) -> Result<Vec<bool>> {
+    ensure!(
+        hashes.len() <= SWARM_MAX_AVAILABILITY,
+        "swarm availability request exceeds {SWARM_MAX_AVAILABILITY} hashes"
+    );
+    let endpoint = bind_endpoint(secret_key, mode, None).await?;
+    let connection = endpoint
+        .connect(remote, ALPN_V3)
+        .await
+        .context("failed to connect swarm peer")?;
+    let (mut send, mut receive) = connection
+        .open_bi()
+        .await
+        .context("failed to open swarm availability stream")?;
+    write_frame(&mut send, &SwarmWireRequest::Availability { hashes }).await?;
+    send.finish()?;
+    let response = read_frame::<SwarmWireResponse>(&mut receive).await?;
+    connection.close(0_u8.into(), b"swarm availability complete");
+    endpoint.close().await;
+    match response {
+        SwarmWireResponse::Availability { bits } => Ok(bits),
+        SwarmWireResponse::HelloOk { .. } | SwarmWireResponse::Chunks { .. } => {
+            bail!("swarm peer sent a non-availability response")
+        }
     }
 }
 
@@ -2064,7 +2124,9 @@ pub async fn swarm_get_chunks(
     let response = read_frame::<SwarmWireResponse>(&mut receive).await?;
     let (present, missing) = match response {
         SwarmWireResponse::Chunks { present, missing } => (present, missing),
-        SwarmWireResponse::HelloOk { .. } => bail!("swarm peer sent hello during chunk fetch"),
+        SwarmWireResponse::HelloOk { .. } | SwarmWireResponse::Availability { .. } => {
+            bail!("swarm peer sent a non-chunk response")
+        }
     };
     let mut chunks = Vec::with_capacity(present.len());
     for expected in present {
@@ -2399,6 +2461,44 @@ mod tests {
         .expect("server can start");
         assert!(server.wait_online(Duration::from_millis(250)).await);
         assert!(!server.address_info().direct_addresses.is_empty());
+        server.shutdown().await.expect("server shuts down");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn swarm_v3_reports_exact_chunk_availability() {
+        let state = TempDir::new().expect("state directory can be created");
+        let destination = TempDir::new().expect("destination can be created");
+        let present = fixture(96 * 1024);
+        let present_hash = Hash32::digest(&present);
+        let missing_hash = Hash32::digest(b"absent availability chunk");
+        {
+            let store = Store::open(state.path()).expect("store can open");
+            store
+                .chunks()
+                .put_verified(present_hash, &present)
+                .expect("seed chunk can be stored");
+        }
+        let client_key = SecretKey::generate();
+        let server = start_server(ServerConfig {
+            secret_key: SecretKey::generate(),
+            destination_root: destination.path().to_path_buf(),
+            state_root: state.path().to_path_buf(),
+            peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
+            network_mode: NetworkMode::DirectOnly,
+        })
+        .await
+        .expect("server can start");
+
+        let available = swarm_availability(
+            client_key,
+            server.endpoint_addr(),
+            NetworkMode::DirectOnly,
+            vec![present_hash, missing_hash],
+        )
+        .await
+        .expect("authorized peer can query availability");
+
+        assert_eq!(available, vec![true, false]);
         server.shutdown().await.expect("server shuts down");
     }
 
