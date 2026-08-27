@@ -254,13 +254,13 @@ pub async fn start_server(config: ServerConfig) -> Result<Server> {
         apply_lock: Arc::clone(&apply_lock),
     };
     let sync_handler = SyncHandler {
-        store,
+        store: Arc::clone(&store),
         index,
         destination_root,
         peer_policy: peer_policy.clone(),
         apply_lock,
     };
-    let swarm_handler = SwarmHandler { peer_policy };
+    let swarm_handler = SwarmHandler { store, peer_policy };
     let router = Router::builder(endpoint)
         .accept(ALPN_V1, push_handler)
         .accept(ALPN_V2, sync_handler)
@@ -1841,6 +1841,7 @@ struct ChunkHeader {
 
 const SWARM_PROTOCOL_VERSION: u16 = 3;
 const SWARM_MAX_INFLIGHT: u16 = 64;
+const SWARM_MAX_WANT: usize = 64;
 
 /// Result of an authorized swarm Hello handshake.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1851,9 +1852,19 @@ pub struct SwarmHelloOk {
     pub max_inflight: u16,
 }
 
+/// Result of requesting CAS chunks from an authorized swarm peer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SwarmChunkFetch {
+    /// Verified chunks returned by the remote peer.
+    pub chunks: Vec<(Hash32, Vec<u8>)>,
+    /// Requested hashes that the remote did not have.
+    pub missing: Vec<Hash32>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 enum SwarmWireRequest {
     Hello { protocol_version: u16 },
+    GetChunks { hashes: Vec<Hash32> },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1862,10 +1873,15 @@ enum SwarmWireResponse {
         protocol_version: u16,
         max_inflight: u16,
     },
+    Chunks {
+        present: Vec<Hash32>,
+        missing: Vec<Hash32>,
+    },
 }
 
 #[derive(Clone, Debug)]
 struct SwarmHandler {
+    store: Arc<Store>,
     peer_policy: PeerPolicy,
 }
 
@@ -1879,36 +1895,88 @@ impl ProtocolHandler for SwarmHandler {
         }
 
         let (mut send, mut receive) = connection.accept_bi().await?;
-        match read_frame::<SwarmWireRequest>(&mut receive).await {
-            Ok(SwarmWireRequest::Hello { protocol_version })
-                if protocol_version == SWARM_PROTOCOL_VERSION =>
-            {
-                if let Err(error) = write_frame(
-                    &mut send,
+        if let Err(error) = self.handle_stream(&mut send, &mut receive).await {
+            warn!(%peer, error = %error, "swarm stream failed");
+            connection.close(0_u8.into(), b"swarm stream failed");
+            return Ok(());
+        }
+        let _ = send.finish();
+        connection.closed().await;
+        Ok(())
+    }
+}
+
+impl SwarmHandler {
+    async fn handle_stream(&self, send: &mut SendStream, receive: &mut RecvStream) -> Result<()> {
+        match read_frame::<SwarmWireRequest>(receive).await? {
+            SwarmWireRequest::Hello { protocol_version } => {
+                ensure!(
+                    protocol_version == SWARM_PROTOCOL_VERSION,
+                    "unsupported swarm protocol version {protocol_version}"
+                );
+                write_frame(
+                    send,
                     &SwarmWireResponse::HelloOk {
                         protocol_version: SWARM_PROTOCOL_VERSION,
                         max_inflight: SWARM_MAX_INFLIGHT,
                     },
                 )
                 .await
-                {
-                    warn!(%peer, error = %error, "swarm hello response failed");
-                    connection.close(0_u8.into(), b"swarm hello failed");
-                    return Ok(());
-                }
-                let _ = send.finish();
-                connection.closed().await;
-                Ok(())
             }
-            Ok(_) => {
-                connection.close(0_u8.into(), b"unsupported swarm hello");
-                Ok(())
-            }
-            Err(_) => {
-                connection.close(0_u8.into(), b"malformed swarm hello");
-                Ok(())
-            }
+            SwarmWireRequest::GetChunks { hashes } => self.serve_chunks(send, hashes).await,
         }
+    }
+
+    async fn serve_chunks(&self, send: &mut SendStream, hashes: Vec<Hash32>) -> Result<()> {
+        ensure!(
+            hashes.len() <= SWARM_MAX_WANT,
+            "swarm chunk request exceeds {SWARM_MAX_WANT} hashes"
+        );
+        let unique: HashSet<_> = hashes.iter().copied().collect();
+        ensure!(
+            unique.len() == hashes.len(),
+            "swarm chunk request contains duplicates"
+        );
+
+        let store = Arc::clone(&self.store);
+        let (present, missing, payloads) = tokio::task::spawn_blocking(move || {
+            let mut present = Vec::new();
+            let mut missing = Vec::new();
+            let mut payloads = Vec::new();
+            for hash in hashes {
+                match store.chunks().read_verified(hash) {
+                    Ok(bytes) => {
+                        present.push(hash);
+                        payloads.push(bytes);
+                    }
+                    Err(_) => missing.push(hash),
+                }
+            }
+            Result::<_, anyhow::Error>::Ok((present, missing, payloads))
+        })
+        .await
+        .context("swarm chunk inventory task failed")??;
+
+        write_frame(
+            send,
+            &SwarmWireResponse::Chunks {
+                present: present.clone(),
+                missing,
+            },
+        )
+        .await?;
+        for (hash, bytes) in present.into_iter().zip(payloads) {
+            write_frame(
+                send,
+                &ChunkHeader {
+                    hash,
+                    length: u32::try_from(bytes.len()).context("swarm chunk length overflow")?,
+                },
+            )
+            .await?;
+            send.write_all(&bytes).await?;
+        }
+        Ok(())
     }
 }
 
@@ -1946,7 +2014,68 @@ pub async fn swarm_hello(
             protocol_version,
             max_inflight,
         }),
+        SwarmWireResponse::Chunks { .. } => bail!("swarm peer sent chunks during hello"),
     }
+}
+
+/// Requests verified CAS chunks from an authorized swarm peer.
+pub async fn swarm_get_chunks(
+    secret_key: SecretKey,
+    remote: EndpointAddr,
+    mode: NetworkMode,
+    hashes: Vec<Hash32>,
+) -> Result<SwarmChunkFetch> {
+    ensure!(
+        hashes.len() <= SWARM_MAX_WANT,
+        "swarm chunk request exceeds {SWARM_MAX_WANT} hashes"
+    );
+    let unique: HashSet<_> = hashes.iter().copied().collect();
+    ensure!(
+        unique.len() == hashes.len(),
+        "swarm chunk request contains duplicates"
+    );
+
+    let endpoint = bind_endpoint(secret_key, mode, None).await?;
+    let connection = endpoint
+        .connect(remote, ALPN_V3)
+        .await
+        .context("failed to connect swarm peer")?;
+    let (mut send, mut receive) = connection
+        .open_bi()
+        .await
+        .context("failed to open swarm chunk stream")?;
+    write_frame(
+        &mut send,
+        &SwarmWireRequest::GetChunks {
+            hashes: hashes.clone(),
+        },
+    )
+    .await?;
+    send.finish()?;
+    let response = read_frame::<SwarmWireResponse>(&mut receive).await?;
+    let (present, missing) = match response {
+        SwarmWireResponse::Chunks { present, missing } => (present, missing),
+        SwarmWireResponse::HelloOk { .. } => bail!("swarm peer sent hello during chunk fetch"),
+    };
+    let mut chunks = Vec::with_capacity(present.len());
+    for expected in present {
+        let header: ChunkHeader = read_frame(&mut receive).await?;
+        ensure!(
+            header.hash == expected,
+            "swarm chunk arrived out of inventory order"
+        );
+        let mut bytes = vec![0_u8; header.length as usize];
+        receive.read_exact(&mut bytes).await?;
+        let actual = Hash32::digest(&bytes);
+        ensure!(
+            actual == expected,
+            "swarm chunk {expected} hashed to {actual}"
+        );
+        chunks.push((expected, bytes));
+    }
+    connection.close(0_u8.into(), b"swarm chunk fetch complete");
+    endpoint.close().await;
+    Ok(SwarmChunkFetch { chunks, missing })
 }
 
 async fn write_frame<T: Serialize>(send: &mut SendStream, value: &T) -> Result<()> {
@@ -2200,6 +2329,53 @@ mod tests {
         .expect("server can start");
         assert!(server.wait_online(Duration::from_millis(250)).await);
         assert!(!server.address_info().direct_addresses.is_empty());
+        server.shutdown().await.expect("server shuts down");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn swarm_v3_serves_only_verified_local_cas_chunks() {
+        let state = TempDir::new().expect("state directory can be created");
+        let destination = TempDir::new().expect("destination can be created");
+        let present = fixture(96 * 1024);
+        let present_hash = Hash32::digest(&present);
+        let missing_hash = Hash32::digest(b"absent swarm chunk");
+        {
+            let store = Store::open(state.path()).expect("store can open");
+            store
+                .chunks()
+                .put_verified(present_hash, &present)
+                .expect("seed chunk can be stored");
+        }
+        let authorized_key = SecretKey::generate();
+        let server = start_server(ServerConfig {
+            secret_key: SecretKey::generate(),
+            destination_root: destination.path().to_path_buf(),
+            state_root: state.path().to_path_buf(),
+            peer_policy: PeerPolicy::AllowListed(HashSet::from([authorized_key.public()])),
+            network_mode: NetworkMode::DirectOnly,
+        })
+        .await
+        .expect("server can start");
+
+        let fetched = swarm_get_chunks(
+            authorized_key.clone(),
+            server.endpoint_addr(),
+            NetworkMode::DirectOnly,
+            vec![present_hash, missing_hash],
+        )
+        .await
+        .expect("authorized swarm peer can request chunks");
+        assert_eq!(fetched.chunks, vec![(present_hash, present)]);
+        assert_eq!(fetched.missing, vec![missing_hash]);
+
+        let rejected = swarm_get_chunks(
+            SecretKey::generate(),
+            server.endpoint_addr(),
+            NetworkMode::DirectOnly,
+            vec![present_hash],
+        )
+        .await;
+        assert!(rejected.is_err());
         server.shutdown().await.expect("server shuts down");
     }
 
