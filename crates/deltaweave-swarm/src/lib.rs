@@ -131,10 +131,13 @@ pub fn schedule_chunks(
             .min_by_key(|peer| {
                 let goodput = peer.goodput_bytes_per_second.max(1);
                 let queue_ms = peer.queued_bytes.saturating_mul(1000) / goodput;
+                let assigned = per_peer.get(&peer.id).copied().unwrap_or(0);
                 (
                     u64::from(peer.rtt_ms)
                         .saturating_add(queue_ms)
-                        .saturating_add(u64::from(peer.failure_penalty) * 500),
+                        .saturating_add(u64::from(peer.failure_penalty) * 500)
+                        .saturating_add(assigned as u64),
+                    assigned,
                     peer.id,
                 )
             });
@@ -232,6 +235,32 @@ mod tests {
         assert_eq!(overlay.active.len(), 12);
         assert_eq!(overlay.passive.len(), 64);
         assert!(overlay.active.len() + overlay.passive.len() <= 76);
+    }
+
+    #[test]
+    fn scheduler_balances_a_complete_plan_across_equivalent_providers() {
+        let chunks: Vec<_> = (0_u64..100)
+            .map(|index| Hash32::digest(&index.to_le_bytes()))
+            .collect();
+        let peers = vec![peer("a", &chunks, 10), peer("b", &chunks, 10)];
+
+        let assignments = schedule_chunks(
+            &chunks,
+            &peers,
+            SchedulerLimits {
+                max_sources: 2,
+                max_chunks_per_peer: chunks.len(),
+                max_assignments: chunks.len(),
+            },
+        );
+
+        let first = assignments
+            .iter()
+            .filter(|assignment| assignment.peer == peers[0].id)
+            .count();
+        let second = assignments.len() - first;
+        assert_eq!(assignments.len(), chunks.len());
+        assert!(first.abs_diff(second) <= 1);
     }
 
     #[test]

@@ -21,12 +21,20 @@ Versioning after its first stable release.
   draining every submitted writer on error. A 64 MiB DirectOnly hardware run
   improved from 4.13 s to a 2.75 s mean; two V3 sources filled the same payload
   in 1.51 s (1.82× single-source throughput).
-- Reject unrequested or oversized V3 chunk payloads before allocation, persist
-  each fill round before requesting more, and keep duplicate endpoint IDs from
-  collapsing distinct source addresses.
+- Reject unrequested or oversized V3 chunk payloads before allocation, stream
+  each fill directly into the durable CAS, and reject duplicate endpoint IDs.
 - Reuse one sync endpoint and one persistent QUIC connection per V3 source,
-  overlap V2 snapshot fetch with those connections, and pipeline two 16-chunk
+  connect only when remote content is required, and pipeline two 16-chunk
   GetChunks streams per source.
+
+### Security
+
+- Bound V3 serving to 64 connections and eight active streams, time out stalled
+  requests and network writes, cap public buffered fetches at 64 MiB, and avoid
+  closing healthy sibling streams after one malformed request.
+- Require one exact present-or-missing outcome per requested hash, retry failed
+  assignments on another source, cap durable writer tasks, and fall back to V2
+  when no V3 source can complete the fill.
 
 ## [0.3.0] - 2026-08-26
 

@@ -13,7 +13,7 @@ use std::{
     },
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use deltaweave_cdc::{manifest_from_path, read_chunk};
 use deltaweave_core::{ChunkingProfile, FileManifest, Hash32, WirePath};
 use redb::{Database, ReadableDatabase, TableDefinition};
@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 const MANIFESTS: TableDefinition<&str, &[u8]> = TableDefinition::new("manifests");
 const OPERATIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("operations");
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+const MAX_STORED_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 
 /// Content-addressed chunk files and their temporary/quarantine areas.
 #[derive(Debug)]
@@ -87,6 +88,10 @@ impl ChunkStore {
     ) -> Result<usize> {
         let chunks: Vec<_> = chunks.into_iter().collect();
         for (hash, bytes) in &chunks {
+            ensure!(
+                bytes.len() <= MAX_STORED_CHUNK_BYTES,
+                "chunk {hash} exceeds {MAX_STORED_CHUNK_BYTES} bytes"
+            );
             let actual = Hash32::digest(bytes);
             if actual != *hash {
                 bail!("refusing chunk {hash}: supplied bytes hash to {actual}");
@@ -119,6 +124,10 @@ impl ChunkStore {
     }
 
     fn install_verified_chunk(&self, hash: Hash32, bytes: &[u8]) -> Result<Option<PathBuf>> {
+        ensure!(
+            bytes.len() <= MAX_STORED_CHUNK_BYTES,
+            "chunk {hash} exceeds {MAX_STORED_CHUNK_BYTES} bytes"
+        );
         let actual = Hash32::digest(bytes);
         if actual != hash {
             bail!("refusing chunk {hash}: supplied bytes hash to {actual}");
@@ -126,7 +135,7 @@ impl ChunkStore {
 
         let destination = self.chunk_path(hash);
         if destination.is_file() {
-            match self.read_verified(hash) {
+            match self.verify_bounded(hash, bytes.len()) {
                 Ok(_) => return Ok(None),
                 Err(_) => {
                     let quarantine = self.unique_path(&self.trash, "corrupt", hash);
@@ -159,7 +168,7 @@ impl ChunkStore {
         match fs::rename(&temporary, &destination) {
             Ok(()) => {}
             Err(error) if destination.is_file() => {
-                let existing = self.read_verified(hash);
+                let existing = self.verify_bounded(hash, bytes.len());
                 let _ = fs::remove_file(&temporary);
                 existing.with_context(|| {
                     format!("chunk race left invalid destination after {error}")
@@ -177,7 +186,13 @@ impl ChunkStore {
 
     /// Reads a chunk and verifies its name against its content.
     pub fn read_verified(&self, hash: Hash32) -> Result<Vec<u8>> {
+        self.read_verified_bounded(hash, MAX_STORED_CHUNK_BYTES)
+    }
+
+    /// Reads and verifies one chunk after rejecting files larger than `max_bytes`.
+    pub fn read_verified_bounded(&self, hash: Hash32, max_bytes: usize) -> Result<Vec<u8>> {
         let path = self.chunk_path(hash);
+        ensure_chunk_size(&path, hash, max_bytes)?;
         let bytes =
             fs::read(&path).with_context(|| format!("failed to read chunk {}", path.display()))?;
         let actual = Hash32::digest(&bytes);
@@ -185,6 +200,35 @@ impl ChunkStore {
             bail!("chunk {hash} is corrupt; actual digest is {actual}");
         }
         Ok(bytes)
+    }
+
+    /// Verifies one bounded chunk without retaining its payload in memory.
+    pub fn verify_bounded(&self, hash: Hash32, max_bytes: usize) -> Result<u64> {
+        let path = self.chunk_path(hash);
+        ensure_chunk_size(&path, hash, max_bytes)?;
+        let mut file = File::open(&path)
+            .with_context(|| format!("failed to open chunk {}", path.display()))?;
+        let mut hasher = blake3::Hasher::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        let mut total = 0_usize;
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .with_context(|| format!("failed to read chunk {}", path.display()))?;
+            if read == 0 {
+                break;
+            }
+            total = total
+                .checked_add(read)
+                .context("chunk byte count overflow")?;
+            ensure!(total <= max_bytes, "chunk {hash} exceeds {max_bytes} bytes");
+            hasher.update(&buffer[..read]);
+        }
+        let actual = Hash32::from_bytes(*hasher.finalize().as_bytes());
+        if actual != hash {
+            bail!("chunk {hash} is corrupt; actual digest is {actual}");
+        }
+        Ok(total as u64)
     }
 
     fn chunk_path(&self, hash: Hash32) -> PathBuf {
@@ -211,6 +255,16 @@ impl ChunkStore {
         }
         destination
     }
+}
+
+fn ensure_chunk_size(path: &Path, hash: Hash32, max_bytes: usize) -> Result<()> {
+    let metadata =
+        fs::metadata(path).with_context(|| format!("failed to stat chunk {}", path.display()))?;
+    ensure!(
+        metadata.len() <= max_bytes as u64,
+        "chunk {hash} exceeds {max_bytes} bytes"
+    );
+    Ok(())
 }
 
 /// ACID metadata index backed by redb.
@@ -348,8 +402,12 @@ impl Store {
             .chunks
             .iter()
             .filter_map(|chunk| {
-                (seen.insert(chunk.hash) && self.chunks.read_verified(chunk.hash).is_err())
-                    .then_some(chunk.hash)
+                (seen.insert(chunk.hash)
+                    && self
+                        .chunks
+                        .verify_bounded(chunk.hash, chunk.length as usize)
+                        .is_err())
+                .then_some(chunk.hash)
             })
             .collect()
     }
@@ -797,6 +855,24 @@ mod tests {
         );
         assert!(!store.contains(good_hash));
         assert!(!store.contains(invalid_hash));
+    }
+
+    #[test]
+    fn chunk_store_rejects_oversized_batch_before_installing_any_chunk() {
+        let temp = TempDir::new().expect("temporary directory can be created");
+        let store = ChunkStore::open(temp.path()).expect("chunk store can open");
+        let valid = fixture(64 * 1024);
+        let valid_hash = Hash32::digest(&valid);
+        let oversized = vec![7_u8; MAX_STORED_CHUNK_BYTES + 1];
+        let oversized_hash = Hash32::digest(&oversized);
+
+        assert!(
+            store
+                .put_verified_batch(vec![(valid_hash, valid), (oversized_hash, oversized)])
+                .is_err()
+        );
+        assert!(!store.contains(valid_hash));
+        assert!(!store.contains(oversized_hash));
     }
 
     #[test]
