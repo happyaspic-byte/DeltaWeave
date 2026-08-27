@@ -14,7 +14,7 @@ use deltaweave_core::{
     ChunkingProfile, FileManifest, Hash32, ReplicaId, SyncEntryKind, SyncRecord, WirePath,
 };
 use deltaweave_index::{IndexOptions, LocalIndex, ScanReport};
-use deltaweave_net::{PullReceipt, SyncApplyReceipt, SyncClient, SyncSession};
+use deltaweave_net::{PullReceipt, SyncApplyReceipt, SyncClient, SyncSession, SwarmSources};
 use deltaweave_reconcile::{
     ApplyAction, ConflictRecord, MerkleTree, actions_to_reach, merge_snapshots,
 };
@@ -167,7 +167,19 @@ impl SyncEngine {
         local_records: Vec<SyncRecord>,
         local_tree: MerkleTree,
     ) -> Result<SyncReport> {
-        let remote = session.fetch_snapshot(&local_tree).await?;
+        let remote_fetch = session.fetch_snapshot(&local_tree);
+        let swarm_connect = async {
+            if self.swarm_sources.is_empty() {
+                None
+            } else {
+                session
+                    .connect_swarm_sources(self.swarm_sources.clone())
+                    .await
+                    .ok()
+            }
+        };
+        let (remote, swarm) = tokio::join!(remote_fetch, swarm_connect);
+        let remote = remote?;
         let remote_tree = MerkleTree::from_records(remote.records.clone())?;
         let merged = merge_snapshots(&local_tree, &remote_tree)?;
         validate_materializable_namespace(&merged.records)?;
@@ -186,7 +198,13 @@ impl SyncEngine {
             })
             .collect();
         let (manifests, stage_stats) = self
-            .stage_desired_files(session, &required_files, &local_records, &remote.records)
+            .stage_desired_files(
+                session,
+                swarm.as_ref(),
+                &required_files,
+                &local_records,
+                &remote.records,
+            )
             .await?;
         self.apply_local(&local_tree, &local_actions, &manifests)?;
         let remote_stats = self.apply_remote(session, &remote_actions).await?;
@@ -238,6 +256,7 @@ impl SyncEngine {
     async fn stage_desired_files(
         &self,
         session: &SyncSession,
+        swarm: Option<&SwarmSources>,
         desired: &[SyncRecord],
         local: &[SyncRecord],
         remote: &[SyncRecord],
@@ -281,7 +300,9 @@ impl SyncEngine {
                     ..
                 },
                 swarm_sources_used,
-            ) = self.stage_remote_file(session, (*source).clone()).await?;
+            ) = self
+                .stage_remote_file(session, swarm, (*source).clone())
+                .await?;
             ensure!(
                 manifest.file_hash == hash,
                 "remote source returned different content"
@@ -301,9 +322,10 @@ impl SyncEngine {
     async fn stage_remote_file(
         &self,
         session: &SyncSession,
+        swarm: Option<&SwarmSources>,
         record: SyncRecord,
     ) -> Result<(PullReceipt, usize)> {
-        if self.swarm_sources.is_empty() {
+        if swarm.is_none() {
             let receipt = session.pull_record(record, Arc::clone(&self.store)).await?;
             return Ok((receipt, 0));
         }
@@ -322,13 +344,12 @@ impl SyncEngine {
             ));
         }
 
-        let swarm_outcome = session
-            .swarm_fill_chunks(
-                self.swarm_sources.clone(),
-                Arc::clone(&self.store),
-                missing.clone(),
-            )
-            .await;
+        let swarm_outcome = match swarm {
+            Some(swarm) => swarm
+                .fill_chunks(Arc::clone(&self.store), missing.clone())
+                .await,
+            None => Err(anyhow::anyhow!("swarm sources unavailable")),
+        };
 
         if let Ok(receipt) = swarm_outcome {
             let still_missing = self.store.missing_chunks(&manifest_receipt.manifest);

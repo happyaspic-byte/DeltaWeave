@@ -30,7 +30,10 @@ use iroh::{
     protocol::{AcceptError, ProtocolHandler, Router},
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::{
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    sync::Semaphore,
+};
 use tracing::{info, warn};
 
 /// Versioned ALPN identifier for DeltaWeave's initial push protocol.
@@ -262,7 +265,11 @@ pub async fn start_server(config: ServerConfig) -> Result<Server> {
         peer_policy: peer_policy.clone(),
         apply_lock,
     };
-    let swarm_handler = SwarmHandler { store, peer_policy };
+    let swarm_handler = SwarmHandler {
+        store,
+        peer_policy,
+        inflight: Arc::new(Semaphore::new(SWARM_MAX_INFLIGHT as usize)),
+    };
     let router = Router::builder(endpoint)
         .accept(ALPN_V1, push_handler)
         .accept(ALPN_V2, sync_handler)
@@ -1013,6 +1020,14 @@ impl SyncSession {
         self.client
             .apply_metadata_connected(&self.endpoint, record)
             .await
+    }
+
+    /// Opens persistent V3 connections to authorized swarm sources using this session endpoint.
+    pub async fn connect_swarm_sources(
+        &self,
+        sources: Vec<EndpointAddr>,
+    ) -> Result<SwarmSources> {
+        connect_swarm_sources(&self.endpoint, sources).await
     }
 
     /// Fills missing hashes in a local CAS from multiple authorized V3 sources using this session's endpoint.
@@ -1955,6 +1970,7 @@ const SWARM_PROTOCOL_VERSION: u16 = 3;
 const SWARM_MAX_INFLIGHT: u16 = 64;
 const SWARM_MAX_WANT: usize = 64;
 const SWARM_FILL_CHUNKS_PER_SOURCE: usize = 16;
+const SWARM_FILL_STREAMS_PER_SOURCE: usize = 2;
 const SWARM_MAX_AVAILABILITY: usize = 4096;
 
 /// Result of an authorized swarm Hello handshake.
@@ -1997,10 +2013,20 @@ enum SwarmWireResponse {
     },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct SwarmHandler {
     store: Arc<Store>,
     peer_policy: PeerPolicy,
+    inflight: Arc<Semaphore>,
+}
+
+impl fmt::Debug for SwarmHandler {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SwarmHandler")
+            .field("peer_policy", &self.peer_policy)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ProtocolHandler for SwarmHandler {
@@ -2017,12 +2043,19 @@ impl ProtocolHandler for SwarmHandler {
                 Ok(streams) => streams,
                 Err(_) => return Ok(()),
             };
-            if let Err(error) = self.handle_stream(&mut send, &mut receive).await {
-                warn!(%peer, error = %error, "swarm stream failed");
-                connection.close(0_u8.into(), b"swarm stream failed");
-                return Ok(());
-            }
-            let _ = send.finish();
+            let handler = self.clone();
+            let connection = connection.clone();
+            tokio::spawn(async move {
+                let Ok(_permit) = handler.inflight.clone().acquire_owned().await else {
+                    return;
+                };
+                if let Err(error) = handler.handle_stream(&mut send, &mut receive).await {
+                    warn!(%peer, error = %error, "swarm stream failed");
+                    connection.close(0_u8.into(), b"swarm stream failed");
+                    return;
+                }
+                let _ = send.finish();
+            });
         }
     }
 }
@@ -2308,23 +2341,24 @@ pub async fn swarm_get_chunks(
     outcome
 }
 
-struct SwarmConnections(Vec<Connection>);
+/// Persistent authenticated V3 connections opened through one sync endpoint.
+pub struct SwarmSources {
+    sources: Vec<EndpointAddr>,
+    connections: Vec<(usize, EndpointAddr, Connection)>,
+}
 
-impl Drop for SwarmConnections {
+impl Drop for SwarmSources {
     fn drop(&mut self) {
-        for connection in self.0.drain(..) {
+        for (_, _, connection) in self.connections.drain(..) {
             connection.close(0_u8.into(), b"swarm fill complete");
         }
     }
 }
 
-/// Fills missing hashes in a local CAS from multiple authorized V3 sources using an established endpoint.
-pub async fn swarm_fill_chunks_connected(
+async fn connect_swarm_sources(
     endpoint: &Endpoint,
     sources: Vec<EndpointAddr>,
-    store: Arc<Store>,
-    hashes: Vec<Hash32>,
-) -> Result<SwarmFillReceipt> {
+) -> Result<SwarmSources> {
     ensure!(
         !sources.is_empty(),
         "swarm fill requires at least one source"
@@ -2332,11 +2366,6 @@ pub async fn swarm_fill_chunks_connected(
     ensure!(
         sources.len() <= 8,
         "swarm fill supports at most eight sources"
-    );
-    let unique: HashSet<_> = hashes.iter().copied().collect();
-    ensure!(
-        unique.len() == hashes.len(),
-        "swarm fill contains duplicate hashes"
     );
 
     let mut join_set = tokio::task::JoinSet::new();
@@ -2350,16 +2379,38 @@ pub async fn swarm_fill_chunks_connected(
             Ok::<_, anyhow::Error>((index, source, connection))
         });
     }
-    let mut source_connections = Vec::with_capacity(sources.len());
+    let mut connections = Vec::with_capacity(sources.len());
     while let Some(res) = join_set.join_next().await {
-        source_connections.push(res.context("swarm connect task panicked")??);
+        connections.push(res.context("swarm connect task panicked")??);
     }
-    source_connections.sort_by_key(|(index, _, _)| *index);
-    let _guard = SwarmConnections(
-        source_connections
-            .iter()
-            .map(|(_, _, conn)| conn.clone())
-            .collect(),
+    connections.sort_by_key(|(index, _, _)| *index);
+    Ok(SwarmSources {
+        sources,
+        connections,
+    })
+}
+
+impl SwarmSources {
+    /// Fills missing hashes in a local CAS through these persistent connections.
+    pub async fn fill_chunks(
+        &self,
+        store: Arc<Store>,
+        hashes: Vec<Hash32>,
+    ) -> Result<SwarmFillReceipt> {
+        swarm_fill_chunks_preconnected(&self.sources, &self.connections, store, hashes).await
+    }
+}
+
+async fn swarm_fill_chunks_preconnected(
+    sources: &[EndpointAddr],
+    source_connections: &[(usize, EndpointAddr, Connection)],
+    store: Arc<Store>,
+    hashes: Vec<Hash32>,
+) -> Result<SwarmFillReceipt> {
+    let unique: HashSet<_> = hashes.iter().copied().collect();
+    ensure!(
+        unique.len() == hashes.len(),
+        "swarm fill contains duplicate hashes"
     );
 
     let remaining_all: Vec<_> = hashes
@@ -2369,7 +2420,7 @@ pub async fn swarm_fill_chunks_connected(
         .collect();
     let mut remaining: HashSet<_> = remaining_all.iter().copied().collect();
     let mut join_set = tokio::task::JoinSet::new();
-    for (index, source, connection) in &source_connections {
+    for (index, source, connection) in source_connections {
         let src = source.clone();
         let conn = connection.clone();
         let r_vec = remaining_all.clone();
@@ -2409,77 +2460,131 @@ pub async fn swarm_fill_chunks_connected(
     let mut used_sources = HashSet::new();
     let mut write_tasks = tokio::task::JoinSet::new();
     let fill_loop = async {
-        while !remaining.is_empty() {
-            let remaining_vec: Vec<_> = remaining.iter().copied().collect();
-            let assignments = schedule_chunks(
-                &remaining_vec,
-                &peers,
-                SchedulerLimits {
-                    max_sources: sources.len().min(8),
-                    max_chunks_per_peer: SWARM_FILL_CHUNKS_PER_SOURCE,
-                    max_assignments: remaining_vec
-                        .len()
-                        .min(sources.len() * SWARM_FILL_CHUNKS_PER_SOURCE),
-                },
-            );
-            ensure!(
-                !assignments.is_empty(),
-                "swarm sources lack {} assigned chunk(s)",
-                remaining.len()
-            );
-            let mut grouped: BTreeMap<Hash32, Vec<Hash32>> = BTreeMap::new();
-            for assignment in assignments {
-                grouped
-                    .entry(assignment.peer)
-                    .or_default()
-                    .push(assignment.hash);
-            }
-            let mut fetch_set = tokio::task::JoinSet::new();
-            for (peer_id, assigned) in grouped {
-                let (source_idx, _source, connection) = source_connections
-                    .iter()
-                    .find(|(index, source, _)| swarm_source_id(source, *index) == peer_id)
-                    .context("scheduled swarm peer disappeared")?;
-                let conn = connection.clone();
-                let idx = *source_idx;
-                fetch_set.spawn(async move {
-                    let fetch = swarm_get_chunks_on(&conn, assigned).await?;
-                    Ok::<_, anyhow::Error>((idx, fetch))
-                });
-            }
-            let previous = remaining.len();
-            while let Some(res) = fetch_set.join_next().await {
-                let (source_idx, fetch) = res.context("swarm source task panicked")??;
-                if !fetch.chunks.is_empty() {
-                    used_sources.insert(source_idx);
+        let mut inflight = vec![0_usize; sources.len()];
+        let mut fetch_set = tokio::task::JoinSet::new();
+        let mut reserved: HashSet<Hash32> = HashSet::new();
+        loop {
+            let idle_peers: Vec<_> = peers
+                .iter()
+                .filter(|peer| {
+                    source_connections.iter().any(|(index, source, _)| {
+                        swarm_source_id(source, *index) == peer.id
+                            && inflight[*index] < SWARM_FILL_STREAMS_PER_SOURCE
+                    })
+                })
+                .cloned()
+                .collect();
+            if !remaining.is_empty() && !idle_peers.is_empty() {
+                let remaining_vec: Vec<_> = remaining.iter().copied().collect();
+                let assignments = schedule_chunks(
+                    &remaining_vec,
+                    &idle_peers,
+                    SchedulerLimits {
+                        max_sources: idle_peers.len().min(8),
+                        max_chunks_per_peer: SWARM_FILL_CHUNKS_PER_SOURCE
+                            * SWARM_FILL_STREAMS_PER_SOURCE,
+                        max_assignments: remaining_vec.len().min(
+                            idle_peers.len()
+                                * SWARM_FILL_CHUNKS_PER_SOURCE
+                                * SWARM_FILL_STREAMS_PER_SOURCE,
+                        ),
+                    },
+                );
+                let mut grouped: BTreeMap<Hash32, Vec<Hash32>> = BTreeMap::new();
+                for assignment in assignments {
+                    grouped
+                        .entry(assignment.peer)
+                        .or_default()
+                        .push(assignment.hash);
                 }
-                if let Some(peer) = peers
-                    .iter_mut()
-                    .find(|peer| swarm_source_id(&sources[source_idx], source_idx) == peer.id)
-                {
-                    for hash in &fetch.missing {
-                        peer.available.remove(hash);
+                for (peer_id, assigned) in grouped {
+                    let (source_idx, _source, connection) = source_connections
+                        .iter()
+                        .find(|(index, source, _)| swarm_source_id(source, *index) == peer_id)
+                        .context("scheduled swarm peer disappeared")?;
+                    let slots = SWARM_FILL_STREAMS_PER_SOURCE.saturating_sub(inflight[*source_idx]);
+                    if slots == 0 {
+                        continue;
+                    }
+                    for batch in assigned.chunks(SWARM_FILL_CHUNKS_PER_SOURCE).take(slots) {
+                        let assigned = batch.to_vec();
+                        for hash in &assigned {
+                            remaining.remove(hash);
+                            reserved.insert(*hash);
+                        }
+                        inflight[*source_idx] += 1;
+                        let conn = connection.clone();
+                        let idx = *source_idx;
+                        fetch_set.spawn(async move {
+                            let fetch = swarm_get_chunks_on(&conn, assigned.clone()).await;
+                            Ok::<_, anyhow::Error>((idx, assigned, fetch))
+                        });
                     }
                 }
-                let mut payloads = Vec::with_capacity(fetch.chunks.len());
-                for (hash, bytes) in fetch.chunks {
-                    remaining.remove(&hash);
-                    transferred_bytes = transferred_bytes
-                        .checked_add(bytes.len() as u64)
-                        .context("swarm transferred-byte counter overflow")?;
-                    payloads.push((hash, bytes));
+            }
+            if fetch_set.is_empty() {
+                ensure!(
+                    remaining.is_empty(),
+                    "swarm sources lack {} assigned chunk(s)",
+                    remaining.len()
+                );
+                break;
+            }
+            let (source_idx, assigned, fetch) = fetch_set
+                .join_next()
+                .await
+                .context("swarm source task missing")?
+                .context("swarm source task panicked")??;
+            inflight[source_idx] -= 1;
+            let fetch = match fetch {
+                Ok(fetch) => fetch,
+                Err(error) => {
+                    for hash in assigned {
+                        reserved.remove(&hash);
+                        remaining.insert(hash);
+                    }
+                    return Err(error);
                 }
-                transferred_chunks += payloads.len();
-                if !payloads.is_empty() {
-                    let chunk_store = Arc::clone(&store);
-                    write_tasks
-                        .spawn_blocking(move || chunk_store.chunks().put_verified_batch(payloads));
+            };
+            if !fetch.chunks.is_empty() {
+                used_sources.insert(source_idx);
+            }
+            if let Some(peer) = peers
+                .iter_mut()
+                .find(|peer| swarm_source_id(&sources[source_idx], source_idx) == peer.id)
+            {
+                for hash in &fetch.missing {
+                    peer.available.remove(hash);
+                    reserved.remove(hash);
+                    remaining.insert(*hash);
                 }
             }
-            ensure!(
-                remaining.len() < previous,
-                "swarm fill made no progress against remaining chunks"
-            );
+            let returned: HashSet<_> = fetch
+                .chunks
+                .iter()
+                .map(|(hash, _)| *hash)
+                .chain(fetch.missing.iter().copied())
+                .collect();
+            for hash in assigned {
+                if !returned.contains(&hash) {
+                    reserved.remove(&hash);
+                    remaining.insert(hash);
+                }
+            }
+            let mut payloads = Vec::with_capacity(fetch.chunks.len());
+            for (hash, bytes) in fetch.chunks {
+                reserved.remove(&hash);
+                transferred_bytes = transferred_bytes
+                    .checked_add(bytes.len() as u64)
+                    .context("swarm transferred-byte counter overflow")?;
+                payloads.push((hash, bytes));
+            }
+            transferred_chunks += payloads.len();
+            if !payloads.is_empty() {
+                let chunk_store = Arc::clone(&store);
+                write_tasks
+                    .spawn_blocking(move || chunk_store.chunks().put_verified_batch(payloads));
+            }
         }
         Ok::<_, anyhow::Error>(())
     };
@@ -2510,6 +2615,17 @@ pub async fn swarm_fill_chunks_connected(
         transferred_bytes,
         sources_used: used_sources.len(),
     })
+}
+
+/// Fills missing hashes in a local CAS from multiple authorized V3 sources using an established endpoint.
+pub async fn swarm_fill_chunks_connected(
+    endpoint: &Endpoint,
+    sources: Vec<EndpointAddr>,
+    store: Arc<Store>,
+    hashes: Vec<Hash32>,
+) -> Result<SwarmFillReceipt> {
+    let swarm = connect_swarm_sources(endpoint, sources).await?;
+    swarm.fill_chunks(store, hashes).await
 }
 
 /// Fills missing hashes in a local CAS from multiple authorized V3 sources.
@@ -2919,14 +3035,17 @@ mod tests {
             .iter()
             .map(|(server, _, _)| server.endpoint_addr())
             .collect();
-        let result = session
-            .swarm_fill_chunks(
-                sources,
+        let swarm = session
+            .connect_swarm_sources(sources)
+            .await
+            .expect("swarm sources connect through the session endpoint");
+        let result = swarm
+            .fill_chunks(
                 Arc::clone(&local_store),
                 vec![first_hash, second_hash],
             )
             .await
-            .expect("session swarm fill succeeds");
+            .expect("preconnected swarm fill succeeds");
         session.close().await;
 
         assert_eq!(result.transferred_chunks, 2);

@@ -25,8 +25,8 @@ Versioning after its first stable release.
   each fill round before requesting more, and keep duplicate endpoint IDs from
   collapsing distinct source addresses.
 - Reuse one sync endpoint and one persistent QUIC connection per V3 source,
-  query source availability concurrently, and schedule up to 16 chunks per
-  active source in each fill pass.
+  overlap V2 snapshot fetch with those connections, and pipeline two 16-chunk
+  GetChunks streams per source.
 
 ## [0.3.0] - 2026-08-26
 
