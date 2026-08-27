@@ -705,6 +705,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "deltaweave-swarm"
+version = "0.3.0"
+dependencies = [
+ "deltaweave-core",
+]
+
+[[package]]
 name = "deltaweave-sync"
 version = "0.3.0"
 dependencies = [

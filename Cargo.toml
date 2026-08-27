@@ -7,6 +7,7 @@ members = [
     "crates/deltaweave-reconcile",
     "crates/deltaweave-store",
     "crates/deltaweave-net",
+    "crates/deltaweave-swarm",
     "crates/deltaweave-sync",
     "crates/deltaweave-cli",
 ]
