@@ -5,6 +5,20 @@ Versioning after its first stable release.
 
 ## [Unreleased]
 
+### Added
+
+- Add the authenticated CAS-only `deltaweave/sync/3` protocol with exact chunk
+  availability, verified local-CAS serving, bounded multi-source filling, and an
+  experimental `swarm-fill` command.
+- Add a rarest-first scheduler with bounded 1/10/100/1,000-peer overlay tests.
+
+### Performance
+
+- Overlap durable receiver chunk writes while preserving per-file fsync and
+  draining every submitted writer on error. A 64 MiB DirectOnly hardware run
+  improved from 4.13 s to a 2.75 s mean; two V3 sources filled the same payload
+  in 1.51 s (1.82× single-source throughput).
+
 ## [0.3.0] - 2026-08-26
 
 ### Added
