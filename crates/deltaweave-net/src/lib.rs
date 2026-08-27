@@ -36,6 +36,8 @@ use tracing::{info, warn};
 pub const ALPN_V1: &[u8] = b"deltaweave/sync/1";
 /// Versioned ALPN identifier for Merkle state reconciliation and bidirectional transfer.
 pub const ALPN_V2: &[u8] = b"deltaweave/sync/2";
+/// Versioned ALPN identifier for CAS-only multi-peer chunk swarming.
+pub const ALPN_V3: &[u8] = b"deltaweave/sync/3";
 const MAX_CONTROL_FRAME: usize = 16 * 1024 * 1024;
 const MAX_CHUNKS_PER_FILE: usize = 250_000;
 const MAX_FILE_SIZE: u64 = 16 * 1024 * 1024 * 1024 * 1024;
@@ -241,7 +243,7 @@ pub async fn start_server(config: ServerConfig) -> Result<Server> {
     let endpoint = bind_endpoint(
         secret_key,
         network_mode,
-        Some(vec![ALPN_V1.to_vec(), ALPN_V2.to_vec()]),
+        Some(vec![ALPN_V1.to_vec(), ALPN_V2.to_vec(), ALPN_V3.to_vec()]),
     )
     .await?;
     let push_handler = PushHandler {
@@ -255,12 +257,14 @@ pub async fn start_server(config: ServerConfig) -> Result<Server> {
         store,
         index,
         destination_root,
-        peer_policy,
+        peer_policy: peer_policy.clone(),
         apply_lock,
     };
+    let swarm_handler = SwarmHandler { peer_policy };
     let router = Router::builder(endpoint)
         .accept(ALPN_V1, push_handler)
         .accept(ALPN_V2, sync_handler)
+        .accept(ALPN_V3, swarm_handler)
         .spawn();
     Ok(Server {
         router,
@@ -1835,6 +1839,116 @@ struct ChunkHeader {
     length: u32,
 }
 
+const SWARM_PROTOCOL_VERSION: u16 = 3;
+const SWARM_MAX_INFLIGHT: u16 = 64;
+
+/// Result of an authorized swarm Hello handshake.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SwarmHelloOk {
+    /// Protocol version advertised by the remote swarm handler.
+    pub protocol_version: u16,
+    /// Maximum concurrent in-flight chunk requests accepted by the remote.
+    pub max_inflight: u16,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+enum SwarmWireRequest {
+    Hello { protocol_version: u16 },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+enum SwarmWireResponse {
+    HelloOk {
+        protocol_version: u16,
+        max_inflight: u16,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct SwarmHandler {
+    peer_policy: PeerPolicy,
+}
+
+impl ProtocolHandler for SwarmHandler {
+    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        let peer = connection.remote_id();
+        if !self.peer_policy.allows(peer) {
+            warn!(%peer, "rejected unauthorized DeltaWeave swarm peer");
+            connection.close(0_u8.into(), b"endpoint ID is not allow-listed");
+            return Ok(());
+        }
+
+        let (mut send, mut receive) = connection.accept_bi().await?;
+        match read_frame::<SwarmWireRequest>(&mut receive).await {
+            Ok(SwarmWireRequest::Hello { protocol_version })
+                if protocol_version == SWARM_PROTOCOL_VERSION =>
+            {
+                if let Err(error) = write_frame(
+                    &mut send,
+                    &SwarmWireResponse::HelloOk {
+                        protocol_version: SWARM_PROTOCOL_VERSION,
+                        max_inflight: SWARM_MAX_INFLIGHT,
+                    },
+                )
+                .await
+                {
+                    warn!(%peer, error = %error, "swarm hello response failed");
+                    connection.close(0_u8.into(), b"swarm hello failed");
+                    return Ok(());
+                }
+                let _ = send.finish();
+                connection.closed().await;
+                Ok(())
+            }
+            Ok(_) => {
+                connection.close(0_u8.into(), b"unsupported swarm hello");
+                Ok(())
+            }
+            Err(_) => {
+                connection.close(0_u8.into(), b"malformed swarm hello");
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Completes an authorized swarm Hello handshake against a receiver.
+pub async fn swarm_hello(
+    secret_key: SecretKey,
+    remote: EndpointAddr,
+    mode: NetworkMode,
+) -> Result<SwarmHelloOk> {
+    let endpoint = bind_endpoint(secret_key, mode, None).await?;
+    let connection = endpoint
+        .connect(remote, ALPN_V3)
+        .await
+        .context("failed to connect swarm peer")?;
+    let (mut send, mut receive) = connection
+        .open_bi()
+        .await
+        .context("failed to open swarm hello stream")?;
+    write_frame(
+        &mut send,
+        &SwarmWireRequest::Hello {
+            protocol_version: SWARM_PROTOCOL_VERSION,
+        },
+    )
+    .await?;
+    send.finish()?;
+    let response = read_frame::<SwarmWireResponse>(&mut receive).await?;
+    connection.close(0_u8.into(), b"swarm hello complete");
+    endpoint.close().await;
+    match response {
+        SwarmWireResponse::HelloOk {
+            protocol_version,
+            max_inflight,
+        } => Ok(SwarmHelloOk {
+            protocol_version,
+            max_inflight,
+        }),
+    }
+}
+
 async fn write_frame<T: Serialize>(send: &mut SendStream, value: &T) -> Result<()> {
     let bytes = postcard::to_stdvec(value)?;
     ensure!(
@@ -2086,6 +2200,41 @@ mod tests {
         .expect("server can start");
         assert!(server.wait_online(Duration::from_millis(250)).await);
         assert!(!server.address_info().direct_addresses.is_empty());
+        server.shutdown().await.expect("server shuts down");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn swarm_v3_hello_requires_an_authorized_peer() {
+        let state = TempDir::new().expect("state directory can be created");
+        let destination = TempDir::new().expect("destination can be created");
+        let authorized_key = SecretKey::generate();
+        let server = start_server(ServerConfig {
+            secret_key: SecretKey::generate(),
+            destination_root: destination.path().to_path_buf(),
+            state_root: state.path().to_path_buf(),
+            peer_policy: PeerPolicy::AllowListed(HashSet::from([authorized_key.public()])),
+            network_mode: NetworkMode::DirectOnly,
+        })
+        .await
+        .expect("server can start");
+
+        let hello = swarm_hello(
+            authorized_key,
+            server.endpoint_addr(),
+            NetworkMode::DirectOnly,
+        )
+        .await
+        .expect("authorized swarm peer completes hello");
+        assert_eq!(hello.protocol_version, 3);
+        assert_eq!(hello.max_inflight, 64);
+
+        let rejected = swarm_hello(
+            SecretKey::generate(),
+            server.endpoint_addr(),
+            NetworkMode::DirectOnly,
+        )
+        .await;
+        assert!(rejected.is_err());
         server.shutdown().await.expect("server shuts down");
     }
 
