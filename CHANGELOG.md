@@ -11,6 +11,9 @@ Versioning after its first stable release.
   availability, verified local-CAS serving, bounded multi-source filling, and an
   experimental `swarm-fill` command.
 - Add a rarest-first scheduler with bounded 1/10/100/1,000-peer overlay tests.
+- Connect `sync-once` to optional authorized V3 swarm sources: the v2 peer
+  remains state authority, V3 sources fill missing CAS hashes, and a v2 content
+  pull is the fallback when swarm filling cannot complete.
 
 ### Performance
 
@@ -18,6 +21,9 @@ Versioning after its first stable release.
   draining every submitted writer on error. A 64 MiB DirectOnly hardware run
   improved from 4.13 s to a 2.75 s mean; two V3 sources filled the same payload
   in 1.51 s (1.82× single-source throughput).
+- Reject unrequested or oversized V3 chunk payloads before allocation, persist
+  each fill round before requesting more, and keep duplicate endpoint IDs from
+  collapsing distinct source addresses.
 
 ## [0.3.0] - 2026-08-26
 

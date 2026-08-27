@@ -240,6 +240,12 @@ struct SyncTargetArgs {
     /// Remote relay URL; repeat when multiple relays are advertised.
     #[arg(long = "relay")]
     relay_urls: Vec<String>,
+    /// Optional V3 swarm source endpoint ID; repeat in the same order as `--swarm-direct`.
+    #[arg(long = "swarm-peer")]
+    swarm_peers: Vec<String>,
+    /// Direct UDP address for each optional V3 swarm source.
+    #[arg(long = "swarm-direct")]
+    swarm_direct_addresses: Vec<SocketAddr>,
     /// Disable discovery and relay services; use supplied direct addresses only.
     #[arg(long)]
     direct_only: bool,
@@ -445,10 +451,24 @@ fn open_sync_engine(args: SyncTargetArgs) -> Result<SyncEngine> {
     if args.direct_only && args.direct_addresses.is_empty() {
         bail!("--direct-only requires at least one --direct address");
     }
+    ensure!(
+        args.swarm_peers.len() == args.swarm_direct_addresses.len(),
+        "sync requires one --swarm-direct for each --swarm-peer"
+    );
+    ensure!(
+        args.swarm_peers.len() <= 8,
+        "sync supports at most eight swarm sources"
+    );
     let identity = load_or_create_identity(&args.identity)?;
     ensure_identity_outside_destination(&args.identity, &args.root)?;
     let profile = args.chunking.profile()?;
     let remote = endpoint_addr(&args.peer, &args.direct_addresses, &args.relay_urls)?;
+    let swarm_sources = args
+        .swarm_peers
+        .iter()
+        .zip(args.swarm_direct_addresses)
+        .map(|(peer, direct)| endpoint_addr(peer, &[direct], &[]))
+        .collect::<Result<Vec<_>>>()?;
     let replica = ReplicaId(Hash32::digest(identity.endpoint_id().as_bytes()));
     SyncEngine::open(SyncConfig {
         root: args.root,
@@ -459,6 +479,7 @@ fn open_sync_engine(args: SyncTargetArgs) -> Result<SyncEngine> {
             remote,
             network_mode: network_mode(args.direct_only),
         },
+        swarm_sources,
         profile,
         ignored_paths: Vec::new(),
     })
@@ -790,6 +811,7 @@ async fn exercise_sync_self_test(
             remote: server.endpoint_addr(),
             network_mode: NetworkMode::DirectOnly,
         },
+        swarm_sources: Vec::new(),
         profile: ChunkingProfile::DEFAULT,
         ignored_paths: Vec::new(),
     };
@@ -1145,6 +1167,25 @@ mod tests {
         ])
         .expect("sync-once command parses");
         assert!(matches!(once.command, Command::SyncOnce(_)));
+
+        let with_swarm = Cli::try_parse_from([
+            "deltaweave",
+            "sync-once",
+            "--root",
+            "data",
+            "--peer",
+            "peer-id",
+            "--swarm-peer",
+            "swarm-peer-1",
+            "--swarm-direct",
+            "172.30.1.21:1234",
+        ])
+        .expect("sync-once command with swarm sources parses");
+        let Command::SyncOnce(args) = with_swarm.command else {
+            panic!("sync-once command expected");
+        };
+        assert_eq!(args.swarm_peers.len(), 1);
+        assert_eq!(args.swarm_direct_addresses.len(), 1);
 
         let continuous = Cli::try_parse_from([
             "deltaweave",

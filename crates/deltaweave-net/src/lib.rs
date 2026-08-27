@@ -41,6 +41,7 @@ pub const ALPN_V2: &[u8] = b"deltaweave/sync/2";
 pub const ALPN_V3: &[u8] = b"deltaweave/sync/3";
 const MAX_CONTROL_FRAME: usize = 16 * 1024 * 1024;
 const MAX_CHUNKS_PER_FILE: usize = 250_000;
+const MAX_CHUNK_PAYLOAD_SIZE: u32 = 16 * 1024 * 1024;
 const MAX_FILE_SIZE: u64 = 16 * 1024 * 1024 * 1024 * 1024;
 const CHUNK_WRITE_BATCH: usize = 8;
 const CHUNK_WRITE_CONCURRENCY: usize = 8;
@@ -479,6 +480,19 @@ pub struct PullReceipt {
     pub reused_extents: usize,
 }
 
+/// File manifest returned without transferring chunk payloads.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PullManifestReceipt {
+    /// Exact remote causal record used for the request.
+    pub record: SyncRecord,
+    /// Verified FastCDC manifest associated with the record.
+    pub manifest: FileManifest,
+    /// Payload bytes received from the remote peer. Always zero.
+    pub transferred_bytes: u64,
+    /// Manifest extents left for another content source to provide.
+    pub reused_extents: usize,
+}
+
 impl SyncClient {
     /// Opens one authenticated local endpoint that can serve all calls in a sync pass.
     pub async fn open_session(&self) -> Result<SyncSession> {
@@ -691,6 +705,81 @@ impl SyncClient {
         Ok(receipt)
     }
 
+    /// Retrieves one exact remote live-file manifest without transferring chunk payloads.
+    pub async fn pull_manifest(&self, record: SyncRecord) -> Result<PullManifestReceipt> {
+        record.validate()?;
+        ensure!(
+            !record.tombstone && record.kind == SyncEntryKind::File,
+            "pull_manifest requires a live file record"
+        );
+        let session = self.open_session().await?;
+        let outcome = session.pull_manifest(record).await;
+        session.close().await;
+        outcome
+    }
+
+    async fn pull_manifest_connected(
+        &self,
+        endpoint: &Endpoint,
+        expected: SyncRecord,
+    ) -> Result<PullManifestReceipt> {
+        let connection = endpoint
+            .connect(self.remote.clone(), ALPN_V2)
+            .await
+            .context("failed to connect for manifest-only pull")?;
+        let (mut send, mut receive) = connection
+            .open_bi()
+            .await
+            .context("open manifest-only pull stream")?;
+        write_frame(
+            &mut send,
+            &SyncWireRequest::PullRecord {
+                record: expected.clone(),
+            },
+        )
+        .await?;
+        let (record, manifest) = match read_frame::<SyncWireResponse>(&mut receive).await? {
+            SyncWireResponse::PullManifest { record, manifest } => (record, manifest),
+            SyncWireResponse::Error { message } => {
+                bail!("remote rejected manifest-only pull: {message}")
+            }
+            _ => bail!("remote sent an unexpected manifest-only pull response"),
+        };
+        ensure!(record == expected, "remote path changed after snapshot");
+        manifest.validate()?;
+        ensure!(
+            manifest.size == record.size && Some(manifest.file_hash) == record.content_hash,
+            "remote pull manifest does not match causal record"
+        );
+        write_frame(
+            &mut send,
+            &SyncWireRequest::NeedChunks { hashes: Vec::new() },
+        )
+        .await?;
+        send.finish().context("finish manifest-only pull request")?;
+        let receipt = match read_frame::<SyncWireResponse>(&mut receive).await? {
+            SyncWireResponse::Applied(receipt) => receipt,
+            SyncWireResponse::Error { message } => {
+                bail!("remote manifest-only pull failed: {message}")
+            }
+            _ => bail!("remote sent an unexpected manifest-only pull completion"),
+        };
+        ensure!(
+            receipt.path == record.path
+                && receipt.record_hash == record.logical_hash()
+                && receipt.transferred_bytes == 0
+                && receipt.reused_extents == manifest.chunks.len(),
+            "manifest-only pull receipt mismatch"
+        );
+        connection.close(0_u8.into(), b"manifest-only pull complete");
+        Ok(PullManifestReceipt {
+            record,
+            reused_extents: manifest.chunks.len(),
+            manifest,
+            transferred_bytes: 0,
+        })
+    }
+
     /// Pulls one exact remote live-file record into `store` without publishing a path yet.
     pub async fn pull_record(&self, record: SyncRecord, store: Arc<Store>) -> Result<PullReceipt> {
         record.validate()?;
@@ -892,6 +981,18 @@ impl SyncSession {
         );
         self.client
             .push_record_connected(&self.endpoint, &source, record, manifest)
+            .await
+    }
+
+    /// Retrieves one exact live-file manifest through this reusable endpoint.
+    pub async fn pull_manifest(&self, record: SyncRecord) -> Result<PullManifestReceipt> {
+        record.validate()?;
+        ensure!(
+            !record.tombstone && record.kind == SyncEntryKind::File,
+            "pull_manifest requires a live file record"
+        );
+        self.client
+            .pull_manifest_connected(&self.endpoint, record)
             .await
     }
 
@@ -2101,9 +2202,9 @@ pub async fn swarm_get_chunks(
         hashes.len() <= SWARM_MAX_WANT,
         "swarm chunk request exceeds {SWARM_MAX_WANT} hashes"
     );
-    let unique: HashSet<_> = hashes.iter().copied().collect();
+    let requested_set: HashSet<_> = hashes.iter().copied().collect();
     ensure!(
-        unique.len() == hashes.len(),
+        requested_set.len() == hashes.len(),
         "swarm chunk request contains duplicates"
     );
 
@@ -2131,12 +2232,22 @@ pub async fn swarm_get_chunks(
             bail!("swarm peer sent a non-chunk response")
         }
     };
+    for hash in present.iter().chain(&missing) {
+        ensure!(
+            requested_set.contains(hash),
+            "swarm peer returned unrequested chunk {hash}"
+        );
+    }
     let mut chunks = Vec::with_capacity(present.len());
     for expected in present {
         let header: ChunkHeader = read_frame(&mut receive).await?;
         ensure!(
             header.hash == expected,
             "swarm chunk arrived out of inventory order"
+        );
+        ensure!(
+            header.length <= MAX_CHUNK_PAYLOAD_SIZE,
+            "swarm chunk length exceeds maximum payload size"
         );
         let mut bytes = vec![0_u8; header.length as usize];
         receive.read_exact(&mut bytes).await?;
@@ -2174,21 +2285,31 @@ pub async fn swarm_fill_chunks(
         "swarm fill contains duplicate hashes"
     );
 
-    let mut remaining: HashSet<_> = hashes.iter().copied().collect();
-    let mut payloads = Vec::new();
+    let mut remaining: HashSet<_> = hashes
+        .iter()
+        .copied()
+        .filter(|hash| !store.chunks().contains(*hash))
+        .collect();
+    let mut transferred_chunks = 0_usize;
     let mut transferred_bytes = 0_u64;
     let mut used_sources = HashSet::new();
     while !remaining.is_empty() {
         let remaining_vec: Vec<_> = remaining.iter().copied().collect();
         let mut peers = Vec::new();
-        for source in &sources {
-            let bits = swarm_availability(
-                secret_key.clone(),
-                source.clone(),
-                mode,
-                remaining_vec.clone(),
-            )
-            .await?;
+        for (index, source) in sources.iter().enumerate() {
+            let mut chunk_queries = Vec::new();
+            for chunk_slice in remaining_vec.chunks(SWARM_MAX_AVAILABILITY) {
+                chunk_queries.push(
+                    swarm_availability(
+                        secret_key.clone(),
+                        source.clone(),
+                        mode,
+                        chunk_slice.to_vec(),
+                    )
+                    .await?,
+                );
+            }
+            let bits: Vec<bool> = chunk_queries.into_iter().flatten().collect();
             ensure!(
                 bits.len() == remaining_vec.len(),
                 "swarm availability bitmap length mismatch"
@@ -2198,8 +2319,9 @@ pub async fn swarm_fill_chunks(
                 .zip(bits)
                 .filter_map(|(hash, present)| present.then_some(*hash))
                 .collect();
+            let peer_id = swarm_source_id(source, index);
             peers.push(PeerAvailability {
-                id: Hash32::digest(source.id.as_bytes()),
+                id: peer_id,
                 available,
                 rtt_ms: 1,
                 queued_bytes: 0,
@@ -2213,7 +2335,7 @@ pub async fn swarm_fill_chunks(
             SchedulerLimits {
                 max_sources: sources.len().min(8),
                 max_chunks_per_peer: SWARM_MAX_WANT,
-                max_assignments: remaining_vec.len(),
+                max_assignments: remaining_vec.len().min(64),
             },
         );
         ensure!(
@@ -2230,41 +2352,45 @@ pub async fn swarm_fill_chunks(
         }
         let mut requests = Vec::new();
         for (peer_id, assigned) in grouped {
-            let source = sources
+            let (source_idx, source) = sources
                 .iter()
-                .find(|source| Hash32::digest(source.id.as_bytes()) == peer_id)
-                .context("scheduled swarm peer disappeared")?
-                .clone();
+                .enumerate()
+                .find(|(index, source)| swarm_source_id(source, *index) == peer_id)
+                .context("scheduled swarm peer disappeared")?;
+            let source = source.clone();
             let key = secret_key.clone();
             requests.push(tokio::spawn(async move {
                 let fetch = swarm_get_chunks(key, source, mode, assigned).await?;
-                Ok::<_, anyhow::Error>((peer_id, fetch))
+                Ok::<_, anyhow::Error>((source_idx, fetch))
             }));
         }
         let previous = remaining.len();
+        let mut round_payloads = Vec::new();
         for request in requests {
-            let (peer_id, fetch) = request.await.context("swarm source task failed")??;
+            let (source_idx, fetch) = request.await.context("swarm source task failed")??;
             if !fetch.chunks.is_empty() {
-                used_sources.insert(peer_id);
+                used_sources.insert(source_idx);
             }
             for (hash, bytes) in fetch.chunks {
                 remaining.remove(&hash);
                 transferred_bytes = transferred_bytes
                     .checked_add(bytes.len() as u64)
                     .context("swarm transferred-byte counter overflow")?;
-                payloads.push((hash, bytes));
+                round_payloads.push((hash, bytes));
             }
         }
         ensure!(
             remaining.len() < previous,
             "swarm fill made no progress against remaining chunks"
         );
-    }
-    let installed = payloads.len();
-    let chunk_store = Arc::clone(&store);
-    tokio::task::spawn_blocking(move || chunk_store.chunks().put_verified_batch(payloads))
+        transferred_chunks += round_payloads.len();
+        let chunk_store = Arc::clone(&store);
+        tokio::task::spawn_blocking(move || {
+            chunk_store.chunks().put_verified_batch(round_payloads)
+        })
         .await
         .context("local swarm chunk-store task failed")??;
+    }
     for hash in hashes {
         ensure!(
             store.chunks().contains(hash),
@@ -2272,7 +2398,7 @@ pub async fn swarm_fill_chunks(
         );
     }
     Ok(SwarmFillReceipt {
-        transferred_chunks: installed,
+        transferred_chunks,
         transferred_bytes,
         sources_used: used_sources.len(),
     })
@@ -2299,6 +2425,13 @@ async fn read_frame<T: DeserializeOwned>(receive: &mut RecvStream) -> Result<T> 
     let mut bytes = vec![0_u8; length];
     receive.read_exact(&mut bytes).await?;
     postcard::from_bytes(&bytes).context("malformed control frame")
+}
+
+fn swarm_source_id(source: &EndpointAddr, index: usize) -> Hash32 {
+    let mut tagged = Vec::with_capacity(source.id.as_bytes().len() + 8);
+    tagged.extend_from_slice(source.id.as_bytes());
+    tagged.extend_from_slice(&(index as u64).to_le_bytes());
+    Hash32::digest(&tagged)
 }
 
 fn truncate_error(message: &str) -> String {
@@ -2812,6 +2945,51 @@ mod tests {
         .fetch_snapshot(&empty)
         .await;
         assert!(reconciliation.is_err());
+        server.shutdown().await.expect("server shuts down");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reconciliation_v2_manifest_only_pull_transfers_zero_payload() {
+        let server_state = TempDir::new().expect("server state can be created");
+        let server_root = TempDir::new().expect("server root can be created");
+        let bytes = fixture(2 * 1024 * 1024 + 97);
+        fs::write(server_root.path().join("remote.bin"), &bytes).expect("seed file can be written");
+        let client_key = SecretKey::generate();
+        let server = start_server(ServerConfig {
+            secret_key: SecretKey::generate(),
+            destination_root: server_root.path().to_path_buf(),
+            state_root: server_state.path().to_path_buf(),
+            peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
+            network_mode: NetworkMode::DirectOnly,
+        })
+        .await
+        .expect("server can start");
+        let client = SyncClient {
+            secret_key: client_key,
+            remote: server.endpoint_addr(),
+            network_mode: NetworkMode::DirectOnly,
+        };
+        let empty =
+            MerkleTree::from_records(Vec::<SyncRecord>::new()).expect("empty Merkle tree is valid");
+        let snapshot = client
+            .fetch_snapshot(&empty)
+            .await
+            .expect("remote snapshot can be fetched");
+        let record = snapshot
+            .records
+            .into_iter()
+            .find(|record| record.path.as_str() == "remote.bin")
+            .expect("snapshot contains remote file");
+
+        let receipt = client
+            .pull_manifest(record.clone())
+            .await
+            .expect("manifest-only pull succeeds");
+
+        assert_eq!(receipt.record, record);
+        assert_eq!(receipt.manifest.file_hash, Hash32::digest(&bytes));
+        assert_eq!(receipt.transferred_bytes, 0);
+        assert_eq!(receipt.reused_extents, receipt.manifest.chunks.len());
         server.shutdown().await.expect("server shuts down");
     }
 

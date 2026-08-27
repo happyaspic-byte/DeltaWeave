@@ -14,11 +14,12 @@ use deltaweave_core::{
     ChunkingProfile, FileManifest, Hash32, ReplicaId, SyncEntryKind, SyncRecord, WirePath,
 };
 use deltaweave_index::{IndexOptions, LocalIndex, ScanReport};
-use deltaweave_net::{PullReceipt, SyncApplyReceipt, SyncClient, SyncSession};
+use deltaweave_net::{PullReceipt, SyncApplyReceipt, SyncClient, SyncSession, swarm_fill_chunks};
 use deltaweave_reconcile::{
     ApplyAction, ConflictRecord, MerkleTree, actions_to_reach, merge_snapshots,
 };
 use deltaweave_store::Store;
+use iroh::EndpointAddr;
 use serde::Serialize;
 
 /// Durable local inputs for one reconciliation engine.
@@ -32,6 +33,8 @@ pub struct SyncConfig {
     pub replica: ReplicaId,
     /// Authenticated remote peer configuration.
     pub client: SyncClient,
+    /// Optional authorized V3 swarm sources used to fill missing CAS chunks.
+    pub swarm_sources: Vec<EndpointAddr>,
     /// Content-defined chunking profile.
     pub profile: ChunkingProfile,
     /// Additional local paths excluded from indexing.
@@ -45,6 +48,7 @@ pub struct SyncEngine {
     index: Arc<LocalIndex>,
     store: Arc<Store>,
     client: SyncClient,
+    swarm_sources: Vec<EndpointAddr>,
     profile: ChunkingProfile,
 }
 
@@ -135,6 +139,7 @@ impl SyncEngine {
             index,
             store,
             client: config.client,
+            swarm_sources: config.swarm_sources,
             profile: config.profile,
         })
     }
@@ -269,9 +274,7 @@ impl SyncEngine {
                 transferred_bytes,
                 reused_extents,
                 ..
-            } = session
-                .pull_record((*source).clone(), Arc::clone(&self.store))
-                .await?;
+            } = self.stage_remote_file(session, (*source).clone()).await?;
             ensure!(
                 manifest.file_hash == hash,
                 "remote source returned different content"
@@ -285,6 +288,57 @@ impl SyncEngine {
             stats.reused_extents = stats.reused_extents.saturating_add(reused_extents);
         }
         Ok((manifests, stats))
+    }
+
+    async fn stage_remote_file(
+        &self,
+        session: &SyncSession,
+        record: SyncRecord,
+    ) -> Result<PullReceipt> {
+        if self.swarm_sources.is_empty() {
+            return session.pull_record(record, Arc::clone(&self.store)).await;
+        }
+
+        let manifest_receipt = session.pull_manifest(record.clone()).await?;
+        let missing = self.store.missing_chunks(&manifest_receipt.manifest);
+        if missing.is_empty() {
+            return Ok(PullReceipt {
+                record,
+                manifest: manifest_receipt.manifest,
+                transferred_bytes: 0,
+                reused_extents: manifest_receipt.reused_extents,
+            });
+        }
+
+        let swarm_outcome = swarm_fill_chunks(
+            self.client.secret_key.clone(),
+            self.swarm_sources.clone(),
+            self.client.network_mode,
+            Arc::clone(&self.store),
+            missing.clone(),
+        )
+        .await;
+
+        if let Ok(receipt) = swarm_outcome {
+            let still_missing = self.store.missing_chunks(&manifest_receipt.manifest);
+            if still_missing.is_empty() {
+                let missing_set: std::collections::HashSet<_> = missing.into_iter().collect();
+                let reused_extents = manifest_receipt
+                    .manifest
+                    .chunks
+                    .iter()
+                    .filter(|chunk| !missing_set.contains(&chunk.hash))
+                    .count();
+                return Ok(PullReceipt {
+                    record,
+                    manifest: manifest_receipt.manifest,
+                    transferred_bytes: receipt.transferred_bytes,
+                    reused_extents,
+                });
+            }
+        }
+
+        session.pull_record(record, Arc::clone(&self.store)).await
     }
 
     fn apply_local(
@@ -543,6 +597,7 @@ mod tests {
                 network_mode: NetworkMode::DirectOnly,
             },
             profile: ChunkingProfile::DEFAULT,
+            swarm_sources: Vec::new(),
             ignored_paths: Vec::new(),
         };
         let engine = SyncEngine::open(config.clone()).expect("sync engine can open");
@@ -633,5 +688,108 @@ mod tests {
         assert_eq!(after_restart.local_actions, 0);
         assert_eq!(after_restart.remote_actions, 0);
         server.shutdown().await.expect("server shuts down");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sync_once_stages_chunks_from_authorized_v3_swarm_sources() {
+        let local_root = TempDir::new().expect("local root can be created");
+        let local_state = TempDir::new().expect("local state can be created");
+        let remote_root = TempDir::new().expect("remote root can be created");
+        let remote_state = TempDir::new().expect("remote state can be created");
+
+        let full_payload: Vec<u8> = (0..4 * 1024 * 1024)
+            .map(|index| ((index * 31) ^ (index >> 5)) as u8)
+            .collect();
+        let expected_hash = Hash32::digest(&full_payload);
+        let remote_file = remote_root.path().join("swarm_synced.bin");
+        fs::write(&remote_file, &full_payload).expect("remote seed file can be written");
+        let seed_state = TempDir::new().expect("seed state can be created");
+        let seed_store = Store::open(seed_state.path()).expect("seed store opens");
+        let seed_manifest = seed_store
+            .ingest_file(&remote_file, ChunkingProfile::DEFAULT)
+            .expect("seed file is chunked");
+        assert!(seed_manifest.chunks.len() > 1);
+
+        let client_key = SecretKey::generate();
+        let auth_server = start_server(ServerConfig {
+            secret_key: SecretKey::generate(),
+            destination_root: remote_root.path().to_path_buf(),
+            state_root: remote_state.path().to_path_buf(),
+            peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
+            network_mode: NetworkMode::DirectOnly,
+        })
+        .await
+        .expect("authoritative server starts");
+
+        let mut swarm_servers = Vec::new();
+        let mid = seed_manifest.chunks.len() / 2;
+        let subsets = [&seed_manifest.chunks[..mid], &seed_manifest.chunks[mid..]];
+        for subset in subsets {
+            let state = TempDir::new().expect("swarm state can be created");
+            let destination = TempDir::new().expect("swarm dest can be created");
+            {
+                let store = Store::open(state.path()).expect("swarm store opens");
+                for descriptor in subset {
+                    let bytes = seed_store
+                        .chunks()
+                        .read_verified(descriptor.hash)
+                        .expect("seed chunk readable");
+                    store
+                        .chunks()
+                        .put_verified(descriptor.hash, &bytes)
+                        .expect("seed chunk placed in swarm source");
+                }
+            }
+            let server = start_server(ServerConfig {
+                secret_key: SecretKey::generate(),
+                destination_root: destination.path().to_path_buf(),
+                state_root: state.path().to_path_buf(),
+                peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
+                network_mode: NetworkMode::DirectOnly,
+            })
+            .await
+            .expect("swarm source starts");
+            swarm_servers.push((server, state, destination));
+        }
+
+        let swarm_sources: Vec<_> = swarm_servers
+            .iter()
+            .map(|(server, _, _)| server.endpoint_addr())
+            .collect();
+
+        let config = SyncConfig {
+            root: local_root.path().to_path_buf(),
+            state_root: local_state.path().to_path_buf(),
+            replica: replica(&client_key),
+            client: SyncClient {
+                secret_key: client_key.clone(),
+                remote: auth_server.endpoint_addr(),
+                network_mode: NetworkMode::DirectOnly,
+            },
+            swarm_sources,
+            profile: ChunkingProfile::DEFAULT,
+            ignored_paths: Vec::new(),
+        };
+
+        let engine = SyncEngine::open(config).expect("sync engine opens with swarm");
+        let report = engine
+            .sync_once()
+            .await
+            .expect("sync_once converges via swarm");
+        assert_eq!(report.status, "pass");
+        assert_eq!(report.pulled_remote_files, 1);
+        assert!(report.pulled_bytes > 0);
+        assert_eq!(report.verified_local_root, report.verified_remote_root);
+
+        let local_file = local_root.path().join("swarm_synced.bin");
+        assert_eq!(
+            Hash32::digest(&fs::read(&local_file).expect("file readable")),
+            expected_hash
+        );
+
+        auth_server.shutdown().await.expect("auth server shut down");
+        for (server, _, _) in swarm_servers {
+            server.shutdown().await.expect("swarm source shut down");
+        }
     }
 }

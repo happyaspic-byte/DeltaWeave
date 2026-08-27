@@ -15,11 +15,11 @@ deltaweave-index = { path = "../deltaweave-index" }
 deltaweave-net = { path = "../deltaweave-net" }
 deltaweave-reconcile = { path = "../deltaweave-reconcile" }
 deltaweave-store = { path = "../deltaweave-store" }
+iroh.workspace = true
 serde.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
-iroh.workspace = true
 tempfile.workspace = true
 
 [lints]

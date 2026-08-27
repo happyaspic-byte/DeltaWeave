@@ -154,4 +154,12 @@ final v2 Merkle verification remain the correctness gates.
 
 The experimental `swarm-fill` command exposes CAS filling for benchmarking. It
 requires one direct address per peer and does not publish a file into the sync
-root. Integration with `sync-once` remains a later compatibility-gated step.
+root.
+
+`sync-once` and `sync` may optionally list up to eight authorized V3 sources
+with matching `--swarm-peer` / `--swarm-direct` arguments. The authoritative
+v2 peer still supplies the causal `SyncRecord` and FastCDC manifest. Missing
+CAS hashes are filled from those V3 sources, then existing v2 materialization,
+causal apply, and final Merkle verification run unchanged. If swarm filling
+cannot complete every required hash, the client falls back to a full v2
+content pull from the authoritative peer.
