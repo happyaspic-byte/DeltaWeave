@@ -611,6 +611,7 @@ dependencies = [
  "deltaweave-core",
  "deltaweave-index",
  "deltaweave-net",
+ "deltaweave-store",
  "deltaweave-sync",
  "iroh",
  "serde",

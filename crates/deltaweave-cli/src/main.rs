@@ -8,6 +8,7 @@ use std::{
     io::Write,
     net::SocketAddr,
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -18,8 +19,9 @@ use deltaweave_core::{ChunkingProfile, Hash32, ReplicaId, WirePath};
 use deltaweave_index::{IndexOptions, LocalIndex, ScanChange, WatchService};
 use deltaweave_net::{
     NetworkMode, PeerPolicy, PushOptions, Server, ServerConfig, SyncClient, TransferReceipt,
-    endpoint_addr, load_or_create_identity, push_file, start_server,
+    endpoint_addr, load_or_create_identity, push_file, start_server, swarm_fill_chunks,
 };
+use deltaweave_store::Store;
 use deltaweave_sync::{SyncConfig, SyncEngine};
 use iroh::{EndpointId, SecretKey};
 use serde_json::json;
@@ -47,6 +49,8 @@ enum Command {
     Serve(ServeArgs),
     /// Send one file and transfer only chunks missing at the receiver.
     Push(PushArgs),
+    /// Fill a private CAS from multiple authorized swarm V3 peers.
+    SwarmFill(SwarmFillArgs),
     /// Build or refresh the authoritative local directory index once.
     Scan(ScanArgs),
     /// Continuously index a directory using native watcher hints and periodic reconciliation.
@@ -146,6 +150,28 @@ struct PushArgs {
     direct_only: bool,
     #[command(flatten)]
     chunking: ChunkingArgs,
+}
+
+#[derive(Debug, Args)]
+struct SwarmFillArgs {
+    /// Private local CAS and metadata state directory.
+    #[arg(long, default_value = ".deltaweave/swarm-state")]
+    state: PathBuf,
+    /// Persistent client identity authorized by every source.
+    #[arg(long, default_value = ".deltaweave/identity.key")]
+    identity: PathBuf,
+    /// Source endpoint ID; repeat in the same order as `--direct`.
+    #[arg(long = "peer", required = true)]
+    peers: Vec<String>,
+    /// Direct UDP address for each source endpoint.
+    #[arg(long = "direct", required = true)]
+    direct_addresses: Vec<SocketAddr>,
+    /// Unique BLAKE3 chunk hash to fetch; repeat as needed.
+    #[arg(long = "hash", required = true)]
+    hashes: Vec<Hash32>,
+    /// Disable discovery and relay services.
+    #[arg(long)]
+    direct_only: bool,
 }
 
 #[derive(Debug, Args)]
@@ -251,6 +277,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Manifest(args) => print_manifest(args),
         Command::Serve(args) => serve(args).await,
         Command::Push(args) => push(args).await,
+        Command::SwarmFill(args) => swarm_fill(args).await,
         Command::Scan(args) => scan(args),
         Command::Watch(args) => watch(args).await,
         Command::SyncOnce(args) => sync_once(args).await,
@@ -377,6 +404,41 @@ async fn push(args: PushArgs) -> Result<()> {
     })
     .await?;
     print_json(&receipt)
+}
+
+async fn swarm_fill(args: SwarmFillArgs) -> Result<()> {
+    ensure!(
+        args.peers.len() == args.direct_addresses.len(),
+        "swarm-fill requires one --direct for each --peer"
+    );
+    ensure!(
+        args.peers.len() <= 8,
+        "swarm-fill supports at most eight sources"
+    );
+    let identity = load_or_create_identity(&args.identity)?;
+    let sources = args
+        .peers
+        .iter()
+        .zip(args.direct_addresses)
+        .map(|(peer, direct)| endpoint_addr(peer, &[direct], &[]))
+        .collect::<Result<Vec<_>>>()?;
+    let store = Arc::new(Store::open(&args.state)?);
+    let started = Instant::now();
+    let receipt = swarm_fill_chunks(
+        identity.secret_key,
+        sources,
+        network_mode(args.direct_only),
+        store,
+        args.hashes,
+    )
+    .await?;
+    print_json(&json!({
+        "status": "pass",
+        "transferred_chunks": receipt.transferred_chunks,
+        "transferred_bytes": receipt.transferred_bytes,
+        "sources_used": receipt.sources_used,
+        "elapsed_ms": started.elapsed().as_millis(),
+    }))
 }
 
 fn open_sync_engine(args: SyncTargetArgs) -> Result<SyncEngine> {
@@ -1038,6 +1100,37 @@ mod tests {
             panic!("scan command expected");
         };
         assert!(args.include_records);
+    }
+
+    #[test]
+    fn parses_experimental_swarm_fill_command() {
+        let cli = Cli::try_parse_from([
+            "deltaweave",
+            "swarm-fill",
+            "--state",
+            "private/state",
+            "--identity",
+            "private/node.key",
+            "--peer",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--direct",
+            "172.30.1.21:1234",
+            "--peer",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "--direct",
+            "172.30.1.22:5678",
+            "--hash",
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "--direct-only",
+        ])
+        .expect("experimental swarm-fill command parses");
+        let Command::SwarmFill(args) = cli.command else {
+            panic!("swarm-fill command expected");
+        };
+        assert_eq!(args.peers.len(), 2);
+        assert_eq!(args.direct_addresses.len(), 2);
+        assert_eq!(args.hashes.len(), 1);
+        assert!(args.direct_only);
     }
 
     #[test]
