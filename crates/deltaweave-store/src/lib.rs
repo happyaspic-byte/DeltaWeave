@@ -114,10 +114,18 @@ impl ChunkStore {
                 }
             }
         }
+        let mut sync_error = None;
         for parent in parents {
-            sync_parent(&parent)?;
+            if let Err(error) = sync_parent(&parent)
+                && sync_error.is_none()
+            {
+                sync_error = Some(error);
+            }
         }
         if let Some(error) = install_error {
+            return Err(error);
+        }
+        if let Some(error) = sync_error {
             return Err(error);
         }
         Ok(written)
@@ -1067,5 +1075,31 @@ mod tests {
                 .is_err()
         );
         assert!(!outside.path().join("escape.bin").exists());
+    }
+
+    #[test]
+    fn chunk_store_batch_attempts_all_parent_syncs_on_error() {
+        let temp = TempDir::new().expect("temporary directory can be created");
+        let store = ChunkStore::open(temp.path()).expect("chunk store can open");
+        let first = fixture(64 * 1024);
+        let first_hash = Hash32::digest(&first);
+        let mut second = fixture(64 * 1024 + 1);
+        let second_hash = loop {
+            let hash = Hash32::digest(&second);
+            if hash.to_hex()[..2] != first_hash.to_hex()[..2] {
+                break hash;
+            }
+            second.push(2);
+        };
+        let mut synced = Vec::new();
+        let result = store.put_verified_batch_with_sync(
+            vec![(first_hash, first), (second_hash, second)],
+            |parent| {
+                synced.push(parent.to_path_buf());
+                bail!("sync failed for {}", parent.display());
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(synced.len(), 2);
     }
 }

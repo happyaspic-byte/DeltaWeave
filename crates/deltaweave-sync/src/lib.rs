@@ -16,7 +16,7 @@ use deltaweave_core::{
 use deltaweave_index::{IndexOptions, LocalIndex, ScanReport};
 use deltaweave_net::{
     PullManifestReceipt, PullReceipt, SwarmSources, SyncApplyReceipt, SyncClient, SyncSession,
-    is_swarm_local_storage_error,
+    is_swarm_local_storage_error, swarm_partial_fill,
 };
 use deltaweave_reconcile::{
     ApplyAction, ConflictRecord, MerkleTree, actions_to_reach, merge_snapshots,
@@ -262,6 +262,7 @@ impl SyncEngine {
         let mut manifests = BTreeMap::new();
         let mut stats = StageStats::default();
         let mut swarm = None;
+        let mut swarm_attempted = false;
         for hash in required {
             if let Some(source) = local_sources.get(&hash) {
                 let source_path = local_path(&self.root, &source.path);
@@ -279,7 +280,12 @@ impl SyncEngine {
                 .with_context(|| format!("no peer retains required content {hash}"))?;
             let manifest_receipt = session.pull_manifest((*source).clone()).await?;
             let missing = self.store.missing_chunks(&manifest_receipt.manifest);
-            if !missing.is_empty() && swarm.is_none() && !self.swarm_sources.is_empty() {
+            if !missing.is_empty()
+                && swarm.is_none()
+                && !swarm_attempted
+                && !self.swarm_sources.is_empty()
+            {
+                swarm_attempted = true;
                 swarm = session
                     .connect_swarm_sources(self.swarm_sources.clone())
                     .await
@@ -346,6 +352,8 @@ impl SyncEngine {
             }
             None => Err(anyhow::anyhow!("swarm sources unavailable")),
         };
+        let mut partial_bytes = 0_u64;
+        let mut partial_source_ids = Vec::new();
 
         match swarm_outcome {
             Ok(receipt) => {
@@ -368,13 +376,24 @@ impl SyncEngine {
                         receipt.source_ids().to_vec(),
                     ));
                 }
+                partial_bytes = receipt.transferred_bytes;
+                partial_source_ids = receipt.source_ids().to_vec();
             }
             Err(error) if is_swarm_local_storage_error(&error) => return Err(error),
-            Err(_) => {}
+            Err(error) => {
+                if let Some(partial) = swarm_partial_fill(&error) {
+                    partial_bytes = partial.transferred_bytes;
+                    partial_source_ids = partial.source_ids;
+                }
+            }
         }
 
-        let fallback_receipt = session.pull_record(record, Arc::clone(&self.store)).await?;
-        Ok((fallback_receipt, Vec::new()))
+        let mut fallback_receipt = session.pull_record(record, Arc::clone(&self.store)).await?;
+        fallback_receipt.transferred_bytes = fallback_receipt
+            .transferred_bytes
+            .checked_add(partial_bytes)
+            .context("pulled-byte counter overflow")?;
+        Ok((fallback_receipt, partial_source_ids))
     }
 
     fn apply_local(

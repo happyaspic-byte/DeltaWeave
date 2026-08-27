@@ -222,11 +222,23 @@ impl Server {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("swarm task registry is poisoned"))?,
         );
-        for task in tasks {
-            task.await.context("swarm stream task failed")?;
-        }
-        Ok(())
+        await_swarm_tasks(tasks).await
     }
+}
+
+async fn await_swarm_tasks(tasks: Vec<tokio::task::JoinHandle<()>>) -> Result<()> {
+    let mut first_error = None;
+    for task in tasks {
+        if let Err(error) = task.await
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    }
+    if let Some(error) = first_error {
+        return Err(error).context("swarm stream task failed");
+    }
+    Ok(())
 }
 
 /// Copyable endpoint information printed by the CLI.
@@ -2353,6 +2365,33 @@ pub async fn swarm_availability(
     outcome
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SwarmPartialFill {
+    /// Verified payload bytes received from swarm sources before fallback.
+    pub transferred_bytes: u64,
+    /// Authenticated endpoint IDs of sources that delivered verified chunks before fallback.
+    pub source_ids: Vec<EndpointId>,
+}
+
+impl fmt::Display for SwarmPartialFill {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "swarm partial fill transferred {} byte(s) across {} source(s)",
+            self.transferred_bytes,
+            self.source_ids.len()
+        )
+    }
+}
+
+impl std::error::Error for SwarmPartialFill {}
+
+/// Returns partial swarm fill progress attached to a non-fatal swarm error, if any.
+#[must_use]
+pub fn swarm_partial_fill(error: &anyhow::Error) -> Option<SwarmPartialFill> {
+    error.downcast_ref::<SwarmPartialFill>().cloned()
+}
+
 /// Outcome after filling a local CAS from multiple authorized swarm peers.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct SwarmFillReceipt {
@@ -2727,15 +2766,39 @@ async fn swarm_fill_chunks_preconnected(
                     failure_penalty: 0,
                 })
             };
-            tokio::time::timeout(SWARM_FETCH_TIMEOUT, query)
+            tokio::time::timeout(SWARM_CONNECT_TIMEOUT, query)
                 .await
                 .context("swarm availability query timed out")?
         });
     }
     let mut peers = Vec::new();
-    while let Some(res) = join_set.join_next().await {
-        if let Ok(Ok(peer)) = res {
-            peers.push(peer);
+    let required: HashSet<_> = remaining_all.iter().copied().collect();
+    let availability_deadline = tokio::time::sleep(SWARM_CONNECT_TIMEOUT);
+    tokio::pin!(availability_deadline);
+    loop {
+        tokio::select! {
+            result = join_set.join_next(), if !join_set.is_empty() => {
+                if let Some(Ok(Ok(peer))) = result {
+                    peers.push(peer);
+                    let covered: HashSet<_> = peers
+                        .iter()
+                        .flat_map(|peer| peer.available.iter().copied())
+                        .collect();
+                    if required.is_subset(&covered) {
+                        join_set.abort_all();
+                        while join_set.join_next().await.is_some() {}
+                        break;
+                    }
+                }
+            }
+            () = &mut availability_deadline => {
+                join_set.abort_all();
+                while join_set.join_next().await.is_some() {}
+                break;
+            }
+        }
+        if join_set.is_empty() {
+            break;
         }
     }
     ensure!(
@@ -2931,17 +2994,28 @@ async fn swarm_fill_chunks_preconnected(
             }
         }
     }
+    let mut partial_source_ids: Vec<_> = used_sources
+        .iter()
+        .map(|source_idx| sources[*source_idx].id)
+        .collect();
+    partial_source_ids.sort();
+    let partial_fill = SwarmPartialFill {
+        transferred_bytes,
+        source_ids: partial_source_ids,
+    };
+
     if let Some(error) = local_error {
         return Err(error.context(SwarmLocalStorageError));
     }
     if let Some(error) = source_error {
-        return Err(error);
+        return Err(error.context(partial_fill));
     }
-    ensure!(
-        queues.iter().all(VecDeque::is_empty) && remaining.is_empty(),
-        "swarm fill left {} chunk(s) unresolved",
-        remaining.len()
-    );
+    if !(queues.iter().all(VecDeque::is_empty) && remaining.is_empty()) {
+        return Err(
+            anyhow::anyhow!("swarm fill left {} chunk(s) unresolved", remaining.len())
+                .context(partial_fill),
+        );
+    }
     let verify_store = Arc::clone(&store);
     tokio::task::spawn_blocking(move || {
         for hash in hashes {
@@ -3168,6 +3242,33 @@ mod tests {
             version: version(label, counter),
             tombstone: false,
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_task_drain_waits_for_all_tasks_after_join_error() {
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let delayed_completed = Arc::clone(&completed);
+        let failed = tokio::spawn(async { panic!("expected stream failure") });
+        let delayed = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            delayed_completed.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let result = await_swarm_tasks(vec![failed, delayed]).await;
+
+        assert!(result.is_err());
+        assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn swarm_partial_fill_survives_error_context() {
+        let partial = SwarmPartialFill {
+            transferred_bytes: 4096,
+            source_ids: vec![SecretKey::generate().public()],
+        };
+        let error = anyhow::anyhow!("source failed").context(partial.clone());
+
+        assert_eq!(swarm_partial_fill(&error), Some(partial));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
