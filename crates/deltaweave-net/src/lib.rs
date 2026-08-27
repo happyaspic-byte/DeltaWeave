@@ -2018,6 +2018,15 @@ pub async fn swarm_hello(
     }
 }
 
+/// Outcome after filling a local CAS from multiple authorized swarm peers.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SwarmFillReceipt {
+    /// Number of unique chunks durably installed or already present.
+    pub transferred_chunks: usize,
+    /// Verified payload bytes received from source peers.
+    pub transferred_bytes: u64,
+}
+
 /// Requests verified CAS chunks from an authorized swarm peer.
 pub async fn swarm_get_chunks(
     secret_key: SecretKey,
@@ -2076,6 +2085,67 @@ pub async fn swarm_get_chunks(
     connection.close(0_u8.into(), b"swarm chunk fetch complete");
     endpoint.close().await;
     Ok(SwarmChunkFetch { chunks, missing })
+}
+
+/// Fills missing hashes in a local CAS from multiple authorized V3 sources.
+pub async fn swarm_fill_chunks(
+    secret_key: SecretKey,
+    sources: Vec<EndpointAddr>,
+    mode: NetworkMode,
+    store: Arc<Store>,
+    hashes: Vec<Hash32>,
+) -> Result<SwarmFillReceipt> {
+    ensure!(
+        !sources.is_empty(),
+        "swarm fill requires at least one source"
+    );
+    ensure!(
+        sources.len() <= 8,
+        "swarm fill supports at most eight sources"
+    );
+    let unique: HashSet<_> = hashes.iter().copied().collect();
+    ensure!(
+        unique.len() == hashes.len(),
+        "swarm fill contains duplicate hashes"
+    );
+
+    let mut remaining: HashSet<_> = hashes.iter().copied().collect();
+    let mut payloads = Vec::new();
+    let mut transferred_bytes = 0_u64;
+    for source in sources {
+        if remaining.is_empty() {
+            break;
+        }
+        let assigned: Vec<_> = remaining.iter().copied().collect();
+        let fetch = swarm_get_chunks(secret_key.clone(), source, mode, assigned).await?;
+        for (hash, bytes) in fetch.chunks {
+            remaining.remove(&hash);
+            transferred_bytes = transferred_bytes
+                .checked_add(bytes.len() as u64)
+                .context("swarm transferred-byte counter overflow")?;
+            payloads.push((hash, bytes));
+        }
+    }
+    ensure!(
+        remaining.is_empty(),
+        "swarm sources lack {} assigned chunk(s)",
+        remaining.len()
+    );
+    let installed = payloads.len();
+    let chunk_store = Arc::clone(&store);
+    tokio::task::spawn_blocking(move || chunk_store.chunks().put_verified_batch(payloads))
+        .await
+        .context("local swarm chunk-store task failed")??;
+    for hash in hashes {
+        ensure!(
+            store.chunks().contains(hash),
+            "swarm fill left chunk {hash} missing"
+        );
+    }
+    Ok(SwarmFillReceipt {
+        transferred_chunks: installed,
+        transferred_bytes,
+    })
 }
 
 async fn write_frame<T: Serialize>(send: &mut SendStream, value: &T) -> Result<()> {
@@ -2330,6 +2400,127 @@ mod tests {
         assert!(server.wait_online(Duration::from_millis(250)).await);
         assert!(!server.address_info().direct_addresses.is_empty());
         server.shutdown().await.expect("server shuts down");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn swarm_v3_retries_not_have_chunks_on_another_source() {
+        let client_key = SecretKey::generate();
+        let bytes = fixture(96 * 1024);
+        let hash = Hash32::digest(&bytes);
+        let mut servers = Vec::new();
+
+        for has_chunk in [false, true] {
+            let state = TempDir::new().expect("server state can be created");
+            let destination = TempDir::new().expect("server destination can be created");
+            if has_chunk {
+                let store = Store::open(state.path()).expect("server store can open");
+                store
+                    .chunks()
+                    .put_verified(hash, &bytes)
+                    .expect("source chunk can be stored");
+            }
+            let server = start_server(ServerConfig {
+                secret_key: SecretKey::generate(),
+                destination_root: destination.path().to_path_buf(),
+                state_root: state.path().to_path_buf(),
+                peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
+                network_mode: NetworkMode::DirectOnly,
+            })
+            .await
+            .expect("swarm source can start");
+            servers.push((server, state, destination));
+        }
+
+        let local = TempDir::new().expect("local state can be created");
+        let local_store = Arc::new(Store::open(local.path()).expect("local store can open"));
+        let result = swarm_fill_chunks(
+            client_key,
+            servers
+                .iter()
+                .map(|(server, _, _)| server.endpoint_addr())
+                .collect(),
+            NetworkMode::DirectOnly,
+            Arc::clone(&local_store),
+            vec![hash],
+        )
+        .await
+        .expect("missing chunk is retried on second source");
+
+        assert_eq!(result.transferred_chunks, 1);
+        assert_eq!(local_store.chunks().read_verified(hash).unwrap(), bytes);
+        for (server, _, _) in servers {
+            server.shutdown().await.expect("source shuts down");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn swarm_v3_downloads_from_two_sources_into_local_cas() {
+        let client_key = SecretKey::generate();
+        let first = fixture(96 * 1024);
+        let second = fixture(128 * 1024 + 7);
+        let first_hash = Hash32::digest(&first);
+        let second_hash = Hash32::digest(&second);
+        let mut servers = Vec::new();
+
+        for (bytes, hash) in [(&first, first_hash), (&second, second_hash)] {
+            let state = TempDir::new().expect("server state can be created");
+            let destination = TempDir::new().expect("server destination can be created");
+            {
+                let store = Store::open(state.path()).expect("server store can open");
+                store
+                    .chunks()
+                    .put_verified(hash, bytes)
+                    .expect("source chunk can be stored");
+            }
+            let server = start_server(ServerConfig {
+                secret_key: SecretKey::generate(),
+                destination_root: destination.path().to_path_buf(),
+                state_root: state.path().to_path_buf(),
+                peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
+                network_mode: NetworkMode::DirectOnly,
+            })
+            .await
+            .expect("swarm source can start");
+            servers.push((server, state, destination));
+        }
+
+        let local = TempDir::new().expect("local state can be created");
+        let local_store = Arc::new(Store::open(local.path()).expect("local store can open"));
+        let result = swarm_fill_chunks(
+            client_key,
+            servers
+                .iter()
+                .map(|(server, _, _)| server.endpoint_addr())
+                .collect(),
+            NetworkMode::DirectOnly,
+            Arc::clone(&local_store),
+            vec![first_hash, second_hash],
+        )
+        .await
+        .expect("two-source swarm fill succeeds");
+
+        assert_eq!(result.transferred_chunks, 2);
+        assert_eq!(
+            result.transferred_bytes,
+            (first.len() + second.len()) as u64
+        );
+        assert_eq!(
+            local_store
+                .chunks()
+                .read_verified(first_hash)
+                .expect("first swarm chunk stored"),
+            first
+        );
+        assert_eq!(
+            local_store
+                .chunks()
+                .read_verified(second_hash)
+                .expect("second swarm chunk stored"),
+            second
+        );
+        for (server, _, _) in servers {
+            server.shutdown().await.expect("source shuts down");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
