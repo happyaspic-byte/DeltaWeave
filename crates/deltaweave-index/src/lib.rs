@@ -333,6 +333,17 @@ impl LocalIndex {
         &self.ignored_paths
     }
 
+    /// Returns this index's authoritative local replica identity.
+    #[must_use]
+    pub const fn replica(&self) -> ReplicaId {
+        self.replica
+    }
+
+    /// Returns the durable logical counter for this index's local replica.
+    pub fn replica_counter(&self) -> Result<u64> {
+        self.metadata_value(REPLICA_COUNTER_KEY)
+    }
+
     /// Performs a complete scan and atomically commits all safe observations.
     pub fn scan(&self) -> Result<ScanReport> {
         self.scan_internal(None)
@@ -487,6 +498,11 @@ impl LocalIndex {
     /// being attached to bytes that were not actually installed.
     pub fn adopt_verified_record(&self, record: &SyncRecord) -> Result<()> {
         record.validate()?;
+        let replica_counter = self.metadata_value(REPLICA_COUNTER_KEY)?;
+        ensure!(
+            record.version.get(self.replica) <= replica_counter,
+            "remote record advances the local replica counter"
+        );
         let generation = self
             .metadata_value(GENERATION_KEY)?
             .checked_add(1)
@@ -578,9 +594,6 @@ impl LocalIndex {
 
         records.insert(record.path.clone(), adopted);
         retries.remove(&record.path);
-        let replica_counter = self
-            .metadata_value(REPLICA_COUNTER_KEY)?
-            .max(record.version.get(self.replica));
         self.commit_state(&records, &retries, generation, replica_counter)
     }
 
@@ -1777,6 +1790,37 @@ mod tests {
         assert!(scan.changes.is_empty());
         assert_eq!(scan.unchanged, 1);
         assert_eq!(index.sync_records().expect("snapshot loads"), vec![remote]);
+    }
+
+    #[test]
+    fn remote_record_cannot_advance_the_durable_local_counter() {
+        let root = TempDir::new().expect("root can be created");
+        let state = TempDir::new().expect("state can be created");
+        fs::write(root.path().join("report.txt"), b"content").expect("file can be written");
+        let index = open_index(root.path(), state.path(), 1_000);
+        index.scan().expect("initial scan succeeds");
+        let before = index.sync_records().expect("snapshot loads");
+        let counter = index.replica_counter().expect("counter loads");
+        let mut remote = before[0].clone();
+        remote.version.observe(replica(), counter + 1);
+
+        let error = index
+            .adopt_verified_record(&remote)
+            .expect_err("remote local-counter advance must be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("remote record advances the local replica counter")
+        );
+        assert_eq!(
+            index.replica_counter().expect("counter remains readable"),
+            counter
+        );
+        assert_eq!(
+            index.sync_records().expect("snapshot remains unchanged"),
+            before
+        );
     }
 
     #[test]

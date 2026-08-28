@@ -1751,6 +1751,10 @@ impl SyncHandler {
 fn ensure_causally_applicable(index: &LocalIndex, incoming: &SyncRecord) -> Result<()> {
     let report = index.scan()?;
     ensure_index_report_safe(&report)?;
+    ensure!(
+        incoming.version.get(index.replica()) <= index.replica_counter()?,
+        "incoming record advances the local replica counter"
+    );
     let Some(current) = index
         .get(&incoming.path)?
         .map(|record| record.to_sync_record())
@@ -1835,23 +1839,31 @@ impl ChunkWritePipeline {
     }
 
     async fn finish(mut self) -> Result<()> {
-        let flush_result = if self.pending.is_empty() {
-            Ok(())
-        } else {
-            self.flush_pending().await
-        };
-        let drain_result = drain_chunk_tasks(self.inflight).await;
-        flush_result.and(drain_result)
+        let mut first_error = None;
+        if !self.pending.is_empty()
+            && let Err(error) = self.flush_pending().await
+        {
+            first_error = Some(error);
+        }
+        if let Err(error) = drain_chunk_tasks(self.inflight).await
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     async fn finish_after<T>(self, operation: Result<T>) -> Result<T> {
         let finish = self.finish().await;
-        match operation {
-            Ok(value) => {
-                finish?;
-                Ok(value)
-            }
-            Err(error) => Err(error),
+        match (finish, operation) {
+            (Ok(()), result) => result,
+            (Err(storage), Ok(_)) => Err(anyhow::Error::new(LocalStorageError(storage))),
+            (Err(storage), Err(transfer)) => Err(anyhow::Error::new(LocalStorageError(
+                storage.context(format!("transfer also failed: {transfer:#}")),
+            ))),
         }
     }
 
@@ -2022,6 +2034,8 @@ const SWARM_PROTOCOL_VERSION: u16 = 3;
 const SWARM_MAX_CONNECTIONS: usize = 64;
 const SWARM_MAX_INFLIGHT: u16 = 8;
 const SWARM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const SWARM_AVAILABILITY_PAGE_TIMEOUT: Duration = Duration::from_secs(10);
+const SWARM_AVAILABILITY_TOTAL_TIMEOUT: Duration = Duration::from_secs(620);
 const SWARM_STREAM_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const SWARM_FETCH_TIMEOUT: Duration = Duration::from_secs(120);
 const SWARM_MAX_BUFFERED_FETCH_BYTES: usize = 64 * 1024 * 1024;
@@ -2174,6 +2188,11 @@ impl SwarmHandler {
             hashes.len() <= SWARM_MAX_AVAILABILITY,
             "swarm availability request exceeds {SWARM_MAX_AVAILABILITY} hashes"
         );
+        let unique: HashSet<_> = hashes.iter().copied().collect();
+        ensure!(
+            unique.len() == hashes.len(),
+            "swarm availability request contains duplicates"
+        );
         let store = Arc::clone(&self.store);
         let bits = tokio::task::spawn_blocking(move || {
             hashes
@@ -2310,6 +2329,11 @@ async fn swarm_availability_on(connection: &Connection, hashes: Vec<Hash32>) -> 
     ensure!(
         hashes.len() <= SWARM_MAX_AVAILABILITY,
         "swarm availability request exceeds {SWARM_MAX_AVAILABILITY} hashes"
+    );
+    let unique: HashSet<_> = hashes.iter().copied().collect();
+    ensure!(
+        unique.len() == hashes.len(),
+        "swarm availability request contains duplicates"
     );
     let expected_len = hashes.len();
     let (mut send, mut receive) = connection
@@ -2520,20 +2544,24 @@ enum SwarmStoredFetchError {
 }
 
 #[derive(Debug)]
-struct SwarmLocalStorageError;
+struct LocalStorageError(anyhow::Error);
 
-impl fmt::Display for SwarmLocalStorageError {
+impl fmt::Display for LocalStorageError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("local swarm storage failed")
+        write!(formatter, "local durable storage failed: {:#}", self.0)
     }
 }
 
-impl std::error::Error for SwarmLocalStorageError {}
+impl std::error::Error for LocalStorageError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
 
 /// Returns whether a swarm fill failed at the local durable CAS boundary.
 #[must_use]
 pub fn is_swarm_local_storage_error(error: &anyhow::Error) -> bool {
-    error.downcast_ref::<SwarmLocalStorageError>().is_some()
+    error.downcast_ref::<LocalStorageError>().is_some()
 }
 
 async fn swarm_store_chunks_on(
@@ -2742,53 +2770,39 @@ async fn swarm_fill_chunks_preconnected(
         let r_vec = remaining_all.clone();
         let idx = *index;
         join_set.spawn(async move {
-            let query = async {
-                let mut available = std::collections::BTreeSet::new();
-                for chunk_slice in r_vec.chunks(SWARM_MAX_AVAILABILITY) {
-                    let bits = tokio::time::timeout(
-                        SWARM_CONNECT_TIMEOUT,
-                        swarm_availability_on(&conn, chunk_slice.to_vec()),
-                    )
-                    .await
-                    .context("swarm availability page timed out")??;
-                    for (hash, present) in chunk_slice.iter().zip(bits) {
-                        if present {
-                            available.insert(*hash);
-                        }
+            let mut available = std::collections::BTreeSet::new();
+            for chunk_slice in r_vec.chunks(SWARM_MAX_AVAILABILITY) {
+                let bits = tokio::time::timeout(
+                    SWARM_AVAILABILITY_PAGE_TIMEOUT,
+                    swarm_availability_on(&conn, chunk_slice.to_vec()),
+                )
+                .await
+                .context("swarm availability page timed out")??;
+                for (hash, present) in chunk_slice.iter().zip(bits) {
+                    if present {
+                        available.insert(*hash);
                     }
                 }
-                Ok::<_, anyhow::Error>(PeerAvailability {
-                    id: swarm_source_id(&src, idx),
-                    available,
-                    rtt_ms: 1,
-                    queued_bytes: 0,
-                    goodput_bytes_per_second: 10 * 1024 * 1024,
-                    failure_penalty: 0,
-                })
-            };
-            tokio::time::timeout(SWARM_CONNECT_TIMEOUT, query)
-                .await
-                .context("swarm availability query timed out")?
+            }
+            Ok::<_, anyhow::Error>(PeerAvailability {
+                id: swarm_source_id(&src, idx),
+                available,
+                rtt_ms: 1,
+                queued_bytes: 0,
+                goodput_bytes_per_second: 10 * 1024 * 1024,
+                failure_penalty: 0,
+            })
         });
     }
     let mut peers = Vec::new();
-    let required: HashSet<_> = remaining_all.iter().copied().collect();
-    let availability_deadline = tokio::time::sleep(SWARM_CONNECT_TIMEOUT);
+    let availability_deadline =
+        tokio::time::sleep(swarm_availability_total_timeout(remaining_all.len()));
     tokio::pin!(availability_deadline);
-    loop {
+    while !join_set.is_empty() {
         tokio::select! {
-            result = join_set.join_next(), if !join_set.is_empty() => {
+            result = join_set.join_next() => {
                 if let Some(Ok(Ok(peer))) = result {
                     peers.push(peer);
-                    let covered: HashSet<_> = peers
-                        .iter()
-                        .flat_map(|peer| peer.available.iter().copied())
-                        .collect();
-                    if required.is_subset(&covered) {
-                        join_set.abort_all();
-                        while join_set.join_next().await.is_some() {}
-                        break;
-                    }
                 }
             }
             () = &mut availability_deadline => {
@@ -2796,9 +2810,6 @@ async fn swarm_fill_chunks_preconnected(
                 while join_set.join_next().await.is_some() {}
                 break;
             }
-        }
-        if join_set.is_empty() {
-            break;
         }
     }
     ensure!(
@@ -2814,11 +2825,6 @@ async fn swarm_fill_chunks_preconnected(
             max_chunks_per_peer: remaining_all.len(),
             max_assignments: remaining_all.len(),
         },
-    );
-    ensure!(
-        assignments.len() == remaining_all.len(),
-        "swarm sources lack {} requested chunk(s)",
-        remaining_all.len().saturating_sub(assignments.len())
     );
     let mut queues = vec![VecDeque::new(); sources.len()];
     for assignment in assignments {
@@ -3005,7 +3011,7 @@ async fn swarm_fill_chunks_preconnected(
     };
 
     if let Some(error) = local_error {
-        return Err(error.context(SwarmLocalStorageError));
+        return Err(anyhow::Error::new(LocalStorageError(error)));
     }
     if let Some(error) = source_error {
         return Err(error.context(partial_fill));
@@ -3179,6 +3185,13 @@ async fn read_frame<T: DeserializeOwned>(receive: &mut RecvStream) -> Result<T> 
     postcard::from_bytes(&bytes).context("malformed control frame")
 }
 
+fn swarm_availability_total_timeout(hash_count: usize) -> Duration {
+    let pages = hash_count.div_ceil(SWARM_MAX_AVAILABILITY).max(1);
+    let page_budget = SWARM_AVAILABILITY_PAGE_TIMEOUT
+        .saturating_mul(u32::try_from(pages).unwrap_or(u32::MAX));
+    SWARM_AVAILABILITY_TOTAL_TIMEOUT.min(page_budget.saturating_add(SWARM_CONNECT_TIMEOUT))
+}
+
 fn swarm_source_id(source: &EndpointAddr, index: usize) -> Hash32 {
     let mut tagged = Vec::with_capacity(source.id.as_bytes().len() + 8);
     tagged.extend_from_slice(source.id.as_bytes());
@@ -3200,7 +3213,7 @@ fn truncate_error(message: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, fs};
+    use std::{collections::HashSet, fs, io};
 
     use deltaweave_core::{SYNC_RECORD_SCHEMA_V1, VersionVector};
     use tempfile::TempDir;
@@ -3261,6 +3274,18 @@ mod tests {
     }
 
     #[test]
+    fn full_availability_query_bound_supports_maximum_hash_count() {
+        assert_eq!(
+            swarm_availability_total_timeout(MAX_CHUNKS_PER_FILE),
+            SWARM_AVAILABILITY_TOTAL_TIMEOUT
+        );
+        assert_eq!(
+            swarm_availability_total_timeout(SWARM_MAX_AVAILABILITY),
+            SWARM_AVAILABILITY_PAGE_TIMEOUT + SWARM_CONNECT_TIMEOUT
+        );
+    }
+
+    #[test]
     fn swarm_partial_fill_survives_error_context() {
         let partial = SwarmPartialFill {
             transferred_bytes: 4096,
@@ -3306,6 +3331,33 @@ mod tests {
             .await;
 
         assert!(result.is_err());
+        assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn chunk_writer_prioritizes_local_failure_over_transfer_failure() {
+        let state = TempDir::new().expect("state directory can be created");
+        let store = Arc::new(Store::open(state.path()).expect("store can open"));
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let delayed_completed = Arc::clone(&completed);
+        let mut writer = ChunkWritePipeline::new(store, 2);
+        writer.inflight.push(tokio::task::spawn_blocking(|| {
+            Err(io::Error::new(io::ErrorKind::StorageFull, "expected durable write failure").into())
+        }));
+        writer.inflight.push(tokio::task::spawn_blocking(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            delayed_completed.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(1)
+        }));
+
+        let error = writer
+            .finish_after::<()>(Err(anyhow::anyhow!("expected transfer failure")))
+            .await
+            .expect_err("durable failure remains primary");
+
+        assert!(is_swarm_local_storage_error(&error));
+        assert!(format!("{error:#}").contains("expected durable write failure"));
+        assert!(format!("{error:#}").contains("expected transfer failure"));
         assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
     }
 
@@ -3523,6 +3575,56 @@ mod tests {
         server.shutdown().await.expect("server shuts down");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn swarm_v3_rejects_duplicate_availability_hashes_before_cas_verification() {
+        let state = TempDir::new().expect("state directory can be created");
+        let destination = TempDir::new().expect("destination can be created");
+        let client_key = SecretKey::generate();
+        let server = start_server(ServerConfig {
+            secret_key: SecretKey::generate(),
+            destination_root: destination.path().to_path_buf(),
+            state_root: state.path().to_path_buf(),
+            peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
+            network_mode: NetworkMode::DirectOnly,
+        })
+        .await
+        .expect("server can start");
+        let hash = Hash32::digest(b"duplicate availability hash");
+        let chunk_path = test_chunk_path(state.path(), hash);
+        fs::create_dir_all(chunk_path.parent().expect("chunk has parent"))
+            .expect("invalid CAS fixture parent can be created");
+        fs::create_dir(&chunk_path).expect("invalid CAS fixture can be created");
+
+        let endpoint = bind_endpoint(client_key, NetworkMode::DirectOnly, None)
+            .await
+            .expect("client endpoint can bind");
+        let connection = endpoint
+            .connect(server.endpoint_addr(), ALPN_V3)
+            .await
+            .expect("authorized client can connect");
+        let (mut send, mut receive) = connection
+            .open_bi()
+            .await
+            .expect("availability stream can open");
+        write_frame(
+            &mut send,
+            &SwarmWireRequest::Availability {
+                hashes: vec![hash, hash],
+            },
+        )
+        .await
+        .expect("duplicate request frame can be sent");
+        send.finish().expect("duplicate request can finish");
+
+        read_frame::<SwarmWireResponse>(&mut receive)
+            .await
+            .expect_err("server rejects duplicate availability hashes");
+        assert!(chunk_path.is_dir());
+        connection.close(0_u8.into(), b"duplicate request rejected");
+        endpoint.close().await;
+        server.shutdown().await.expect("server shuts down");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn swarm_v3_retries_not_have_chunks_on_another_source() {
         let client_key = SecretKey::generate();
@@ -3641,6 +3743,114 @@ mod tests {
         for (server, _, _) in servers {
             server.shutdown().await.expect("source shuts down");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn swarm_v3_balances_mirrored_chunks_across_all_sources() {
+        let client_key = SecretKey::generate();
+        let chunks: Vec<_> = (0..32)
+            .map(|index| {
+                let bytes = fixture(64 * 1024 + index);
+                (Hash32::digest(&bytes), bytes)
+            })
+            .collect();
+        let mut servers = Vec::new();
+
+        for _ in 0..2 {
+            let state = TempDir::new().expect("server state can be created");
+            let destination = TempDir::new().expect("server destination can be created");
+            {
+                let store = Store::open(state.path()).expect("server store can open");
+                for (hash, bytes) in &chunks {
+                    store
+                        .chunks()
+                        .put_verified(*hash, bytes)
+                        .expect("mirrored chunk can be stored");
+                }
+            }
+            let server = start_server(ServerConfig {
+                secret_key: SecretKey::generate(),
+                destination_root: destination.path().to_path_buf(),
+                state_root: state.path().to_path_buf(),
+                peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
+                network_mode: NetworkMode::DirectOnly,
+            })
+            .await
+            .expect("mirrored source can start");
+            servers.push((server, state, destination));
+        }
+
+        let local = TempDir::new().expect("local state can be created");
+        let local_store = Arc::new(Store::open(local.path()).expect("local store can open"));
+        let receipt = swarm_fill_chunks(
+            client_key,
+            servers
+                .iter()
+                .map(|(server, _, _)| server.endpoint_addr())
+                .collect(),
+            NetworkMode::DirectOnly,
+            Arc::clone(&local_store),
+            chunks.iter().map(|(hash, _)| *hash).collect(),
+        )
+        .await
+        .expect("mirrored swarm fill succeeds");
+
+        assert_eq!(receipt.transferred_chunks, chunks.len());
+        assert_eq!(receipt.sources_used, 2);
+        for (hash, bytes) in chunks {
+            assert_eq!(local_store.chunks().read_verified(hash).unwrap(), bytes);
+        }
+        for (server, _, _) in servers {
+            server.shutdown().await.expect("source shuts down");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn swarm_v3_fetches_available_chunks_before_partial_fallback() {
+        let client_key = SecretKey::generate();
+        let available_bytes = fixture(96 * 1024);
+        let available_hash = Hash32::digest(&available_bytes);
+        let unavailable_hash = Hash32::digest(b"unavailable swarm chunk");
+        let source_state = TempDir::new().expect("source state can be created");
+        let source_destination = TempDir::new().expect("source destination can be created");
+        {
+            let store = Store::open(source_state.path()).expect("source store can open");
+            store
+                .chunks()
+                .put_verified(available_hash, &available_bytes)
+                .expect("available chunk can be stored");
+        }
+        let server = start_server(ServerConfig {
+            secret_key: SecretKey::generate(),
+            destination_root: source_destination.path().to_path_buf(),
+            state_root: source_state.path().to_path_buf(),
+            peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
+            network_mode: NetworkMode::DirectOnly,
+        })
+        .await
+        .expect("partial source can start");
+        let local = TempDir::new().expect("local state can be created");
+        let local_store = Arc::new(Store::open(local.path()).expect("local store can open"));
+
+        let error = swarm_fill_chunks(
+            client_key,
+            vec![server.endpoint_addr()],
+            NetworkMode::DirectOnly,
+            Arc::clone(&local_store),
+            vec![available_hash, unavailable_hash],
+        )
+        .await
+        .expect_err("incomplete source returns partial progress");
+        let partial = swarm_partial_fill(&error).expect("partial progress is preserved");
+
+        assert_eq!(partial.transferred_bytes, available_bytes.len() as u64);
+        assert_eq!(partial.source_ids, vec![server.endpoint_addr().id]);
+        assert_eq!(
+            local_store.chunks().read_verified(available_hash).unwrap(),
+            available_bytes
+        );
+        assert!(!local_store.chunks().contains(unavailable_hash));
+        server.shutdown().await.expect("source shuts down");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4018,6 +4228,65 @@ mod tests {
         assert_eq!(receipt.manifest.file_hash, Hash32::digest(&bytes));
         assert_eq!(receipt.transferred_bytes, 0);
         assert_eq!(receipt.reused_extents, receipt.manifest.chunks.len());
+        server.shutdown().await.expect("server shuts down");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reconciliation_v2_rejects_receiver_counter_poisoning() {
+        let server_state = TempDir::new().expect("server state can be created");
+        let server_root = TempDir::new().expect("server root can be created");
+        let client_key = SecretKey::generate();
+        let server_key = SecretKey::generate();
+        let receiver_replica = ReplicaId(Hash32::digest(server_key.public().as_bytes()));
+        let server = start_server(ServerConfig {
+            secret_key: server_key,
+            destination_root: server_root.path().to_path_buf(),
+            state_root: server_state.path().to_path_buf(),
+            peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
+            network_mode: NetworkMode::DirectOnly,
+        })
+        .await
+        .expect("server can start");
+        let client = SyncClient {
+            secret_key: client_key,
+            remote: server.endpoint_addr(),
+            network_mode: NetworkMode::DirectOnly,
+        };
+        let poisoned_path = WirePath::new("poisoned").expect("path is portable");
+        let mut poisoned_version = VersionVector::default();
+        poisoned_version.observe(receiver_replica, u64::MAX);
+        let poisoned = SyncRecord {
+            schema_version: SYNC_RECORD_SCHEMA_V1,
+            path: poisoned_path.clone(),
+            kind: SyncEntryKind::Directory,
+            size: 0,
+            content_hash: None,
+            readonly: false,
+            version: poisoned_version,
+            tombstone: false,
+        };
+
+        let error = client
+            .apply_metadata(poisoned)
+            .await
+            .expect_err("receiver-local counter poisoning is rejected");
+        assert!(error.to_string().contains("local replica counter"));
+        assert!(!server_root.path().join(poisoned_path.as_str()).exists());
+
+        fs::write(server_root.path().join("local.txt"), b"local")
+            .expect("normal local change can be written");
+        let empty =
+            MerkleTree::from_records(Vec::<SyncRecord>::new()).expect("empty tree is valid");
+        let snapshot = client
+            .fetch_snapshot(&empty)
+            .await
+            .expect("normal local scan remains functional");
+        let local = snapshot
+            .records
+            .iter()
+            .find(|record| record.path.as_str() == "local.txt")
+            .expect("local change is indexed");
+        assert_eq!(local.version.get(receiver_replica), 1);
         server.shutdown().await.expect("server shuts down");
     }
 

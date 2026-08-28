@@ -266,7 +266,12 @@ impl SyncEngine {
         for hash in required {
             if let Some(source) = local_sources.get(&hash) {
                 let source_path = local_path(&self.root, &source.path);
-                let manifest = self.store.ingest_file(&source_path, self.profile)?;
+                let store = Arc::clone(&self.store);
+                let profile = self.profile;
+                let manifest =
+                    tokio::task::spawn_blocking(move || store.ingest_file(source_path, profile))
+                        .await
+                        .context("local file ingestion task failed")??;
                 ensure!(
                     manifest.file_hash == hash,
                     "local source changed after its snapshot"
@@ -279,7 +284,8 @@ impl SyncEngine {
                 .get(&hash)
                 .with_context(|| format!("no peer retains required content {hash}"))?;
             let manifest_receipt = session.pull_manifest((*source).clone()).await?;
-            let missing = self.store.missing_chunks(&manifest_receipt.manifest);
+            let missing =
+                missing_chunks(Arc::clone(&self.store), manifest_receipt.manifest.clone()).await?;
             if !missing.is_empty()
                 && swarm.is_none()
                 && !swarm_attempted
@@ -357,7 +363,9 @@ impl SyncEngine {
 
         match swarm_outcome {
             Ok(receipt) => {
-                let still_missing = self.store.missing_chunks(&manifest_receipt.manifest);
+                let still_missing =
+                    missing_chunks(Arc::clone(&self.store), manifest_receipt.manifest.clone())
+                        .await?;
                 if still_missing.is_empty() {
                     let missing_set: std::collections::HashSet<_> = missing.into_iter().collect();
                     let reused_extents = manifest_receipt
@@ -491,6 +499,12 @@ async fn scan_index(index: Arc<LocalIndex>) -> Result<ScanReport> {
         .context("index scan task failed")?
 }
 
+async fn missing_chunks(store: Arc<Store>, manifest: FileManifest) -> Result<Vec<Hash32>> {
+    tokio::task::spawn_blocking(move || store.missing_chunks(&manifest))
+        .await
+        .context("chunk inventory task failed")
+}
+
 async fn read_records(index: Arc<LocalIndex>) -> Result<Vec<SyncRecord>> {
     tokio::task::spawn_blocking(move || index.sync_records())
         .await
@@ -613,6 +627,43 @@ mod tests {
 
     fn replica(key: &SecretKey) -> ReplicaId {
         ReplicaId(Hash32::digest(key.public().as_bytes()))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn async_missing_chunk_inventory_preserves_results() {
+        let state = TempDir::new().expect("state can be created");
+        let local = Arc::new(Store::open(state.path()).expect("store can open"));
+        let first = Hash32::digest(b"first missing chunk");
+        let second = Hash32::digest(b"second missing chunk");
+        let manifest = FileManifest {
+            schema_version: deltaweave_core::MANIFEST_SCHEMA_V1,
+            size: 3,
+            file_hash: Hash32::digest(b"aba"),
+            profile: ChunkingProfile::DEFAULT,
+            chunks: vec![
+                deltaweave_core::ChunkDescriptor {
+                    offset: 0,
+                    length: 1,
+                    hash: first,
+                },
+                deltaweave_core::ChunkDescriptor {
+                    offset: 1,
+                    length: 1,
+                    hash: second,
+                },
+                deltaweave_core::ChunkDescriptor {
+                    offset: 2,
+                    length: 1,
+                    hash: first,
+                },
+            ],
+        };
+
+        let missing = missing_chunks(Arc::clone(&local), manifest)
+            .await
+            .expect("inventory helper completes");
+
+        assert_eq!(missing, vec![first, second]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -743,6 +794,93 @@ mod tests {
         assert_eq!(after_restart.local_actions, 0);
         assert_eq!(after_restart.remote_actions, 0);
         server.shutdown().await.expect("server shuts down");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sync_once_uses_partial_swarm_progress_before_v2_fallback() {
+        let local_root = TempDir::new().expect("local root can be created");
+        let local_state = TempDir::new().expect("local state can be created");
+        let remote_root = TempDir::new().expect("remote root can be created");
+        let remote_state = TempDir::new().expect("remote state can be created");
+        let payload: Vec<u8> = (0..4 * 1024 * 1024)
+            .map(|index| ((index * 31) ^ (index >> 5)) as u8)
+            .collect();
+        let remote_file = remote_root.path().join("partial.bin");
+        fs::write(&remote_file, &payload).expect("remote seed file can be written");
+        let seed_state = TempDir::new().expect("seed state can be created");
+        let seed_store = Store::open(seed_state.path()).expect("seed store opens");
+        let seed_manifest = seed_store
+            .ingest_file(&remote_file, ChunkingProfile::DEFAULT)
+            .expect("seed file is chunked");
+        assert!(seed_manifest.chunks.len() > 1);
+        let swarm_state = TempDir::new().expect("swarm state can be created");
+        let swarm_destination = TempDir::new().expect("swarm destination can be created");
+        {
+            let store = Store::open(swarm_state.path()).expect("swarm store opens");
+            let descriptor = seed_manifest.chunks.first().expect("fixture has a chunk");
+            let bytes = seed_store
+                .chunks()
+                .read_verified(descriptor.hash)
+                .expect("seed chunk readable");
+            store
+                .chunks()
+                .put_verified(descriptor.hash, &bytes)
+                .expect("partial source chunk can be stored");
+        }
+
+        let client_key = SecretKey::generate();
+        let auth_server = start_server(ServerConfig {
+            secret_key: SecretKey::generate(),
+            destination_root: remote_root.path().to_path_buf(),
+            state_root: remote_state.path().to_path_buf(),
+            peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
+            network_mode: NetworkMode::DirectOnly,
+        })
+        .await
+        .expect("authoritative server starts");
+        let swarm_server = start_server(ServerConfig {
+            secret_key: SecretKey::generate(),
+            destination_root: swarm_destination.path().to_path_buf(),
+            state_root: swarm_state.path().to_path_buf(),
+            peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
+            network_mode: NetworkMode::DirectOnly,
+        })
+        .await
+        .expect("partial swarm source starts");
+        let engine = SyncEngine::open(SyncConfig {
+            root: local_root.path().to_path_buf(),
+            state_root: local_state.path().to_path_buf(),
+            replica: replica(&client_key),
+            client: SyncClient {
+                secret_key: client_key,
+                remote: auth_server.endpoint_addr(),
+                network_mode: NetworkMode::DirectOnly,
+            },
+            swarm_sources: vec![swarm_server.endpoint_addr()],
+            profile: ChunkingProfile::DEFAULT,
+            ignored_paths: Vec::new(),
+        })
+        .expect("sync engine opens");
+
+        let report = engine
+            .sync_once()
+            .await
+            .expect("partial swarm fill and v2 fallback converge");
+
+        assert_eq!(report.swarm_sources_used, 1);
+        assert_eq!(report.verified_local_root, report.verified_remote_root);
+        assert_eq!(
+            fs::read(local_root.path().join("partial.bin")).expect("local file readable"),
+            payload
+        );
+        auth_server
+            .shutdown()
+            .await
+            .expect("auth server shuts down");
+        swarm_server
+            .shutdown()
+            .await
+            .expect("swarm server shuts down");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
