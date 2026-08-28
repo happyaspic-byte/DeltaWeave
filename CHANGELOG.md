@@ -5,6 +5,17 @@ Versioning after its first stable release.
 
 ## [Unreleased]
 
+### Security
+
+- Reject non-NFC WirePath aliases, Unicode whitespace, fullwidth-dot lookalikes,
+  and reserved Windows names padded with format characters.
+- Disable postcard default features so `heapless`/`atomic-polyfill` drop out of
+  the lockfile when the graph permits; keep `RUSTSEC-2024-0436` ignored until
+  iroh no longer pulls unmaintained `paste`.
+- Add `deny.toml` and a cargo-deny GitHub Actions job covering licenses, bans,
+  advisories, and crate sources.
+- Add a `cargo-fuzz` target for `WirePath` parsing.
+
 ## [0.3.0] - 2026-08-26
 
 ### Added

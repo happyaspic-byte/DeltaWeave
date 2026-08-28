@@ -2061,9 +2061,13 @@ mod tests {
 
     #[test]
     fn collision_key_normalizes_case_and_unicode_composition() {
-        let upper = WirePath::new("Reports/CAFÉ.txt").expect("path is portable");
-        let decomposed = WirePath::new("reports/CAFE\u{301}.TXT").expect("path is portable");
-        assert_eq!(collision_key(&upper), collision_key(&decomposed));
+        let upper = WirePath::new("Reports/CAFÉ.txt").expect("NFC path is portable");
+        let mixed = WirePath::new("reports/café.TXT").expect("NFC path is portable");
+        assert_eq!(collision_key(&upper), collision_key(&mixed));
+        assert_eq!(
+            WirePath::new("reports/CAFE\u{301}.TXT"),
+            Err(deltaweave_core::WirePathError::NotCanonical)
+        );
 
         let sharp_s = WirePath::new("Straße.txt").expect("path is portable");
         let expanded = WirePath::new("STRASSE.TXT").expect("path is portable");

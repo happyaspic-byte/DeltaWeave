@@ -1,0 +1,23 @@
+[package]
+name = "deltaweave-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.91"
+
+[workspace]
+members = ["."]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+deltaweave-core = { path = "../crates/deltaweave-core" }
+
+[[bin]]
+name = "wire_path"
+path = "fuzz_targets/wire_path.rs"
+test = false
+doc = false
+bench = false
