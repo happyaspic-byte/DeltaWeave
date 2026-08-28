@@ -197,9 +197,12 @@ jobs:
       - name: Install cargo-audit
         run: cargo install cargo-audit --version 0.22.2 --locked
       - name: Audit release lockfile
+        # Unmaintained paste remains a transitive iroh/netlink crate
+        # (RUSTSEC-2024-0436). Yanked chacha20 is pulled by iroh/rand and is
+        # tracked as a warning in deny.toml. Keep every other RustSec warning
+        # fatal. --no-yanked matches .github/workflows/security.yml.
         run: >-
-          cargo audit --deny warnings
-          --ignore RUSTSEC-2023-0089
+          cargo audit --deny warnings --no-yanked
           --ignore RUSTSEC-2024-0436
 
   publish:
