@@ -151,6 +151,19 @@ fn dispatch(instance: &DaemonInstance, request: Request) -> Response {
                 instance_id: instance.instance_id.clone(),
             }),
         },
+        (
+            Ok(_),
+            Command::CreateJob {
+                preview_confirmed: false,
+                ..
+            },
+        ) => Response {
+            request_id: request.request_id,
+            result: Err(ErrorBody {
+                code: ErrorCode::InvalidRequest,
+                message: "preview confirmation required".into(),
+            }),
+        },
         (Ok(_), Command::Stop) => Response {
             request_id: request.request_id,
             result: Ok(CommandResult::Accepted {
@@ -185,4 +198,35 @@ async fn read_frame<T: serde::de::DeserializeOwned>(stream: &mut UnixStream) -> 
     let mut buf = vec![0_u8; len];
     stream.read_exact(&mut buf).await?;
     serde_json::from_slice(&buf).context("invalid IPC JSON")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use deltaweave_daemon_api::Direction;
+
+    #[test]
+    fn create_job_requires_preview_confirmation() {
+        let response = dispatch(
+            &DaemonInstance::new(),
+            Request {
+                protocol_version: ProtocolVersion {
+                    major: PROTOCOL_VERSION_MAJOR,
+                    minor: PROTOCOL_VERSION_MINOR,
+                },
+                request_id: "create".into(),
+                command: Command::CreateJob {
+                    name: "ISOs".into(),
+                    local_root: "/tmp/x".into(),
+                    peer_endpoint_id: "aa".repeat(32),
+                    direction: Direction::Bidirectional,
+                    preview_confirmed: false,
+                },
+            },
+        );
+
+        let error = response.result.unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+        assert_eq!(error.message, "preview confirmation required");
+    }
 }

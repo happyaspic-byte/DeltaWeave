@@ -75,6 +75,8 @@ pub enum Command {
         peer_endpoint_id: String,
         /// Transfer direction.
         direction: Direction,
+        /// The user explicitly accepted the dry-run preview.
+        preview_confirmed: bool,
     },
     /// Pause a running job.
     PauseJob {

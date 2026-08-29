@@ -24,3 +24,29 @@ h2 {
   font-size: 16px;
   margin: 0 0 8px;
 }
+
+.wizard {
+  margin: 16px 24px;
+  padding: 20px;
+  border: 1px solid #d4d9df;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.wizard label {
+  display: block;
+  margin: 12px 0;
+}
+
+.wizard input[type="text"],
+.wizard input:not([type]) {
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 520px;
+  padding: 8px;
+}
+
+.wizard-step,
+.wizard small {
+  color: #56616f;
+}
