@@ -61,6 +61,8 @@ enum Command {
     Sync(SyncArgs),
     /// Manage pairing tickets, authorized peers, and identity rotation.
     Pair(PairArgs),
+    /// Attach to or run the local daemon.
+    Daemon(DaemonArgs),
     /// Run an isolated local end-to-end transfer and delta-reuse check.
     SelfTest,
 }
@@ -147,6 +149,20 @@ struct ServeArgs {
     /// Fixed UDP bind address so pairing tickets survive server restart.
     #[arg(long)]
     bind: Option<SocketAddr>,
+}
+
+#[derive(Debug, Args)]
+struct DaemonArgs {
+    #[command(subcommand)]
+    command: DaemonCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum DaemonCommand {
+    /// Run the daemon in the foreground.
+    Run,
+    /// Print Hello from a live daemon.
+    Status,
 }
 
 #[derive(Debug, Args)]
@@ -341,6 +357,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::SyncOnce(args) => sync_once(args).await,
         Command::Sync(args) => sync_forever(args).await,
         Command::Pair(args) => pair(args).await,
+        Command::Daemon(args) => daemon(args).await,
         Command::SelfTest => self_test().await,
     }
 }
@@ -460,6 +477,35 @@ async fn wait_for_shutdown_signal() -> Result<()> {
     tokio::signal::ctrl_c()
         .await
         .context("failed to wait for Ctrl-C")
+}
+
+async fn daemon(args: DaemonArgs) -> Result<()> {
+    match args.command {
+        DaemonCommand::Run => deltaweave_daemon::run().await,
+        DaemonCommand::Status => daemon_status().await,
+    }
+}
+
+async fn daemon_status() -> Result<()> {
+    #[cfg(unix)]
+    {
+        let data_dir = deltaweave_daemon::default_data_dir()?;
+        let socket = deltaweave_daemon::ipc_path(&data_dir);
+        let hello = deltaweave_daemon::connect_and_hello(&socket)
+            .await
+            .with_context(|| format!("failed to attach to {}", socket.display()))?;
+        print_json(&json!({
+            "instance_id": hello.instance_id,
+            "protocol_version": {
+                "major": hello.protocol_version.major,
+                "minor": hello.protocol_version.minor,
+            },
+        }))
+    }
+    #[cfg(not(unix))]
+    {
+        anyhow::bail!("daemon status is only implemented on Unix in this build")
+    }
 }
 
 async fn pair(args: PairArgs) -> Result<()> {
@@ -1231,6 +1277,17 @@ mod tests {
         assert_eq!(args.debounce_ms, 750);
         assert_eq!(args.max_debounce_ms, 5_000);
         assert_eq!(args.max_backoff_seconds, 300);
+    }
+
+    #[test]
+    fn daemon_status_parses() {
+        let cli = Cli::try_parse_from(["deltaweave", "daemon", "status"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Daemon(DaemonArgs {
+                command: DaemonCommand::Status
+            })
+        ));
     }
 
     #[test]

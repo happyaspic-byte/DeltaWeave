@@ -9,6 +9,7 @@ mod ipc;
 mod jobs;
 mod pair;
 mod preview;
+mod runtime;
 
 pub use config::{ConfigStore, Direction, JobConfig};
 pub use instance::DaemonInstance;
@@ -17,6 +18,7 @@ pub use ipc::{connect_and_hello, serve_unix, try_bind_unix, wait_until_exists};
 pub use jobs::{JobSupervisor, ProgressCoalescer};
 pub use pair::{PairingConfig, PairingService};
 pub use preview::{list_conflicts, preview_snapshots, resolve_conflict};
+pub use runtime::{default_data_dir, ipc_path, run};
 
 #[cfg(test)]
 mod tests {

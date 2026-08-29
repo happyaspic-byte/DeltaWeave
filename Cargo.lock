@@ -594,6 +594,7 @@ dependencies = [
  "clap",
  "deltaweave-cdc",
  "deltaweave-core",
+ "deltaweave-daemon",
  "deltaweave-index",
  "deltaweave-net",
  "deltaweave-sync",
