@@ -5,7 +5,7 @@ use std::{fmt, path::PathBuf, sync::Arc};
 use anyhow::{Result, bail};
 use deltaweave_daemon_api::{CommandResult, ConflictAction, Direction as ApiDirection, JobInfo};
 
-use crate::{ConfigStore, Direction, JobSupervisor};
+use crate::{ConfigStore, Direction, JobSupervisor, PairingService};
 
 /// Unique live daemon process.
 #[derive(Clone)]
@@ -15,6 +15,7 @@ pub struct DaemonInstance {
     stop: tokio::sync::watch::Sender<bool>,
     config: Option<Arc<ConfigStore>>,
     supervisor: Arc<JobSupervisor>,
+    pairing: Option<Arc<PairingService>>,
 }
 
 impl fmt::Debug for DaemonInstance {
@@ -66,7 +67,20 @@ impl DaemonInstance {
             stop,
             config,
             supervisor: Arc::new(supervisor),
+            pairing: None,
         }
+    }
+
+    /// Creates an instance that can issue and redeem pairing tickets.
+    #[must_use]
+    pub fn with_pairing(
+        config: Option<Arc<ConfigStore>>,
+        supervisor: JobSupervisor,
+        pairing: PairingService,
+    ) -> Self {
+        let mut instance = Self::with_runtime(config, supervisor);
+        instance.pairing = Some(Arc::new(pairing));
+        instance
     }
 
     pub(crate) fn request_stop(&self) {
@@ -158,6 +172,27 @@ impl DaemonInstance {
     pub(crate) fn list_job_conflicts(&self, id: &str) -> Result<CommandResult> {
         let job = self.job(id)?;
         crate::list_conflicts(&job.local_root)
+    }
+
+    pub(crate) async fn redeem_ticket(&self, code: &str) -> Result<CommandResult> {
+        self.pairing_service()?.redeem_ticket(code).await
+    }
+
+    pub(crate) fn issue_ticket(&self, ttl_seconds: Option<u64>) -> Result<CommandResult> {
+        self.pairing_service()?.issue_ticket(ttl_seconds)
+    }
+
+    pub(crate) fn revoke_peer(&self, endpoint_id: &str) -> Result<CommandResult> {
+        self.pairing_service()?.revoke_peer(endpoint_id)?;
+        Ok(CommandResult::Accepted {
+            id: endpoint_id.into(),
+        })
+    }
+
+    fn pairing_service(&self) -> Result<&PairingService> {
+        self.pairing
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("pairing service unavailable"))
     }
 
     fn job(&self, id: &str) -> Result<crate::JobConfig> {

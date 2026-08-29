@@ -25,10 +25,11 @@ pub struct PairingConfig {
 }
 
 /// Owns one iroh server plus its access store for ticket issue/redeem/revoke.
+#[derive(Clone)]
 pub struct PairingService {
     identity: Identity,
     access: Arc<access::AccessStore>,
-    server: Option<Server>,
+    server: Option<Arc<Server>>,
 }
 
 impl PairingService {
@@ -64,7 +65,7 @@ impl PairingService {
         Ok(Self {
             identity,
             access,
-            server: Some(server),
+            server: Some(Arc::new(server)),
         })
     }
 
@@ -124,10 +125,15 @@ impl PairingService {
         self.access.revoke(peer)
     }
 
-    /// Shuts down the iroh server.
+    /// Shuts down the iroh server when this is the last handle.
     pub async fn shutdown(mut self) -> Result<()> {
         if let Some(server) = self.server.take() {
-            server.shutdown().await?;
+            match Arc::try_unwrap(server) {
+                Ok(owned) => owned.shutdown().await?,
+                Err(shared) => {
+                    let _ = shared;
+                }
+            }
         }
         Ok(())
     }

@@ -53,17 +53,24 @@ pub async fn run() -> Result<()> {
         return Ok(());
     }
     let store = std::sync::Arc::new(crate::ConfigStore::open(data_dir.join("config.redb"))?);
+    let pairing = crate::PairingService::start(crate::PairingConfig {
+        state_root: data_dir.join("pairing"),
+        destination_root: data_dir.join("pairing-inbox"),
+        identity_path: data_dir.join("identity.key"),
+        bind: None,
+    })
+    .await?;
     #[cfg(unix)]
     {
-        run_unix(&data_dir, store).await
+        run_unix(&data_dir, store, pairing).await
     }
     #[cfg(windows)]
     {
-        run_windows(&data_dir, store).await
+        run_windows(&data_dir, store, pairing).await
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (data_dir, store);
+        let _ = (data_dir, store, pairing);
         anyhow::bail!("daemon IPC is not implemented on this platform")
     }
 }
@@ -79,15 +86,19 @@ async fn try_attach(data_dir: &Path) -> Result<Option<String>> {
 }
 
 #[cfg(unix)]
-async fn run_unix(data_dir: &Path, store: std::sync::Arc<crate::ConfigStore>) -> Result<()> {
+async fn run_unix(
+    data_dir: &Path,
+    store: std::sync::Arc<crate::ConfigStore>,
+    pairing: crate::PairingService,
+) -> Result<()> {
     use std::time::{Duration, Instant};
 
     use anyhow::ensure;
 
-    use crate::{DaemonInstance, serve_unix};
+    use crate::{DaemonInstance, JobSupervisor, serve_unix};
 
     let socket = ipc_path(data_dir);
-    let instance = DaemonInstance::with_config(Some(store));
+    let instance = DaemonInstance::with_pairing(Some(store), JobSupervisor::new(), pairing);
     let instance_id = instance.instance_id.clone();
     let serve_socket = socket.clone();
     let mut server = tokio::spawn(async move { serve_unix(instance, serve_socket).await });
@@ -120,11 +131,15 @@ async fn run_unix(data_dir: &Path, store: std::sync::Arc<crate::ConfigStore>) ->
 }
 
 #[cfg(windows)]
-async fn run_windows(data_dir: &Path, store: std::sync::Arc<crate::ConfigStore>) -> Result<()> {
-    use crate::{DaemonInstance, serve_windows};
+async fn run_windows(
+    data_dir: &Path,
+    store: std::sync::Arc<crate::ConfigStore>,
+    pairing: crate::PairingService,
+) -> Result<()> {
+    use crate::{DaemonInstance, JobSupervisor, serve_windows};
 
     let socket = ipc_path(data_dir);
-    let instance = DaemonInstance::with_config(Some(store));
+    let instance = DaemonInstance::with_pairing(Some(store), JobSupervisor::new(), pairing);
     let instance_id = instance.instance_id.clone();
     let serve_socket = socket.clone();
     let mut server = tokio::spawn(async move { serve_windows(instance, serve_socket).await });

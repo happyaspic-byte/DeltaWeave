@@ -90,7 +90,7 @@ where
             Ok(request) => request,
             Err(_) => return Ok(()),
         };
-        let response = dispatch(&instance, request);
+        let response = dispatch(&instance, request).await;
         let stopping = matches!(
             response.result,
             Ok(CommandResult::Accepted { ref id }) if id == "daemon"
@@ -108,12 +108,12 @@ fn command_response(request_id: String, result: Result<CommandResult>) -> Respon
         request_id,
         result: result.map_err(|error| ErrorBody {
             code: ErrorCode::InvalidRequest,
-            message: error.to_string(),
+            message: crate::redact_diagnostics(&error.to_string()),
         }),
     }
 }
 
-fn dispatch(instance: &DaemonInstance, request: Request) -> Response {
+async fn dispatch(instance: &DaemonInstance, request: Request) -> Response {
     let negotiated = request
         .protocol_version
         .negotiate(PROTOCOL_VERSION_MAJOR, PROTOCOL_VERSION_MINOR);
@@ -167,6 +167,15 @@ fn dispatch(instance: &DaemonInstance, request: Request) -> Response {
         }
         (Ok(_), Command::ListConflicts { id }) => {
             command_response(request.request_id, instance.list_job_conflicts(&id))
+        }
+        (Ok(_), Command::IssueTicket { ttl_seconds }) => {
+            command_response(request.request_id, instance.issue_ticket(ttl_seconds))
+        }
+        (Ok(_), Command::RedeemTicket { code }) => {
+            command_response(request.request_id, instance.redeem_ticket(&code).await)
+        }
+        (Ok(_), Command::RevokePeer { endpoint_id }) => {
+            command_response(request.request_id, instance.revoke_peer(&endpoint_id))
         }
         (Ok(_), Command::Stop) => Response {
             request_id: request.request_id,
@@ -396,8 +405,8 @@ mod tests {
     use super::*;
     use deltaweave_daemon_api::Direction;
 
-    #[test]
-    fn create_job_requires_preview_confirmation() {
+    #[tokio::test]
+    async fn create_job_requires_preview_confirmation() {
         let response = dispatch(
             &DaemonInstance::new(),
             Request {
@@ -414,15 +423,16 @@ mod tests {
                     preview_confirmed: false,
                 },
             },
-        );
+        )
+        .await;
 
         let error = response.result.unwrap_err();
         assert_eq!(error.code, ErrorCode::InvalidRequest);
         assert_eq!(error.message, "preview confirmation required");
     }
 
-    #[test]
-    fn resolve_conflict_keep_remote_replaces_canonical() {
+    #[tokio::test]
+    async fn resolve_conflict_keep_remote_replaces_canonical() {
         use std::sync::Arc;
 
         use crate::{ConfigStore, JobConfig};
@@ -462,7 +472,8 @@ mod tests {
                     action: ConflictAction::KeepRemote,
                 },
             },
-        );
+        )
+        .await;
 
         assert_eq!(
             response.result.unwrap(),
@@ -484,8 +495,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn create_job_persists_when_preview_confirmed() {
+    #[tokio::test]
+    async fn create_job_persists_when_preview_confirmed() {
         use std::sync::Arc;
 
         use crate::{ConfigStore, JobSupervisor};
@@ -506,6 +517,7 @@ mod tests {
                 preview_confirmed: true,
             }),
         )
+        .await
         .result
         .unwrap();
         let CommandResult::Accepted { id } = created else {
@@ -513,6 +525,7 @@ mod tests {
         };
 
         let listed = dispatch(&instance, request(Command::ListJobs))
+            .await
             .result
             .unwrap();
         let CommandResult::Jobs { jobs } = listed else {
@@ -525,8 +538,8 @@ mod tests {
         assert!(!jobs[0].paused);
     }
 
-    #[test]
-    fn pause_and_resume_job_update_supervisor() {
+    #[tokio::test]
+    async fn pause_and_resume_job_update_supervisor() {
         use std::sync::Arc;
 
         use crate::{ConfigStore, JobSupervisor};
@@ -548,6 +561,7 @@ mod tests {
                 preview_confirmed: true,
             }),
         )
+        .await
         .result
         .unwrap();
         let CommandResult::Accepted { id } = created else {
@@ -555,10 +569,12 @@ mod tests {
         };
 
         let paused = dispatch(&instance, request(Command::PauseJob { id: id.clone() }))
+            .await
             .result
             .unwrap();
         assert_eq!(paused, CommandResult::Accepted { id: id.clone() });
         let listed = dispatch(&instance, request(Command::ListJobs))
+            .await
             .result
             .unwrap();
         let CommandResult::Jobs { jobs } = listed else {
@@ -567,16 +583,80 @@ mod tests {
         assert!(jobs[0].paused);
 
         let resumed = dispatch(&instance, request(Command::ResumeJob { id: id.clone() }))
+            .await
             .result
             .unwrap();
         assert_eq!(resumed, CommandResult::Accepted { id });
         let listed = dispatch(&instance, request(Command::ListJobs))
+            .await
             .result
             .unwrap();
         let CommandResult::Jobs { jobs } = listed else {
             panic!("expected Jobs, got {listed:?}");
         };
         assert!(!jobs[0].paused);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn redeem_ticket_reaches_pairing_service_and_single_use_is_enforced() {
+        use crate::{PairingConfig, PairingService};
+        use deltaweave_daemon_api::CommandResult;
+
+        let server_dir = tempfile::tempdir().unwrap();
+        let client_dir = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let reserved = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let bind = reserved.local_addr().unwrap();
+        drop(reserved);
+
+        let server = PairingService::start(PairingConfig {
+            state_root: server_dir.path().to_path_buf(),
+            destination_root: dest.path().to_path_buf(),
+            identity_path: server_dir.path().join("node.key"),
+            bind: Some(bind),
+        })
+        .await
+        .unwrap();
+        let issued = server.issue_ticket(None).unwrap();
+        let CommandResult::TicketIssued { code, .. } = issued else {
+            panic!("expected TicketIssued, got {issued:?}");
+        };
+
+        let client = PairingService::start(PairingConfig {
+            state_root: client_dir.path().join("state"),
+            destination_root: client_dir.path().join("dest"),
+            identity_path: client_dir.path().join("node.key"),
+            bind: None,
+        })
+        .await
+        .unwrap();
+        let redeem_client = client.clone();
+
+        let instance =
+            DaemonInstance::with_pairing(None, crate::JobSupervisor::new(), redeem_client);
+        let response = dispatch(
+            &instance,
+            request(Command::RedeemTicket { code: code.clone() }),
+        )
+        .await;
+
+        match response.result {
+            Ok(CommandResult::TicketRedeemed { outcome, .. }) => {
+                assert_eq!(outcome, "paired");
+            }
+            other => panic!("expected TicketRedeemed, got {other:?}"),
+        }
+
+        let second = dispatch(&instance, request(Command::RedeemTicket { code })).await;
+        let error = second
+            .result
+            .expect_err("a consumed ticket cannot be redeemed twice");
+        assert!(
+            !format!("{error:?}").contains("dwpair1:"),
+            "error must not echo the ticket code"
+        );
+        client.shutdown().await.unwrap();
+        server.shutdown().await.unwrap();
     }
 
     #[cfg(windows)]
