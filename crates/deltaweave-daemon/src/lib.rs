@@ -7,12 +7,16 @@ mod instance;
 #[cfg(unix)]
 mod ipc;
 mod jobs;
+mod pair;
+mod preview;
 
 pub use config::{ConfigStore, Direction, JobConfig};
 pub use instance::DaemonInstance;
 #[cfg(unix)]
 pub use ipc::{connect_and_hello, serve_unix, try_bind_unix, wait_until_exists};
 pub use jobs::{JobSupervisor, ProgressCoalescer};
+pub use pair::{PairingConfig, PairingService};
+pub use preview::{list_conflicts, preview_snapshots, resolve_conflict};
 
 #[cfg(test)]
 mod tests {
@@ -79,5 +83,54 @@ mod tests {
 
     fn dummy_progress(i: u64) -> u64 {
         i
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn consumed_ticket_cannot_be_redeemed_twice_through_daemon() {
+        use deltaweave_daemon_api::CommandResult;
+
+        let server_dir = tempfile::tempdir().unwrap();
+        let client_dir = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let reserved = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let bind = reserved.local_addr().unwrap();
+        drop(reserved);
+
+        let server = PairingService::start(PairingConfig {
+            state_root: server_dir.path().to_path_buf(),
+            destination_root: dest.path().to_path_buf(),
+            identity_path: server_dir.path().join("node.key"),
+            bind: Some(bind),
+        })
+        .await
+        .unwrap();
+        let issued = server.issue_ticket(None).unwrap();
+        let CommandResult::TicketIssued { code, .. } = issued else {
+            panic!("expected TicketIssued, got {issued:?}");
+        };
+        assert!(code.starts_with("dwpair1:"));
+
+        let client = PairingService::start(PairingConfig {
+            state_root: client_dir.path().join("state"),
+            destination_root: client_dir.path().join("dest"),
+            identity_path: client_dir.path().join("node.key"),
+            bind: None,
+        })
+        .await
+        .unwrap();
+        let first = client.redeem_ticket(&code).await.unwrap();
+        match first {
+            CommandResult::TicketRedeemed { outcome, .. } => {
+                assert_eq!(outcome, "paired");
+            }
+            other => panic!("expected TicketRedeemed, got {other:?}"),
+        }
+        let second = client.redeem_ticket(&code).await;
+        assert!(
+            second.is_err(),
+            "a consumed ticket cannot be redeemed twice"
+        );
+        server.shutdown().await.unwrap();
+        client.shutdown().await.unwrap();
     }
 }

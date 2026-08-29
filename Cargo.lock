@@ -633,7 +633,10 @@ name = "deltaweave-daemon"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "deltaweave-core",
  "deltaweave-daemon-api",
+ "deltaweave-net",
+ "deltaweave-reconcile",
  "deltaweave-sync",
  "postcard",
  "redb",

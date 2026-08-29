@@ -96,6 +96,52 @@ pub enum Command {
         /// Job id.
         id: String,
     },
+    /// Issue a single-use pairing ticket from the live server address.
+    IssueTicket {
+        /// Lifetime in seconds; default 600.
+        ttl_seconds: Option<u64>,
+    },
+    /// Redeem a printable ticket code using this daemon's identity.
+    RedeemTicket {
+        /// Printable `dwpair1:` code.
+        code: String,
+    },
+    /// Revoke an authorized peer.
+    RevokePeer {
+        /// Peer endpoint id as hex.
+        endpoint_id: String,
+    },
+    /// Dry-run a job without applying.
+    PreviewJob {
+        /// Job id.
+        id: String,
+    },
+    /// List unresolved conflict copies for a job.
+    ListConflicts {
+        /// Job id.
+        id: String,
+    },
+    /// Resolve one conflict path.
+    ResolveConflict {
+        /// Job id.
+        id: String,
+        /// Portable path of the conflicted file.
+        path: String,
+        /// How to resolve.
+        action: ConflictAction,
+    },
+}
+
+/// User choice for one conflicted path.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictAction {
+    /// Keep this machine's verified content at the canonical path.
+    KeepLocal,
+    /// Keep the peer's verified content at the canonical path.
+    KeepRemote,
+    /// Leave the portable conflict copy in place.
+    KeepBoth,
 }
 
 /// Correlated command reply.
@@ -147,6 +193,55 @@ pub enum CommandResult {
         /// Job id.
         id: String,
     },
+    /// A pairing ticket was issued.
+    TicketIssued {
+        /// Printable `dwpair1:` code. Never appears in events.
+        code: String,
+        /// Unix-seconds expiry.
+        expires_at: u64,
+        /// Server endpoint id as hex.
+        server_endpoint_id: String,
+        /// Truncated endpoint fingerprint for UI confirmation.
+        server_fingerprint: String,
+    },
+    /// A pairing ticket was redeemed.
+    TicketRedeemed {
+        /// `paired` or `already_paired`.
+        outcome: String,
+        /// Remote endpoint id as hex.
+        peer_endpoint_id: String,
+        /// Truncated remote fingerprint for UI confirmation.
+        peer_fingerprint: String,
+    },
+    /// Dry-run counts; no apply.
+    Preview {
+        /// Local files that would be sent.
+        sends: u64,
+        /// Remote files that would be received.
+        receives: u64,
+        /// Paths that would be deleted locally.
+        deletes: u64,
+        /// Concurrent-edit conflicts.
+        conflicts: u64,
+    },
+    /// Conflict copies for one job.
+    Conflicts {
+        /// Unresolved conflicts.
+        conflicts: Vec<ConflictInfo>,
+    },
+}
+
+/// One conflict presented to the UI.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ConflictInfo {
+    /// Canonical portable path.
+    pub path: String,
+    /// Portable `.conflict-<hash>` copy, if retained.
+    pub conflict_path: Option<String>,
+    /// Winner content hash hex.
+    pub winner_hash: String,
+    /// Loser content hash hex.
+    pub loser_hash: String,
 }
 
 /// Stable error codes.
@@ -254,5 +349,17 @@ mod tests {
             too_new.negotiate(1, 0).unwrap_err().code,
             ErrorCode::UpgradeRequired
         );
+    }
+
+    #[test]
+    fn ticket_response_omits_secret_bytes() {
+        let json = serde_json::to_string(&CommandResult::TicketIssued {
+            code: "dwpair1:ab".into(),
+            expires_at: 1,
+            server_endpoint_id: "aa".repeat(32),
+            server_fingerprint: "abcd".into(),
+        })
+        .unwrap();
+        assert!(!json.contains("secret"));
     }
 }
