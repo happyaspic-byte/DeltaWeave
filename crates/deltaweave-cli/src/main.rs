@@ -8,6 +8,7 @@ use std::{
     io::Write,
     net::SocketAddr,
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -18,7 +19,10 @@ use deltaweave_core::{ChunkingProfile, Hash32, ReplicaId, WirePath};
 use deltaweave_index::{IndexOptions, LocalIndex, ScanChange, WatchService};
 use deltaweave_net::{
     NetworkMode, PeerPolicy, PushOptions, Server, ServerConfig, SyncClient, TransferReceipt,
-    endpoint_addr, load_or_create_identity, push_file, start_server,
+    access::{AccessStore, PairingTicket, unix_now},
+    endpoint_addr, load_or_create_identity, push_file,
+    quota::QuotaPolicy,
+    redeem_pairing_ticket, start_server,
 };
 use deltaweave_sync::{SyncConfig, SyncEngine};
 use iroh::{EndpointId, SecretKey};
@@ -55,6 +59,8 @@ enum Command {
     SyncOnce(SyncTargetArgs),
     /// Continuously reconcile a local folder with retry/backoff until stopped.
     Sync(SyncArgs),
+    /// Manage pairing tickets, authorized peers, and identity rotation.
+    Pair(PairArgs),
     /// Run an isolated local end-to-end transfer and delta-reuse check.
     SelfTest,
 }
@@ -108,6 +114,9 @@ struct ServeArgs {
     /// Private metadata, chunk, journal, and trash directory.
     #[arg(long, default_value = ".deltaweave/state")]
     state: PathBuf,
+    /// Durable peer authorization and stable replica database.
+    #[arg(long, default_value = ".deltaweave/state/access.redb")]
+    access: PathBuf,
     /// Persistent secret-key file.
     #[arg(long, default_value = ".deltaweave/identity.key")]
     identity: PathBuf,
@@ -120,6 +129,74 @@ struct ServeArgs {
     /// Disable discovery and relay services; advertise direct addresses only.
     #[arg(long)]
     direct_only: bool,
+    /// Resolve peer authorization from durable state instead of CLI flags.
+    #[arg(long, conflicts_with_all = ["allowed_peers", "allow_any_authenticated"])]
+    durable_access: bool,
+    /// Sustained per-peer receive rate in bytes per second; 0 disables pacing.
+    #[arg(long, default_value_t = 0)]
+    rate_bytes_per_second: u64,
+    /// Token-bucket burst above the sustained rate in bytes.
+    #[arg(long, default_value_t = 0)]
+    burst_bytes: u64,
+    /// Simultaneous in-flight operations per peer; 0 means unlimited.
+    #[arg(long, default_value_t = 0)]
+    max_concurrent_operations: u32,
+    /// Maximum unique CAS bytes stored by this node; 0 means unlimited.
+    #[arg(long, default_value_t = 0)]
+    max_storage_bytes: u64,
+}
+
+#[derive(Debug, Args)]
+struct PairArgs {
+    #[command(subcommand)]
+    command: PairCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum PairCommand {
+    /// Issue a single-use pairing ticket bound to this server's address.
+    Issue {
+        /// Ticket lifetime in seconds.
+        #[arg(long, default_value_t = 600)]
+        ttl_seconds: u64,
+        /// Server direct UDP address embedded in the ticket.
+        #[arg(long)]
+        direct_address: SocketAddr,
+        /// Durable access database.
+        #[arg(long, default_value = ".deltaweave/state/access.redb")]
+        access: PathBuf,
+        /// Server identity whose endpoint ID is embedded in the ticket.
+        #[arg(long, default_value = ".deltaweave/identity.key")]
+        identity: PathBuf,
+    },
+    /// Redeem a ticket code, authorizing this endpoint with the server.
+    Redeem {
+        /// Printable ticket code (dwpair1:...).
+        code: String,
+        /// Local secret-key file used when redeeming.
+        #[arg(long, default_value = ".deltaweave/identity.key")]
+        identity: PathBuf,
+    },
+    /// List authorized peers.
+    List {
+        /// Durable access database.
+        #[arg(long, default_value = ".deltaweave/state/access.redb")]
+        access: PathBuf,
+    },
+    /// Revoke an authorized endpoint.
+    Revoke {
+        /// Durable access database.
+        #[arg(long, default_value = ".deltaweave/state/access.redb")]
+        access: PathBuf,
+        /// Endpoint ID to revoke.
+        endpoint_id: String,
+    },
+    /// Rotate the transport identity, keeping the stable replica identity.
+    Rotate {
+        /// Identity file to replace.
+        #[arg(long, default_value = ".deltaweave/identity.key")]
+        identity: PathBuf,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -183,6 +260,9 @@ struct IndexArgs {
     /// Private redb index file. If beneath root, its parent is excluded automatically.
     #[arg(long, default_value = ".deltaweave/index.redb")]
     state: PathBuf,
+    /// Durable peer authorization and stable replica database.
+    #[arg(long, default_value = ".deltaweave/state/access.redb")]
+    access: PathBuf,
     /// Persistent node identity used to derive a stable replica ID.
     #[arg(long, default_value = ".deltaweave/identity.key")]
     identity: PathBuf,
@@ -202,13 +282,15 @@ struct SyncTargetArgs {
     /// Private local index, CAS, journal, and recovery directory outside `root`.
     #[arg(long, default_value = ".deltaweave/sync-state")]
     state: PathBuf,
+    /// Durable peer authorization and stable replica database.
+    #[arg(long, default_value = ".deltaweave/state/access.redb")]
+    access: PathBuf,
     /// Persistent local endpoint identity outside `root`.
     #[arg(long, default_value = ".deltaweave/identity.key")]
     identity: PathBuf,
     /// Remote receiver endpoint ID.
     #[arg(long)]
     peer: String,
-    /// Remote direct UDP address; repeat when multiple addresses are advertised.
     #[arg(long = "direct")]
     direct_addresses: Vec<SocketAddr>,
     /// Remote relay URL; repeat when multiple relays are advertised.
@@ -255,6 +337,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Watch(args) => watch(args).await,
         Command::SyncOnce(args) => sync_once(args).await,
         Command::Sync(args) => sync_forever(args).await,
+        Command::Pair(args) => pair(args).await,
         Command::SelfTest => self_test().await,
     }
 }
@@ -274,12 +357,15 @@ fn print_manifest(args: ManifestArgs) -> Result<()> {
 }
 
 async fn serve(args: ServeArgs) -> Result<()> {
-    if args.allowed_peers.is_empty() && !args.allow_any_authenticated {
-        bail!("serve requires at least one --allow-peer, or explicit --allow-any-authenticated");
+    if args.allowed_peers.is_empty() && !args.allow_any_authenticated && !args.durable_access {
+        bail!("serve requires --allow-peer, --allow-any-authenticated, or --durable-access");
     }
     let identity = load_or_create_identity(&args.identity)?;
     ensure_identity_outside_destination(&args.identity, &args.root)?;
-    let peer_policy = if args.allow_any_authenticated {
+    let peer_policy = if args.durable_access {
+        let access = AccessStore::open(&args.access)?;
+        PeerPolicy::Durable(Arc::new(access))
+    } else if args.allow_any_authenticated {
         PeerPolicy::AnyAuthenticated
     } else {
         let peers = args
@@ -292,6 +378,12 @@ async fn serve(args: ServeArgs) -> Result<()> {
             .collect::<Result<HashSet<_>>>()?;
         PeerPolicy::AllowListed(peers)
     };
+    let quota_policy = QuotaPolicy {
+        bytes_per_second: args.rate_bytes_per_second,
+        burst_bytes: args.burst_bytes,
+        max_concurrent_operations_per_peer: args.max_concurrent_operations,
+        max_storage_bytes: args.max_storage_bytes,
+    };
 
     let server = start_server(ServerConfig {
         secret_key: identity.secret_key,
@@ -299,6 +391,11 @@ async fn serve(args: ServeArgs) -> Result<()> {
         state_root: args.state,
         peer_policy,
         network_mode: network_mode(args.direct_only),
+        quota_policy: if quota_policy == QuotaPolicy::UNLIMITED {
+            None
+        } else {
+            Some(quota_policy)
+        },
     })
     .await?;
     if !server.wait_online(Duration::from_secs(20)).await {
@@ -361,6 +458,62 @@ async fn wait_for_shutdown_signal() -> Result<()> {
         .context("failed to wait for Ctrl-C")
 }
 
+async fn pair(args: PairArgs) -> Result<()> {
+    match args.command {
+        PairCommand::Issue {
+            ttl_seconds,
+            direct_address,
+            access,
+            identity,
+        } => {
+            ensure!(ttl_seconds > 0, "--ttl-seconds must be greater than zero");
+            let identity = load_or_create_identity(identity)?;
+            let expires_at = unix_now()
+                .checked_add(ttl_seconds)
+                .context("pairing ticket expiry overflow")?;
+            let access = AccessStore::open(access)?;
+            let ticket = access.issue_ticket(
+                &identity.endpoint_id(),
+                &direct_address.to_string(),
+                expires_at,
+            )?;
+            print_json(&json!({
+                "code": ticket.to_code(),
+                "expires_at": ticket.expires_at,
+                "server_endpoint_id": ticket.server_endpoint_id,
+            }))
+        }
+        PairCommand::Redeem { code, identity } => {
+            let ticket = PairingTicket::from_code(&code)?;
+            let identity = load_or_create_identity(identity)?;
+            let outcome =
+                redeem_pairing_ticket(identity.secret_key, ticket, NetworkMode::DirectOnly).await?;
+            print_json(&json!({"outcome": format!("{outcome:?}")}))
+        }
+        PairCommand::List { access } => {
+            let peers = AccessStore::open(access)?.list_peers()?;
+            print_json(&peers)
+        }
+        PairCommand::Revoke {
+            access,
+            endpoint_id,
+        } => {
+            let endpoint_id = endpoint_id
+                .parse::<EndpointId>()
+                .context("invalid endpoint ID")?;
+            let revoked = AccessStore::open(access)?.revoke(endpoint_id)?;
+            print_json(&json!({"endpoint_id": endpoint_id.to_string(), "revoked": revoked}))
+        }
+        PairCommand::Rotate { identity } => {
+            let rotation = AccessStore::rotate_identity(&identity)?;
+            print_json(&json!({
+                "new_endpoint_id": rotation.new_endpoint_id.to_string(),
+                "previous_endpoint_id": rotation.previous_endpoint_id.to_string(),
+            }))
+        }
+    }
+}
+
 async fn push(args: PushArgs) -> Result<()> {
     if args.direct_only && args.direct_addresses.is_empty() {
         bail!("--direct-only requires at least one --direct address");
@@ -387,7 +540,8 @@ fn open_sync_engine(args: SyncTargetArgs) -> Result<SyncEngine> {
     ensure_identity_outside_destination(&args.identity, &args.root)?;
     let profile = args.chunking.profile()?;
     let remote = endpoint_addr(&args.peer, &args.direct_addresses, &args.relay_urls)?;
-    let replica = ReplicaId(Hash32::digest(identity.endpoint_id().as_bytes()));
+    let access = AccessStore::open(&args.access)?;
+    let replica = access.stable_replica_id(&identity.secret_key)?;
     SyncEngine::open(SyncConfig {
         root: args.root,
         state_root: args.state,
@@ -615,7 +769,7 @@ async fn watch(args: WatchArgs) -> Result<()> {
 
 fn open_index(mut args: IndexArgs) -> Result<LocalIndex> {
     let identity = load_or_create_identity(&args.identity)?;
-    let replica = ReplicaId(Hash32::digest(identity.endpoint_id().as_bytes()));
+    let replica = AccessStore::open(&args.access)?.stable_replica_id(&identity.secret_key)?;
     args.ignored_paths.push(args.identity.clone());
     let mut options = IndexOptions {
         ignored_paths: args.ignored_paths,
@@ -642,6 +796,7 @@ async fn self_test() -> Result<()> {
         state_root: state,
         peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
         network_mode: NetworkMode::DirectOnly,
+        quota_policy: None,
     })
     .await
     .context("self-test receiver failed to start")?;
@@ -1071,6 +1226,133 @@ mod tests {
         assert_eq!(args.debounce_ms, 750);
         assert_eq!(args.max_debounce_ms, 5_000);
         assert_eq!(args.max_backoff_seconds, 300);
+    }
+
+    #[test]
+    fn parses_pairing_lifecycle_commands() {
+        let issue = Cli::try_parse_from([
+            "deltaweave",
+            "pair",
+            "issue",
+            "--ttl-seconds",
+            "90",
+            "--direct-address",
+            "127.0.0.1:4000",
+            "--access",
+            "access.redb",
+            "--identity",
+            "server.key",
+        ])
+        .expect("pair issue parses");
+        let Command::Pair(PairArgs {
+            command:
+                PairCommand::Issue {
+                    ttl_seconds,
+                    direct_address,
+                    access,
+                    identity,
+                },
+        }) = issue.command
+        else {
+            panic!("pair issue expected");
+        };
+        assert_eq!(ttl_seconds, 90);
+        assert_eq!(
+            direct_address,
+            "127.0.0.1:4000".parse().expect("valid address")
+        );
+        assert_eq!(access, PathBuf::from("access.redb"));
+        assert_eq!(identity, PathBuf::from("server.key"));
+
+        let redeem = Cli::try_parse_from([
+            "deltaweave",
+            "pair",
+            "redeem",
+            "dwpair1:00",
+            "--identity",
+            "client.key",
+        ])
+        .expect("pair redeem parses");
+        let Command::Pair(PairArgs {
+            command: PairCommand::Redeem { code, identity },
+        }) = redeem.command
+        else {
+            panic!("pair redeem expected");
+        };
+        assert_eq!(code, "dwpair1:00");
+        assert_eq!(identity, PathBuf::from("client.key"));
+
+        let list = Cli::try_parse_from(["deltaweave", "pair", "list", "--access", "access.redb"])
+            .expect("pair list parses");
+        assert!(matches!(
+            list.command,
+            Command::Pair(PairArgs {
+                command: PairCommand::List { access }
+            }) if access == *"access.redb"
+        ));
+
+        let peer = SecretKey::generate().public().to_string();
+        let revoke = Cli::try_parse_from([
+            "deltaweave",
+            "pair",
+            "revoke",
+            "--access",
+            "access.redb",
+            &peer,
+        ])
+        .expect("pair revoke parses");
+        assert!(matches!(
+            revoke.command,
+            Command::Pair(PairArgs {
+                command: PairCommand::Revoke { access, endpoint_id }
+            }) if access == *"access.redb" && endpoint_id == peer
+        ));
+
+        let rotate =
+            Cli::try_parse_from(["deltaweave", "pair", "rotate", "--identity", "node.key"])
+                .expect("pair rotate parses");
+        assert!(matches!(
+            rotate.command,
+            Command::Pair(PairArgs {
+                command: PairCommand::Rotate { identity }
+            }) if identity == *"node.key"
+        ));
+    }
+
+    #[test]
+    fn serve_and_sync_accept_a_shared_access_database_path() {
+        let serve = Cli::try_parse_from([
+            "deltaweave",
+            "serve",
+            "--root",
+            "output",
+            "--durable-access",
+            "--access",
+            "access.redb",
+        ])
+        .expect("durable serve parses");
+        assert!(matches!(
+            serve.command,
+            Command::Serve(ServeArgs { access, durable_access: true, .. })
+                if access == *"access.redb"
+        ));
+
+        let sync = Cli::try_parse_from([
+            "deltaweave",
+            "sync-once",
+            "--root",
+            "data",
+            "--peer",
+            "peer-id",
+            "--access",
+            "access.redb",
+        ])
+        .expect("sync-once parses");
+        assert!(matches!(
+            sync.command,
+            Command::SyncOnce(SyncTargetArgs { access, .. })
+                if access == *"access.redb"
+        ));
     }
 
     #[test]

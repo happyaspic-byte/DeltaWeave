@@ -651,6 +651,7 @@ name = "deltaweave-net"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "deltaweave-cdc",
  "deltaweave-core",
  "deltaweave-index",
@@ -659,6 +660,7 @@ dependencies = [
  "hex",
  "iroh",
  "postcard",
+ "redb",
  "serde",
  "tempfile",
  "tokio",

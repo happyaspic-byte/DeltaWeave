@@ -55,6 +55,31 @@ impl ChunkStore {
         self.chunk_path(hash).is_file()
     }
 
+    /// Sums verified unique chunk file lengths currently stored.
+    pub fn usage_bytes(&self) -> Result<u64> {
+        fn walk(path: &Path) -> Result<u64> {
+            if !path.exists() {
+                return Ok(0);
+            }
+            let mut total = 0_u64;
+            for entry in fs::read_dir(path)? {
+                let entry = entry?;
+                let metadata = entry.metadata()?;
+                if metadata.is_dir() {
+                    total = total
+                        .checked_add(walk(&entry.path())?)
+                        .context("CAS usage overflow")?;
+                } else if metadata.is_file() {
+                    total = total
+                        .checked_add(metadata.len())
+                        .context("CAS usage overflow")?;
+                }
+            }
+            Ok(total)
+        }
+        walk(&self.chunks)
+    }
+
     /// Stores bytes only after verifying that their content matches `hash`.
     ///
     /// Returns `true` when new bytes were written and `false` when a verified chunk
@@ -276,6 +301,11 @@ impl Store {
     #[must_use]
     pub const fn chunks(&self) -> &ChunkStore {
         &self.chunks
+    }
+
+    /// Unique verified chunk bytes currently occupying the CAS.
+    pub fn cas_usage_bytes(&self) -> Result<u64> {
+        self.chunks.usage_bytes()
     }
 
     /// Returns the ACID metadata store.
