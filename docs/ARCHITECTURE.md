@@ -123,3 +123,24 @@ The current orchestrator is two-peer. The merge model is orientation-independent
 for records/conflicts and includes a deterministic three-peer partition test,
 but production multi-peer membership, tombstone acknowledgement/GC, device
 revocation, and protocol migration remain hardening work.
+
+## Daemon supervision and local IPC
+
+`deltaweave-daemon` extracts the continuous synchronization loop from the CLI
+into a reusable supervisor. The CLI still owns configuration, JSON
+presentation, and the `SyncEngine` adapter; the daemon crate owns lifecycle
+state, retry/backoff, pause/resume, the single-instance lock, and the
+authenticated local control plane. Wire messages on `deltaweave/sync/2` are
+unchanged.
+
+Operator-visible states are `starting`, `running`, `paused`, `retrying`,
+`stopping`, and `stopped`. Authenticated commands are `status`, `pause`,
+`resume`, and `stop`. Snapshots carry the remote endpoint, last success, last
+error, next retry, and counters, and never include the owner token.
+
+Unix IPC is a `0600` Unix domain socket plus an owner-only bearer token.
+Windows IPC is loopback TCP plus the same 32-byte token; named pipes and
+unsafe SCM FFI are deliberately unused. Frames are length-prefixed JSON with a
+64 KiB cap; oversized, malformed, and unauthenticated requests are rejected.
+
+Operational instructions and service caveats live in [DAEMON.md](DAEMON.md).

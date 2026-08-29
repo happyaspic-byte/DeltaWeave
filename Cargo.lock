@@ -594,6 +594,7 @@ dependencies = [
  "clap",
  "deltaweave-cdc",
  "deltaweave-core",
+ "deltaweave-daemon",
  "deltaweave-index",
  "deltaweave-net",
  "deltaweave-sync",
@@ -626,6 +627,20 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.20",
  "unicode-normalization",
+]
+
+[[package]]
+name = "deltaweave-daemon"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "deltaweave-index",
+ "getrandom 0.4.3",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

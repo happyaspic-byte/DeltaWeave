@@ -8,6 +8,7 @@ use std::{
     io::Write,
     net::SocketAddr,
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -15,6 +16,10 @@ use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, Parser, Subcommand};
 use deltaweave_cdc::manifest_from_path;
 use deltaweave_core::{ChunkingProfile, Hash32, ReplicaId, WirePath};
+use deltaweave_daemon::{
+    AuthToken, Command as DaemonCommand, ControlConfig, Daemon, DaemonConfig, IpcClient, Snapshot,
+    SyncLoop, SyncLoopConfig, SyncLoopEvent, SyncTask,
+};
 use deltaweave_index::{IndexOptions, LocalIndex, ScanChange, WatchService};
 use deltaweave_net::{
     NetworkMode, PeerPolicy, PushOptions, Server, ServerConfig, SyncClient, TransferReceipt,
@@ -55,6 +60,13 @@ enum Command {
     SyncOnce(SyncTargetArgs),
     /// Continuously reconcile a local folder with retry/backoff until stopped.
     Sync(SyncArgs),
+    /// Run synchronization under the authenticated local daemon control plane.
+    Daemon(DaemonArgs),
+    /// Send one authenticated command to a local daemon.
+    Ctl(CtlArgs),
+    /// Render or run an operating-system service entry point.
+    #[command(subcommand)]
+    Service(ServiceArgs),
     /// Run an isolated local end-to-end transfer and delta-reuse check.
     SelfTest,
 }
@@ -194,7 +206,7 @@ struct IndexArgs {
     ignored_paths: Vec<PathBuf>,
 }
 
-#[derive(Debug, Args)]
+#[derive(Clone, Debug, Args)]
 struct SyncTargetArgs {
     /// Local folder participating in bidirectional synchronization.
     #[arg(long)]
@@ -239,6 +251,68 @@ struct SyncArgs {
     max_backoff_seconds: u64,
 }
 
+#[derive(Debug, Args)]
+struct DaemonArgs {
+    #[command(flatten)]
+    sync: SyncArgs,
+    /// Directory holding daemon lock, owner token, and IPC socket.
+    #[arg(long)]
+    control_state: PathBuf,
+}
+
+#[derive(Debug, Subcommand)]
+enum CtlCommand {
+    /// Print the current daemon snapshot.
+    Status,
+    /// Pause the synchronization loop.
+    Pause,
+    /// Resume a paused synchronization loop.
+    Resume,
+    /// Request a graceful shutdown.
+    Stop,
+}
+
+impl CtlCommand {
+    fn daemon_command(&self) -> DaemonCommand {
+        match self {
+            Self::Status => DaemonCommand::Status,
+            Self::Pause => DaemonCommand::Pause,
+            Self::Resume => DaemonCommand::Resume,
+            Self::Stop => DaemonCommand::Stop,
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct CtlArgs {
+    /// Directory holding daemon lock, owner token, and IPC socket.
+    #[arg(long)]
+    control_state: PathBuf,
+    #[command(subcommand)]
+    command: CtlCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum ServiceArgs {
+    /// Print a hardened systemd unit for the given absolute paths and user.
+    SystemdUnit(SystemdUnitArgs),
+    /// Windows service entry point invoked by the Service Control Manager.
+    #[cfg(windows)]
+    Run(DaemonArgs),
+}
+
+#[derive(Debug, Args)]
+struct SystemdUnitArgs {
+    /// Absolute path to the deltaweave executable.
+    #[arg(long)]
+    executable: PathBuf,
+    /// System user that runs the daemon.
+    #[arg(long)]
+    user: String,
+    #[command(flatten)]
+    daemon: DaemonArgs,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
@@ -255,6 +329,14 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Watch(args) => watch(args).await,
         Command::SyncOnce(args) => sync_once(args).await,
         Command::Sync(args) => sync_forever(args).await,
+        Command::Daemon(args) => run_daemon(args).await,
+        Command::Ctl(args) => run_ctl(args).await,
+        Command::Service(ServiceArgs::SystemdUnit(args)) => {
+            print!("{}", render_systemd_unit(&args)?);
+            Ok(())
+        }
+        #[cfg(windows)]
+        Command::Service(ServiceArgs::Run(args)) => run_daemon(args).await,
         Command::SelfTest => self_test().await,
     }
 }
@@ -407,100 +489,206 @@ async fn sync_once(args: SyncTargetArgs) -> Result<()> {
     print_json(&engine.sync_once().await?)
 }
 
-async fn sync_forever(args: SyncArgs) -> Result<()> {
-    ensure!(
-        args.interval_seconds > 0,
-        "--interval-seconds must be greater than zero"
-    );
-    ensure!(
-        args.max_backoff_seconds > 0,
-        "--max-backoff-seconds must be greater than zero"
-    );
-    ensure!(
-        args.debounce_ms > 0,
-        "--debounce-ms must be greater than zero"
-    );
-    ensure!(
-        args.max_debounce_ms >= args.debounce_ms,
-        "--max-debounce-ms must be at least --debounce-ms"
-    );
-    let interval = Duration::from_secs(args.interval_seconds);
-    let maximum_backoff = Duration::from_secs(args.max_backoff_seconds);
-    let root = args.target.root.clone();
-    let debounce = Duration::from_millis(args.debounce_ms);
-    let maximum_debounce = Duration::from_millis(args.max_debounce_ms);
-    let engine = open_sync_engine(args.target)?;
-    let watcher_result = WatchService::new(&root, &[], debounce, maximum_debounce);
-    let (mut watcher, watcher_error) = match watcher_result {
-        Ok(watcher) => (Some(watcher), None),
-        Err(error) => (None, Some(error.to_string())),
+struct EngineTask(SyncEngine);
+
+impl SyncTask for EngineTask {
+    async fn sync_once(&self) -> anyhow::Result<serde_json::Value> {
+        Ok(serde_json::to_value(self.0.sync_once().await?)?)
+    }
+}
+
+fn loop_config(args: &SyncArgs) -> SyncLoopConfig {
+    SyncLoopConfig {
+        interval: Duration::from_secs(args.interval_seconds),
+        debounce: Duration::from_millis(args.debounce_ms),
+        maximum_debounce: Duration::from_millis(args.max_debounce_ms),
+        maximum_backoff: Duration::from_secs(args.max_backoff_seconds),
+        watch_root: Some(args.target.root.clone()),
+        ignored_paths: Vec::new(),
+    }
+}
+
+async fn run_daemon(args: DaemonArgs) -> Result<()> {
+    let engine = open_sync_engine(args.sync.target.clone())?;
+    let config = DaemonConfig {
+        control: ControlConfig::new(&args.control_state),
+        sync: loop_config(&args.sync),
+        endpoint: Some(args.sync.target.peer.clone()),
     };
-    print_json(&json!({
-        "event": "sync_started",
-        "local_change_detection": if watcher.is_some() { "native_watcher" } else { "polling_fallback" },
-        "remote_poll_seconds": interval.as_secs(),
-        "watcher_error": watcher_error,
-    }))?;
-    let shutdown = wait_for_shutdown_signal();
-    tokio::pin!(shutdown);
-    let mut backoff = Duration::from_secs(1);
-    loop {
-        let (delay, watch_for_local_changes) = tokio::select! {
-            result = &mut shutdown => {
-                result?;
-                print_json(&json!({"event": "shutdown", "status": "stopped"}))?;
-                return Ok(());
-            }
-            result = engine.sync_once() => {
-                match result {
-                    Ok(report) => {
-                        print_json(&json!({"event": "sync", "report": report}))?;
-                        backoff = Duration::from_secs(1);
-                        (interval, true)
-                    }
-                    Err(error) => {
-                        print_json(&json!({
-                            "event": "sync_error",
-                            "error": error.to_string(),
-                            "retry_in_seconds": backoff.as_secs(),
-                            "status": "retrying",
-                        }))?;
-                        let delay = backoff;
-                        backoff = backoff.saturating_mul(2).min(maximum_backoff);
-                        (delay, false)
-                    }
-                }
-            }
-        };
-        let waiting_since = Instant::now();
-        loop {
-            let remaining = delay.saturating_sub(waiting_since.elapsed());
-            if remaining.is_zero() {
-                break;
-            }
-            tokio::select! {
-                result = &mut shutdown => {
-                    result?;
-                    print_json(&json!({"event": "shutdown", "status": "stopped"}))?;
-                    return Ok(());
-                }
-                _ = tokio::time::sleep(remaining.min(Duration::from_millis(100))) => {}
-            }
-            if watch_for_local_changes
-                && let Some(trigger) = watcher
-                    .as_mut()
-                    .and_then(|watcher| watcher.poll(Instant::now()))
-            {
-                print_json(&json!({
-                    "event": "local_change",
-                    "native_events": trigger.event_count,
-                    "rescan_required": trigger.rescan_required,
-                    "status": "synchronizing",
-                }))?;
-                break;
-            }
+    let daemon = Arc::new(Daemon::new(config, Arc::new(EngineTask(engine)))?);
+    let token = AuthToken::load_or_create(&daemon.config().control.token_path())?;
+    let running = Arc::clone(&daemon).spawn().await?;
+    let ipc = Arc::clone(&daemon).spawn_ipc(token).await?;
+    let stopped = running.wait();
+    tokio::pin!(stopped);
+    tokio::select! {
+        result = wait_for_shutdown_signal() => {
+            result?;
+            let _response = daemon.execute(DaemonCommand::Stop).await?;
+            stopped.await?;
+        }
+        result = &mut stopped => {
+            result?;
         }
     }
+    ipc.shutdown().await?;
+    Ok(())
+}
+
+async fn run_ctl(args: CtlArgs) -> Result<()> {
+    let control = ControlConfig::new(args.control_state);
+    ensure!(
+        control.token_path().is_file(),
+        "daemon owner token not found at {}",
+        control.token_path().display()
+    );
+    let token = AuthToken::load_or_create(&control.token_path())?;
+    let client = IpcClient::new(control.ipc_path(), token);
+    let response = client.send(args.command.daemon_command()).await?;
+    print_json(&response)?;
+    ensure!(
+        response.ok,
+        "{}",
+        response.message.as_deref().unwrap_or("ctl command failed")
+    );
+    Ok(())
+}
+
+fn require_absolute(path: &Path, name: &str) -> Result<()> {
+    ensure!(
+        path.is_absolute(),
+        "{name} must be an absolute path, got {}",
+        path.display()
+    );
+    Ok(())
+}
+
+fn systemd_quote(value: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            _ => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn render_systemd_unit(args: &SystemdUnitArgs) -> Result<String> {
+    require_absolute(&args.executable, "executable")?;
+    require_absolute(&args.daemon.control_state, "control-state")?;
+    require_absolute(&args.daemon.sync.target.root, "root")?;
+    require_absolute(&args.daemon.sync.target.state, "state")?;
+    require_absolute(&args.daemon.sync.target.identity, "identity")?;
+    ensure!(!args.user.is_empty(), "user must not be empty");
+    ensure!(
+        !args.user.contains(['\n', '\r']),
+        "user must not contain line breaks"
+    );
+
+    let mut exec = format!(
+        "ExecStart={} daemon --root {} --state {} --identity {} --peer {} --control-state {} --interval-seconds {} --debounce-ms {} --max-debounce-ms {} --max-backoff-seconds {}",
+        systemd_quote(&args.executable.display().to_string()),
+        systemd_quote(&args.daemon.sync.target.root.display().to_string()),
+        systemd_quote(&args.daemon.sync.target.state.display().to_string()),
+        systemd_quote(&args.daemon.sync.target.identity.display().to_string()),
+        systemd_quote(&args.daemon.sync.target.peer),
+        systemd_quote(&args.daemon.control_state.display().to_string()),
+        args.daemon.sync.interval_seconds,
+        args.daemon.sync.debounce_ms,
+        args.daemon.sync.max_debounce_ms,
+        args.daemon.sync.max_backoff_seconds,
+    );
+    for address in &args.daemon.sync.target.direct_addresses {
+        exec.push_str(" --direct ");
+        exec.push_str(&systemd_quote(&address.to_string()));
+    }
+    for url in &args.daemon.sync.target.relay_urls {
+        exec.push_str(" --relay ");
+        exec.push_str(&systemd_quote(url));
+    }
+    if args.daemon.sync.target.direct_only {
+        exec.push_str(" --direct-only");
+    }
+
+    Ok(format!(
+        "[Unit]\n\
+         Description=DeltaWeave synchronization daemon\n\
+         After=network-online.target\n\
+         Wants=network-online.target\n\
+         \n\
+         [Service]\n\
+         Type=simple\n\
+         User={}\n\
+         {}\n\
+         Restart=on-failure\n\
+         RestartSec=5\n\
+         NoNewPrivileges=true\n\
+         ProtectSystem=strict\n\
+         ProtectHome=read-only\n\
+         PrivateTmp=true\n\
+         ReadWritePaths={} {} {}\n\
+         \n\
+         [Install]\n\
+         WantedBy=multi-user.target\n",
+        args.user,
+        exec,
+        systemd_quote(&args.daemon.sync.target.root.display().to_string()),
+        systemd_quote(&args.daemon.sync.target.state.display().to_string()),
+        systemd_quote(&args.daemon.control_state.display().to_string()),
+    ))
+}
+
+async fn sync_forever(args: SyncArgs) -> Result<()> {
+    let loop_config = loop_config(&args);
+    loop_config.validate()?;
+    let task = Arc::new(EngineTask(open_sync_engine(args.target)?));
+    let sync = Arc::new(SyncLoop::from_config(task, &loop_config));
+    sync.set_event_hook(move |event| {
+        let value = match event {
+            SyncLoopEvent::Started {
+                watch_state,
+                watcher_error,
+            } => json!({
+                "event": "sync_started",
+                "local_change_detection": match watch_state {
+                    deltaweave_daemon::WatchState::PollingFallback => "polling_fallback",
+                    _ => "native_watcher",
+                },
+                "remote_poll_seconds": loop_config.interval.as_secs(),
+                "watcher_error": watcher_error,
+            }),
+            SyncLoopEvent::Success { report } => json!({"event": "sync", "report": report}),
+            SyncLoopEvent::Failure { error, retry } => json!({
+                "event": "sync_error",
+                "error": error,
+                "retry_in_seconds": retry.as_secs(),
+                "status": "retrying",
+            }),
+            SyncLoopEvent::LocalChange {
+                event_count,
+                rescan_required,
+            } => json!({
+                "event": "local_change",
+                "native_events": event_count,
+                "rescan_required": rescan_required,
+                "status": "synchronizing",
+            }),
+            SyncLoopEvent::Stopped => json!({"event": "shutdown", "status": "stopped"}),
+        };
+        let _ = print_json(&value);
+    })
+    .await;
+    let snapshot = Arc::new(tokio::sync::Mutex::new(Snapshot::default()));
+    let (shutdown, receiver) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(Arc::clone(&sync).run_forever(snapshot, receiver));
+    wait_for_shutdown_signal().await?;
+    let _ = shutdown.send(true);
+    sync.resume().await;
+    task.await?;
+    Ok(())
 }
 
 fn scan(args: ScanArgs) -> Result<()> {

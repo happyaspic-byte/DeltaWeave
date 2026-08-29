@@ -57,6 +57,7 @@ with a one-node/no-action Merkle fast path.
 | Version-vector conflict handling | Implemented; deterministic winner and portable conflict copy preserve both file contents |
 | Partition/restart convergence | Implemented in three-peer model and two-peer restart integration tests |
 | Continuous retrying synchronization | Implemented via `sync`, with bounded exponential backoff |
+| Supervised daemon and authenticated local IPC | Implemented via `daemon`/`ctl`; Unix socket or Windows loopback |
 | Symlink/special-file materialization | Safely rejected; indexed but not followed |
 | Windows CFAPI / Linux FUSE on-demand files | Planned |
 
@@ -73,10 +74,12 @@ The scope and acceptance gates for later phases live in [ROADMAP.md](ROADMAP.md)
 | `deltaweave-store` | Verified chunk storage, redb metadata, journaled materialization |
 | `deltaweave-net` | iroh identity, authorization, Merkle queries, and causal push/pull protocols |
 | `deltaweave-sync` | Retry-safe two-peer orchestration and independent convergence verification |
-| `deltaweave` | JSON CLI for identity, indexing, serving, syncing, diagnostics, and self-test |
+| `deltaweave-daemon` | Supervised sync loop, single-instance lock, and authenticated local IPC |
+| `deltaweave` | JSON CLI for identity, indexing, serving, syncing, daemon control, and self-test |
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and
 [docs/PROTOCOL.md](docs/PROTOCOL.md) for the invariants behind these boundaries.
+Daemon and service operations are documented in [docs/DAEMON.md](docs/DAEMON.md).
 
 ## Download a test release
 
@@ -214,6 +217,67 @@ failure falls back to polling, and transient failures retry with exponential bac
 Every pass refuses incomplete scans, retry-queued files, cross-platform name
 collisions, stale causal writes, and concurrent records that have not first
 gone through deterministic reconciliation.
+
+## Run as a local daemon
+
+`sync` remains the foreground continuous mode. `daemon` wraps the same
+reconciliation loop behind an authenticated local control plane. The CLI only
+parses configuration and prints JSON; the loop, lock, and IPC live in
+`deltaweave-daemon`.
+
+```bash
+deltaweave daemon \
+  --root /srv/sync \
+  --state /var/lib/deltaweave/sync \
+  --identity /var/lib/deltaweave/identity.key \
+  --peer <PEER_ENDPOINT_ID> \
+  --control-state /var/lib/deltaweave/control
+```
+
+Control the running instance from the same owner account:
+
+```bash
+deltaweave ctl --control-state /var/lib/deltaweave/control status
+deltaweave ctl --control-state /var/lib/deltaweave/control pause
+deltaweave ctl --control-state /var/lib/deltaweave/control resume
+deltaweave ctl --control-state /var/lib/deltaweave/control stop
+```
+
+IPC is local and owner-authenticated. On Unix the daemon binds `control.sock`
+at mode `0600` and stores a 32-byte owner token in `owner.token` (also `0600`).
+On Windows it binds loopback TCP and writes the address to `control.sock`; the
+bearer token remains the secret. Frames are length-prefixed JSON with a hard
+size cap. A create-new PID lock refuses a second instance and recovers a stale
+PID only after the process is confirmed gone.
+
+Print a hardened systemd unit from absolute paths (the command does not install
+it):
+
+```bash
+deltaweave service systemd-unit \
+  --executable /usr/local/bin/deltaweave \
+  --user deltaweave \
+  --root /srv/sync \
+  --state /var/lib/deltaweave/sync \
+  --identity /var/lib/deltaweave/identity.key \
+  --peer <PEER_ENDPOINT_ID> \
+  --control-state /var/lib/deltaweave/control
+```
+
+The unit enables `NoNewPrivileges`, strict system protection, read-only home,
+private temporary files, explicit writable paths, and failure restart. Paths
+with spaces are quoted. A home-directory sync root needs a systemd override.
+
+On Windows, `deltaweave service run` is the SCM entry point, not an installer.
+Register it separately after placing the executable, for example:
+
+```text
+sc.exe create DeltaWeave binPath= "C:\DeltaWeave\deltaweave.exe service run --root C:\Sync --state C:\DeltaWeave-Private\state --identity C:\DeltaWeave-Private\windows.key --peer <PEER> --control-state C:\DeltaWeave-Private\control" start= auto
+```
+
+Keep `--control-state` owner-only; copying it leaks the bearer token. `ctl`
+never creates a token. This baseline does not provide a full Windows Service
+installer or claim SCM recovery configuration.
 
 ## Security model
 
