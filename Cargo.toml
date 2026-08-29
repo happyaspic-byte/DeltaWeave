@@ -10,6 +10,7 @@ members = [
     "crates/deltaweave-sync",
     "crates/deltaweave-cli",
     "crates/deltaweave-daemon-api",
+    "crates/deltaweave-daemon",
 ]
 
 [workspace.package]
