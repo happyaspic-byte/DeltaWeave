@@ -357,17 +357,17 @@ mod windows_impl {
         use windows_acl::acl::ACL;
         use windows_acl::helper::{current_user, name_to_sid, string_to_sid};
 
-        let mut acl = ACL::from_object_handle(server.as_raw_handle(), false)
+        let mut acl = ACL::from_object_handle(server.as_raw_handle().cast(), false)
             .map_err(|code| anyhow::anyhow!("failed to read pipe ACL ({code})"))?;
         for well_known in ["S-1-1-0", "S-1-5-11", "S-1-5-32-545"] {
-            if let Ok(sid) = string_to_sid(well_known) {
-                let _ = acl.remove(sid.as_ptr().cast(), None, None);
+            if let Ok(mut sid) = string_to_sid(well_known) {
+                let _ = acl.remove(sid.as_mut_ptr().cast(), None, None);
             }
         }
         let username = current_user().context("failed to resolve current Windows user")?;
-        let user_sid = name_to_sid(&username, None)
+        let mut user_sid = name_to_sid(&username, None)
             .map_err(|code| anyhow::anyhow!("failed to resolve current user SID ({code})"))?;
-        acl.allow(user_sid.as_ptr().cast(), false, 0x001F_01FF)
+        acl.allow(user_sid.as_mut_ptr().cast(), false, 0x001F_01FF)
             .map_err(|code| anyhow::anyhow!("failed to restrict pipe to current user ({code})"))?;
         Ok(())
     }
