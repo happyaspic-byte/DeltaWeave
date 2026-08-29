@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+use deltaweave_daemon_api::{Command, ConflictAction};
 use tauri::{
     Manager, WindowEvent,
     menu::{Menu, MenuItem},
@@ -52,8 +53,33 @@ pub fn run() {
                 let _ = window.hide();
             }
         })
+        .invoke_handler(tauri::generate_handler![resolve_conflict])
         .run(tauri::generate_context!())
         .expect("error while running DeltaWeave");
+}
+
+#[tauri::command]
+async fn resolve_conflict(id: String, path: String, action: String) -> Result<(), String> {
+    let action = match action.as_str() {
+        "keep_local" => ConflictAction::KeepLocal,
+        "keep_remote" => ConflictAction::KeepRemote,
+        "keep_both" => ConflictAction::KeepBoth,
+        _ => return Err("invalid conflict action".into()),
+    };
+    #[cfg(unix)]
+    {
+        let data_dir = deltaweave_daemon::default_data_dir().map_err(|err| err.to_string())?;
+        let socket = deltaweave_daemon::ipc_path(data_dir);
+        deltaweave_daemon::send_command(&socket, Command::ResolveConflict { id, path, action })
+            .await
+            .map(|_| ())
+            .map_err(|err| err.to_string())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (id, path, action);
+        Err("daemon IPC is only implemented on Unix in this build".into())
+    }
 }
 
 fn spawn_daemon_if_needed(app: tauri::AppHandle) {

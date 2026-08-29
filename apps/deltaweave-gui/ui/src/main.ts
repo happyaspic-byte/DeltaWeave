@@ -1,3 +1,7 @@
+import {
+  submitConflictResolution,
+  type ResolveConflictCommand,
+} from "./conflicts";
 import { renderDashboard } from "./dashboard";
 import {
   advanceWizard,
@@ -36,6 +40,20 @@ root?.addEventListener("click", (event) => {
     } catch (error) {
       window.alert(error instanceof Error ? error.message : String(error));
     }
+    return;
+  }
+  if (target.dataset.action === "resolve-conflict") {
+    void submitConflictResolution(
+      {
+        action: target.dataset.action,
+        jobId: target.dataset.jobId,
+        path: target.dataset.path,
+        kind: target.dataset.kind,
+      },
+      sendResolveConflict,
+    ).catch((error: unknown) => {
+      window.alert(error instanceof Error ? error.message : String(error));
+    });
   }
 });
 
@@ -80,6 +98,22 @@ function radioValue(host: HTMLElement, name: string): string {
 function checkboxChecked(host: HTMLElement, name: string): boolean {
   const field = host.querySelector(`input[name="${name}"]`);
   return field instanceof HTMLInputElement ? field.checked : false;
+}
+
+function sendResolveConflict(command: ResolveConflictCommand): Promise<void> {
+  const invoke = (
+    globalThis as {
+      __TAURI__?: { core?: { invoke?: (cmd: string, args: object) => Promise<unknown> } };
+    }
+  ).__TAURI__?.core?.invoke;
+  if (typeof invoke !== "function") {
+    return Promise.resolve();
+  }
+  return invoke("resolve_conflict", {
+    id: command.id,
+    path: command.path,
+    action: command.action,
+  }).then(() => undefined);
 }
 
 paint();

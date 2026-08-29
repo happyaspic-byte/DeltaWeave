@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod config;
+mod diagnostics;
 mod instance;
 #[cfg(unix)]
 mod ipc;
@@ -12,6 +13,7 @@ mod preview;
 mod runtime;
 
 pub use config::{ConfigStore, Direction, JobConfig};
+pub use diagnostics::{diagnostic_bundle_json, redact_diagnostics};
 pub use instance::DaemonInstance;
 #[cfg(unix)]
 pub use ipc::{connect_and_hello, send_command, serve_unix, try_bind_unix, wait_until_exists};

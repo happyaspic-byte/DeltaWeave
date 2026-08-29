@@ -54,8 +54,8 @@ pub async fn run() -> Result<()> {
             print_ready(&instance_id)?;
             return Ok(());
         }
-        let _store = crate::ConfigStore::open(data_dir.join("config.redb"))?;
-        run_unix(&data_dir).await
+        let store = std::sync::Arc::new(crate::ConfigStore::open(data_dir.join("config.redb"))?);
+        run_unix(&data_dir, store).await
     }
     #[cfg(not(unix))]
     {
@@ -82,7 +82,7 @@ async fn try_attach(data_dir: &Path) -> Result<Option<String>> {
 }
 
 #[cfg(unix)]
-async fn run_unix(data_dir: &Path) -> Result<()> {
+async fn run_unix(data_dir: &Path, store: std::sync::Arc<crate::ConfigStore>) -> Result<()> {
     use std::time::{Duration, Instant};
 
     use anyhow::ensure;
@@ -90,7 +90,7 @@ async fn run_unix(data_dir: &Path) -> Result<()> {
     use crate::{DaemonInstance, serve_unix};
 
     let socket = ipc_path(data_dir);
-    let instance = DaemonInstance::new();
+    let instance = DaemonInstance::with_config(Some(store));
     let instance_id = instance.instance_id.clone();
     let serve_socket = socket.clone();
     let mut server = tokio::spawn(async move { serve_unix(instance, serve_socket).await });

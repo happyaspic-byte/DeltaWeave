@@ -6,6 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use deltaweave_core::WirePath;
 use deltaweave_daemon_api::{CommandResult, ConflictAction, ConflictInfo};
 use deltaweave_reconcile::{ApplyAction, MerkleTree, actions_to_reach, merge_snapshots};
 
@@ -33,16 +34,25 @@ pub fn list_conflicts(root: &Path) -> Result<CommandResult> {
 /// Applies a UI conflict action to files already on disk.
 pub fn resolve_conflict(root: &Path, path: &str, action: ConflictAction) -> Result<CommandResult> {
     let canonical = join_portable(root, path)?;
+    let copy = find_conflict_copy(root, path)?;
+    let Some(copy) = copy else {
+        bail!("no conflict copy for {path}");
+    };
     match action {
-        ConflictAction::KeepBoth => {}
-        ConflictAction::KeepLocal => {}
+        ConflictAction::KeepBoth => {
+            let retained = retained_copy_path(&copy)?;
+            fs::rename(&copy, &retained)
+                .with_context(|| format!("failed to retain {}", copy.display()))?;
+        }
+        ConflictAction::KeepLocal => {
+            fs::remove_file(&copy)
+                .with_context(|| format!("failed to remove {}", copy.display()))?;
+        }
         ConflictAction::KeepRemote => {
-            let copy = find_conflict_copy(root, path)?;
-            let Some(copy) = copy else {
-                bail!("no conflict copy for {path}");
-            };
             fs::copy(&copy, &canonical)
                 .with_context(|| format!("failed to restore {}", canonical.display()))?;
+            fs::remove_file(&copy)
+                .with_context(|| format!("failed to remove {}", copy.display()))?;
         }
     }
     Ok(CommandResult::Accepted { id: path.into() })
@@ -78,15 +88,9 @@ fn collect_conflicts(root: &Path, dir: &Path, out: &mut Vec<ConflictInfo>) -> Re
         }
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if let Some(index) = name.find(".conflict-") {
-            let stem = &name[..index];
+        if conflict_canonical_name(&name).is_some() {
             let portable = portable_from(root, &path)?;
-            let parent = portable.rsplit_once('/').map_or("", |(parent, _)| parent);
-            let canonical = if parent.is_empty() {
-                stem.to_owned()
-            } else {
-                format!("{parent}/{stem}")
-            };
+            let canonical = canonical_from_conflict_path(&portable)?;
             out.push(ConflictInfo {
                 path: canonical,
                 conflict_path: Some(portable),
@@ -99,15 +103,17 @@ fn collect_conflicts(root: &Path, dir: &Path, out: &mut Vec<ConflictInfo>) -> Re
 }
 
 fn find_conflict_copy(root: &Path, canonical: &str) -> Result<Option<PathBuf>> {
-    let parent = Path::new(canonical).parent().unwrap_or(Path::new(""));
-    let stem = Path::new(canonical)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(canonical);
-    let dir = if parent.as_os_str().is_empty() {
+    let canonical_path = WirePath::new(canonical).context("invalid canonical conflict path")?;
+    let (parent, file_name) = canonical_path
+        .as_str()
+        .rsplit_once('/')
+        .map_or(("", canonical_path.as_str()), |(parent, name)| {
+            (parent, name)
+        });
+    let dir = if parent.is_empty() {
         root.to_path_buf()
     } else {
-        join_portable(root, &parent.to_string_lossy())?
+        join_portable(root, parent)?
     };
     if !dir.is_dir() {
         return Ok(None);
@@ -116,19 +122,56 @@ fn find_conflict_copy(root: &Path, canonical: &str) -> Result<Option<PathBuf>> {
         let entry = entry?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name.starts_with(&format!("{stem}.conflict-")) {
+        if conflict_canonical_name(&name).as_deref() == Some(file_name) {
             return Ok(Some(entry.path()));
         }
     }
     Ok(None)
 }
 
+fn conflict_canonical_name(name: &str) -> Option<String> {
+    let marker = name.find(".conflict-")?;
+    let stem = &name[..marker];
+    let suffix = &name[marker + ".conflict-".len()..];
+    let extension_index = suffix.find('.');
+    let (token, extension) =
+        extension_index.map_or((suffix, ""), |index| (&suffix[..index], &suffix[index..]));
+    let token = token.split_once('-').map_or(token, |(hash, _)| hash);
+    if stem.is_empty()
+        || token.len() < 12
+        || !token.chars().all(|character| character.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    Some(format!("{stem}{extension}"))
+}
+
+fn canonical_from_conflict_path(path: &str) -> Result<String> {
+    let (parent, name) = path
+        .rsplit_once('/')
+        .map_or(("", path), |(parent, name)| (parent, name));
+    let canonical = conflict_canonical_name(name).context("invalid conflict copy name")?;
+    if parent.is_empty() {
+        Ok(canonical)
+    } else {
+        Ok(format!("{parent}/{canonical}"))
+    }
+}
+
+fn retained_copy_path(copy: &Path) -> Result<PathBuf> {
+    let name = copy
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("conflict copy name is not UTF-8")?;
+    let retained = name.replacen(".conflict-", ".kept-", 1);
+    Ok(copy.with_file_name(retained))
+}
+
 fn join_portable(root: &Path, path: &str) -> Result<PathBuf> {
+    let portable = WirePath::new(path).context("invalid portable path")?;
     let mut joined = root.to_path_buf();
-    if !path.is_empty() {
-        for component in path.split('/') {
-            joined.push(component);
-        }
+    for component in portable.components() {
+        joined.push(component);
     }
     Ok(joined)
 }
@@ -142,4 +185,33 @@ fn portable_from(root: &Path, path: &Path) -> Result<String> {
         .map(|component| component.as_os_str().to_string_lossy())
         .collect::<Vec<_>>()
         .join("/"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_parent_components() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = root.path().parent().unwrap().join("outside.txt");
+        std::fs::write(&outside, b"outside").unwrap();
+        let result = resolve_conflict(root.path(), "../outside.txt", ConflictAction::KeepLocal);
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(outside).unwrap(), b"outside");
+    }
+
+    #[test]
+    fn keep_local_removes_conflict_copy() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("file.txt"), b"local").unwrap();
+        let copy = root.path().join("file.conflict-abcdef123456.txt");
+        std::fs::write(&copy, b"remote").unwrap();
+        resolve_conflict(root.path(), "file.txt", ConflictAction::KeepLocal).unwrap();
+        assert!(!copy.exists());
+        assert_eq!(
+            std::fs::read(root.path().join("file.txt")).unwrap(),
+            b"local"
+        );
+    }
 }

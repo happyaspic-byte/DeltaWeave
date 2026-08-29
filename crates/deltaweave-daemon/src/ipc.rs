@@ -170,6 +170,15 @@ fn dispatch(instance: &DaemonInstance, request: Request) -> Response {
                 id: "daemon".into(),
             }),
         },
+        (Ok(_), Command::ResolveConflict { id, path, action }) => Response {
+            request_id: request.request_id,
+            result: instance
+                .resolve_job_conflict(&id, &path, action)
+                .map_err(|error| ErrorBody {
+                    code: ErrorCode::InvalidRequest,
+                    message: error.to_string(),
+                }),
+        },
         (Ok(_), _) => Response {
             request_id: request.request_id,
             result: Err(ErrorBody {
@@ -228,5 +237,57 @@ mod tests {
         let error = response.result.unwrap_err();
         assert_eq!(error.code, ErrorCode::InvalidRequest);
         assert_eq!(error.message, "preview confirmation required");
+    }
+
+    #[test]
+    fn resolve_conflict_keep_remote_replaces_canonical() {
+        use std::sync::Arc;
+
+        use crate::{ConfigStore, JobConfig};
+        use deltaweave_daemon_api::ConflictAction;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sync");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("file.txt"), b"local").unwrap();
+        std::fs::write(root.join("file.conflict-abcdef123456.txt"), b"remote").unwrap();
+
+        let store = ConfigStore::open(dir.path().join("config.redb")).unwrap();
+        store
+            .insert_job(&JobConfig {
+                id: "job-a".into(),
+                name: "ISOs".into(),
+                local_root: root.clone(),
+                state_root: dir.path().join("state"),
+                peer_endpoint_id: "aa".repeat(32),
+                direction: crate::Direction::Bidirectional,
+                continuous: true,
+                paused: false,
+            })
+            .unwrap();
+
+        let response = dispatch(
+            &DaemonInstance::with_config(Some(Arc::new(store))),
+            Request {
+                protocol_version: ProtocolVersion {
+                    major: PROTOCOL_VERSION_MAJOR,
+                    minor: PROTOCOL_VERSION_MINOR,
+                },
+                request_id: "resolve".into(),
+                command: Command::ResolveConflict {
+                    id: "job-a".into(),
+                    path: "file.txt".into(),
+                    action: ConflictAction::KeepRemote,
+                },
+            },
+        );
+
+        assert_eq!(
+            response.result.unwrap(),
+            CommandResult::Accepted {
+                id: "file.txt".into()
+            }
+        );
+        assert_eq!(std::fs::read(root.join("file.txt")).unwrap(), b"remote");
     }
 }

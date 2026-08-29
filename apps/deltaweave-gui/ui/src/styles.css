@@ -50,3 +50,8 @@ h2 {
 .wizard small {
   color: #56616f;
 }
+
+.conflicts button {
+  margin-right: 8px;
+  margin-bottom: 8px;
+}
