@@ -50,6 +50,7 @@ pub struct JobConfig {
 /// Exclusive redb-backed job list.
 pub struct ConfigStore {
     database: Database,
+    data_root: PathBuf,
 }
 
 impl fmt::Debug for ConfigStore {
@@ -83,7 +84,14 @@ impl ConfigStore {
         }
         write.open_table(JOBS)?;
         write.commit()?;
-        Ok(Self { database })
+        let data_root = path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        Ok(Self {
+            database,
+            data_root,
+        })
     }
 
     /// Inserts a job after rejecting overlapping roots and duplicate canonical folders.
@@ -141,6 +149,66 @@ impl ConfigStore {
         records.sort_by(|left, right| left.id.cmp(&right.id));
         Ok(records)
     }
+
+    /// Creates and persists one GUI job.
+    pub fn create_job(
+        &self,
+        name: String,
+        local_root: PathBuf,
+        peer_endpoint_id: String,
+        direction: Direction,
+    ) -> Result<JobConfig> {
+        ensure!(!name.trim().is_empty(), "job name must not be empty");
+        ensure!(
+            peer_endpoint_id.len() == 64
+                && peer_endpoint_id
+                    .chars()
+                    .all(|character| character.is_ascii_hexdigit()),
+            "invalid peer endpoint ID"
+        );
+        let id = job_id(&local_root, &peer_endpoint_id);
+        let job = JobConfig {
+            state_root: self.data_root.join("jobs").join(&id),
+            id,
+            name,
+            local_root,
+            peer_endpoint_id,
+            direction,
+            continuous: true,
+            paused: false,
+        };
+        self.insert_job(&job)?;
+        Ok(job)
+    }
+
+    /// Updates the durable pause flag for one job.
+    pub fn set_paused(&self, id: &str, paused: bool) -> Result<()> {
+        let write = self.database.begin_write()?;
+        {
+            let mut jobs = write.open_table(JOBS)?;
+            let encoded = jobs
+                .get(id)?
+                .map(|value| value.value().to_vec())
+                .ok_or_else(|| anyhow::anyhow!("unknown job"))?;
+            let mut job: JobConfig =
+                postcard::from_bytes(&encoded).context("invalid job record")?;
+            job.paused = paused;
+            let encoded = postcard::to_stdvec(&job)?;
+            jobs.insert(id, encoded.as_slice())?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+}
+
+fn job_id(local_root: &Path, peer_endpoint_id: &str) -> String {
+    let canonical = local_root
+        .canonicalize()
+        .unwrap_or_else(|_| local_root.to_path_buf());
+    let digest = deltaweave_core::Hash32::digest(
+        format!("{}:{peer_endpoint_id}", canonical.display()).as_bytes(),
+    );
+    digest.to_hex()[..16].to_owned()
 }
 
 fn canonicalize_existing(path: &Path, label: &str) -> Result<PathBuf> {

@@ -94,9 +94,14 @@ impl JobSupervisor {
 
     /// Registers a job if it is not already present.
     pub fn ensure_job(&self, id: &str) {
+        self.ensure_job_with_pause(id, false);
+    }
+
+    /// Registers a job with its durable pause state.
+    pub fn ensure_job_with_pause(&self, id: &str, paused: bool) {
         let mut jobs = self.jobs.lock().expect("job lock");
         jobs.entry(id.to_owned()).or_insert_with(|| JobHandle {
-            paused: false,
+            paused,
             cancel: SyncCancel::new(),
             running: false,
         });

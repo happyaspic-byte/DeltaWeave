@@ -125,13 +125,26 @@ async fn handle_connection(instance: DaemonInstance, mut stream: UnixStream) -> 
             Ok(request) => request,
             Err(_) => return Ok(()),
         };
-        let stopping = matches!(&request.command, Command::Stop);
         let response = dispatch(&instance, request);
+        let stopping = matches!(
+            response.result,
+            Ok(CommandResult::Accepted { ref id }) if id == "daemon"
+        );
         write_frame(&mut stream, &response).await?;
         if stopping {
             instance.request_stop();
             return Ok(());
         }
+    }
+}
+
+fn command_response(request_id: String, result: anyhow::Result<CommandResult>) -> Response {
+    Response {
+        request_id,
+        result: result.map_err(|error| ErrorBody {
+            code: ErrorCode::InvalidRequest,
+            message: error.to_string(),
+        }),
     }
 }
 
@@ -164,6 +177,32 @@ fn dispatch(instance: &DaemonInstance, request: Request) -> Response {
                 message: "preview confirmation required".into(),
             }),
         },
+        (Ok(_), Command::ListJobs) => command_response(request.request_id, instance.list_jobs()),
+        (
+            Ok(_),
+            Command::CreateJob {
+                name,
+                local_root,
+                peer_endpoint_id,
+                direction,
+                preview_confirmed: true,
+            },
+        ) => command_response(
+            request.request_id,
+            instance.create_job(name, local_root, peer_endpoint_id, direction),
+        ),
+        (Ok(_), Command::PauseJob { id }) => {
+            command_response(request.request_id, instance.set_job_paused(&id, true))
+        }
+        (Ok(_), Command::ResumeJob { id }) => {
+            command_response(request.request_id, instance.set_job_paused(&id, false))
+        }
+        (Ok(_), Command::CancelJob { id }) => {
+            command_response(request.request_id, instance.cancel_job(&id))
+        }
+        (Ok(_), Command::ListConflicts { id }) => {
+            command_response(request.request_id, instance.list_job_conflicts(&id))
+        }
         (Ok(_), Command::Stop) => Response {
             request_id: request.request_id,
             result: Ok(CommandResult::Accepted {
@@ -289,5 +328,111 @@ mod tests {
             }
         );
         assert_eq!(std::fs::read(root.join("file.txt")).unwrap(), b"remote");
+    }
+
+    fn request(command: Command) -> Request {
+        Request {
+            protocol_version: ProtocolVersion {
+                major: PROTOCOL_VERSION_MAJOR,
+                minor: PROTOCOL_VERSION_MINOR,
+            },
+            request_id: "cmd".into(),
+            command,
+        }
+    }
+
+    #[test]
+    fn create_job_persists_when_preview_confirmed() {
+        use std::sync::Arc;
+
+        use crate::{ConfigStore, JobSupervisor};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sync");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Arc::new(ConfigStore::open(dir.path().join("config.redb")).unwrap());
+        let instance = DaemonInstance::with_runtime(Some(store.clone()), JobSupervisor::new());
+
+        let created = dispatch(
+            &instance,
+            request(Command::CreateJob {
+                name: "ISOs".into(),
+                local_root: root.to_string_lossy().into(),
+                peer_endpoint_id: "aa".repeat(32),
+                direction: Direction::Bidirectional,
+                preview_confirmed: true,
+            }),
+        )
+        .result
+        .unwrap();
+        let CommandResult::Accepted { id } = created else {
+            panic!("expected Accepted, got {created:?}");
+        };
+
+        let listed = dispatch(&instance, request(Command::ListJobs))
+            .result
+            .unwrap();
+        let CommandResult::Jobs { jobs } = listed else {
+            panic!("expected Jobs, got {listed:?}");
+        };
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, id);
+        assert_eq!(jobs[0].name, "ISOs");
+        assert_eq!(jobs[0].peer_endpoint_id, "aa".repeat(32));
+        assert!(!jobs[0].paused);
+    }
+
+    #[test]
+    fn pause_and_resume_job_update_supervisor() {
+        use std::sync::Arc;
+
+        use crate::{ConfigStore, JobSupervisor};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sync");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Arc::new(ConfigStore::open(dir.path().join("config.redb")).unwrap());
+        let supervisor = JobSupervisor::new();
+        let instance = DaemonInstance::with_runtime(Some(store), supervisor);
+
+        let created = dispatch(
+            &instance,
+            request(Command::CreateJob {
+                name: "ISOs".into(),
+                local_root: root.to_string_lossy().into(),
+                peer_endpoint_id: "aa".repeat(32),
+                direction: Direction::Bidirectional,
+                preview_confirmed: true,
+            }),
+        )
+        .result
+        .unwrap();
+        let CommandResult::Accepted { id } = created else {
+            panic!("expected Accepted, got {created:?}");
+        };
+
+        let paused = dispatch(&instance, request(Command::PauseJob { id: id.clone() }))
+            .result
+            .unwrap();
+        assert_eq!(paused, CommandResult::Accepted { id: id.clone() });
+        let listed = dispatch(&instance, request(Command::ListJobs))
+            .result
+            .unwrap();
+        let CommandResult::Jobs { jobs } = listed else {
+            panic!("expected Jobs, got {listed:?}");
+        };
+        assert!(jobs[0].paused);
+
+        let resumed = dispatch(&instance, request(Command::ResumeJob { id: id.clone() }))
+            .result
+            .unwrap();
+        assert_eq!(resumed, CommandResult::Accepted { id });
+        let listed = dispatch(&instance, request(Command::ListJobs))
+            .result
+            .unwrap();
+        let CommandResult::Jobs { jobs } = listed else {
+            panic!("expected Jobs, got {listed:?}");
+        };
+        assert!(!jobs[0].paused);
     }
 }
