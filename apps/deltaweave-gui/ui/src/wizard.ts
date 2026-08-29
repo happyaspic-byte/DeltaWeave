@@ -59,7 +59,7 @@ export function advanceWizard(state: WizardState): WizardState {
     return { ...state, stage: "peer" };
   }
   if (state.stage === "peer") {
-    if (!state.peerEndpointId) {
+    if (!state.peerEndpointId && !state.ticket.startsWith("dwpair1:")) {
       throw new Error("피어를 선택하세요");
     }
     return { ...state, stage: "direction" };
@@ -85,6 +85,15 @@ export function buildCreateJob(state: WizardState): CreateJobCommand {
     direction: state.direction,
     preview_confirmed: true,
   };
+}
+
+export async function submitCreateJob(
+  state: WizardState,
+  send: (command: CreateJobCommand) => Promise<void> | void,
+): Promise<CreateJobCommand> {
+  const command = buildCreateJob(state);
+  await send(command);
+  return command;
 }
 
 export function renderWizard(state: WizardState): string {

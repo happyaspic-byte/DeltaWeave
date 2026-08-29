@@ -53,9 +53,44 @@ pub fn run() {
                 let _ = window.hide();
             }
         })
-        .invoke_handler(tauri::generate_handler![resolve_conflict])
+        .invoke_handler(tauri::generate_handler![
+            resolve_conflict,
+            create_job,
+            redeem_ticket
+        ])
         .run(tauri::generate_context!())
         .expect("error while running DeltaWeave");
+}
+
+#[tauri::command]
+async fn create_job(
+    name: String,
+    local_root: String,
+    peer_endpoint_id: String,
+    direction: String,
+    preview_confirmed: bool,
+) -> Result<(), String> {
+    let direction = match direction.as_str() {
+        "bidirectional" => deltaweave_daemon_api::Direction::Bidirectional,
+        "send_only" => deltaweave_daemon_api::Direction::SendOnly,
+        "receive_only" => deltaweave_daemon_api::Direction::ReceiveOnly,
+        _ => return Err("invalid sync direction".into()),
+    };
+    send_daemon(Command::CreateJob {
+        name,
+        local_root,
+        peer_endpoint_id,
+        direction,
+        preview_confirmed,
+    })
+    .await
+    .map(|_| ())
+}
+
+#[tauri::command]
+async fn redeem_ticket(code: String) -> Result<serde_json::Value, String> {
+    let result = send_daemon(Command::RedeemTicket { code }).await?;
+    serde_json::to_value(result).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -66,18 +101,23 @@ async fn resolve_conflict(id: String, path: String, action: String) -> Result<()
         "keep_both" => ConflictAction::KeepBoth,
         _ => return Err("invalid conflict action".into()),
     };
+    send_daemon(Command::ResolveConflict { id, path, action })
+        .await
+        .map(|_| ())
+}
+
+async fn send_daemon(command: Command) -> Result<deltaweave_daemon_api::CommandResult, String> {
     #[cfg(unix)]
     {
-        let data_dir = deltaweave_daemon::default_data_dir().map_err(|err| err.to_string())?;
+        let data_dir = deltaweave_daemon::default_data_dir().map_err(|error| error.to_string())?;
         let socket = deltaweave_daemon::ipc_path(data_dir);
-        deltaweave_daemon::send_command(&socket, Command::ResolveConflict { id, path, action })
+        deltaweave_daemon::send_command(&socket, command)
             .await
-            .map(|_| ())
-            .map_err(|err| err.to_string())
+            .map_err(|error| error.to_string())
     }
     #[cfg(not(unix))]
     {
-        let _ = (id, path, action);
+        let _ = command;
         Err("daemon IPC is only implemented on Unix in this build".into())
     }
 }

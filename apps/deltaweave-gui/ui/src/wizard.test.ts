@@ -55,5 +55,34 @@ describe("add folder wizard", () => {
         peerEndpointId: "aa".repeat(32),
       }).stage,
     ).toBe("direction");
+    expect(
+      advanceWizard({
+        ...state,
+        stage: "peer",
+        folder: "C:\\Sync",
+        ticket: "dwpair1:deadbeef",
+      }).stage,
+    ).toBe("direction");
+  });
+
+  it("submits CreateJob after preview confirmation", async () => {
+    const { submitCreateJob } = await import("./wizard");
+    const sent: ReturnType<typeof buildCreateJob>[] = [];
+    const command = await submitCreateJob(
+      {
+        ...createWizardState(),
+        stage: "preview",
+        folder: "C:\\DeltaWeave-Private",
+        peerEndpointId: "aa".repeat(32),
+        direction: "bidirectional",
+        preview: { sends: 1, receives: 0, deletes: 0, conflicts: 0 },
+        previewConfirmed: true,
+      },
+      (job) => {
+        sent.push(job);
+      },
+    );
+    expect(command.preview_confirmed).toBe(true);
+    expect(sent).toHaveLength(1);
   });
 });

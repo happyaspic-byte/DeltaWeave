@@ -7,6 +7,8 @@ import {
   advanceWizard,
   createWizardState,
   renderWizard,
+  submitCreateJob,
+  type CreateJobCommand,
   type WizardState,
 } from "./wizard";
 
@@ -34,12 +36,30 @@ root?.addEventListener("click", (event) => {
     return;
   }
   if (target.dataset.action === "next-stage") {
-    try {
-      wizard = advanceWizard(readWizard(root));
-      paint();
-    } catch (error) {
+    void (async () => {
+      try {
+        wizard = readWizard(root);
+        if (wizard.stage === "peer" && wizard.ticket.startsWith("dwpair1:")) {
+          const redeemed = await invokeDaemon<{
+            peer_endpoint_id?: string;
+          }>("redeem_ticket", { code: wizard.ticket });
+          wizard = {
+            ...wizard,
+            peerEndpointId: redeemed.peer_endpoint_id ?? wizard.peerEndpointId,
+          };
+        }
+        wizard = advanceWizard(wizard);
+        paint();
+      } catch (error) {
+        window.alert(error instanceof Error ? error.message : String(error));
+      }
+    })();
+    return;
+  }
+  if (target.dataset.action === "create-job") {
+    void submitCreateJob(readWizard(root), sendCreateJob).catch((error: unknown) => {
       window.alert(error instanceof Error ? error.message : String(error));
-    }
+    });
     return;
   }
   if (target.dataset.action === "resolve-conflict") {
@@ -101,19 +121,27 @@ function checkboxChecked(host: HTMLElement, name: string): boolean {
 }
 
 function sendResolveConflict(command: ResolveConflictCommand): Promise<void> {
-  const invoke = (
-    globalThis as {
-      __TAURI__?: { core?: { invoke?: (cmd: string, args: object) => Promise<unknown> } };
-    }
-  ).__TAURI__?.core?.invoke;
-  if (typeof invoke !== "function") {
-    return Promise.resolve();
-  }
-  return invoke("resolve_conflict", {
+  return invokeDaemon("resolve_conflict", {
     id: command.id,
     path: command.path,
     action: command.action,
   }).then(() => undefined);
+}
+
+function sendCreateJob(command: CreateJobCommand): Promise<void> {
+  return invokeDaemon("create_job", command).then(() => undefined);
+}
+
+async function invokeDaemon<T>(command: string, args: object): Promise<T> {
+  const invoke = (
+    globalThis as {
+      __TAURI__?: { core?: { invoke?: (cmd: string, args: object) => Promise<T> } };
+    }
+  ).__TAURI__?.core?.invoke;
+  if (typeof invoke !== "function") {
+    return {} as T;
+  }
+  return invoke(command, args);
 }
 
 paint();
