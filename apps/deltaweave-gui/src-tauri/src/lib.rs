@@ -107,34 +107,18 @@ async fn resolve_conflict(id: String, path: String, action: String) -> Result<()
 }
 
 async fn send_daemon(command: Command) -> Result<deltaweave_daemon_api::CommandResult, String> {
-    #[cfg(unix)]
-    {
-        let data_dir = deltaweave_daemon::default_data_dir().map_err(|error| error.to_string())?;
-        let socket = deltaweave_daemon::ipc_path(data_dir);
-        deltaweave_daemon::send_command(&socket, command)
-            .await
-            .map_err(|error| error.to_string())
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = command;
-        Err("daemon IPC is only implemented on Unix in this build".into())
-    }
+    let data_dir = deltaweave_daemon::default_data_dir().map_err(|error| error.to_string())?;
+    let socket = deltaweave_daemon::ipc_path(data_dir);
+    deltaweave_daemon::send_command(&socket, command)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 fn spawn_daemon_if_needed(app: tauri::AppHandle) {
     tauri::async_runtime::spawn(async move {
-        #[cfg(unix)]
-        {
-            let live = deltaweave_daemon::default_data_dir()
-                .map(|dir| deltaweave_daemon::ipc_path(&dir))
-                .ok()
-                .map(|socket| async move {
-                    deltaweave_daemon::connect_and_hello(&socket).await.is_ok()
-                });
-            if let Some(check) = live
-                && check.await
-            {
+        if let Ok(data_dir) = deltaweave_daemon::default_data_dir() {
+            let socket = deltaweave_daemon::ipc_path(data_dir);
+            if deltaweave_daemon::connect_and_hello(&socket).await.is_ok() {
                 return;
             }
         }
@@ -147,7 +131,6 @@ fn spawn_daemon_if_needed(app: tauri::AppHandle) {
 fn quit_sync_engine(app: &tauri::AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        #[cfg(unix)]
         if let Ok(data_dir) = deltaweave_daemon::default_data_dir() {
             let socket = deltaweave_daemon::ipc_path(data_dir);
             let _ = deltaweave_daemon::send_command(&socket, deltaweave_daemon_api::Command::Stop)

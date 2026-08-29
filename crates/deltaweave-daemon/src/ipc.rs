@@ -1,4 +1,4 @@
-//! Length-delimited JSON IPC over a Unix socket.
+//! Length-delimited JSON IPC over a Unix socket or Windows named pipe.
 
 use std::{
     path::{Path, PathBuf},
@@ -11,10 +11,7 @@ use deltaweave_daemon_api::{
     ProtocolVersion, Request, Response,
 };
 use serde::Serialize;
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{UnixListener, UnixStream},
-};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::DaemonInstance;
 
@@ -29,63 +26,7 @@ pub struct HelloReply {
     pub protocol_version: ProtocolVersion,
 }
 
-/// Binds a Unix socket or fails if another daemon already owns the path.
-pub fn try_bind_unix(path: impl AsRef<Path>) -> Result<std::os::unix::net::UnixListener> {
-    let path = path.as_ref();
-    match std::os::unix::net::UnixListener::bind(path) {
-        Ok(listener) => Ok(listener),
-        Err(err) => {
-            if path.exists() {
-                bail!("already running");
-            }
-            Err(err).with_context(|| format!("failed to bind {}", path.display()))
-        }
-    }
-}
-
-/// Accepts IPC clients on `path` until Stop is accepted.
-pub async fn serve_unix(instance: DaemonInstance, path: PathBuf) -> Result<()> {
-    let listener = match UnixListener::bind(&path) {
-        Ok(listener) => listener,
-        Err(_) if path.exists() => bail!("already running"),
-        Err(err) => {
-            return Err(err).with_context(|| format!("failed to bind {}", path.display()));
-        }
-    };
-    let mut stop = instance.subscribe_stop();
-    loop {
-        tokio::select! {
-            changed = stop.changed() => {
-                changed.context("daemon stop channel closed")?;
-                if *stop.borrow() {
-                    return Ok(());
-                }
-            }
-            accepted = listener.accept() => {
-                let (stream, _) = accepted?;
-                let instance = instance.clone();
-                tokio::spawn(async move {
-                    let _ = handle_connection(instance, stream).await;
-                });
-            }
-        }
-    }
-}
-
-/// Waits until `path` exists or panics after five seconds.
-pub async fn wait_until_exists(path: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !path.exists() {
-        assert!(
-            Instant::now() < deadline,
-            "socket {} did not appear",
-            path.display()
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-}
-
-/// Connects and completes Hello against a live daemon socket.
+/// Connects and completes Hello against a live daemon endpoint.
 pub async fn connect_and_hello(path: &Path) -> Result<HelloReply> {
     match send_command(path, Command::Hello).await? {
         CommandResult::Hello {
@@ -101,9 +42,30 @@ pub async fn connect_and_hello(path: &Path) -> Result<HelloReply> {
 
 /// Sends one command and returns its successful payload.
 pub async fn send_command(path: &Path, command: Command) -> Result<CommandResult> {
-    let mut stream = UnixStream::connect(path)
-        .await
-        .with_context(|| format!("failed to connect to {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        let mut stream = tokio::net::UnixStream::connect(path)
+            .await
+            .with_context(|| format!("failed to connect to {}", path.display()))?;
+        exchange(&mut stream, command).await
+    }
+    #[cfg(windows)]
+    {
+        let pipe_name = windows_impl::pipe_name_from(path);
+        let mut client = windows_impl::wait_for_pipe(&pipe_name).await?;
+        exchange(&mut client, command).await
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (path, command);
+        bail!("daemon IPC is not implemented on this platform")
+    }
+}
+
+async fn exchange<S>(stream: &mut S, command: Command) -> Result<CommandResult>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let request = Request {
         protocol_version: ProtocolVersion {
             major: PROTOCOL_VERSION_MAJOR,
@@ -112,14 +74,17 @@ pub async fn send_command(path: &Path, command: Command) -> Result<CommandResult
         request_id: "client".into(),
         command,
     };
-    write_frame(&mut stream, &request).await?;
-    let response: Response = read_frame(&mut stream).await?;
+    write_frame(stream, &request).await?;
+    let response: Response = read_frame(stream).await?;
     response
         .result
         .map_err(|error| anyhow::anyhow!(error.message))
 }
 
-async fn handle_connection(instance: DaemonInstance, mut stream: UnixStream) -> Result<()> {
+async fn handle_connection<S>(instance: DaemonInstance, mut stream: S) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     loop {
         let request: Request = match read_frame(&mut stream).await {
             Ok(request) => request,
@@ -138,7 +103,7 @@ async fn handle_connection(instance: DaemonInstance, mut stream: UnixStream) -> 
     }
 }
 
-fn command_response(request_id: String, result: anyhow::Result<CommandResult>) -> Response {
+fn command_response(request_id: String, result: Result<CommandResult>) -> Response {
     Response {
         request_id,
         result: result.map_err(|error| ErrorBody {
@@ -228,7 +193,11 @@ fn dispatch(instance: &DaemonInstance, request: Request) -> Response {
     }
 }
 
-async fn write_frame<T: Serialize>(stream: &mut UnixStream, value: &T) -> Result<()> {
+async fn write_frame<S, T>(stream: &mut S, value: &T) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+    T: Serialize,
+{
     let json = serde_json::to_vec(value)?;
     ensure!(json.len() <= MAX_FRAME, "frame too large");
     let len = u32::try_from(json.len()).context("frame length overflows u32")?;
@@ -238,7 +207,11 @@ async fn write_frame<T: Serialize>(stream: &mut UnixStream, value: &T) -> Result
     Ok(())
 }
 
-async fn read_frame<T: serde::de::DeserializeOwned>(stream: &mut UnixStream) -> Result<T> {
+async fn read_frame<S, T>(stream: &mut S) -> Result<T>
+where
+    S: AsyncRead + Unpin,
+    T: serde::de::DeserializeOwned,
+{
     let mut len_buf = [0_u8; 4];
     stream.read_exact(&mut len_buf).await?;
     let len = usize::try_from(u32::from_le_bytes(len_buf))?;
@@ -247,6 +220,176 @@ async fn read_frame<T: serde::de::DeserializeOwned>(stream: &mut UnixStream) -> 
     stream.read_exact(&mut buf).await?;
     serde_json::from_slice(&buf).context("invalid IPC JSON")
 }
+
+#[cfg(unix)]
+mod unix_impl {
+    use super::*;
+
+    /// Binds a Unix socket or fails if another daemon already owns the path.
+    pub fn try_bind_unix(path: impl AsRef<Path>) -> Result<std::os::unix::net::UnixListener> {
+        let path = path.as_ref();
+        match std::os::unix::net::UnixListener::bind(path) {
+            Ok(listener) => Ok(listener),
+            Err(err) => {
+                if path.exists() {
+                    bail!("already running");
+                }
+                Err(err).with_context(|| format!("failed to bind {}", path.display()))
+            }
+        }
+    }
+
+    /// Accepts IPC clients on `path` until Stop is accepted.
+    pub async fn serve_unix(instance: DaemonInstance, path: PathBuf) -> Result<()> {
+        let listener = match tokio::net::UnixListener::bind(&path) {
+            Ok(listener) => listener,
+            Err(_) if path.exists() => bail!("already running"),
+            Err(err) => {
+                return Err(err).with_context(|| format!("failed to bind {}", path.display()));
+            }
+        };
+        let mut stop = instance.subscribe_stop();
+        loop {
+            tokio::select! {
+                changed = stop.changed() => {
+                    changed.context("daemon stop channel closed")?;
+                    if *stop.borrow() {
+                        return Ok(());
+                    }
+                }
+                accepted = listener.accept() => {
+                    let (stream, _) = accepted?;
+                    let instance = instance.clone();
+                    tokio::spawn(async move {
+                        let _ = handle_connection(instance, stream).await;
+                    });
+                }
+            }
+        }
+    }
+
+    /// Waits until `path` exists or panics after five seconds.
+    pub async fn wait_until_exists(path: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !path.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "socket {} did not appear",
+                path.display()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+}
+
+#[cfg(unix)]
+pub use unix_impl::{serve_unix, try_bind_unix, wait_until_exists};
+
+#[cfg(windows)]
+mod windows_impl {
+    use super::*;
+    use tokio::net::windows::named_pipe::ServerOptions;
+
+    pub(super) fn pipe_name_from(path: &Path) -> String {
+        let text = path.to_string_lossy();
+        if text.starts_with(r"\\.\pipe\") {
+            text.into_owned()
+        } else {
+            format!(r"\\.\pipe\{text}")
+        }
+    }
+
+    pub(super) async fn wait_for_pipe(
+        name: &str,
+    ) -> Result<tokio::net::windows::named_pipe::NamedPipeClient> {
+        use tokio::net::windows::named_pipe::ClientOptions;
+
+        const ERROR_PIPE_BUSY: i32 = 231;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match ClientOptions::new().open(name) {
+                Ok(client) => return Ok(client),
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::NotFound
+                        || err.raw_os_error() == Some(ERROR_PIPE_BUSY) => {}
+                Err(err) => return Err(err).with_context(|| format!("failed to open {name}")),
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "named pipe {name} did not appear"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Serves IPC on a named pipe until Stop is accepted.
+    ///
+    /// `first_pipe_instance(true)` makes a second daemon fail with
+    /// PermissionDenied instead of silently attaching, remote clients are
+    /// rejected, and the pipe DACL is rewritten to allow only the creating
+    /// user; the daemon never impersonates a client.
+    fn create_pipe(
+        name: &str,
+        first: bool,
+    ) -> Result<tokio::net::windows::named_pipe::NamedPipeServer> {
+        let server = ServerOptions::new()
+            .first_pipe_instance(first)
+            .reject_remote_clients(true)
+            .create(name)?;
+        restrict_to_current_user(&server)?;
+        Ok(server)
+    }
+
+    fn restrict_to_current_user(
+        server: &tokio::net::windows::named_pipe::NamedPipeServer,
+    ) -> Result<()> {
+        use std::os::windows::io::AsRawHandle;
+
+        use windows_acl::acl::ACL;
+        use windows_acl::helper::{current_user, name_to_sid, string_to_sid};
+
+        let mut acl = ACL::from_object_handle(server.as_raw_handle(), false)
+            .map_err(|code| anyhow::anyhow!("failed to read pipe ACL ({code})"))?;
+        for well_known in ["S-1-1-0", "S-1-5-11", "S-1-5-32-545"] {
+            if let Ok(sid) = string_to_sid(well_known) {
+                let _ = acl.remove(sid.as_ptr().cast(), None, None);
+            }
+        }
+        let username = current_user().context("failed to resolve current Windows user")?;
+        let user_sid = name_to_sid(&username, None)
+            .map_err(|code| anyhow::anyhow!("failed to resolve current user SID ({code})"))?;
+        acl.allow(user_sid.as_ptr().cast(), false, 0x001F_01FF)
+            .map_err(|code| anyhow::anyhow!("failed to restrict pipe to current user ({code})"))?;
+        Ok(())
+    }
+
+    pub async fn serve_windows(instance: DaemonInstance, path: PathBuf) -> Result<()> {
+        let name = pipe_name_from(&path);
+        let mut server = create_pipe(&name, true)?;
+        let mut stop = instance.subscribe_stop();
+        loop {
+            tokio::select! {
+                changed = stop.changed() => {
+                    changed.context("daemon stop channel closed")?;
+                    if *stop.borrow() {
+                        return Ok(());
+                    }
+                }
+                connected = server.connect() => {
+                    connected?;
+                    let connected_server = std::mem::replace(&mut server, create_pipe(&name, false)?);
+                    let instance = instance.clone();
+                    tokio::spawn(async move {
+                        let _ = handle_connection(instance, connected_server).await;
+                    });
+                }
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+pub use windows_impl::serve_windows;
 
 #[cfg(test)]
 mod tests {
@@ -434,5 +577,18 @@ mod tests {
             panic!("expected Jobs, got {listed:?}");
         };
         assert!(!jobs[0].paused);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_pipe_name_uses_local_namespace() {
+        assert_eq!(
+            super::windows_impl::pipe_name_from(Path::new(r"\\.\pipe\deltaweave")),
+            r"\\.\pipe\deltaweave"
+        );
+        assert_eq!(
+            super::windows_impl::pipe_name_from(Path::new("deltaweave")),
+            r"\\.\pipe\deltaweave"
+        );
     }
 }

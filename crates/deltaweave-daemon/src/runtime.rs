@@ -48,36 +48,33 @@ pub async fn run() -> Result<()> {
     let data_dir = default_data_dir()?;
     std::fs::create_dir_all(&data_dir)
         .with_context(|| format!("failed to create daemon data dir {}", data_dir.display()))?;
+    if let Some(instance_id) = try_attach(&data_dir).await? {
+        print_ready(&instance_id)?;
+        return Ok(());
+    }
+    let store = std::sync::Arc::new(crate::ConfigStore::open(data_dir.join("config.redb"))?);
     #[cfg(unix)]
     {
-        if let Some(instance_id) = try_attach(&data_dir).await? {
-            print_ready(&instance_id)?;
-            return Ok(());
-        }
-        let store = std::sync::Arc::new(crate::ConfigStore::open(data_dir.join("config.redb"))?);
         run_unix(&data_dir, store).await
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        let _ = data_dir;
-        anyhow::bail!("daemon IPC is only implemented on Unix in this build")
+        run_windows(&data_dir, store).await
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (data_dir, store);
+        anyhow::bail!("daemon IPC is not implemented on this platform")
     }
 }
 
-#[cfg(unix)]
 async fn try_attach(data_dir: &Path) -> Result<Option<String>> {
     use crate::connect_and_hello;
 
     let socket = ipc_path(data_dir);
-    if !socket.exists() {
-        return Ok(None);
-    }
     match connect_and_hello(&socket).await {
         Ok(hello) => Ok(Some(hello.instance_id)),
-        Err(_) => {
-            let _ = std::fs::remove_file(&socket);
-            Ok(None)
-        }
+        Err(_) => Ok(None),
     }
 }
 
@@ -109,6 +106,28 @@ async fn run_unix(data_dir: &Path, store: std::sync::Arc<crate::ConfigStore>) ->
     if server.is_finished() {
         return server.await?;
     }
+    print_ready(&instance_id)?;
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            server.abort();
+        }
+        result = &mut server => {
+            return result?;
+        }
+    }
+    let _ = server.await;
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn run_windows(data_dir: &Path, store: std::sync::Arc<crate::ConfigStore>) -> Result<()> {
+    use crate::{DaemonInstance, serve_windows};
+
+    let socket = ipc_path(data_dir);
+    let instance = DaemonInstance::with_config(Some(store));
+    let instance_id = instance.instance_id.clone();
+    let serve_socket = socket.clone();
+    let mut server = tokio::spawn(async move { serve_windows(instance, serve_socket).await });
     print_ready(&instance_id)?;
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {

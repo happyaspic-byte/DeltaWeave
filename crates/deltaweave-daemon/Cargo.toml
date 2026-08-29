@@ -29,6 +29,9 @@ tokio = { workspace = true, features = [
   "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"
 ] }
 
+[target.'cfg(windows)'.dependencies]
+windows-acl = "0.3.0"
+
 [dev-dependencies]
 tempfile.workspace = true
 
