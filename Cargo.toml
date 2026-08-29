@@ -11,6 +11,7 @@ members = [
     "crates/deltaweave-cli",
     "crates/deltaweave-daemon-api",
     "crates/deltaweave-daemon",
+    "apps/deltaweave-gui/src-tauri",
 ]
 
 [workspace.package]

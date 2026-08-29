@@ -14,7 +14,7 @@ mod runtime;
 pub use config::{ConfigStore, Direction, JobConfig};
 pub use instance::DaemonInstance;
 #[cfg(unix)]
-pub use ipc::{connect_and_hello, serve_unix, try_bind_unix, wait_until_exists};
+pub use ipc::{connect_and_hello, send_command, serve_unix, try_bind_unix, wait_until_exists};
 pub use jobs::{JobSupervisor, ProgressCoalescer};
 pub use pair::{PairingConfig, PairingService};
 pub use preview::{list_conflicts, preview_snapshots, resolve_conflict};
@@ -61,6 +61,29 @@ mod tests {
         let err = try_bind_unix(&socket).unwrap_err();
         assert!(format!("{err:#}").contains("already running"));
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn stop_command_replies_before_server_exits() {
+        use deltaweave_daemon_api::{Command, CommandResult};
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("dw.sock");
+        let server = tokio::spawn(serve_unix(DaemonInstance::new(), socket.clone()));
+        wait_until_exists(&socket).await;
+
+        let result = send_command(&socket, Command::Stop).await.unwrap();
+        assert_eq!(
+            result,
+            CommandResult::Accepted {
+                id: "daemon".into()
+            }
+        );
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("server did not stop")
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

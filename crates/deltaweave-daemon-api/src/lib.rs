@@ -130,6 +130,8 @@ pub enum Command {
         /// How to resolve.
         action: ConflictAction,
     },
+    /// Stop the daemon after flushing durable state.
+    Stop,
 }
 
 /// User choice for one conflicted path.

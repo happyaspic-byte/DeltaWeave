@@ -43,7 +43,7 @@ pub fn try_bind_unix(path: impl AsRef<Path>) -> Result<std::os::unix::net::UnixL
     }
 }
 
-/// Accepts IPC clients on `path` until the task is cancelled.
+/// Accepts IPC clients on `path` until Stop is accepted.
 pub async fn serve_unix(instance: DaemonInstance, path: PathBuf) -> Result<()> {
     let listener = match UnixListener::bind(&path) {
         Ok(listener) => listener,
@@ -52,12 +52,23 @@ pub async fn serve_unix(instance: DaemonInstance, path: PathBuf) -> Result<()> {
             return Err(err).with_context(|| format!("failed to bind {}", path.display()));
         }
     };
+    let mut stop = instance.subscribe_stop();
     loop {
-        let (stream, _) = listener.accept().await?;
-        let instance = instance.clone();
-        tokio::spawn(async move {
-            let _ = handle_connection(instance, stream).await;
-        });
+        tokio::select! {
+            changed = stop.changed() => {
+                changed.context("daemon stop channel closed")?;
+                if *stop.borrow() {
+                    return Ok(());
+                }
+            }
+            accepted = listener.accept() => {
+                let (stream, _) = accepted?;
+                let instance = instance.clone();
+                tokio::spawn(async move {
+                    let _ = handle_connection(instance, stream).await;
+                });
+            }
+        }
     }
 }
 
@@ -76,6 +87,20 @@ pub async fn wait_until_exists(path: &Path) {
 
 /// Connects and completes Hello against a live daemon socket.
 pub async fn connect_and_hello(path: &Path) -> Result<HelloReply> {
+    match send_command(path, Command::Hello).await? {
+        CommandResult::Hello {
+            instance_id,
+            protocol_version,
+        } => Ok(HelloReply {
+            instance_id,
+            protocol_version,
+        }),
+        _ => bail!("unexpected hello reply"),
+    }
+}
+
+/// Sends one command and returns its successful payload.
+pub async fn send_command(path: &Path, command: Command) -> Result<CommandResult> {
     let mut stream = UnixStream::connect(path)
         .await
         .with_context(|| format!("failed to connect to {}", path.display()))?;
@@ -84,22 +109,14 @@ pub async fn connect_and_hello(path: &Path) -> Result<HelloReply> {
             major: PROTOCOL_VERSION_MAJOR,
             minor: PROTOCOL_VERSION_MINOR,
         },
-        request_id: "hello".into(),
-        command: Command::Hello,
+        request_id: "client".into(),
+        command,
     };
     write_frame(&mut stream, &request).await?;
     let response: Response = read_frame(&mut stream).await?;
-    match response.result {
-        Ok(CommandResult::Hello {
-            instance_id,
-            protocol_version,
-        }) => Ok(HelloReply {
-            instance_id,
-            protocol_version,
-        }),
-        Ok(_) => bail!("unexpected hello reply"),
-        Err(error) => bail!("{}", error.message),
-    }
+    response
+        .result
+        .map_err(|error| anyhow::anyhow!(error.message))
 }
 
 async fn handle_connection(instance: DaemonInstance, mut stream: UnixStream) -> Result<()> {
@@ -108,8 +125,13 @@ async fn handle_connection(instance: DaemonInstance, mut stream: UnixStream) -> 
             Ok(request) => request,
             Err(_) => return Ok(()),
         };
+        let stopping = matches!(&request.command, Command::Stop);
         let response = dispatch(&instance, request);
         write_frame(&mut stream, &response).await?;
+        if stopping {
+            instance.request_stop();
+            return Ok(());
+        }
     }
 }
 
@@ -127,6 +149,12 @@ fn dispatch(instance: &DaemonInstance, request: Request) -> Response {
             result: Ok(CommandResult::Hello {
                 protocol_version,
                 instance_id: instance.instance_id.clone(),
+            }),
+        },
+        (Ok(_), Command::Stop) => Response {
+            request_id: request.request_id,
+            result: Ok(CommandResult::Accepted {
+                id: "daemon".into(),
             }),
         },
         (Ok(_), _) => Response {
