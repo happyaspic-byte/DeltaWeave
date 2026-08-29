@@ -48,6 +48,72 @@ pub struct SyncEngine {
     profile: ChunkingProfile,
 }
 
+/// Cooperative cancellation token for one sync round.
+#[derive(Clone, Debug)]
+pub struct SyncCancel {
+    inner: tokio::sync::watch::Sender<bool>,
+}
+
+impl Default for SyncCancel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SyncCancel {
+    /// Creates an uncancelled token.
+    #[must_use]
+    pub fn new() -> Self {
+        let (inner, _) = tokio::sync::watch::channel(false);
+        Self { inner }
+    }
+
+    /// Requests cancellation at the next gate.
+    pub fn cancel(&self) {
+        let _ = self.inner.send_replace(true);
+    }
+
+    /// Returns whether cancellation has been requested.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        *self.inner.borrow()
+    }
+}
+
+/// Named stage of one bidirectional round.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncPhase {
+    /// Local index scan.
+    Scan,
+    /// Remote snapshot fetch.
+    FetchRemote,
+    /// Content staging into the local CAS.
+    Stage,
+    /// Local and remote apply.
+    Apply,
+    /// Independent convergence check.
+    Verify,
+}
+
+/// Snapshot emitted at cancel gates.
+#[derive(Clone, Debug, Serialize)]
+pub struct SyncProgress {
+    /// Current stage.
+    pub phase: SyncPhase,
+    /// Optional path being processed.
+    pub current_path: Option<String>,
+    /// Payload bytes pulled so far.
+    pub pulled_bytes: u64,
+    /// Payload bytes pushed so far.
+    pub pushed_bytes: u64,
+    /// Manifest extents reused so far.
+    pub reused_extents: usize,
+}
+
+/// Callback that receives coalesced progress snapshots.
+pub type ProgressSink = Arc<dyn Fn(SyncProgress) + Send + Sync>;
+
 /// Auditable outcome after both peers have been re-read and proven converged.
 #[derive(Clone, Debug, Serialize)]
 pub struct SyncReport {
@@ -145,13 +211,31 @@ impl SyncEngine {
 
     /// Merges, applies, and independently verifies one complete bidirectional round.
     pub async fn sync_once(&self) -> Result<SyncReport> {
+        self.sync_once_with(None, None).await
+    }
+
+    /// Same as [`Self::sync_once`], with optional progress and cooperative cancel.
+    pub async fn sync_once_with(
+        &self,
+        progress: Option<ProgressSink>,
+        cancel: Option<SyncCancel>,
+    ) -> Result<SyncReport> {
+        throw_if_cancelled(cancel.as_ref())?;
+        emit_progress(progress.as_ref(), SyncPhase::Scan, 0, 0, 0);
         let scan = scan_index(Arc::clone(&self.index)).await?;
         ensure_scan_is_safe(&scan, "local")?;
         let local_records = read_records(Arc::clone(&self.index)).await?;
         let local_tree = MerkleTree::from_records(local_records.clone())?;
+        emit_progress(progress.as_ref(), SyncPhase::FetchRemote, 0, 0, 0);
         let session = self.client.open_session().await?;
         let outcome = self
-            .sync_with_session(&session, local_records, local_tree)
+            .sync_with_session(
+                &session,
+                local_records,
+                local_tree,
+                progress.as_ref(),
+                cancel.as_ref(),
+            )
             .await;
         session.close().await;
         outcome
@@ -162,6 +246,8 @@ impl SyncEngine {
         session: &SyncSession,
         local_records: Vec<SyncRecord>,
         local_tree: MerkleTree,
+        progress: Option<&ProgressSink>,
+        cancel: Option<&SyncCancel>,
     ) -> Result<SyncReport> {
         let remote = session.fetch_snapshot(&local_tree).await?;
         let remote_tree = MerkleTree::from_records(remote.records.clone())?;
@@ -181,12 +267,32 @@ impl SyncEngine {
                 ApplyAction::Delete { .. } | ApplyAction::Materialize { .. } => None,
             })
             .collect();
+        throw_if_cancelled(cancel)?;
+        emit_progress(progress, SyncPhase::Stage, 0, 0, 0);
         let (manifests, stage_stats) = self
             .stage_desired_files(session, &required_files, &local_records, &remote.records)
             .await?;
+        throw_if_cancelled(cancel)?;
+        emit_progress(
+            progress,
+            SyncPhase::Apply,
+            stage_stats.pulled_bytes,
+            0,
+            stage_stats.reused_extents,
+        );
         self.apply_local(&local_tree, &local_actions, &manifests)?;
         let remote_stats = self.apply_remote(session, &remote_actions).await?;
 
+        throw_if_cancelled(cancel)?;
+        emit_progress(
+            progress,
+            SyncPhase::Verify,
+            stage_stats.pulled_bytes,
+            remote_stats.pushed_bytes,
+            stage_stats
+                .reused_extents
+                .saturating_add(remote_stats.reused_extents),
+        );
         let verification_scan = scan_index(Arc::clone(&self.index)).await?;
         ensure_scan_is_safe(&verification_scan, "verified local")?;
         let verified_local =
@@ -377,6 +483,31 @@ impl SyncEngine {
             stats.reused_extents = stats.reused_extents.saturating_add(reused_extents);
         }
         Ok(stats)
+    }
+}
+
+fn throw_if_cancelled(cancel: Option<&SyncCancel>) -> Result<()> {
+    if cancel.is_some_and(SyncCancel::is_cancelled) {
+        bail!("sync cancelled");
+    }
+    Ok(())
+}
+
+fn emit_progress(
+    progress: Option<&ProgressSink>,
+    phase: SyncPhase,
+    pulled_bytes: u64,
+    pushed_bytes: u64,
+    reused_extents: usize,
+) {
+    if let Some(sink) = progress {
+        sink(SyncProgress {
+            phase,
+            current_path: None,
+            pulled_bytes,
+            pushed_bytes,
+            reused_extents,
+        });
     }
 }
 
@@ -677,6 +808,72 @@ mod tests {
             .expect("restart retry converges");
         assert_eq!(after_restart.local_actions, 0);
         assert_eq!(after_restart.remote_actions, 0);
+        server.shutdown().await.expect("server shuts down");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelled_sync_returns_before_apply_and_is_safe_to_retry() {
+        let local_root = TempDir::new().expect("local root can be created");
+        let local_state = TempDir::new().expect("local state can be created");
+        let remote_root = TempDir::new().expect("remote root can be created");
+        let remote_state = TempDir::new().expect("remote state can be created");
+        fs::write(local_root.path().join("local.txt"), b"from local")
+            .expect("local fixture can be written");
+        fs::write(remote_root.path().join("remote.txt"), b"from remote")
+            .expect("remote fixture can be written");
+
+        let client_key = SecretKey::generate();
+        let server = start_server(ServerConfig {
+            secret_key: SecretKey::generate(),
+            destination_root: remote_root.path().to_path_buf(),
+            state_root: remote_state.path().to_path_buf(),
+            peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
+            network_mode: NetworkMode::DirectOnly,
+            quota_policy: None,
+            bind: None,
+        })
+        .await
+        .expect("server can start");
+        let engine = SyncEngine::open(SyncConfig {
+            root: local_root.path().to_path_buf(),
+            state_root: local_state.path().to_path_buf(),
+            replica: replica(&client_key),
+            client: SyncClient {
+                secret_key: client_key,
+                remote: server.endpoint_addr(),
+                network_mode: NetworkMode::DirectOnly,
+            },
+            profile: ChunkingProfile::DEFAULT,
+            ignored_paths: Vec::new(),
+        })
+        .expect("sync engine can open");
+
+        let cancel = SyncCancel::new();
+        cancel.cancel();
+        let err = engine
+            .sync_once_with(None, Some(cancel.clone()))
+            .await
+            .expect_err("cancelled before work");
+        assert!(
+            format!("{err:#}").contains("cancelled"),
+            "unexpected error: {err:#}"
+        );
+        assert!(!local_root.path().join("remote.txt").exists());
+        assert!(!remote_root.path().join("local.txt").exists());
+
+        let retry = engine
+            .sync_once()
+            .await
+            .expect("retry after cancel converges");
+        assert_eq!(retry.status, "pass");
+        assert_eq!(
+            fs::read(local_root.path().join("remote.txt")).expect("remote file reaches local"),
+            b"from remote"
+        );
+        assert_eq!(
+            fs::read(remote_root.path().join("local.txt")).expect("local file reaches remote"),
+            b"from local"
+        );
         server.shutdown().await.expect("server shuts down");
     }
 }
