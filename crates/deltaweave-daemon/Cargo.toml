@@ -11,10 +11,13 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+deltaweave-daemon-api = { path = "../deltaweave-daemon-api" }
 postcard.workspace = true
 redb.workspace = true
 serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["net"] }
 
 [dev-dependencies]
 tempfile.workspace = true
