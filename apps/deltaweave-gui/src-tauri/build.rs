@@ -25,7 +25,13 @@ fn ensure_sidecar() {
     }
     let _ = fs::create_dir_all("binaries");
     for candidate in [
+        format!("../../../target/{triple}/release/deltaweave-daemon.exe"),
+        format!("../../../target/{triple}/release/deltaweave-daemon"),
+        format!("../../../target/{triple}/debug/deltaweave-daemon.exe"),
         format!("../../../target/{triple}/debug/deltaweave-daemon"),
+        "../../../target/release/deltaweave-daemon.exe".into(),
+        "../../../target/release/deltaweave-daemon".into(),
+        "../../../target/debug/deltaweave-daemon.exe".into(),
         "../../../target/debug/deltaweave-daemon".into(),
     ] {
         let src = Path::new(&candidate);
