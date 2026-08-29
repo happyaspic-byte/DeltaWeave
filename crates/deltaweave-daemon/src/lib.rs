@@ -41,6 +41,7 @@ mod tests {
             local_root: root.clone(),
             state_root: dir.path().join("state-a"),
             peer_endpoint_id: "aa".repeat(32),
+            peer_address: None,
             direction: Direction::Bidirectional,
             continuous: true,
             paused: false,

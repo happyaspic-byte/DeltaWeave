@@ -42,10 +42,12 @@ root?.addEventListener("click", (event) => {
         if (wizard.stage === "peer" && wizard.ticket.startsWith("dwpair1:")) {
           const redeemed = await invokeDaemon<{
             peer_endpoint_id?: string;
+            server_direct_address?: string;
           }>("redeem_ticket", { code: wizard.ticket });
           wizard = {
             ...wizard,
             peerEndpointId: redeemed.peer_endpoint_id ?? wizard.peerEndpointId,
+            peerAddress: redeemed.server_direct_address ?? wizard.peerAddress,
           };
         }
         wizard = advanceWizard(wizard);

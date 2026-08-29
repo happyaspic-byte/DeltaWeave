@@ -73,6 +73,8 @@ pub enum Command {
         local_root: String,
         /// Remote endpoint id as hex.
         peer_endpoint_id: String,
+        /// Peer direct address, learned from the redeemed ticket.
+        peer_address: Option<String>,
         /// Transfer direction.
         direction: Direction,
         /// The user explicitly accepted the dry-run preview.
@@ -216,6 +218,8 @@ pub enum CommandResult {
         peer_endpoint_id: String,
         /// Truncated remote fingerprint for UI confirmation.
         peer_fingerprint: String,
+        /// Server direct address for later sync passes.
+        server_direct_address: String,
     },
     /// Dry-run counts; no apply.
     Preview {

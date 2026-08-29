@@ -41,6 +41,8 @@ pub fn run() {
                             let _ = window.set_focus();
                         }
                     }
+                    "sync_all" => tray_command(app, TrayAction::SyncAll),
+                    "pause_all" => tray_command(app, TrayAction::PauseAll),
                     "quit" => quit_sync_engine(app),
                     _ => {}
                 })
@@ -67,6 +69,7 @@ async fn create_job(
     name: String,
     local_root: String,
     peer_endpoint_id: String,
+    peer_address: Option<String>,
     direction: String,
     preview_confirmed: bool,
 ) -> Result<(), String> {
@@ -80,6 +83,7 @@ async fn create_job(
         name,
         local_root,
         peer_endpoint_id,
+        peer_address,
         direction,
         preview_confirmed,
     })
@@ -112,6 +116,27 @@ async fn send_daemon(command: Command) -> Result<deltaweave_daemon_api::CommandR
     deltaweave_daemon::send_command(&socket, command)
         .await
         .map_err(|error| error.to_string())
+}
+
+enum TrayAction {
+    SyncAll,
+    PauseAll,
+}
+
+fn tray_command(_app: &tauri::AppHandle, action: TrayAction) {
+    tauri::async_runtime::spawn(async move {
+        let jobs = match send_daemon(Command::ListJobs).await {
+            Ok(deltaweave_daemon_api::CommandResult::Jobs { jobs }) => jobs,
+            _ => return,
+        };
+        for job in jobs {
+            let command = match action {
+                TrayAction::SyncAll => Command::SyncNow { id: job.id },
+                TrayAction::PauseAll => Command::PauseJob { id: job.id },
+            };
+            let _ = send_daemon(command).await;
+        }
+    });
 }
 
 fn spawn_daemon_if_needed(app: tauri::AppHandle) {

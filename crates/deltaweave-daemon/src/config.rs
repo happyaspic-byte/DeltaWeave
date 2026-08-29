@@ -39,6 +39,9 @@ pub struct JobConfig {
     pub state_root: PathBuf,
     /// Remote endpoint id as hex.
     pub peer_endpoint_id: String,
+    /// Direct address of the peer, if known.
+    #[serde(default)]
+    pub peer_address: Option<String>,
     /// Transfer direction.
     pub direction: Direction,
     /// Whether the job runs continuously.
@@ -156,6 +159,7 @@ impl ConfigStore {
         name: String,
         local_root: PathBuf,
         peer_endpoint_id: String,
+        peer_address: Option<String>,
         direction: Direction,
     ) -> Result<JobConfig> {
         ensure!(!name.trim().is_empty(), "job name must not be empty");
@@ -173,6 +177,7 @@ impl ConfigStore {
             name,
             local_root,
             peer_endpoint_id,
+            peer_address,
             direction,
             continuous: true,
             paused: false,

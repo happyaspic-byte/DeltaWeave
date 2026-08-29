@@ -19,6 +19,7 @@ export type WizardState = {
   folder: string;
   peers: DiscoveredPeer[];
   peerEndpointId: string;
+  peerAddress: string | null;
   ticket: string;
   manualAddress: string;
   manualPort: string;
@@ -32,6 +33,7 @@ export type CreateJobCommand = {
   name: string;
   local_root: string;
   peer_endpoint_id: string;
+  peer_address: string | null;
   direction: SyncDirection;
   preview_confirmed: true;
 };
@@ -42,6 +44,7 @@ export function createWizardState(): WizardState {
     folder: "",
     peers: [],
     peerEndpointId: "",
+    peerAddress: null,
     ticket: "",
     manualAddress: "",
     manualPort: "",
@@ -82,6 +85,7 @@ export function buildCreateJob(state: WizardState): CreateJobCommand {
     name: folderName(state.folder),
     local_root: state.folder,
     peer_endpoint_id: state.peerEndpointId,
+    peer_address: state.peerAddress,
     direction: state.direction,
     preview_confirmed: true,
   };

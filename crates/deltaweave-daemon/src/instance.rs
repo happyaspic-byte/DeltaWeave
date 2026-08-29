@@ -138,6 +138,7 @@ impl DaemonInstance {
         name: String,
         local_root: String,
         peer_endpoint_id: String,
+        peer_address: Option<String>,
         direction: ApiDirection,
     ) -> Result<CommandResult> {
         let store = self.config_store()?;
@@ -146,7 +147,13 @@ impl DaemonInstance {
             ApiDirection::SendOnly => Direction::SendOnly,
             ApiDirection::ReceiveOnly => Direction::ReceiveOnly,
         };
-        let job = store.create_job(name, PathBuf::from(local_root), peer_endpoint_id, direction)?;
+        let job = store.create_job(
+            name,
+            PathBuf::from(local_root),
+            peer_endpoint_id,
+            peer_address,
+            direction,
+        )?;
         self.supervisor.ensure_job(&job.id);
         Ok(CommandResult::Accepted { id: job.id })
     }
@@ -167,6 +174,17 @@ impl DaemonInstance {
         self.supervisor.ensure_job(id);
         self.supervisor.cancel(id)?;
         Ok(CommandResult::Accepted { id: id.into() })
+    }
+
+    pub(crate) fn sync_now(&self, id: &str) -> Result<CommandResult> {
+        let _cancel = self.supervisor.begin_sync(id)?;
+        self.supervisor.end_sync(id);
+        Ok(CommandResult::Accepted { id: id.into() })
+    }
+
+    pub(crate) fn preview_job(&self, id: &str) -> Result<CommandResult> {
+        self.job(id)?;
+        bail!("peer snapshot unavailable")
     }
 
     pub(crate) fn list_job_conflicts(&self, id: &str) -> Result<CommandResult> {

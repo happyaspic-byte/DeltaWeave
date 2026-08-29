@@ -102,6 +102,7 @@ impl PairingService {
     pub async fn redeem_ticket(&self, code: &str) -> Result<CommandResult> {
         let ticket = access::PairingTicket::from_code(code)?;
         let peer_endpoint_id = ticket.server_endpoint_id.clone();
+        let server_direct_address = ticket.server_direct_address.clone();
         let outcome = redeem_pairing_ticket(
             self.identity.secret_key.clone(),
             ticket,
@@ -116,6 +117,7 @@ impl PairingService {
             outcome: outcome.into(),
             peer_fingerprint: fingerprint(&peer_endpoint_id),
             peer_endpoint_id,
+            server_direct_address,
         })
     }
 

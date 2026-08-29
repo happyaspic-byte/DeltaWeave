@@ -149,12 +149,13 @@ async fn dispatch(instance: &DaemonInstance, request: Request) -> Response {
                 name,
                 local_root,
                 peer_endpoint_id,
+                peer_address,
                 direction,
                 preview_confirmed: true,
             },
         ) => command_response(
             request.request_id,
-            instance.create_job(name, local_root, peer_endpoint_id, direction),
+            instance.create_job(name, local_root, peer_endpoint_id, peer_address, direction),
         ),
         (Ok(_), Command::PauseJob { id }) => {
             command_response(request.request_id, instance.set_job_paused(&id, true))
@@ -164,6 +165,12 @@ async fn dispatch(instance: &DaemonInstance, request: Request) -> Response {
         }
         (Ok(_), Command::CancelJob { id }) => {
             command_response(request.request_id, instance.cancel_job(&id))
+        }
+        (Ok(_), Command::SyncNow { id }) => {
+            command_response(request.request_id, instance.sync_now(&id))
+        }
+        (Ok(_), Command::PreviewJob { id }) => {
+            command_response(request.request_id, instance.preview_job(&id))
         }
         (Ok(_), Command::ListConflicts { id }) => {
             command_response(request.request_id, instance.list_job_conflicts(&id))
@@ -189,15 +196,8 @@ async fn dispatch(instance: &DaemonInstance, request: Request) -> Response {
                 .resolve_job_conflict(&id, &path, action)
                 .map_err(|error| ErrorBody {
                     code: ErrorCode::InvalidRequest,
-                    message: error.to_string(),
+                    message: crate::redact_diagnostics(&error.to_string()),
                 }),
-        },
-        (Ok(_), _) => Response {
-            request_id: request.request_id,
-            result: Err(ErrorBody {
-                code: ErrorCode::InvalidRequest,
-                message: "command not implemented".into(),
-            }),
         },
     }
 }
@@ -419,6 +419,7 @@ mod tests {
                     name: "ISOs".into(),
                     local_root: "/tmp/x".into(),
                     peer_endpoint_id: "aa".repeat(32),
+                    peer_address: None,
                     direction: Direction::Bidirectional,
                     preview_confirmed: false,
                 },
@@ -452,6 +453,7 @@ mod tests {
                 local_root: root.clone(),
                 state_root: dir.path().join("state"),
                 peer_endpoint_id: "aa".repeat(32),
+                peer_address: None,
                 direction: crate::Direction::Bidirectional,
                 continuous: true,
                 paused: false,
@@ -513,6 +515,7 @@ mod tests {
                 name: "ISOs".into(),
                 local_root: root.to_string_lossy().into(),
                 peer_endpoint_id: "aa".repeat(32),
+                peer_address: None,
                 direction: Direction::Bidirectional,
                 preview_confirmed: true,
             }),
@@ -557,6 +560,7 @@ mod tests {
                 name: "ISOs".into(),
                 local_root: root.to_string_lossy().into(),
                 peer_endpoint_id: "aa".repeat(32),
+                peer_address: None,
                 direction: Direction::Bidirectional,
                 preview_confirmed: true,
             }),
@@ -595,6 +599,60 @@ mod tests {
             panic!("expected Jobs, got {listed:?}");
         };
         assert!(!jobs[0].paused);
+    }
+
+    #[tokio::test]
+    async fn sync_now_rejects_paused_job() {
+        use std::sync::Arc;
+
+        use crate::{ConfigStore, JobSupervisor};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sync");
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Arc::new(ConfigStore::open(dir.path().join("config.redb")).unwrap());
+        let instance = DaemonInstance::with_runtime(Some(store), JobSupervisor::new());
+        let created = dispatch(
+            &instance,
+            request(Command::CreateJob {
+                name: "ISOs".into(),
+                local_root: root.to_string_lossy().into(),
+                peer_endpoint_id: "aa".repeat(32),
+                peer_address: None,
+                direction: Direction::Bidirectional,
+                preview_confirmed: true,
+            }),
+        )
+        .await
+        .result
+        .unwrap();
+        let CommandResult::Accepted { id } = created else {
+            panic!("expected Accepted, got {created:?}");
+        };
+        dispatch(&instance, request(Command::PauseJob { id: id.clone() }))
+            .await
+            .result
+            .unwrap();
+
+        let error = dispatch(&instance, request(Command::SyncNow { id }))
+            .await
+            .result
+            .expect_err("paused jobs must not start a pass");
+        assert_eq!(error.message, "job is paused");
+    }
+
+    #[tokio::test]
+    async fn preview_job_rejects_unknown_job() {
+        let error = dispatch(
+            &DaemonInstance::new(),
+            request(Command::PreviewJob {
+                id: "missing".into(),
+            }),
+        )
+        .await
+        .result
+        .expect_err("unknown jobs have no preview");
+        assert_eq!(error.message, "config store unavailable");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

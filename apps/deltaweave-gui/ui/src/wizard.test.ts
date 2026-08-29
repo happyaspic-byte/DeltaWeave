@@ -25,6 +25,7 @@ describe("add folder wizard", () => {
       name: "DeltaWeave-Private",
       local_root: "C:\\DeltaWeave-Private",
       peer_endpoint_id: "aa".repeat(32),
+      peer_address: null,
       direction: "bidirectional",
       preview_confirmed: true,
     });
