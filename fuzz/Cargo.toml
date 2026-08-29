@@ -13,11 +13,27 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+deltaweave-cdc = { path = "../crates/deltaweave-cdc" }
 deltaweave-core = { path = "../crates/deltaweave-core" }
+deltaweave-reconcile = { path = "../crates/deltaweave-reconcile" }
 
 [[bin]]
 name = "wire_path"
 path = "fuzz_targets/wire_path.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cdc"
+path = "fuzz_targets/cdc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "merkle"
+path = "fuzz_targets/merkle.rs"
 test = false
 doc = false
 bench = false

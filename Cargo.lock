@@ -697,6 +697,7 @@ name = "deltaweave-sync"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "deltaweave-cdc",
  "deltaweave-core",
  "deltaweave-index",
  "deltaweave-net",
