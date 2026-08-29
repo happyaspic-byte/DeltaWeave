@@ -629,6 +629,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "deltaweave-daemon-api"
+version = "0.3.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "deltaweave-index"
 version = "0.3.0"
 dependencies = [
