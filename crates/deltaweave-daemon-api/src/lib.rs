@@ -45,12 +45,57 @@ pub struct Request {
     pub command: Command,
 }
 
+/// Transfer direction for a job.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Direction {
+    /// Both sides may apply changes.
+    Bidirectional,
+    /// Local changes are pushed; remote changes are not applied locally.
+    SendOnly,
+    /// Remote changes are applied; local changes are not pushed.
+    ReceiveOnly,
+}
+
 /// Commands the daemon accepts.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Command {
     /// Capability negotiation.
     Hello,
+    /// List persisted jobs.
+    ListJobs,
+    /// Create a folder-to-peer job.
+    CreateJob {
+        /// User-visible name.
+        name: String,
+        /// Local folder path.
+        local_root: String,
+        /// Remote endpoint id as hex.
+        peer_endpoint_id: String,
+        /// Transfer direction.
+        direction: Direction,
+    },
+    /// Pause a running job.
+    PauseJob {
+        /// Job id.
+        id: String,
+    },
+    /// Resume a paused job.
+    ResumeJob {
+        /// Job id.
+        id: String,
+    },
+    /// Run one sync pass now.
+    SyncNow {
+        /// Job id.
+        id: String,
+    },
+    /// Cancel the current pass at the next gate.
+    CancelJob {
+        /// Job id.
+        id: String,
+    },
 }
 
 /// Correlated command reply.
@@ -60,6 +105,25 @@ pub struct Response {
     pub request_id: String,
     /// Success payload or domain error.
     pub result: Result<CommandResult, ErrorBody>,
+}
+
+/// One job as seen over IPC.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct JobInfo {
+    /// Stable job identifier.
+    pub id: String,
+    /// User-visible name.
+    pub name: String,
+    /// Local folder path.
+    pub local_root: String,
+    /// Remote endpoint id as hex.
+    pub peer_endpoint_id: String,
+    /// Transfer direction.
+    pub direction: Direction,
+    /// Whether the job runs continuously.
+    pub continuous: bool,
+    /// Whether the job is paused.
+    pub paused: bool,
 }
 
 /// Successful command payloads.
@@ -72,6 +136,16 @@ pub enum CommandResult {
         protocol_version: ProtocolVersion,
         /// Unique daemon instance id.
         instance_id: String,
+    },
+    /// Current jobs.
+    Jobs {
+        /// Jobs ordered by id.
+        jobs: Vec<JobInfo>,
+    },
+    /// A job-mutating command succeeded.
+    Accepted {
+        /// Job id.
+        id: String,
     },
 }
 
@@ -109,6 +183,18 @@ pub struct Event {
     pub body: EventBody,
 }
 
+/// Dashboard severity for one job.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Severity {
+    /// Healthy idle or transferring.
+    Normal,
+    /// Transient issue; retrying.
+    Attention,
+    /// User action required.
+    ActionRequired,
+}
+
 /// Event payloads.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -117,6 +203,34 @@ pub enum EventBody {
     DaemonReady {
         /// Unique daemon instance id.
         instance_id: String,
+    },
+    /// Coalesced transfer progress.
+    JobProgress {
+        /// Job id.
+        id: String,
+        /// Sync phase name.
+        phase: String,
+        /// Optional path being processed.
+        current_path: Option<String>,
+        /// Payload bytes pulled so far.
+        pulled_bytes: u64,
+        /// Payload bytes pushed so far.
+        pushed_bytes: u64,
+        /// Manifest extents reused so far.
+        reused_extents: usize,
+        /// Instantaneous throughput estimate.
+        bytes_per_second: u64,
+        /// Estimated remaining seconds.
+        eta_seconds: Option<u64>,
+    },
+    /// Job status line.
+    JobState {
+        /// Job id.
+        id: String,
+        /// Dashboard severity.
+        severity: Severity,
+        /// User-visible summary; never includes secrets.
+        summary: String,
     },
 }
 

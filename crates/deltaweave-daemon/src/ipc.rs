@@ -7,8 +7,8 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use deltaweave_daemon_api::{
-    Command, CommandResult, PROTOCOL_VERSION_MAJOR, PROTOCOL_VERSION_MINOR, ProtocolVersion,
-    Request, Response,
+    Command, CommandResult, ErrorBody, ErrorCode, PROTOCOL_VERSION_MAJOR, PROTOCOL_VERSION_MINOR,
+    ProtocolVersion, Request, Response,
 };
 use serde::Serialize;
 use tokio::{
@@ -97,6 +97,7 @@ pub async fn connect_and_hello(path: &Path) -> Result<HelloReply> {
             instance_id,
             protocol_version,
         }),
+        Ok(_) => bail!("unexpected hello reply"),
         Err(error) => bail!("{}", error.message),
     }
 }
@@ -126,6 +127,13 @@ fn dispatch(instance: &DaemonInstance, request: Request) -> Response {
             result: Ok(CommandResult::Hello {
                 protocol_version,
                 instance_id: instance.instance_id.clone(),
+            }),
+        },
+        (Ok(_), _) => Response {
+            request_id: request.request_id,
+            result: Err(ErrorBody {
+                code: ErrorCode::InvalidRequest,
+                message: "command not implemented".into(),
             }),
         },
     }

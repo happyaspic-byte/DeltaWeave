@@ -629,6 +629,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "deltaweave-daemon"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "deltaweave-daemon-api",
+ "deltaweave-sync",
+ "postcard",
+ "redb",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
 name = "deltaweave-daemon-api"
 version = "0.3.0"
 dependencies = [

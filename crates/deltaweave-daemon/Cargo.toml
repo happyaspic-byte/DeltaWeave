@@ -12,6 +12,7 @@ publish.workspace = true
 [dependencies]
 anyhow.workspace = true
 deltaweave-daemon-api = { path = "../deltaweave-daemon-api" }
+deltaweave-sync = { path = "../deltaweave-sync" }
 postcard.workspace = true
 redb.workspace = true
 serde = { workspace = true, features = ["derive"] }

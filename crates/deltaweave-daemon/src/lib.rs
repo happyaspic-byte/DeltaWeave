@@ -6,15 +6,18 @@ mod config;
 mod instance;
 #[cfg(unix)]
 mod ipc;
+mod jobs;
 
 pub use config::{ConfigStore, Direction, JobConfig};
 pub use instance::DaemonInstance;
 #[cfg(unix)]
 pub use ipc::{connect_and_hello, serve_unix, try_bind_unix, wait_until_exists};
+pub use jobs::{JobSupervisor, ProgressCoalescer};
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn rejects_second_job_on_same_canonical_root() {
@@ -52,5 +55,29 @@ mod tests {
         let err = try_bind_unix(&socket).unwrap_err();
         assert!(format!("{err:#}").contains("already running"));
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn progress_is_coalesced_to_ten_hertz() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = ProgressCoalescer::new(Duration::from_millis(100), tx);
+        let start = Instant::now();
+        for i in 0..1000 {
+            sink.emit(dummy_progress(i));
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let mut n = 0;
+        while rx.try_recv().is_ok() {
+            n += 1;
+        }
+        assert!(
+            n <= 2,
+            "got {n} events in {elapsed:?}",
+            elapsed = start.elapsed()
+        );
+    }
+
+    fn dummy_progress(i: u64) -> u64 {
+        i
     }
 }
