@@ -101,6 +101,8 @@ impl SyncEngine {
     /// Opens durable state after rejecting overlapping public and private roots.
     pub fn open(config: SyncConfig) -> Result<Self> {
         config.profile.validate()?;
+        reject_symlink_root(&config.root, "synchronization root")?;
+        reject_symlink_root(&config.state_root, "private state root")?;
         fs::create_dir_all(&config.root).with_context(|| {
             format!(
                 "failed to create synchronization root {}",
@@ -113,6 +115,8 @@ impl SyncEngine {
                 config.state_root.display()
             )
         })?;
+        reject_symlink_root(&config.root, "synchronization root")?;
+        reject_symlink_root(&config.state_root, "private state root")?;
         let root = fs::canonicalize(&config.root)?;
         let state_root = fs::canonicalize(&config.state_root)?;
         ensure!(
@@ -462,6 +466,32 @@ fn action_records(
         .collect()
 }
 
+fn reject_symlink_root(path: &Path, label: &str) -> Result<()> {
+    let mut current = path;
+    loop {
+        if let Ok(metadata) = fs::symlink_metadata(current) {
+            ensure!(
+                !metadata.file_type().is_symlink(),
+                "{label} must not contain a symbolic link"
+            );
+        }
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        if parent == current {
+            break;
+        }
+        current = parent;
+    }
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        ensure!(
+            metadata.is_dir(),
+            "{label} must be a real directory, not a symlink"
+        );
+    }
+    Ok(())
+}
+
 fn local_path(root: &Path, path: &WirePath) -> PathBuf {
     let mut local = root.to_path_buf();
     for component in path.components() {
@@ -504,6 +534,19 @@ mod tests {
 
     fn replica(key: &SecretKey) -> ReplicaId {
         ReplicaId(Hash32::digest(key.public().as_bytes()))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_root_rejects_symbolic_link() {
+        use std::os::unix::fs::symlink;
+
+        let parent = TempDir::new().expect("root parent can be created");
+        let outside = TempDir::new().expect("outside root can be created");
+        let root = parent.path().join("root");
+        symlink(outside.path(), &root).expect("root symlink can be created");
+
+        assert!(reject_symlink_root(&root, "synchronization root").is_err());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

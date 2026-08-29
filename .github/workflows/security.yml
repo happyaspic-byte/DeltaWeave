@@ -27,12 +27,21 @@ jobs:
         run: cargo install cargo-audit --version 0.22.2 --locked
       - name: Audit Cargo.lock
         # Unmaintained paste remains a transitive iroh/netlink crate
-        # (RUSTSEC-2024-0436). Yanked chacha20 is pulled by iroh/rand and is
-        # tracked as a warning in deny.toml. Keep every other RustSec warning
-        # fatal.
+        # (RUSTSEC-2024-0436). Keep every other RustSec warning, including
+        # yanked crates, fatal.
         run: >-
-          cargo audit --deny warnings --no-yanked
+          cargo audit --deny warnings
           --ignore RUSTSEC-2024-0436
+
+  fuzz-check:
+    name: Fuzz workspace compilation
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@1.91.0
+      - name: Check fuzz workspace
+        run: cargo check --manifest-path fuzz/Cargo.toml --locked
 
   cargo-deny:
     name: cargo-deny

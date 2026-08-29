@@ -309,7 +309,35 @@ fn endpoint_addr_with_local_fallback(endpoint: &Endpoint) -> EndpointAddr {
     EndpointAddr::from_parts(current.id, relays.chain(sockets))
 }
 
+fn reject_symlink_root(path: &Path, label: &str) -> Result<()> {
+    let mut current = path;
+    loop {
+        if let Ok(metadata) = fs::symlink_metadata(current) {
+            ensure!(
+                !metadata.file_type().is_symlink(),
+                "{label} must not contain a symbolic link"
+            );
+        }
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        if parent == current {
+            break;
+        }
+        current = parent;
+    }
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        ensure!(
+            metadata.is_dir(),
+            "{label} must be a real directory, not a symlink"
+        );
+    }
+    Ok(())
+}
+
 fn prepare_server_roots(destination_root: &Path, state_root: &Path) -> Result<(PathBuf, PathBuf)> {
+    reject_symlink_root(destination_root, "destination root")?;
+    reject_symlink_root(state_root, "state root")?;
     fs::create_dir_all(destination_root).with_context(|| {
         format!(
             "failed to create destination root {}",
@@ -318,6 +346,8 @@ fn prepare_server_roots(destination_root: &Path, state_root: &Path) -> Result<(P
     })?;
     fs::create_dir_all(state_root)
         .with_context(|| format!("failed to create state root {}", state_root.display()))?;
+    reject_symlink_root(destination_root, "destination root")?;
+    reject_symlink_root(state_root, "state root")?;
     let destination_root = fs::canonicalize(destination_root)?;
     let state_root = fs::canonicalize(state_root)?;
     ensure!(
@@ -612,7 +642,11 @@ impl SyncClient {
             "push_record requires a live file record"
         );
         let source = source.as_ref().to_path_buf();
-        ensure!(source.is_file(), "source is not a regular file");
+        let metadata = fs::symlink_metadata(&source)?;
+        ensure!(
+            !metadata.file_type().is_symlink() && metadata.is_file(),
+            "source is not a regular file"
+        );
         let source_for_manifest = source.clone();
         let manifest =
             tokio::task::spawn_blocking(move || manifest_from_path(source_for_manifest, profile))
@@ -876,7 +910,11 @@ impl SyncSession {
             "push_record requires a live file record"
         );
         let source = source.as_ref().to_path_buf();
-        ensure!(source.is_file(), "source is not a regular file");
+        let metadata = fs::symlink_metadata(&source)?;
+        ensure!(
+            !metadata.file_type().is_symlink() && metadata.is_file(),
+            "source is not a regular file"
+        );
         let source_for_manifest = source.clone();
         let manifest =
             tokio::task::spawn_blocking(move || manifest_from_path(source_for_manifest, profile))
@@ -1943,6 +1981,31 @@ mod tests {
             Vec::<u8>::new()
         );
         server.shutdown().await.expect("server shuts down");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn server_rejects_symbolic_link_roots() {
+        use std::os::unix::fs::symlink;
+
+        let parent = TempDir::new().expect("root parent can be created");
+        let destination = TempDir::new().expect("destination can be created");
+        let state = TempDir::new().expect("state can be created");
+        let destination_link = parent.path().join("destination");
+        let state_link = parent.path().join("state");
+        symlink(destination.path(), &destination_link).expect("destination symlink can be created");
+        symlink(state.path(), &state_link).expect("state symlink can be created");
+
+        let result = start_server(ServerConfig {
+            secret_key: SecretKey::generate(),
+            destination_root: destination_link,
+            state_root: state_link,
+            peer_policy: PeerPolicy::AllowListed(HashSet::new()),
+            network_mode: NetworkMode::DirectOnly,
+        })
+        .await;
+
+        assert!(result.is_err());
     }
 
     #[tokio::test]

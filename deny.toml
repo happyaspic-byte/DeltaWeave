@@ -10,12 +10,11 @@ feature-depth = 1
 
 [advisories]
 # Unmaintained `paste` remains a transitive iroh/netlink dependency
-# (RUSTSEC-2024-0436). Keep every other advisory fatal. Yanked `chacha20`
-# 0.10.1 is still pulled by iroh/rand and is tracked as a warning.
+# (RUSTSEC-2024-0436). Keep every other advisory fatal, including yanked crates.
 ignore = [
     { id = "RUSTSEC-2024-0436", reason = "unmaintained paste 1.0.15 is still pulled by netlink-packet-core via iroh 1.1.0" },
 ]
-yanked = "warn"
+yanked = "deny"
 
 [licenses]
 allow = [

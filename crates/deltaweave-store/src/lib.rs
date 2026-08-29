@@ -262,7 +262,9 @@ impl Store {
     /// Opens a complete DeltaWeave state directory.
     pub fn open(state_root: impl AsRef<Path>) -> Result<Self> {
         let state_root = state_root.as_ref();
+        reject_root_path(state_root)?;
         fs::create_dir_all(state_root)?;
+        reject_root_path(state_root)?;
         Ok(Self {
             chunks: ChunkStore::open(state_root)?,
             metadata: MetadataStore::open(state_root.join("metadata.redb"))?,
@@ -306,6 +308,10 @@ impl Store {
         profile: ChunkingProfile,
     ) -> Result<FileManifest> {
         let source = source.as_ref();
+        let metadata = fs::symlink_metadata(source)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            bail!("source must be a regular file, not a symbolic link");
+        }
         let manifest = manifest_from_path(source, profile)?;
         let mut file = File::open(source)?;
         for descriptor in &manifest.chunks {
@@ -561,6 +567,33 @@ pub struct RemoveOutcome {
     pub preserved_path: Option<PathBuf>,
 }
 
+fn reject_root_path(path: &Path) -> Result<()> {
+    let mut current = path;
+    loop {
+        match fs::symlink_metadata(current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                bail!("state root must not contain a symbolic link")
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        if parent == current {
+            break;
+        }
+        current = parent;
+    }
+    if let Ok(metadata) = fs::symlink_metadata(path)
+        && !metadata.is_dir()
+    {
+        bail!("state root must be a real directory");
+    }
+    Ok(())
+}
+
 fn checked_destination(root: &Path, path: &WirePath) -> Result<PathBuf> {
     let root_metadata = fs::symlink_metadata(root)?;
     if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
@@ -769,6 +802,25 @@ mod tests {
         assert!(store.missing_chunks(&manifest).contains(&first.hash));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn ingest_file_rejects_symbolic_link_sources() {
+        use std::os::unix::fs::symlink;
+
+        let state = TempDir::new().expect("state directory can be created");
+        let source = state.path().join("source.bin");
+        let outside = state.path().join("outside.bin");
+        fs::write(&outside, b"outside").expect("outside source can be written");
+        symlink(&outside, &source).expect("source symlink can be created");
+        let store = Store::open(state.path().join("private")).expect("store can open");
+
+        assert!(
+            store
+                .ingest_file(&source, ChunkingProfile::DEFAULT)
+                .is_err()
+        );
+    }
+
     #[test]
     fn ingest_file_populates_every_manifest_chunk() {
         let state = TempDir::new().expect("state directory can be created");
@@ -833,6 +885,20 @@ mod tests {
                 .is_err()
         );
         assert!(destination.path().join("folder/unindexed.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_rejects_symlinked_state_root() {
+        use std::os::unix::fs::symlink;
+
+        let state = TempDir::new().expect("state parent can be created");
+        let outside = TempDir::new().expect("outside state can be created");
+        let link = state.path().join("link");
+        symlink(outside.path(), &link).expect("state symlink can be created");
+
+        assert!(Store::open(&link).is_err());
+        assert!(!outside.path().join("chunks").exists());
     }
 
     #[cfg(unix)]
