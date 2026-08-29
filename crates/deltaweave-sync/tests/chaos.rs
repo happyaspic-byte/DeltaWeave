@@ -68,6 +68,7 @@ async fn start_mesh_peer(peer: &Peer, clients: &[&Peer]) -> Server {
         peer_policy: PeerPolicy::AllowListed(allowed),
         network_mode: NetworkMode::DirectOnly,
         quota_policy: None,
+        bind: None,
     })
     .await
     .expect("mesh server can start")
@@ -243,6 +244,7 @@ async fn server_death_partition_heals_after_restart() {
         peer_policy: PeerPolicy::AllowListed(allowed),
         network_mode: NetworkMode::DirectOnly,
         quota_policy: None,
+        bind: None,
     })
     .await
     .expect("gamma server restarts with the same identity and state");

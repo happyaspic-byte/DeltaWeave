@@ -175,6 +175,8 @@ pub struct ServerConfig {
     pub network_mode: NetworkMode,
     /// Per-peer bandwidth, concurrency, and storage admission.
     pub quota_policy: Option<quota::QuotaPolicy>,
+    /// Fixed UDP bind address. When set, restarts keep the same port so pairing tickets stay valid.
+    pub bind: Option<SocketAddr>,
 }
 
 /// A running DeltaWeave protocol router.
@@ -240,6 +242,7 @@ pub async fn start_server(config: ServerConfig) -> Result<Server> {
         peer_policy,
         network_mode,
         quota_policy,
+        bind,
     } = config;
     let (destination_root, state_root) = prepare_server_roots(&destination_root, &state_root)?;
     let access = match &peer_policy {
@@ -272,6 +275,7 @@ pub async fn start_server(config: ServerConfig) -> Result<Server> {
             ALPN_V2.to_vec(),
             ALPN_PAIRING.to_vec(),
         ]),
+        bind,
     )
     .await?;
     let push_handler = PushHandler {
@@ -402,6 +406,7 @@ async fn bind_endpoint(
     secret_key: SecretKey,
     mode: NetworkMode,
     alpns: Option<Vec<Vec<u8>>>,
+    bind: Option<SocketAddr>,
 ) -> Result<Endpoint> {
     let mut builder = match mode {
         NetworkMode::Internet => Endpoint::builder(presets::N0),
@@ -410,6 +415,11 @@ async fn bind_endpoint(
     .secret_key(secret_key);
     if let Some(alpns) = alpns {
         builder = builder.alpns(alpns);
+    }
+    if let Some(addr) = bind {
+        builder = builder
+            .bind_addr(addr)
+            .map_err(|error| anyhow::anyhow!("invalid bind address {addr}: {error}"))?;
     }
     builder.bind().await.context("failed to bind iroh endpoint")
 }
@@ -465,7 +475,7 @@ pub async fn redeem_pairing_ticket(
         .parse::<SocketAddr>()
         .context("pairing ticket has an invalid server address")?;
     let remote = EndpointAddr::from_parts(server_id, [TransportAddr::Ip(direct)]);
-    let endpoint = bind_endpoint(secret_key, network_mode, None).await?;
+    let endpoint = bind_endpoint(secret_key, network_mode, None, None).await?;
     let outcome = async {
         let connection = endpoint
             .connect(remote, ALPN_PAIRING)
@@ -581,7 +591,8 @@ pub struct PullReceipt {
 impl SyncClient {
     /// Opens one authenticated local endpoint that can serve all calls in a sync pass.
     pub async fn open_session(&self) -> Result<SyncSession> {
-        let endpoint = bind_endpoint(self.secret_key.clone(), self.network_mode, None).await?;
+        let endpoint =
+            bind_endpoint(self.secret_key.clone(), self.network_mode, None, None).await?;
         Ok(SyncSession {
             client: self.clone(),
             endpoint,
@@ -1064,7 +1075,7 @@ pub async fn push_file(options: PushOptions) -> Result<TransferReceipt> {
             .await
             .context("manifest task failed")??;
 
-    let endpoint = bind_endpoint(options.secret_key, options.network_mode, None).await?;
+    let endpoint = bind_endpoint(options.secret_key, options.network_mode, None, None).await?;
     let result = push_connected(
         &endpoint,
         &options.source,
@@ -2110,6 +2121,7 @@ mod tests {
             peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
             network_mode: NetworkMode::DirectOnly,
             quota_policy: None,
+            bind: None,
         })
         .await
         .expect("server can start");
@@ -2210,6 +2222,7 @@ mod tests {
             peer_policy: PeerPolicy::AllowListed(HashSet::new()),
             network_mode: NetworkMode::DirectOnly,
             quota_policy: None,
+            bind: None,
         })
         .await;
 
@@ -2226,6 +2239,7 @@ mod tests {
             peer_policy: PeerPolicy::AllowListed(HashSet::new()),
             network_mode: NetworkMode::DirectOnly,
             quota_policy: None,
+            bind: None,
         })
         .await;
 
@@ -2243,6 +2257,7 @@ mod tests {
             peer_policy: PeerPolicy::AllowListed(HashSet::new()),
             network_mode: NetworkMode::DirectOnly,
             quota_policy: None,
+            bind: None,
         })
         .await
         .expect("server can start");
@@ -2265,6 +2280,7 @@ mod tests {
             peer_policy: PeerPolicy::AllowListed(HashSet::from([SecretKey::generate().public()])),
             network_mode: NetworkMode::DirectOnly,
             quota_policy: None,
+            bind: None,
         })
         .await
         .expect("server can start");
@@ -2313,6 +2329,7 @@ mod tests {
             peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
             network_mode: NetworkMode::DirectOnly,
             quota_policy: None,
+            bind: None,
         })
         .await
         .expect("server can start");
@@ -2486,6 +2503,7 @@ mod tests {
             peer_policy: PeerPolicy::Durable(Arc::clone(&access)),
             network_mode: NetworkMode::DirectOnly,
             quota_policy: None,
+            bind: None,
         })
         .await
         .expect("durable server can start");
@@ -2575,5 +2593,82 @@ mod tests {
         assert!(!destination.path().join("revoked.bin").exists());
 
         server.shutdown().await.expect("server shuts down");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bound_port_survives_restart_so_issued_ticket_still_redeems() {
+        let reserved = std::net::UdpSocket::bind("127.0.0.1:0").expect("can reserve a UDP port");
+        let bind = reserved.local_addr().expect("reserved address is readable");
+        drop(reserved);
+
+        let state = TempDir::new().expect("server state can be created");
+        let destination = TempDir::new().expect("server root can be created");
+        let server_key = SecretKey::generate();
+        let client_key = SecretKey::generate();
+        let access = Arc::new(
+            access::AccessStore::open(state.path().join("access.redb"))
+                .expect("access store opens"),
+        );
+        let config = ServerConfig {
+            secret_key: server_key.clone(),
+            destination_root: destination.path().to_path_buf(),
+            state_root: state.path().to_path_buf(),
+            peer_policy: PeerPolicy::Durable(Arc::clone(&access)),
+            network_mode: NetworkMode::DirectOnly,
+            quota_policy: None,
+            bind: Some(bind),
+        };
+        let server = start_server(config.clone())
+            .await
+            .expect("bound server can start");
+        assert!(
+            advertised_ports(&server).contains(&bind.port()),
+            "first bind must advertise UDP port {}",
+            bind.port()
+        );
+        let ticket = access
+            .issue_ticket(
+                &server_key.public(),
+                &bind.to_string(),
+                access::unix_now() + 600,
+            )
+            .expect("ticket can be issued against the bound address");
+        server.shutdown().await.expect("bound server shuts down");
+
+        let restarted = start_server(config)
+            .await
+            .expect("server restarts on the same UDP port");
+        assert!(
+            advertised_ports(&restarted).contains(&bind.port()),
+            "restart must keep UDP port {}",
+            bind.port()
+        );
+        let outcome = redeem_pairing_ticket(client_key.clone(), ticket, NetworkMode::DirectOnly)
+            .await
+            .expect("ticket issued before restart still redeems on the same port");
+        assert_eq!(outcome, access::RedeemOutcome::Paired);
+        assert!(
+            access
+                .is_authorized(client_key.public())
+                .expect("authorization is readable")
+        );
+        restarted
+            .shutdown()
+            .await
+            .expect("restarted server shuts down");
+    }
+
+    fn advertised_ports(server: &Server) -> Vec<u16> {
+        server
+            .address_info()
+            .direct_addresses
+            .iter()
+            .filter_map(|address| {
+                address
+                    .parse::<SocketAddr>()
+                    .ok()
+                    .map(|socket| socket.port())
+            })
+            .collect()
     }
 }

@@ -144,6 +144,9 @@ struct ServeArgs {
     /// Maximum unique CAS bytes stored by this node; 0 means unlimited.
     #[arg(long, default_value_t = 0)]
     max_storage_bytes: u64,
+    /// Fixed UDP bind address so pairing tickets survive server restart.
+    #[arg(long)]
+    bind: Option<SocketAddr>,
 }
 
 #[derive(Debug, Args)]
@@ -396,6 +399,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
         } else {
             Some(quota_policy)
         },
+        bind: args.bind,
     })
     .await?;
     if !server.wait_online(Duration::from_secs(20)).await {
@@ -797,6 +801,7 @@ async fn self_test() -> Result<()> {
         peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
         network_mode: NetworkMode::DirectOnly,
         quota_policy: None,
+        bind: None,
     })
     .await
     .context("self-test receiver failed to start")?;
@@ -1320,6 +1325,27 @@ mod tests {
     }
 
     #[test]
+    fn serve_parses_fixed_udp_bind() {
+        let cli = Cli::try_parse_from([
+            "deltaweave",
+            "serve",
+            "--root",
+            "output",
+            "--direct-only",
+            "--bind",
+            "127.0.0.1:4433",
+        ])
+        .expect("serve --bind parses");
+        let Command::Serve(args) = cli.command else {
+            panic!("serve command expected");
+        };
+        assert_eq!(
+            args.bind,
+            Some("127.0.0.1:4433".parse().expect("valid address"))
+        );
+    }
+
+    #[test]
     fn serve_and_sync_accept_a_shared_access_database_path() {
         let serve = Cli::try_parse_from([
             "deltaweave",
@@ -1333,7 +1359,7 @@ mod tests {
         .expect("durable serve parses");
         assert!(matches!(
             serve.command,
-            Command::Serve(ServeArgs { access, durable_access: true, .. })
+            Command::Serve(ServeArgs { access, durable_access: true, bind: None, .. })
                 if access == *"access.redb"
         ));
 

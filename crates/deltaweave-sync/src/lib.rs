@@ -574,6 +574,7 @@ mod tests {
             peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
             network_mode: NetworkMode::DirectOnly,
             quota_policy: None,
+            bind: None,
         })
         .await
         .expect("server can start");
