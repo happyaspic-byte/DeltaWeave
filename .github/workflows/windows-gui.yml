@@ -174,10 +174,10 @@ jobs:
             throw "serve did not become ready"
           }
           $code = (Get-Content "$server\ticket.code" -Raw).Trim()
-          $redeem = & $dw pair redeem $code --identity "$client\identity.key"
+          $redeem = & $dw pair redeem $code --identity "$client\identity.key" | Out-String
           if ($redeem -notmatch 'Paired') { throw "redeem failed" }
           $code = $null
-          $sync = & $dw sync-once --root "$client\root" --state "$client\state" --access "$client\state\access.redb" --identity "$client\identity.key" --peer $serverId --direct $bind --direct-only
+          $sync = & $dw sync-once --root "$client\root" --state "$client\state" --access "$client\state\access.redb" --identity "$client\identity.key" --peer $serverId --direct $bind --direct-only | Out-String
           if ($sync -notmatch '"status"\s*:\s*"pass"') {
             Write-Host $sync
             throw "sync-once did not pass"
