@@ -176,10 +176,29 @@ impl DaemonInstance {
         Ok(CommandResult::Accepted { id: id.into() })
     }
 
-    pub(crate) fn sync_now(&self, id: &str) -> Result<CommandResult> {
-        let _cancel = self.supervisor.begin_sync(id)?;
+    pub(crate) async fn sync_now(&self, id: &str) -> Result<CommandResult> {
+        let cancel = self.supervisor.begin_sync(id)?;
+        let outcome = async {
+            let job = self.job(id)?;
+            let address = job
+                .peer_address
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("peer direct address unavailable"))?;
+            let pairing = self.pairing_service()?;
+            let engine = deltaweave_sync::SyncEngine::open(deltaweave_sync::SyncConfig {
+                root: job.local_root,
+                state_root: job.state_root,
+                replica: pairing.replica_id()?,
+                client: pairing.sync_client(&job.peer_endpoint_id, address)?,
+                profile: deltaweave_core::ChunkingProfile::DEFAULT,
+                ignored_paths: Vec::new(),
+            })?;
+            engine.sync_once_with(None, Some(cancel)).await?;
+            Ok(CommandResult::Accepted { id: id.into() })
+        }
+        .await;
         self.supervisor.end_sync(id);
-        Ok(CommandResult::Accepted { id: id.into() })
+        outcome
     }
 
     pub(crate) fn preview_job(&self, id: &str) -> Result<CommandResult> {

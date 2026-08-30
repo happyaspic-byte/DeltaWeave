@@ -167,7 +167,7 @@ async fn dispatch(instance: &DaemonInstance, request: Request) -> Response {
             command_response(request.request_id, instance.cancel_job(&id))
         }
         (Ok(_), Command::SyncNow { id }) => {
-            command_response(request.request_id, instance.sync_now(&id))
+            command_response(request.request_id, instance.sync_now(&id).await)
         }
         (Ok(_), Command::PreviewJob { id }) => {
             command_response(request.request_id, instance.preview_job(&id))
@@ -653,6 +653,87 @@ mod tests {
         .result
         .expect_err("unknown jobs have no preview");
         assert_eq!(error.message, "config store unavailable");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sync_now_transfers_a_file_to_the_paired_peer() {
+        use std::sync::Arc;
+
+        use crate::{ConfigStore, JobSupervisor, PairingConfig, PairingService};
+
+        let server_dir = tempfile::tempdir().unwrap();
+        let client_dir = tempfile::tempdir().unwrap();
+        let server_root = tempfile::tempdir().unwrap();
+        let client_root = tempfile::tempdir().unwrap();
+        let reserved = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let bind = reserved.local_addr().unwrap();
+        drop(reserved);
+
+        let server = PairingService::start(PairingConfig {
+            state_root: server_dir.path().join("state"),
+            destination_root: server_root.path().to_path_buf(),
+            identity_path: server_dir.path().join("node.key"),
+            bind: Some(bind),
+        })
+        .await
+        .unwrap();
+        let issued = server.issue_ticket(None).unwrap();
+        let CommandResult::TicketIssued { code, .. } = issued else {
+            panic!("expected TicketIssued, got {issued:?}");
+        };
+
+        let client = PairingService::start(PairingConfig {
+            state_root: client_dir.path().join("pairing"),
+            destination_root: client_dir.path().join("inbox"),
+            identity_path: client_dir.path().join("node.key"),
+            bind: None,
+        })
+        .await
+        .unwrap();
+        let redeemed = client.redeem_ticket(&code).await.unwrap();
+        let CommandResult::TicketRedeemed {
+            peer_endpoint_id,
+            server_direct_address,
+            ..
+        } = redeemed
+        else {
+            panic!("expected TicketRedeemed, got {redeemed:?}");
+        };
+
+        std::fs::write(client_root.path().join("hello.txt"), b"from windows").unwrap();
+        let store = Arc::new(ConfigStore::open(client_dir.path().join("config.redb")).unwrap());
+        let instance =
+            DaemonInstance::with_pairing(Some(store), JobSupervisor::new(), client.clone());
+        let created = dispatch(
+            &instance,
+            request(Command::CreateJob {
+                name: "Files".into(),
+                local_root: client_root.path().to_string_lossy().into(),
+                peer_endpoint_id,
+                peer_address: Some(server_direct_address),
+                direction: Direction::Bidirectional,
+                preview_confirmed: true,
+            }),
+        )
+        .await
+        .result
+        .unwrap();
+        let CommandResult::Accepted { id } = created else {
+            panic!("expected Accepted, got {created:?}");
+        };
+
+        dispatch(&instance, request(Command::SyncNow { id }))
+            .await
+            .result
+            .unwrap();
+        assert_eq!(
+            std::fs::read(server_root.path().join("hello.txt")).unwrap(),
+            b"from windows"
+        );
+
+        drop(instance);
+        client.shutdown().await.unwrap();
+        server.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

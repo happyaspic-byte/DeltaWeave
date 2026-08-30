@@ -121,6 +121,26 @@ impl PairingService {
         })
     }
 
+    pub(crate) fn sync_client(
+        &self,
+        endpoint_id: &str,
+        direct_address: &str,
+    ) -> Result<deltaweave_net::SyncClient> {
+        let direct = direct_address
+            .parse()
+            .context("invalid peer direct address")?;
+        let remote = deltaweave_net::endpoint_addr(endpoint_id, &[direct], &[])?;
+        Ok(deltaweave_net::SyncClient {
+            secret_key: self.identity.secret_key.clone(),
+            remote,
+            network_mode: NetworkMode::DirectOnly,
+        })
+    }
+
+    pub(crate) fn replica_id(&self) -> Result<deltaweave_core::ReplicaId> {
+        self.access.stable_replica_id(&self.identity.secret_key)
+    }
+
     /// Revokes a previously authorized peer.
     pub fn revoke_peer(&self, endpoint_id: &str) -> Result<bool> {
         let peer = endpoint_id.parse().context("invalid endpoint ID")?;
