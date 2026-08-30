@@ -192,6 +192,9 @@ pub enum CommandResult {
         protocol_version: ProtocolVersion,
         /// Unique daemon instance id.
         instance_id: String,
+        /// This daemon's public endpoint id as hex.
+        #[serde(default)]
+        local_endpoint_id: String,
     },
     /// Current jobs.
     Jobs {

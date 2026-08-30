@@ -66,7 +66,8 @@ pub fn run() {
             resume_job,
             issue_ticket,
             list_conflicts,
-            browse_folder
+            browse_folder,
+            hello
         ])
         .run(tauri::generate_context!())
         .expect("error while running DeltaWeave");
@@ -118,6 +119,11 @@ async fn preview_job(
     })
     .await?;
     serde_json::to_value(result).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn hello() -> Result<serde_json::Value, String> {
+    serde_json::to_value(send_daemon(Command::Hello).await?).map_err(|error| error.to_string())
 }
 
 #[tauri::command]

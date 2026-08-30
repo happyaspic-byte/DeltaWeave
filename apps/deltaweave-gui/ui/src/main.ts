@@ -16,6 +16,7 @@ const root = document.getElementById("app");
 let wizard: WizardState = createWizardState();
 let jobs: DashboardJob[] = [];
 let conflicts: { jobId: string; path: string; localNewer: boolean }[] = [];
+let localEndpointId = "";
 
 function paint(): void {
   if (!root) {
@@ -28,6 +29,7 @@ function paint(): void {
       percent: 0,
       jobs,
       conflicts,
+      localEndpointId,
     }),
     renderWizard(wizard),
   ].join("");
@@ -229,6 +231,8 @@ function sendCreateJob(command: CreateJobCommand): Promise<void> {
 }
 
 async function refreshJobs(): Promise<void> {
+  const hello = await invokeDaemon<{ local_endpoint_id?: string }>("hello", {});
+  localEndpointId = hello.local_endpoint_id ?? localEndpointId;
   const listed = await invokeDaemon<{ jobs?: DashboardJob[] }>("list_jobs", {});
   jobs = listed.jobs ?? [];
   const nextConflicts: { jobId: string; path: string; localNewer: boolean }[] = [];

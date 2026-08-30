@@ -277,6 +277,13 @@ impl DaemonInstance {
         self.pairing_service()?.issue_ticket(ttl_seconds)
     }
 
+    pub(crate) fn local_endpoint_id(&self) -> String {
+        self.pairing
+            .as_ref()
+            .map(|pairing| pairing.local_endpoint_id())
+            .unwrap_or_default()
+    }
+
     pub(crate) fn revoke_peer(&self, endpoint_id: &str) -> Result<CommandResult> {
         self.pairing_service()?.revoke_peer(endpoint_id)?;
         Ok(CommandResult::Accepted {

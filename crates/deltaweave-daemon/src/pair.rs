@@ -147,6 +147,12 @@ impl PairingService {
         self.access.revoke(peer)
     }
 
+    /// Public endpoint id of this daemon, as hex.
+    #[must_use]
+    pub fn local_endpoint_id(&self) -> String {
+        self.identity.endpoint_id().to_string()
+    }
+
     /// Shuts down the iroh server when this is the last handle.
     pub async fn shutdown(mut self) -> Result<()> {
         if let Some(server) = self.server.take() {

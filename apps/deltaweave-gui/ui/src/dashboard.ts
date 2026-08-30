@@ -19,6 +19,7 @@ export type DashboardState = {
   percent: number;
   jobs: DashboardJob[];
   conflicts: ConflictPane[];
+  localEndpointId: string;
 };
 
 export function renderDashboard(state: DashboardState): string {
@@ -28,6 +29,7 @@ export function renderDashboard(state: DashboardState): string {
     `<p class="speed">${megabytes} MB/s</p>`,
     `<p class="file">${escapeHtml(state.currentPath)}</p>`,
     `<p class="percent">${state.percent}%</p>`,
+    `<p class="identity">이 PC <code>${escapeHtml(state.localEndpointId)}</code></p>`,
     `</section>`,
     `<section class="jobs"><h2>동기화 폴더</h2>${renderJobs(state.jobs)}</section>`,
     renderConflictPane(

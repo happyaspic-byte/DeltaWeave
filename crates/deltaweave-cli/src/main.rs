@@ -496,6 +496,7 @@ async fn daemon_status() -> Result<()> {
             .with_context(|| format!("failed to attach to {}", socket.display()))?;
         print_json(&json!({
             "instance_id": hello.instance_id,
+            "local_endpoint_id": hello.local_endpoint_id,
             "protocol_version": {
                 "major": hello.protocol_version.major,
                 "minor": hello.protocol_version.minor,

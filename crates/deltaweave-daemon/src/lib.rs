@@ -163,4 +163,35 @@ mod tests {
         server.shutdown().await.unwrap();
         client.shutdown().await.unwrap();
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn hello_includes_local_endpoint_id() {
+        use deltaweave_daemon_api::{Command, CommandResult};
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("dw.sock");
+        let pairing = PairingService::start(PairingConfig {
+            state_root: dir.path().join("state"),
+            destination_root: dest.path().to_path_buf(),
+            identity_path: dir.path().join("node.key"),
+            bind: None,
+        })
+        .await
+        .unwrap();
+        let expected = pairing.local_endpoint_id();
+        assert_eq!(expected.len(), 64);
+        let instance = DaemonInstance::with_pairing(None, JobSupervisor::new(), pairing);
+        let server = tokio::spawn(serve_unix(instance, socket.clone()));
+        wait_until_exists(&socket).await;
+        let result = send_command(&socket, Command::Hello).await.unwrap();
+        let CommandResult::Hello {
+            local_endpoint_id, ..
+        } = result
+        else {
+            panic!("expected Hello, got {result:?}");
+        };
+        assert_eq!(local_endpoint_id, expected);
+        server.abort();
+    }
 }

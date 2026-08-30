@@ -24,6 +24,8 @@ pub struct HelloReply {
     pub instance_id: String,
     /// Negotiated protocol version.
     pub protocol_version: ProtocolVersion,
+    /// This daemon's public endpoint id as hex.
+    pub local_endpoint_id: String,
 }
 
 /// Connects and completes Hello against a live daemon endpoint.
@@ -32,9 +34,11 @@ pub async fn connect_and_hello(path: &Path) -> Result<HelloReply> {
         CommandResult::Hello {
             instance_id,
             protocol_version,
+            local_endpoint_id,
         } => Ok(HelloReply {
             instance_id,
             protocol_version,
+            local_endpoint_id,
         }),
         _ => bail!("unexpected hello reply"),
     }
@@ -127,6 +131,7 @@ async fn dispatch(instance: &DaemonInstance, request: Request) -> Response {
             result: Ok(CommandResult::Hello {
                 protocol_version,
                 instance_id: instance.instance_id.clone(),
+                local_endpoint_id: instance.local_endpoint_id(),
             }),
         },
         (
