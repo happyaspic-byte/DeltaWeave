@@ -123,3 +123,78 @@ jobs:
             throw "daemon did not print ready"
           }
           Stop-Process -Id $job.Id -Force -ErrorAction SilentlyContinue
+
+  pair-sync:
+    name: Windows pair and hash match
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@1.91.0
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - name: Build CLI
+        run: cargo build --locked --release --target x86_64-pc-windows-msvc -p deltaweave
+      - name: Pair, sync-once, and match hashes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $dw = Resolve-Path "target/x86_64-pc-windows-msvc/release/deltaweave.exe"
+          $root = Join-Path $env:RUNNER_TEMP "dw-pair"
+          $server = Join-Path $root "server"
+          $client = Join-Path $root "client"
+          New-Item -ItemType Directory -Force -Path "$server\root","$server\state","$client\root","$client\state" | Out-Null
+          Set-Content -Path "$server\root\from-server.txt" -Value "server-file" -NoNewline
+          Set-Content -Path "$client\root\from-client.txt" -Value "client-file" -NoNewline
+          $serverInit = & $dw init --identity "$server\identity.key" | ConvertFrom-Json
+          $null = & $dw init --identity "$client\identity.key"
+          $serverId = $serverInit.endpoint_id
+          if (-not $serverId) { throw "missing server endpoint id" }
+          $bind = "127.0.0.1:17893"
+          $issued = & $dw pair issue --ttl-seconds 600 --direct-address $bind --access "$server\state\access.redb" --identity "$server\identity.key" | ConvertFrom-Json
+          if (-not $issued.code.StartsWith("dwpair1:")) { throw "ticket missing prefix" }
+          Set-Content -Path "$server\ticket.code" -Value $issued.code
+          $issued = $null
+          $serve = Start-Process -FilePath $dw -ArgumentList @(
+            "serve","--root","$server\root","--state","$server\state","--access","$server\state\access.redb",
+            "--identity","$server\identity.key","--durable-access","--direct-only","--bind",$bind
+          ) -RedirectStandardOutput "$server\serve.json" -RedirectStandardError "$server\serve.err" -PassThru
+          $ready = $false
+          for ($i = 0; $i -lt 80; $i++) {
+            Start-Sleep -Milliseconds 250
+            if (Test-Path "$server\serve.json") {
+              $log = Get-Content "$server\serve.json" -Raw
+              if ($log -match '"status"\s*:\s*"ready"') { $ready = $true; break }
+            }
+            if ($serve.HasExited) { break }
+          }
+          if (-not $ready) {
+            Get-Content "$server\serve.json","$server\serve.err" -ErrorAction SilentlyContinue
+            throw "serve did not become ready"
+          }
+          $code = (Get-Content "$server\ticket.code" -Raw).Trim()
+          $redeem = & $dw pair redeem $code --identity "$client\identity.key"
+          if ($redeem -notmatch 'Paired') { throw "redeem failed" }
+          $code = $null
+          $sync = & $dw sync-once --root "$client\root" --state "$client\state" --access "$client\state\access.redb" --identity "$client\identity.key" --peer $serverId --direct $bind --direct-only
+          if ($sync -notmatch '"status"\s*:\s*"pass"') {
+            Write-Host $sync
+            throw "sync-once did not pass"
+          }
+          function Hash-File($path) {
+            (Get-FileHash $path -Algorithm SHA256).Hash.ToLower()
+          }
+          $pairs = @(
+            @("$server\root\from-server.txt","$client\root\from-server.txt"),
+            @("$server\root\from-client.txt","$client\root\from-client.txt")
+          )
+          foreach ($pair in $pairs) {
+            if (-not (Test-Path $pair[0]) -or -not (Test-Path $pair[1])) { throw "missing synced file $($pair[1])" }
+            $a = Hash-File $pair[0]
+            $b = Hash-File $pair[1]
+            Write-Host "$a $($pair[0])"
+            Write-Host "$b $($pair[1])"
+            if ($a -ne $b) { throw "hash mismatch for $($pair[0])" }
+          }
+          Stop-Process -Id $serve.Id -Force -ErrorAction SilentlyContinue
