@@ -91,6 +91,36 @@ impl DaemonInstance {
         self.stop.subscribe()
     }
 
+    pub(crate) fn start_continuous_loop(&self) {
+        if let Ok(store) = self.config_store()
+            && let Ok(jobs) = store.list_jobs()
+        {
+            for job in jobs {
+                self.supervisor.ensure_job_with_pause(&job.id, job.paused);
+            }
+        }
+        let instance = self.clone();
+        tokio::spawn(async move {
+            let mut stop = instance.subscribe_stop();
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    changed = stop.changed() => {
+                        if changed.is_err() || *stop.borrow() {
+                            return;
+                        }
+                    }
+                    _ = interval.tick() => {
+                        for id in instance.supervisor.unpaused_ids() {
+                            let _ = instance.sync_now(&id).await;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     pub(crate) fn resolve_job_conflict(
         &self,
         id: &str,

@@ -65,7 +65,8 @@ pub fn run() {
             pause_job,
             resume_job,
             issue_ticket,
-            list_conflicts
+            list_conflicts,
+            browse_folder
         ])
         .run(tauri::generate_context!())
         .expect("error while running DeltaWeave");
@@ -149,6 +150,14 @@ async fn issue_ticket(ttl_seconds: Option<u64>) -> Result<serde_json::Value, Str
 async fn list_conflicts(id: String) -> Result<serde_json::Value, String> {
     serde_json::to_value(send_daemon(Command::ListConflicts { id }).await?)
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn browse_folder() -> Result<Option<String>, String> {
+    Ok(rfd::FileDialog::new()
+        .set_title("동기화할 폴더 선택")
+        .pick_folder()
+        .map(|picked| picked.to_string_lossy().into_owned()))
 }
 
 #[tauri::command]

@@ -184,6 +184,18 @@ impl JobSupervisor {
             .get(id)
             .is_some_and(|handle| handle.paused)
     }
+
+    /// Job ids that are registered and not paused.
+    #[must_use]
+    pub fn unpaused_ids(&self) -> Vec<String> {
+        self.jobs
+            .lock()
+            .expect("job lock")
+            .iter()
+            .filter(|(_, handle)| !handle.paused)
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
 }
 
 /// Releases the in-flight flag for one job.

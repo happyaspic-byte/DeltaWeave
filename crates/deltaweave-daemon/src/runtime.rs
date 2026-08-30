@@ -99,6 +99,7 @@ async fn run_unix(
 
     let socket = ipc_path(data_dir);
     let instance = DaemonInstance::with_pairing(Some(store), JobSupervisor::new(), pairing);
+    instance.start_continuous_loop();
     let instance_id = instance.instance_id.clone();
     let serve_socket = socket.clone();
     let mut server = tokio::spawn(async move { serve_unix(instance, serve_socket).await });
@@ -140,6 +141,7 @@ async fn run_windows(
 
     let socket = ipc_path(data_dir);
     let instance = DaemonInstance::with_pairing(Some(store), JobSupervisor::new(), pairing);
+    instance.start_continuous_loop();
     let instance_id = instance.instance_id.clone();
     let serve_socket = socket.clone();
     let mut server = tokio::spawn(async move { serve_windows(instance, serve_socket).await });

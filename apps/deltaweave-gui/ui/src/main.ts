@@ -94,6 +94,15 @@ root?.addEventListener("click", (event) => {
     })();
     return;
   }
+  if (target.dataset.action === "browse-folder") {
+    void invokeDaemon<string | null>("browse_folder", {}).then((folder) => {
+      if (folder) {
+        wizard = { ...readWizard(root), folder };
+        paint();
+      }
+    });
+    return;
+  }
   if (target.dataset.action === "create-job") {
     void submitCreateJob(readWizard(root), sendCreateJob)
       .then(async () => {
