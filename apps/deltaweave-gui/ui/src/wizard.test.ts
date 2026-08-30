@@ -66,6 +66,23 @@ describe("add folder wizard", () => {
     ).toBe("direction");
   });
 
+  it("advances from the peer stage using advanced endpoint id and address", () => {
+    const next = advanceWizard({
+      ...createWizardState(),
+      stage: "peer",
+      folder: "C:\\Sync",
+      manualEndpointId: "bb".repeat(32),
+      manualAddress: "172.30.1.22",
+      manualPort: "17891",
+    });
+    expect(next.stage).toBe("direction");
+    expect(next.peerEndpointId).toBe("bb".repeat(32));
+    expect(next.peerAddress).toBe("172.30.1.22:17891");
+    expect(renderWizard({ ...createWizardState(), stage: "peer" })).toContain(
+      'name="manual-endpoint-id"',
+    );
+  });
+
   it("submits CreateJob after preview confirmation", async () => {
     const { submitCreateJob } = await import("./wizard");
     const sent: ReturnType<typeof buildCreateJob>[] = [];

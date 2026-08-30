@@ -54,11 +54,13 @@ root?.addEventListener("click", (event) => {
           };
         } else if (
           wizard.stage === "peer" &&
+          wizard.manualEndpointId &&
           wizard.manualAddress &&
           wizard.manualPort
         ) {
           wizard = {
             ...wizard,
+            peerEndpointId: wizard.manualEndpointId,
             peerAddress: `${wizard.manualAddress}:${wizard.manualPort}`,
           };
         }
@@ -190,6 +192,8 @@ function readWizard(host: HTMLElement): WizardState {
     folder: folder || wizard.folder,
     ticket: ticket || wizard.ticket,
     peerEndpointId: peer || wizard.peerEndpointId,
+    manualEndpointId:
+      inputValue(host, "manual-endpoint-id") || wizard.manualEndpointId,
     manualAddress: inputValue(host, "manual-address") || wizard.manualAddress,
     manualPort: inputValue(host, "manual-port") || wizard.manualPort,
     direction,

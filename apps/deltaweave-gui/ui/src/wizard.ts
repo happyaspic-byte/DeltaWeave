@@ -21,6 +21,7 @@ export type WizardState = {
   peerEndpointId: string;
   peerAddress: string | null;
   ticket: string;
+  manualEndpointId: string;
   manualAddress: string;
   manualPort: string;
   direction: SyncDirection;
@@ -46,6 +47,7 @@ export function createWizardState(): WizardState {
     peerEndpointId: "",
     peerAddress: null,
     ticket: "",
+    manualEndpointId: "",
     manualAddress: "",
     manualPort: "",
     direction: "bidirectional",
@@ -62,6 +64,17 @@ export function advanceWizard(state: WizardState): WizardState {
     return { ...state, stage: "peer" };
   }
   if (state.stage === "peer") {
+    const manualEndpointId = state.manualEndpointId.trim();
+    const manualAddress = state.manualAddress.trim();
+    const manualPort = state.manualPort.trim();
+    if (manualEndpointId && manualAddress && manualPort) {
+      return {
+        ...state,
+        stage: "direction",
+        peerEndpointId: manualEndpointId,
+        peerAddress: `${manualAddress}:${manualPort}`,
+      };
+    }
     if (!state.peerEndpointId && !state.ticket.startsWith("dwpair1:")) {
       throw new Error("피어를 선택하세요");
     }
@@ -117,6 +130,7 @@ export function renderWizard(state: WizardState): string {
       <button type="button" data-action="issue-ticket">이 PC의 페어링 티켓 만들기</button>
       <details>
         <summary>고급</summary>
+        <label>피어 ID <input name="manual-endpoint-id" value="${escapeHtml(state.manualEndpointId)}" /></label>
         <label>IP 주소 <input name="manual-address" value="${escapeHtml(state.manualAddress)}" /></label>
         <label>포트 <input name="manual-port" inputmode="numeric" value="${escapeHtml(state.manualPort)}" /></label>
       </details>`,
