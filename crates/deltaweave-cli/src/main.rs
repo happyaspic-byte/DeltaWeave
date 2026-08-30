@@ -6,7 +6,7 @@ use std::{
     collections::HashSet,
     fs,
     io::Write,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr, UdpSocket},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -405,15 +405,51 @@ fn quick_profile_path() -> Result<PathBuf> {
 }
 
 fn save_quick_profile(profile: &QuickProfile) -> Result<()> {
-    let path = quick_profile_path()?;
+    save_quick_profile_at(&quick_profile_path()?, profile)
+}
+
+fn save_quick_profile_at(path: &Path, profile: &QuickProfile) -> Result<()> {
     let temp = path.with_extension("tmp");
+    let backup = path.with_extension("bak");
     {
         let mut file = fs::File::create(&temp)?;
         serde_json::to_writer(&mut file, profile)?;
         file.flush()?;
+        file.sync_all()?;
     }
-    fs::rename(&temp, &path)?;
+    if backup.exists() {
+        fs::remove_file(&backup)?;
+    }
+    if path.exists() {
+        fs::rename(path, &backup)?;
+    }
+    if let Err(error) = fs::rename(&temp, path) {
+        if backup.exists() {
+            let _ = fs::rename(&backup, path);
+        }
+        return Err(error.into());
+    }
+    if backup.exists() {
+        fs::remove_file(backup)?;
+    }
     Ok(())
+}
+
+fn quick_folder_id(folder: &Path) -> Result<String> {
+    let canonical = fs::canonicalize(folder)?;
+    Ok(Hash32::digest(canonical.to_string_lossy().as_bytes()).to_hex()[..16].to_string())
+}
+
+fn quick_folder_state(folder: &Path) -> Result<PathBuf> {
+    Ok(quick_data_dir()?
+        .join("folders")
+        .join(quick_folder_id(folder)?))
+}
+
+fn quick_lan_ip() -> Result<IpAddr> {
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    socket.connect("1.1.1.1:53")?;
+    Ok(socket.local_addr()?.ip())
 }
 
 fn load_quick_profile() -> Result<QuickProfile> {
@@ -466,7 +502,7 @@ async fn quick_connect(ticket_code: &str) -> Result<()> {
 fn quick_sync_engine_args(folder: &Path) -> Result<SyncTargetArgs> {
     let profile = load_quick_profile()?;
     let dir = quick_data_dir()?;
-    let state_root = dir.join("state");
+    let state_root = quick_folder_state(folder)?;
     fs::create_dir_all(&state_root)?;
     Ok(SyncTargetArgs {
         root: folder.to_path_buf(),
@@ -492,42 +528,83 @@ async fn quick_sync_folder(folder: PathBuf, watch: bool) -> Result<()> {
         let report = engine.sync_once().await?;
         return print_sync_card(&report);
     }
-    sync_forever(SyncArgs {
-        target: args,
-        interval_seconds: 5,
-        debounce_ms: 750,
-        max_debounce_ms: 5_000,
-        max_backoff_seconds: 300,
-    })
-    .await
+    let engine = open_sync_engine(args)?;
+    let mut out = std::io::stdout().lock();
+    writeln!(out, "\n┌ DeltaWeave 자동 동기화")?;
+    writeln!(out, "├ 폴더      {}", folder.display())?;
+    writeln!(out, "├ 간격      5초")?;
+    writeln!(out, "└ 실행 중… Ctrl-C로 중지")?;
+    drop(out);
+    loop {
+        tokio::select! {
+            result = wait_for_shutdown_signal() => {
+                result?;
+                let mut out = std::io::stdout().lock();
+                writeln!(out, "\n└ 자동 동기화 종료")?;
+                return Ok(());
+            }
+            result = engine.sync_once() => {
+                match result {
+                    Ok(report) => print_sync_card(&report)?,
+                    Err(error) => {
+                        let mut out = std::io::stdout().lock();
+                        writeln!(out, "\n┌ 동기화 재시도")?;
+                        writeln!(out, "├ 오류      {error}")?;
+                        writeln!(out, "└ 5초 뒤 재시도")?;
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
 }
 
 async fn quick_share(folder: PathBuf, bind: SocketAddr) -> Result<()> {
     let dir = quick_data_dir()?;
-    let identity = load_or_create_identity(dir.join("identity.key"))?;
-    let peer = identity.endpoint_id().to_string();
+    let share_dir = dir.join("share");
+    let state_dir = share_dir.join("folders").join(quick_folder_id(&folder)?);
+    let access_path = share_dir.join("access.redb");
+    let identity_path = share_dir.join("identity.key");
+    fs::create_dir_all(&state_dir)?;
+    let identity = load_or_create_identity(&identity_path)?;
+    ensure_identity_outside_destination(&identity_path, &folder)?;
+    let advertised_ip = if bind.ip().is_unspecified() {
+        quick_lan_ip()?
+    } else {
+        bind.ip()
+    };
+    let advertised = SocketAddr::new(advertised_ip, bind.port());
+    let access = Arc::new(AccessStore::open(&access_path)?);
+    let server = start_server(ServerConfig {
+        secret_key: identity.secret_key.clone(),
+        destination_root: folder.clone(),
+        state_root: state_dir,
+        peer_policy: PeerPolicy::Durable(Arc::clone(&access)),
+        network_mode: NetworkMode::DirectOnly,
+        quota_policy: None,
+        bind: Some(bind),
+    })
+    .await?;
+    if !server.wait_online(Duration::from_secs(20)).await {
+        server.shutdown().await?;
+        bail!("공유 서버를 20초 안에 열지 못했습니다");
+    }
+    let expires_at = unix_now()
+        .checked_add(600)
+        .context("pairing ticket expiry overflow")?;
+    let ticket =
+        access.issue_ticket(&identity.endpoint_id(), &advertised.to_string(), expires_at)?;
     let mut out = std::io::stdout().lock();
     writeln!(out, "\n┌ DeltaWeave 공유 시작")?;
     writeln!(out, "├ 폴더      {}", folder.display())?;
-    writeln!(out, "├ 내 ID     {peer}")?;
+    writeln!(out, "├ 내 ID     {}", identity.endpoint_id())?;
+    writeln!(out, "├ 주소      {advertised}")?;
+    writeln!(out, "├ 티켓      {}", ticket.to_code())?;
+    writeln!(out, "├ 만료      10분 · 1회용")?;
     writeln!(out, "└ 대기 중… Ctrl-C로 중지")?;
     out.flush()?;
-    let args = ServeArgs {
-        root: folder,
-        state: dir.join("state"),
-        access: dir.join("state").join("access.redb"),
-        identity: dir.join("identity.key"),
-        allowed_peers: Vec::new(),
-        allow_any_authenticated: false,
-        direct_only: false,
-        durable_access: true,
-        rate_bytes_per_second: 0,
-        burst_bytes: 0,
-        max_concurrent_operations: 0,
-        max_storage_bytes: 0,
-        bind: Some(bind),
-    };
-    serve(args).await
+    wait_for_shutdown_signal().await?;
+    server.shutdown().await
 }
 
 fn initialize(args: InitArgs) -> Result<()> {
@@ -1366,6 +1443,121 @@ mod tests {
             serde_json::from_reader(std::fs::File::open(&profile_path).unwrap()).unwrap();
         assert_eq!(decoded.peer_endpoint_id, profile.peer_endpoint_id);
         assert_eq!(decoded.peer_address, profile.peer_address);
+    }
+
+    #[test]
+    fn quick_profile_replaces_existing_file_like_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile_path = dir.path().join("profile.json");
+        let first = QuickProfile {
+            peer_endpoint_id: "aa".repeat(32),
+            peer_address: "172.30.1.22:17891".into(),
+        };
+        save_quick_profile_at(&profile_path, &first).unwrap();
+        let second = QuickProfile {
+            peer_endpoint_id: "bb".repeat(32),
+            peer_address: "172.30.1.22:17892".into(),
+        };
+        save_quick_profile_at(&profile_path, &second).unwrap();
+        let decoded: QuickProfile =
+            serde_json::from_reader(std::fs::File::open(&profile_path).unwrap()).unwrap();
+        assert_eq!(decoded.peer_endpoint_id, second.peer_endpoint_id);
+        assert_eq!(decoded.peer_address, second.peer_address);
+        assert!(!profile_path.with_extension("tmp").exists());
+    }
+
+    #[test]
+    fn quick_folder_state_separates_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("folder-a");
+        let second = dir.path().join("folder-b");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let first_id = super::quick_folder_id(&first).unwrap();
+        let second_id = super::quick_folder_id(&second).unwrap();
+        assert_ne!(first_id, second_id);
+        assert_eq!(first_id, super::quick_folder_id(&first).unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn quick_share_issues_a_ticket_the_client_can_redeem() {
+        let base = tempfile::tempdir().unwrap();
+        let shared = base.path().join("shared");
+        let client_root = base.path().join("client");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::create_dir_all(&client_root).unwrap();
+        std::fs::write(shared.join("from-server.txt"), "server").unwrap();
+
+        let server_state = base.path().join("server-state");
+        let client_state = base.path().join("client-state");
+        std::fs::create_dir_all(&server_state).unwrap();
+        std::fs::create_dir_all(&client_state).unwrap();
+
+        let server_identity_path = base.path().join("server.key");
+        let client_identity_path = base.path().join("client.key");
+        let server_identity = load_or_create_identity(&server_identity_path).unwrap();
+        let client_identity = load_or_create_identity(&client_identity_path).unwrap();
+
+        let access = Arc::new(AccessStore::open(base.path().join("access.redb")).unwrap());
+        let server = start_server(ServerConfig {
+            secret_key: server_identity.secret_key.clone(),
+            destination_root: shared.clone(),
+            state_root: server_state,
+            peer_policy: PeerPolicy::Durable(Arc::clone(&access)),
+            network_mode: NetworkMode::DirectOnly,
+            quota_policy: None,
+            bind: Some("127.0.0.1:0".parse().unwrap()),
+        })
+        .await
+        .unwrap();
+        assert!(
+            server.wait_online(Duration::from_secs(20)).await,
+            "share server never advertised an address"
+        );
+        let address = server
+            .endpoint_addr()
+            .ip_addrs()
+            .next()
+            .unwrap()
+            .to_string();
+
+        let expires_at = unix_now().checked_add(600).unwrap();
+        let ticket = access
+            .issue_ticket(&server_identity.endpoint_id(), &address, expires_at)
+            .unwrap();
+
+        let outcome = redeem_pairing_ticket(
+            client_identity.secret_key.clone(),
+            ticket.clone(),
+            NetworkMode::DirectOnly,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, deltaweave_net::access::RedeemOutcome::Paired);
+
+        let client_access = base.path().join("client-access.redb");
+        let engine = open_sync_engine(SyncTargetArgs {
+            root: client_root.clone(),
+            state: client_state,
+            access: client_access,
+            identity: client_identity_path,
+            peer: ticket.server_endpoint_id,
+            direct_addresses: vec![address.parse().unwrap()],
+            relay_urls: Vec::new(),
+            direct_only: true,
+            chunking: ChunkingArgs {
+                min_chunk: ChunkingProfile::DEFAULT.min_size,
+                avg_chunk: ChunkingProfile::DEFAULT.avg_size,
+                max_chunk: ChunkingProfile::DEFAULT.max_size,
+            },
+        })
+        .unwrap();
+        let report = engine.sync_once().await.unwrap();
+        assert_eq!(report.status, "pass");
+        assert_eq!(report.conflicts.len(), 0);
+        let copied = client_root.join("from-server.txt");
+        assert_eq!(std::fs::read(&copied).unwrap(), b"server");
+        server.shutdown().await.unwrap();
     }
 
     #[test]
