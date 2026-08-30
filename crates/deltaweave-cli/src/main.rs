@@ -30,6 +30,12 @@ use serde_json::json;
 use tracing_subscriber::EnvFilter;
 
 const QUICK_PROFILE_NAME: &str = "profile.json";
+const QUICK_SHARE_QUOTA: QuotaPolicy = QuotaPolicy {
+    bytes_per_second: 8 * 1024 * 1024,
+    burst_bytes: 16 * 1024 * 1024,
+    max_concurrent_operations_per_peer: 4,
+    max_storage_bytes: 10 * 1024 * 1024 * 1024,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -409,29 +415,83 @@ fn save_quick_profile(profile: &QuickProfile) -> Result<()> {
 }
 
 fn save_quick_profile_at(path: &Path, profile: &QuickProfile) -> Result<()> {
-    let temp = path.with_extension("tmp");
-    let backup = path.with_extension("bak");
+    let nonce =
+        Hash32::digest(SecretKey::generate().to_bytes().as_slice()).to_hex()[..12].to_string();
+    let temp = path.with_file_name(format!(".profile.{nonce}.tmp"));
+    let mut options = fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
     {
-        let mut file = fs::File::create(&temp)?;
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let write_result = (|| -> Result<()> {
+        let mut file = options
+            .open(&temp)
+            .with_context(|| format!("failed to create {}", temp.display()))?;
         serde_json::to_writer(&mut file, profile)?;
-        file.flush()?;
         file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temp);
+        return Err(error);
+    }
+    if let Some(parent) = path.parent()
+        && let Err(error) = sync_dir(parent)
+    {
+        let _ = fs::remove_file(&temp);
+        return Err(error);
+    }
+    replace_quick_profile(path, &temp, &nonce)
+}
+
+#[cfg(unix)]
+fn replace_quick_profile(path: &Path, temp: &Path, _nonce: &str) -> Result<()> {
+    if let Err(error) = fs::rename(temp, path) {
+        let _ = fs::remove_file(temp);
+        return Err(error).with_context(|| format!("failed to replace {}", path.display()));
+    }
+    if let Some(parent) = path.parent() {
+        let _ = sync_dir(parent);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn replace_quick_profile(path: &Path, temp: &Path, nonce: &str) -> Result<()> {
+    let backup = path.with_file_name(format!(".profile.{nonce}.bak"));
+    if backup.exists() {
+        fs::remove_file(&backup)?;
+    }
+    if path.exists()
+        && let Err(error) = fs::rename(path, &backup)
+    {
+        let _ = fs::remove_file(temp);
+        return Err(error).with_context(|| format!("failed to back up {}", path.display()));
+    }
+    if let Err(error) = fs::rename(temp, path) {
+        if backup.exists() {
+            let _ = fs::rename(&backup, path);
+        }
+        let _ = fs::remove_file(temp);
+        return Err(error).with_context(|| format!("failed to replace {}", path.display()));
     }
     if backup.exists() {
         fs::remove_file(&backup)?;
     }
-    if path.exists() {
-        fs::rename(path, &backup)?;
-    }
-    if let Err(error) = fs::rename(&temp, path) {
-        if backup.exists() {
-            let _ = fs::rename(&backup, path);
-        }
-        return Err(error.into());
-    }
-    if backup.exists() {
-        fs::remove_file(backup)?;
-    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_dir(path: &Path) -> Result<()> {
+    let file = fs::File::open(path)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -581,7 +641,7 @@ async fn quick_share(folder: PathBuf, bind: SocketAddr) -> Result<()> {
         state_root: state_dir,
         peer_policy: PeerPolicy::Durable(Arc::clone(&access)),
         network_mode: NetworkMode::DirectOnly,
-        quota_policy: None,
+        quota_policy: Some(QUICK_SHARE_QUOTA),
         bind: Some(bind),
     })
     .await?;
@@ -1410,6 +1470,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn quick_share_quota_bounds_disk_and_bandwidth() {
+        let quota = QUICK_SHARE_QUOTA;
+        assert!(
+            quota.max_storage_bytes > 0,
+            "quick share must cap stored bytes instead of unlimited"
+        );
+        assert!(
+            quota.bytes_per_second > 0,
+            "quick share must cap receive rate instead of unlimited"
+        );
+        assert!(
+            quota.max_concurrent_operations_per_peer > 0,
+            "quick share must cap per-peer concurrency instead of unlimited"
+        );
+        assert_ne!(quota, QuotaPolicy::UNLIMITED);
+        assert!(
+            quota.max_storage_bytes <= 16 * 1024 * 1024 * 1024,
+            "quick share storage cap must stay small enough to protect a laptop disk"
+        );
+        assert!(
+            quota.bytes_per_second <= 16 * 1024 * 1024,
+            "quick share rate must stay below LAN saturation"
+        );
+    }
+
+    #[test]
     fn parses_quick_user_commands() {
         let connect = Cli::try_parse_from(["deltaweave", "connect", "dwpair1:abc"])
             .expect("quick connect parses");
@@ -1463,7 +1549,16 @@ mod tests {
             serde_json::from_reader(std::fs::File::open(&profile_path).unwrap()).unwrap();
         assert_eq!(decoded.peer_endpoint_id, second.peer_endpoint_id);
         assert_eq!(decoded.peer_address, second.peer_address);
-        assert!(!profile_path.with_extension("tmp").exists());
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .filter(|name| name != "profile.json")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temporary profile files must be gone, leftover={leftovers:?}"
+        );
     }
 
     #[test]

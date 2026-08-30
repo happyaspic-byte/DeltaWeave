@@ -54,6 +54,7 @@ mod tests {
         assert!(format!("{err:#}").contains("already has a job"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn second_bind_connects_to_existing_instance() {
         let dir = tempfile::tempdir().unwrap();
@@ -68,6 +69,7 @@ mod tests {
         server.abort();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn stop_command_replies_before_server_exits() {
         use deltaweave_daemon_api::{Command, CommandResult};
@@ -164,6 +166,7 @@ mod tests {
         client.shutdown().await.unwrap();
     }
 
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn hello_includes_local_endpoint_id() {
         use deltaweave_daemon_api::{Command, CommandResult};
