@@ -83,3 +83,43 @@ jobs:
               --notes "$notes" \
               --repo "$GITHUB_REPOSITORY"
           fi
+      - name: Silent-install NSIS and require daemon ready
+        shell: pwsh
+        run: |
+          $setup = Resolve-Path dist/DeltaWeave-windows-x86_64-setup-unsigned.exe
+          Start-Process -FilePath $setup -ArgumentList "/S" -Wait
+          $roots = @(
+            "$env:LOCALAPPDATA\DeltaWeave",
+            "$env:LOCALAPPDATA\Programs\DeltaWeave",
+            "$env:APPDATA\DeltaWeave"
+          )
+          $daemon = $null
+          foreach ($root in $roots) {
+            if (Test-Path $root) {
+              $daemon = Get-ChildItem -Recurse -Filter "deltaweave-daemon*.exe" $root -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($daemon) { break }
+            }
+          }
+          if (-not $daemon) {
+            throw "installed daemon sidecar not found under LocalAppData"
+          }
+          Write-Host "DAEMON $($daemon.FullName)"
+          $job = Start-Process -FilePath $daemon.FullName -RedirectStandardOutput daemon-ready.json -RedirectStandardError daemon-err.txt -PassThru
+          $text = ""
+          $ok = $false
+          for ($i = 0; $i -lt 40; $i++) {
+            Start-Sleep -Milliseconds 250
+            if (Test-Path daemon-ready.json) {
+              $text = Get-Content daemon-ready.json -Raw
+              if ($text -match '"status"\s*:\s*"ready"' -and $text -match '"instance_id"') {
+                $ok = $true
+                break
+              }
+            }
+            if ($job.HasExited) { break }
+          }
+          Get-Content daemon-ready.json, daemon-err.txt -ErrorAction SilentlyContinue
+          if (-not $ok) {
+            throw "daemon did not print ready"
+          }
+          Stop-Process -Id $job.Id -Force -ErrorAction SilentlyContinue

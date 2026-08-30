@@ -487,26 +487,19 @@ async fn daemon(args: DaemonArgs) -> Result<()> {
 }
 
 async fn daemon_status() -> Result<()> {
-    #[cfg(unix)]
-    {
-        let data_dir = deltaweave_daemon::default_data_dir()?;
-        let socket = deltaweave_daemon::ipc_path(&data_dir);
-        let hello = deltaweave_daemon::connect_and_hello(&socket)
-            .await
-            .with_context(|| format!("failed to attach to {}", socket.display()))?;
-        print_json(&json!({
-            "instance_id": hello.instance_id,
-            "local_endpoint_id": hello.local_endpoint_id,
-            "protocol_version": {
-                "major": hello.protocol_version.major,
-                "minor": hello.protocol_version.minor,
-            },
-        }))
-    }
-    #[cfg(not(unix))]
-    {
-        anyhow::bail!("daemon status is only implemented on Unix in this build")
-    }
+    let data_dir = deltaweave_daemon::default_data_dir()?;
+    let socket = deltaweave_daemon::ipc_path(&data_dir);
+    let hello = deltaweave_daemon::connect_and_hello(&socket)
+        .await
+        .with_context(|| format!("failed to attach to {}", socket.display()))?;
+    print_json(&json!({
+        "instance_id": hello.instance_id,
+        "local_endpoint_id": hello.local_endpoint_id,
+        "protocol_version": {
+            "major": hello.protocol_version.major,
+            "minor": hello.protocol_version.minor,
+        },
+    }))
 }
 
 async fn pair(args: PairArgs) -> Result<()> {
