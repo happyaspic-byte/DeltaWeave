@@ -177,8 +177,11 @@ impl DaemonInstance {
     }
 
     pub(crate) async fn sync_now(&self, id: &str) -> Result<CommandResult> {
+        let _ = self.job(id)?;
+        self.supervisor.ensure_job(id);
         let cancel = self.supervisor.begin_sync(id)?;
-        let outcome = async {
+        let _guard = self.supervisor.sync_guard(id);
+        async {
             let job = self.job(id)?;
             let address = job
                 .peer_address
@@ -193,12 +196,15 @@ impl DaemonInstance {
                 profile: deltaweave_core::ChunkingProfile::DEFAULT,
                 ignored_paths: Vec::new(),
             })?;
-            engine.sync_once_with(None, Some(cancel)).await?;
+            let direction = match job.direction {
+                Direction::Bidirectional => deltaweave_sync::SyncDirection::Bidirectional,
+                Direction::SendOnly => deltaweave_sync::SyncDirection::SendOnly,
+                Direction::ReceiveOnly => deltaweave_sync::SyncDirection::ReceiveOnly,
+            };
+            engine.sync_once_with(None, Some(cancel), direction).await?;
             Ok(CommandResult::Accepted { id: id.into() })
         }
-        .await;
-        self.supervisor.end_sync(id);
-        outcome
+        .await
     }
 
     pub(crate) async fn preview_job(

@@ -21,6 +21,18 @@ use deltaweave_reconcile::{
 use deltaweave_store::Store;
 use serde::Serialize;
 
+/// Transfer direction for one reconciliation pass.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SyncDirection {
+    /// Both sides apply the merged namespace.
+    #[default]
+    Bidirectional,
+    /// Local snapshot is the authority; remote is updated, local is not.
+    SendOnly,
+    /// Remote snapshot is the authority; local is updated, remote is not.
+    ReceiveOnly,
+}
+
 /// Durable local inputs for one reconciliation engine.
 #[derive(Clone, Debug)]
 pub struct SyncConfig {
@@ -211,7 +223,8 @@ impl SyncEngine {
 
     /// Merges, applies, and independently verifies one complete bidirectional round.
     pub async fn sync_once(&self) -> Result<SyncReport> {
-        self.sync_once_with(None, None).await
+        self.sync_once_with(None, None, SyncDirection::Bidirectional)
+            .await
     }
 
     /// Scans and fetches both snapshots without applying changes.
@@ -236,6 +249,7 @@ impl SyncEngine {
         &self,
         progress: Option<ProgressSink>,
         cancel: Option<SyncCancel>,
+        direction: SyncDirection,
     ) -> Result<SyncReport> {
         throw_if_cancelled(cancel.as_ref())?;
         emit_progress(progress.as_ref(), SyncPhase::Scan, 0, 0, 0);
@@ -252,6 +266,7 @@ impl SyncEngine {
                 local_tree,
                 progress.as_ref(),
                 cancel.as_ref(),
+                direction,
             )
             .await;
         session.close().await;
@@ -265,14 +280,25 @@ impl SyncEngine {
         local_tree: MerkleTree,
         progress: Option<&ProgressSink>,
         cancel: Option<&SyncCancel>,
+        direction: SyncDirection,
     ) -> Result<SyncReport> {
         let remote = session.fetch_snapshot(&local_tree).await?;
         let remote_tree = MerkleTree::from_records(remote.records.clone())?;
         let merged = merge_snapshots(&local_tree, &remote_tree)?;
         validate_materializable_namespace(&merged.records)?;
         let desired_tree = merged.tree()?;
-        let local_actions = actions_to_reach(&local_tree, &merged)?;
-        let remote_actions = actions_to_reach(&remote_tree, &merged)?;
+        let local_actions = match direction {
+            SyncDirection::SendOnly => Vec::new(),
+            SyncDirection::Bidirectional | SyncDirection::ReceiveOnly => {
+                actions_to_reach(&local_tree, &merged)?
+            }
+        };
+        let remote_actions = match direction {
+            SyncDirection::ReceiveOnly => Vec::new(),
+            SyncDirection::Bidirectional | SyncDirection::SendOnly => {
+                actions_to_reach(&remote_tree, &merged)?
+            }
+        };
 
         let required_files: Vec<_> = local_actions
             .iter()
@@ -314,8 +340,11 @@ impl SyncEngine {
         ensure_scan_is_safe(&verification_scan, "verified local")?;
         let verified_local =
             MerkleTree::from_records(read_records(Arc::clone(&self.index)).await?)?;
-        if verified_local.root_hash() != desired_tree.root_hash()
-            || verified_local.len() != desired_tree.len()
+        if matches!(
+            direction,
+            SyncDirection::Bidirectional | SyncDirection::ReceiveOnly
+        ) && (verified_local.root_hash() != desired_tree.root_hash()
+            || verified_local.len() != desired_tree.len())
         {
             let different = verified_local.different_paths(&desired_tree);
             bail!(
@@ -326,11 +355,17 @@ impl SyncEngine {
             );
         }
         let verified_remote = session.fetch_snapshot(&verified_local).await?;
-        ensure!(
-            verified_remote.root_hash == desired_tree.root_hash()
-                && verified_remote.record_count == desired_tree.len(),
-            "remote state did not converge to the deterministic desired root"
-        );
+        if matches!(
+            direction,
+            SyncDirection::Bidirectional | SyncDirection::SendOnly
+        ) {
+            let remote_tree = MerkleTree::from_records(verified_remote.records.clone())?;
+            let remaining = actions_to_reach(&remote_tree, &merged)?;
+            ensure!(
+                remaining.is_empty(),
+                "remote state did not apply every send-only action"
+            );
+        }
 
         Ok(SyncReport {
             status: "pass",
@@ -868,7 +903,7 @@ mod tests {
         let cancel = SyncCancel::new();
         cancel.cancel();
         let err = engine
-            .sync_once_with(None, Some(cancel.clone()))
+            .sync_once_with(None, Some(cancel.clone()), SyncDirection::Bidirectional)
             .await
             .expect_err("cancelled before work");
         assert!(
@@ -892,5 +927,57 @@ mod tests {
             b"from local"
         );
         server.shutdown().await.expect("server shuts down");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn directional_sync_only_changes_the_allowed_side() {
+        for direction in [SyncDirection::SendOnly, SyncDirection::ReceiveOnly] {
+            let local_root = TempDir::new().expect("local root");
+            let local_state = TempDir::new().expect("local state");
+            let remote_root = TempDir::new().expect("remote root");
+            let remote_state = TempDir::new().expect("remote state");
+            fs::write(local_root.path().join("local.txt"), b"local").unwrap();
+            fs::write(remote_root.path().join("remote.txt"), b"remote").unwrap();
+
+            let client_key = SecretKey::generate();
+            let server = start_server(ServerConfig {
+                secret_key: SecretKey::generate(),
+                destination_root: remote_root.path().to_path_buf(),
+                state_root: remote_state.path().to_path_buf(),
+                peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
+                network_mode: NetworkMode::DirectOnly,
+                quota_policy: None,
+                bind: None,
+            })
+            .await
+            .unwrap();
+            let engine = SyncEngine::open(SyncConfig {
+                root: local_root.path().to_path_buf(),
+                state_root: local_state.path().to_path_buf(),
+                replica: replica(&client_key),
+                client: SyncClient {
+                    secret_key: client_key,
+                    remote: server.endpoint_addr(),
+                    network_mode: NetworkMode::DirectOnly,
+                },
+                profile: ChunkingProfile::DEFAULT,
+                ignored_paths: Vec::new(),
+            })
+            .unwrap();
+
+            engine.sync_once_with(None, None, direction).await.unwrap();
+            match direction {
+                SyncDirection::SendOnly => {
+                    assert!(remote_root.path().join("local.txt").is_file());
+                    assert!(!local_root.path().join("remote.txt").exists());
+                }
+                SyncDirection::ReceiveOnly => {
+                    assert!(local_root.path().join("remote.txt").is_file());
+                    assert!(!remote_root.path().join("local.txt").exists());
+                }
+                SyncDirection::Bidirectional => unreachable!(),
+            }
+            server.shutdown().await.unwrap();
+        }
     }
 }

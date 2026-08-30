@@ -157,6 +157,7 @@ impl JobSupervisor {
             bail!("sync already running");
         }
         handle.running = true;
+        handle.cancel = SyncCancel::new();
         Ok(handle.cancel.clone())
     }
 
@@ -167,6 +168,14 @@ impl JobSupervisor {
         }
     }
 
+    /// Clears `running` when the pass is dropped or finishes.
+    pub fn sync_guard(self: &Arc<Self>, id: &str) -> SyncGuard {
+        SyncGuard {
+            supervisor: Arc::clone(self),
+            id: id.to_owned(),
+        }
+    }
+
     /// Whether the job is paused.
     pub fn is_paused(&self, id: &str) -> bool {
         self.jobs
@@ -174,5 +183,17 @@ impl JobSupervisor {
             .expect("job lock")
             .get(id)
             .is_some_and(|handle| handle.paused)
+    }
+}
+
+/// Releases the in-flight flag for one job.
+pub struct SyncGuard {
+    supervisor: Arc<JobSupervisor>,
+    id: String,
+}
+
+impl Drop for SyncGuard {
+    fn drop(&mut self) {
+        self.supervisor.end_sync(&self.id);
     }
 }
