@@ -63,6 +63,12 @@ impl fmt::Debug for ConfigStore {
 }
 
 impl ConfigStore {
+    /// Parent directory of the configuration database.
+    #[must_use]
+    pub fn data_root(&self) -> &Path {
+        &self.data_root
+    }
+
     /// Opens or creates the configuration database.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();

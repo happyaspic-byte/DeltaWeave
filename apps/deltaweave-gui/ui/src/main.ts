@@ -2,7 +2,7 @@ import {
   submitConflictResolution,
   type ResolveConflictCommand,
 } from "./conflicts";
-import { renderDashboard } from "./dashboard";
+import { renderDashboard, type DashboardJob } from "./dashboard";
 import {
   advanceWizard,
   createWizardState,
@@ -14,6 +14,8 @@ import {
 
 const root = document.getElementById("app");
 let wizard: WizardState = createWizardState();
+let jobs: DashboardJob[] = [];
+let conflicts: { jobId: string; path: string; localNewer: boolean }[] = [];
 
 function paint(): void {
   if (!root) {
@@ -24,7 +26,8 @@ function paint(): void {
       bytesPerSecond: 0,
       currentPath: "",
       percent: 0,
-      conflicts: [],
+      jobs,
+      conflicts,
     }),
     renderWizard(wizard),
   ].join("");
@@ -49,8 +52,41 @@ root?.addEventListener("click", (event) => {
             peerEndpointId: redeemed.peer_endpoint_id ?? wizard.peerEndpointId,
             peerAddress: redeemed.server_direct_address ?? wizard.peerAddress,
           };
+        } else if (
+          wizard.stage === "peer" &&
+          wizard.manualAddress &&
+          wizard.manualPort
+        ) {
+          wizard = {
+            ...wizard,
+            peerAddress: `${wizard.manualAddress}:${wizard.manualPort}`,
+          };
         }
         wizard = advanceWizard(wizard);
+        if (wizard.stage === "preview" && !wizard.preview) {
+          if (!wizard.peerEndpointId || !wizard.peerAddress) {
+            throw new Error("피어 주소가 없습니다");
+          }
+          const preview = await invokeDaemon<{
+            sends?: number;
+            receives?: number;
+            deletes?: number;
+            conflicts?: number;
+          }>("preview_job", {
+            local_root: wizard.folder,
+            peer_endpoint_id: wizard.peerEndpointId,
+            peer_address: wizard.peerAddress,
+          });
+          wizard = {
+            ...wizard,
+            preview: {
+              sends: preview.sends ?? 0,
+              receives: preview.receives ?? 0,
+              deletes: preview.deletes ?? 0,
+              conflicts: preview.conflicts ?? 0,
+            },
+          };
+        }
         paint();
       } catch (error) {
         window.alert(error instanceof Error ? error.message : String(error));
@@ -59,9 +95,54 @@ root?.addEventListener("click", (event) => {
     return;
   }
   if (target.dataset.action === "create-job") {
-    void submitCreateJob(readWizard(root), sendCreateJob).catch((error: unknown) => {
-      window.alert(error instanceof Error ? error.message : String(error));
-    });
+    void submitCreateJob(readWizard(root), sendCreateJob)
+      .then(async () => {
+        wizard = createWizardState();
+        await refreshJobs();
+        paint();
+      })
+      .catch((error: unknown) => {
+        window.alert(error instanceof Error ? error.message : String(error));
+      });
+    return;
+  }
+  if (target.dataset.action === "sync-job" && target.dataset.jobId) {
+    void invokeDaemon("sync_now", { id: target.dataset.jobId })
+      .then(refreshJobs)
+      .then(paint)
+      .catch((error: unknown) => {
+        window.alert(error instanceof Error ? error.message : String(error));
+      });
+    return;
+  }
+  if (target.dataset.action === "pause-job" && target.dataset.jobId) {
+    void invokeDaemon("pause_job", { id: target.dataset.jobId })
+      .then(refreshJobs)
+      .then(paint)
+      .catch((error: unknown) => {
+        window.alert(error instanceof Error ? error.message : String(error));
+      });
+    return;
+  }
+  if (target.dataset.action === "resume-job" && target.dataset.jobId) {
+    void invokeDaemon("resume_job", { id: target.dataset.jobId })
+      .then(refreshJobs)
+      .then(paint)
+      .catch((error: unknown) => {
+        window.alert(error instanceof Error ? error.message : String(error));
+      });
+    return;
+  }
+  if (target.dataset.action === "issue-ticket") {
+    void invokeDaemon<{ code?: string }>("issue_ticket", { ttl_seconds: 600 })
+      .then((issued) => {
+        if (issued.code) {
+          window.alert(`페어링 티켓:\n${issued.code}`);
+        }
+      })
+      .catch((error: unknown) => {
+        window.alert(error instanceof Error ? error.message : String(error));
+      });
     return;
   }
   if (target.dataset.action === "resolve-conflict") {
@@ -134,6 +215,23 @@ function sendCreateJob(command: CreateJobCommand): Promise<void> {
   return invokeDaemon("create_job", command).then(() => undefined);
 }
 
+async function refreshJobs(): Promise<void> {
+  const listed = await invokeDaemon<{ jobs?: DashboardJob[] }>("list_jobs", {});
+  jobs = listed.jobs ?? [];
+  const nextConflicts: { jobId: string; path: string; localNewer: boolean }[] = [];
+  for (const job of jobs) {
+    const listedConflicts = await invokeDaemon<{
+      conflicts?: { path?: string }[];
+    }>("list_conflicts", { id: job.id });
+    for (const conflict of listedConflicts.conflicts ?? []) {
+      if (conflict.path) {
+        nextConflicts.push({ jobId: job.id, path: conflict.path, localNewer: true });
+      }
+    }
+  }
+  conflicts = nextConflicts;
+}
+
 async function invokeDaemon<T>(command: string, args: object): Promise<T> {
   const invoke = (
     globalThis as {
@@ -146,4 +244,4 @@ async function invokeDaemon<T>(command: string, args: object): Promise<T> {
   return invoke(command, args);
 }
 
-paint();
+void refreshJobs().then(paint).catch(paint);

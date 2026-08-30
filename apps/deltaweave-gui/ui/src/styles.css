@@ -55,3 +55,21 @@ h2 {
   margin-right: 8px;
   margin-bottom: 8px;
 }
+
+.jobs {
+  padding: 16px 24px;
+}
+
+.job {
+  display: grid;
+  gap: 4px;
+  margin: 12px 0;
+  padding: 12px;
+  border: 1px solid #d4d9df;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.job small {
+  color: #56616f;
+}

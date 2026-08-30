@@ -115,10 +115,14 @@ pub enum Command {
         /// Peer endpoint id as hex.
         endpoint_id: String,
     },
-    /// Dry-run a job without applying.
+    /// Dry-run a proposed job without applying changes.
     PreviewJob {
-        /// Job id.
-        id: String,
+        /// Local folder path.
+        local_root: String,
+        /// Remote endpoint id as hex.
+        peer_endpoint_id: String,
+        /// Peer direct address learned from pairing.
+        peer_address: String,
     },
     /// List unresolved conflict copies for a job.
     ListConflicts {

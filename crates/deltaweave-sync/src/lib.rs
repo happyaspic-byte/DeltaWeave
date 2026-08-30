@@ -214,6 +214,23 @@ impl SyncEngine {
         self.sync_once_with(None, None).await
     }
 
+    /// Scans and fetches both snapshots without applying changes.
+    pub async fn preview_once(&self) -> Result<(MerkleTree, MerkleTree)> {
+        let scan = scan_index(Arc::clone(&self.index)).await?;
+        ensure_scan_is_safe(&scan, "local")?;
+        let local_records = read_records(Arc::clone(&self.index)).await?;
+        let local_tree = MerkleTree::from_records(local_records)?;
+        let session = self.client.open_session().await?;
+        let outcome = async {
+            let remote = session.fetch_snapshot(&local_tree).await?;
+            let remote_tree = MerkleTree::from_records(remote.records)?;
+            Ok((local_tree, remote_tree))
+        }
+        .await;
+        session.close().await;
+        outcome
+    }
+
     /// Same as [`Self::sync_once`], with optional progress and cooperative cancel.
     pub async fn sync_once_with(
         &self,

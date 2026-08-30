@@ -58,7 +58,14 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             resolve_conflict,
             create_job,
-            redeem_ticket
+            redeem_ticket,
+            preview_job,
+            list_jobs,
+            sync_now,
+            pause_job,
+            resume_job,
+            issue_ticket,
+            list_conflicts
         ])
         .run(tauri::generate_context!())
         .expect("error while running DeltaWeave");
@@ -95,6 +102,53 @@ async fn create_job(
 async fn redeem_ticket(code: String) -> Result<serde_json::Value, String> {
     let result = send_daemon(Command::RedeemTicket { code }).await?;
     serde_json::to_value(result).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn preview_job(
+    local_root: String,
+    peer_endpoint_id: String,
+    peer_address: String,
+) -> Result<serde_json::Value, String> {
+    let result = send_daemon(Command::PreviewJob {
+        local_root,
+        peer_endpoint_id,
+        peer_address,
+    })
+    .await?;
+    serde_json::to_value(result).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn list_jobs() -> Result<serde_json::Value, String> {
+    serde_json::to_value(send_daemon(Command::ListJobs).await?).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn sync_now(id: String) -> Result<(), String> {
+    send_daemon(Command::SyncNow { id }).await.map(|_| ())
+}
+
+#[tauri::command]
+async fn pause_job(id: String) -> Result<(), String> {
+    send_daemon(Command::PauseJob { id }).await.map(|_| ())
+}
+
+#[tauri::command]
+async fn resume_job(id: String) -> Result<(), String> {
+    send_daemon(Command::ResumeJob { id }).await.map(|_| ())
+}
+
+#[tauri::command]
+async fn issue_ticket(ttl_seconds: Option<u64>) -> Result<serde_json::Value, String> {
+    serde_json::to_value(send_daemon(Command::IssueTicket { ttl_seconds }).await?)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn list_conflicts(id: String) -> Result<serde_json::Value, String> {
+    serde_json::to_value(send_daemon(Command::ListConflicts { id }).await?)
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]

@@ -169,9 +169,19 @@ async fn dispatch(instance: &DaemonInstance, request: Request) -> Response {
         (Ok(_), Command::SyncNow { id }) => {
             command_response(request.request_id, instance.sync_now(&id).await)
         }
-        (Ok(_), Command::PreviewJob { id }) => {
-            command_response(request.request_id, instance.preview_job(&id))
-        }
+        (
+            Ok(_),
+            Command::PreviewJob {
+                local_root,
+                peer_endpoint_id,
+                peer_address,
+            },
+        ) => command_response(
+            request.request_id,
+            instance
+                .preview_job(local_root, peer_endpoint_id, peer_address)
+                .await,
+        ),
         (Ok(_), Command::ListConflicts { id }) => {
             command_response(request.request_id, instance.list_job_conflicts(&id))
         }
@@ -642,17 +652,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preview_job_rejects_unknown_job() {
+    async fn preview_job_requires_pairing() {
         let error = dispatch(
             &DaemonInstance::new(),
             request(Command::PreviewJob {
-                id: "missing".into(),
+                local_root: "/tmp".into(),
+                peer_endpoint_id: "aa".repeat(32),
+                peer_address: "127.0.0.1:1".into(),
             }),
         )
         .await
         .result
-        .expect_err("unknown jobs have no preview");
-        assert_eq!(error.message, "config store unavailable");
+        .expect_err("preview needs pairing");
+        assert_eq!(error.message, "pairing service unavailable");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

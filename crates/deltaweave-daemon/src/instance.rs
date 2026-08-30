@@ -201,9 +201,31 @@ impl DaemonInstance {
         outcome
     }
 
-    pub(crate) fn preview_job(&self, id: &str) -> Result<CommandResult> {
-        self.job(id)?;
-        bail!("peer snapshot unavailable")
+    pub(crate) async fn preview_job(
+        &self,
+        local_root: String,
+        peer_endpoint_id: String,
+        peer_address: String,
+    ) -> Result<CommandResult> {
+        let pairing = self.pairing_service()?;
+        let store = self.config_store()?;
+        let digest = deltaweave_core::Hash32::digest(
+            format!("{local_root}:{peer_endpoint_id}:{peer_address}").as_bytes(),
+        );
+        let state_root = store
+            .data_root()
+            .join("preview")
+            .join(&digest.to_hex()[..16]);
+        let engine = deltaweave_sync::SyncEngine::open(deltaweave_sync::SyncConfig {
+            root: PathBuf::from(local_root),
+            state_root,
+            replica: pairing.replica_id()?,
+            client: pairing.sync_client(&peer_endpoint_id, &peer_address)?,
+            profile: deltaweave_core::ChunkingProfile::DEFAULT,
+            ignored_paths: Vec::new(),
+        })?;
+        let (local, remote) = engine.preview_once().await?;
+        crate::preview_snapshots(&local, &remote)
     }
 
     pub(crate) fn list_job_conflicts(&self, id: &str) -> Result<CommandResult> {

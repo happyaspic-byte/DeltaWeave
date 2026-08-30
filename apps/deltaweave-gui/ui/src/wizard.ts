@@ -114,6 +114,7 @@ export function renderWizard(state: WizardState): string {
         ${renderPeers(state.peers, state.peerEndpointId)}
       </section>
       <label>페어링 티켓 <input name="ticket" placeholder="dwpair1:" value="${escapeHtml(state.ticket)}" /></label>
+      <button type="button" data-action="issue-ticket">이 PC의 페어링 티켓 만들기</button>
       <details>
         <summary>고급</summary>
         <label>IP 주소 <input name="manual-address" value="${escapeHtml(state.manualAddress)}" /></label>
