@@ -1,0 +1,21 @@
+{
+  "identifier": "default",
+  "description": "Main window capabilities",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "autostart:allow-enable",
+    "autostart:allow-disable",
+    "autostart:allow-is-enabled",
+    {
+      "identifier": "shell:allow-spawn",
+      "allow": [
+        {
+          "name": "binaries/deltaweave-daemon",
+          "sidecar": true,
+          "args": true
+        }
+      ]
+    }
+  ]
+}

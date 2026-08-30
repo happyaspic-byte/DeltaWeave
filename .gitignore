@@ -1,3 +1,4 @@
+.superpowers/
 /target/
 **/*.rs.bk
 *.log
@@ -6,4 +7,11 @@
 .idea/
 .vscode/
 .DS_Store
+node_modules/
+apps/deltaweave-gui/ui/dist/
+apps/deltaweave-gui/src-tauri/binaries/deltaweave-daemon-*
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
+/fuzz/coverage/
 

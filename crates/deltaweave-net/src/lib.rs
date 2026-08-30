@@ -2,6 +2,9 @@
 
 #![forbid(unsafe_code)]
 
+pub mod access;
+pub mod quota;
+
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fmt,
@@ -11,14 +14,13 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail, ensure};
 use deltaweave_cdc::{manifest_from_path, verify_chunk};
 use deltaweave_core::{
-    CausalRelation, ChunkingProfile, FileManifest, Hash32, ReplicaId, SyncEntryKind, SyncRecord,
-    WirePath,
+    CausalRelation, ChunkingProfile, FileManifest, Hash32, SyncEntryKind, SyncRecord, WirePath,
 };
 use deltaweave_index::{IndexOptions, LocalIndex};
 use deltaweave_reconcile::{MerkleNodeSummary, MerkleTree};
@@ -36,6 +38,8 @@ use tracing::{info, warn};
 pub const ALPN_V1: &[u8] = b"deltaweave/sync/1";
 /// Versioned ALPN identifier for Merkle state reconciliation and bidirectional transfer.
 pub const ALPN_V2: &[u8] = b"deltaweave/sync/2";
+/// Versioned ALPN identifier for one-time peer pairing.
+pub const ALPN_PAIRING: &[u8] = b"deltaweave/pair/1";
 const MAX_CONTROL_FRAME: usize = 16 * 1024 * 1024;
 const MAX_CHUNKS_PER_FILE: usize = 250_000;
 const MAX_FILE_SIZE: u64 = 16 * 1024 * 1024 * 1024 * 1024;
@@ -130,20 +134,28 @@ fn read_identity(path: &Path) -> Result<SecretKey> {
         .with_context(|| format!("invalid identity file {}", path.display()))
 }
 
+/// Reads the public endpoint ID from an existing identity file.
+pub fn read_identity_public(path: impl AsRef<Path>) -> Result<EndpointId> {
+    Ok(read_identity(path.as_ref())?.public())
+}
+
 /// Application-level authorization applied after iroh authenticates the peer key.
 #[derive(Clone, Debug)]
 pub enum PeerPolicy {
     /// Only explicitly listed endpoint IDs may push files.
     AllowListed(HashSet<EndpointId>),
+    /// Resolve authorization from durable state for every new connection.
+    Durable(Arc<access::AccessStore>),
     /// Accept any authenticated iroh endpoint. Intended only for controlled testing.
     AnyAuthenticated,
 }
 
 impl PeerPolicy {
-    fn allows(&self, peer: EndpointId) -> bool {
+    fn allows(&self, peer: EndpointId) -> Result<bool> {
         match self {
-            Self::AllowListed(peers) => peers.contains(&peer),
-            Self::AnyAuthenticated => true,
+            Self::AllowListed(peers) => Ok(peers.contains(&peer)),
+            Self::Durable(access) => access.is_authorized(peer),
+            Self::AnyAuthenticated => Ok(true),
         }
     }
 }
@@ -161,6 +173,10 @@ pub struct ServerConfig {
     pub peer_policy: PeerPolicy,
     /// Discovery and relay behavior.
     pub network_mode: NetworkMode,
+    /// Per-peer bandwidth, concurrency, and storage admission.
+    pub quota_policy: Option<quota::QuotaPolicy>,
+    /// Fixed UDP bind address. When set, restarts keep the same port so pairing tickets stay valid.
+    pub bind: Option<SocketAddr>,
 }
 
 /// A running DeltaWeave protocol router.
@@ -225,9 +241,18 @@ pub async fn start_server(config: ServerConfig) -> Result<Server> {
         state_root,
         peer_policy,
         network_mode,
+        quota_policy,
+        bind,
     } = config;
-    let replica = ReplicaId(Hash32::digest(secret_key.public().as_bytes()));
     let (destination_root, state_root) = prepare_server_roots(&destination_root, &state_root)?;
+    let access = match &peer_policy {
+        PeerPolicy::Durable(access) => Arc::clone(access),
+        PeerPolicy::AllowListed(_) | PeerPolicy::AnyAuthenticated => {
+            Arc::new(access::AccessStore::open(state_root.join("access.redb"))?)
+        }
+    };
+    let server_endpoint_id = secret_key.public();
+    let replica = access.stable_replica_id(&secret_key)?;
     let store = Arc::new(Store::open(&state_root)?);
     let index = Arc::new(LocalIndex::open(
         &destination_root,
@@ -236,10 +261,21 @@ pub async fn start_server(config: ServerConfig) -> Result<Server> {
         IndexOptions::default(),
     )?);
     let apply_lock = Arc::new(tokio::sync::Mutex::new(()));
+    let quota = if let Some(policy) = quota_policy {
+        let used_storage = quota::measure_cas_usage(store.chunks())?;
+        Some(Arc::new(quota::QuotaAccountant::new(policy, used_storage)))
+    } else {
+        None
+    };
     let endpoint = bind_endpoint(
         secret_key,
         network_mode,
-        Some(vec![ALPN_V1.to_vec(), ALPN_V2.to_vec()]),
+        Some(vec![
+            ALPN_V1.to_vec(),
+            ALPN_V2.to_vec(),
+            ALPN_PAIRING.to_vec(),
+        ]),
+        bind,
     )
     .await?;
     let push_handler = PushHandler {
@@ -248,6 +284,7 @@ pub async fn start_server(config: ServerConfig) -> Result<Server> {
         destination_root: destination_root.clone(),
         peer_policy: peer_policy.clone(),
         apply_lock: Arc::clone(&apply_lock),
+        quota: quota.clone(),
     };
     let sync_handler = SyncHandler {
         store,
@@ -255,10 +292,16 @@ pub async fn start_server(config: ServerConfig) -> Result<Server> {
         destination_root,
         peer_policy,
         apply_lock,
+        quota,
+    };
+    let pairing_handler = PairingHandler {
+        access,
+        server_endpoint_id,
     };
     let router = Router::builder(endpoint)
         .accept(ALPN_V1, push_handler)
         .accept(ALPN_V2, sync_handler)
+        .accept(ALPN_PAIRING, pairing_handler)
         .spawn();
     Ok(Server {
         router,
@@ -309,7 +352,35 @@ fn endpoint_addr_with_local_fallback(endpoint: &Endpoint) -> EndpointAddr {
     EndpointAddr::from_parts(current.id, relays.chain(sockets))
 }
 
+fn reject_symlink_root(path: &Path, label: &str) -> Result<()> {
+    let mut current = path;
+    loop {
+        if let Ok(metadata) = fs::symlink_metadata(current) {
+            ensure!(
+                !metadata.file_type().is_symlink(),
+                "{label} must not contain a symbolic link"
+            );
+        }
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        if parent == current {
+            break;
+        }
+        current = parent;
+    }
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        ensure!(
+            metadata.is_dir(),
+            "{label} must be a real directory, not a symlink"
+        );
+    }
+    Ok(())
+}
+
 fn prepare_server_roots(destination_root: &Path, state_root: &Path) -> Result<(PathBuf, PathBuf)> {
+    reject_symlink_root(destination_root, "destination root")?;
+    reject_symlink_root(state_root, "state root")?;
     fs::create_dir_all(destination_root).with_context(|| {
         format!(
             "failed to create destination root {}",
@@ -318,6 +389,8 @@ fn prepare_server_roots(destination_root: &Path, state_root: &Path) -> Result<(P
     })?;
     fs::create_dir_all(state_root)
         .with_context(|| format!("failed to create state root {}", state_root.display()))?;
+    reject_symlink_root(destination_root, "destination root")?;
+    reject_symlink_root(state_root, "state root")?;
     let destination_root = fs::canonicalize(destination_root)?;
     let state_root = fs::canonicalize(state_root)?;
     ensure!(
@@ -333,6 +406,7 @@ async fn bind_endpoint(
     secret_key: SecretKey,
     mode: NetworkMode,
     alpns: Option<Vec<Vec<u8>>>,
+    bind: Option<SocketAddr>,
 ) -> Result<Endpoint> {
     let mut builder = match mode {
         NetworkMode::Internet => Endpoint::builder(presets::N0),
@@ -341,6 +415,11 @@ async fn bind_endpoint(
     .secret_key(secret_key);
     if let Some(alpns) = alpns {
         builder = builder.alpns(alpns);
+    }
+    if let Some(addr) = bind {
+        builder = builder
+            .bind_addr(addr)
+            .map_err(|error| anyhow::anyhow!("invalid bind address {addr}: {error}"))?;
     }
     builder.bind().await.context("failed to bind iroh endpoint")
 }
@@ -379,6 +458,43 @@ pub fn endpoint_addr(
         .map(TransportAddr::Ip)
         .chain(relays);
     Ok(EndpointAddr::from_parts(endpoint_id, addresses))
+}
+
+/// Redeems a one-time pairing ticket using the client's authenticated endpoint identity.
+pub async fn redeem_pairing_ticket(
+    secret_key: SecretKey,
+    ticket: access::PairingTicket,
+    network_mode: NetworkMode,
+) -> Result<access::RedeemOutcome> {
+    let server_id = ticket
+        .server_endpoint_id
+        .parse::<EndpointId>()
+        .context("pairing ticket has an invalid server endpoint ID")?;
+    let direct = ticket
+        .server_direct_address
+        .parse::<SocketAddr>()
+        .context("pairing ticket has an invalid server address")?;
+    let remote = EndpointAddr::from_parts(server_id, [TransportAddr::Ip(direct)]);
+    let endpoint = bind_endpoint(secret_key, network_mode, None, None).await?;
+    let outcome = async {
+        let connection = endpoint
+            .connect(remote, ALPN_PAIRING)
+            .await
+            .context("failed to connect to pairing endpoint")?;
+        let (mut send, mut receive) = connection.open_bi().await.context("open pairing stream")?;
+        write_frame(&mut send, &PairingWireRequest { ticket }).await?;
+        send.finish().context("finish pairing request")?;
+        let outcome = match read_frame::<PairingWireResponse>(&mut receive).await? {
+            PairingWireResponse::Paired => access::RedeemOutcome::Paired,
+            PairingWireResponse::AlreadyPaired => access::RedeemOutcome::AlreadyPaired,
+            PairingWireResponse::Rejected => bail!("pairing ticket was rejected"),
+        };
+        connection.close(0_u8.into(), b"pairing complete");
+        Ok(outcome)
+    }
+    .await;
+    endpoint.close().await;
+    outcome
 }
 
 /// Server-confirmed result of a verified transfer.
@@ -475,7 +591,8 @@ pub struct PullReceipt {
 impl SyncClient {
     /// Opens one authenticated local endpoint that can serve all calls in a sync pass.
     pub async fn open_session(&self) -> Result<SyncSession> {
-        let endpoint = bind_endpoint(self.secret_key.clone(), self.network_mode, None).await?;
+        let endpoint =
+            bind_endpoint(self.secret_key.clone(), self.network_mode, None, None).await?;
         Ok(SyncSession {
             client: self.clone(),
             endpoint,
@@ -612,7 +729,11 @@ impl SyncClient {
             "push_record requires a live file record"
         );
         let source = source.as_ref().to_path_buf();
-        ensure!(source.is_file(), "source is not a regular file");
+        let metadata = fs::symlink_metadata(&source)?;
+        ensure!(
+            !metadata.file_type().is_symlink() && metadata.is_file(),
+            "source is not a regular file"
+        );
         let source_for_manifest = source.clone();
         let manifest =
             tokio::task::spawn_blocking(move || manifest_from_path(source_for_manifest, profile))
@@ -876,7 +997,11 @@ impl SyncSession {
             "push_record requires a live file record"
         );
         let source = source.as_ref().to_path_buf();
-        ensure!(source.is_file(), "source is not a regular file");
+        let metadata = fs::symlink_metadata(&source)?;
+        ensure!(
+            !metadata.file_type().is_symlink() && metadata.is_file(),
+            "source is not a regular file"
+        );
         let source_for_manifest = source.clone();
         let manifest =
             tokio::task::spawn_blocking(move || manifest_from_path(source_for_manifest, profile))
@@ -950,7 +1075,7 @@ pub async fn push_file(options: PushOptions) -> Result<TransferReceipt> {
             .await
             .context("manifest task failed")??;
 
-    let endpoint = bind_endpoint(options.secret_key, options.network_mode, None).await?;
+    let endpoint = bind_endpoint(options.secret_key, options.network_mode, None, None).await?;
     let result = push_connected(
         &endpoint,
         &options.source,
@@ -1127,6 +1252,7 @@ struct PushHandler {
     destination_root: PathBuf,
     peer_policy: PeerPolicy,
     apply_lock: Arc<tokio::sync::Mutex<()>>,
+    quota: Option<Arc<quota::QuotaAccountant>>,
 }
 
 impl fmt::Debug for PushHandler {
@@ -1142,15 +1268,19 @@ impl fmt::Debug for PushHandler {
 impl ProtocolHandler for PushHandler {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
         let peer = connection.remote_id();
-        if !self.peer_policy.allows(peer) {
+        if !self.peer_policy.allows(peer).map_err(accept_err)? {
             warn!(%peer, "rejected unauthorized DeltaWeave peer");
             connection.close(0_u8.into(), b"endpoint ID is not allow-listed");
             return Ok(());
         }
 
+        let _operation_permit = match self.quota.as_ref() {
+            Some(quota) => Some(quota.acquire_operation(peer).map_err(accept_err)?),
+            None => None,
+        };
         let (mut send, mut receive) = connection.accept_bi().await?;
         info!(%peer, "accepted DeltaWeave peer");
-        if let Err(error) = self.handle_push(&mut send, &mut receive).await {
+        if let Err(error) = self.handle_push(peer, &mut send, &mut receive).await {
             warn!(%peer, error = %error, "DeltaWeave transfer failed");
             let message = truncate_error(&error.to_string());
             let _ = write_frame(&mut send, &WireResponse::Error { message }).await;
@@ -1167,7 +1297,12 @@ impl ProtocolHandler for PushHandler {
 }
 
 impl PushHandler {
-    async fn handle_push(&self, send: &mut SendStream, receive: &mut RecvStream) -> Result<()> {
+    async fn handle_push(
+        &self,
+        peer: EndpointId,
+        send: &mut SendStream,
+        receive: &mut RecvStream,
+    ) -> Result<()> {
         let request: WireRequest = read_frame(receive).await?;
         let (path, manifest) = match request {
             WireRequest::Push { path, manifest } => (path, manifest),
@@ -1195,6 +1330,11 @@ impl PushHandler {
             .iter()
             .filter(|chunk| !missing_set.contains(&chunk.hash))
             .count();
+        let unique_bytes = quota::unique_missing_bytes(&manifest, &missing);
+        let mut reservation = match self.quota.as_ref() {
+            Some(quota) => Some(quota.reserve_storage(unique_bytes)?),
+            None => None,
+        };
         write_frame(
             send,
             &WireResponse::NeedChunks {
@@ -1209,6 +1349,7 @@ impl PushHandler {
             .map(|chunk| (chunk.hash, chunk.clone()))
             .collect();
         let mut transferred_bytes = 0_u64;
+        let mut newly_written = 0_u64;
         for expected_hash in missing {
             let header: ChunkHeader = read_frame(receive).await?;
             ensure!(
@@ -1227,17 +1368,28 @@ impl PushHandler {
                 header.length <= manifest.profile.max_size,
                 "chunk exceeds configured maximum"
             );
+            pace_bandwidth(self.quota.as_ref(), peer, u64::from(header.length)).await?;
             let mut bytes = vec![0_u8; header.length as usize];
             receive.read_exact(&mut bytes).await?;
             verify_chunk(descriptor, &bytes)?;
 
             let store = Arc::clone(&self.store);
-            tokio::task::spawn_blocking(move || store.chunks().put_verified(header.hash, &bytes))
-                .await
-                .context("chunk-store task failed")??;
+            let written = tokio::task::spawn_blocking(move || {
+                store.chunks().put_verified(header.hash, &bytes)
+            })
+            .await
+            .context("chunk-store task failed")??;
+            if written {
+                newly_written = newly_written
+                    .checked_add(u64::from(header.length))
+                    .context("unique-byte counter overflow")?;
+            }
             transferred_bytes = transferred_bytes
                 .checked_add(u64::from(header.length))
                 .context("transferred-byte counter overflow")?;
+        }
+        if let Some(reservation) = reservation.as_mut() {
+            reservation.commit(newly_written)?;
         }
 
         let _apply_guard = self.apply_lock.lock().await;
@@ -1289,6 +1441,7 @@ struct SyncHandler {
     destination_root: PathBuf,
     peer_policy: PeerPolicy,
     apply_lock: Arc<tokio::sync::Mutex<()>>,
+    quota: Option<Arc<quota::QuotaAccountant>>,
 }
 
 impl fmt::Debug for SyncHandler {
@@ -1301,15 +1454,57 @@ impl fmt::Debug for SyncHandler {
     }
 }
 
+#[derive(Clone)]
+struct PairingHandler {
+    access: Arc<access::AccessStore>,
+    server_endpoint_id: EndpointId,
+}
+
+impl fmt::Debug for PairingHandler {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PairingHandler(..)")
+    }
+}
+
+impl ProtocolHandler for PairingHandler {
+    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        let peer = connection.remote_id();
+        let (mut send, mut receive) = connection.accept_bi().await?;
+        let response = match read_frame::<PairingWireRequest>(&mut receive).await {
+            Ok(request) => match self.access.redeem(
+                &request.ticket,
+                self.server_endpoint_id,
+                peer,
+                access::unix_now(),
+            ) {
+                Ok(access::RedeemOutcome::Paired) => PairingWireResponse::Paired,
+                Ok(access::RedeemOutcome::AlreadyPaired) => PairingWireResponse::AlreadyPaired,
+                Err(_) => PairingWireResponse::Rejected,
+            },
+            Err(_) => PairingWireResponse::Rejected,
+        };
+        write_frame(&mut send, &response)
+            .await
+            .map_err(accept_err)?;
+        send.finish()?;
+        connection.closed().await;
+        Ok(())
+    }
+}
+
 impl ProtocolHandler for SyncHandler {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
         let peer = connection.remote_id();
-        if !self.peer_policy.allows(peer) {
+        if !self.peer_policy.allows(peer).map_err(accept_err)? {
             warn!(%peer, "rejected unauthorized DeltaWeave reconciliation peer");
             connection.close(0_u8.into(), b"endpoint ID is not allow-listed");
             return Ok(());
         }
 
+        let _operation_permit = match self.quota.as_ref() {
+            Some(quota) => Some(quota.acquire_operation(peer).map_err(accept_err)?),
+            None => None,
+        };
         let (mut send, mut receive) = connection.accept_bi().await?;
         info!(%peer, "accepted DeltaWeave reconciliation peer");
         let outcome = async {
@@ -1319,10 +1514,11 @@ impl ProtocolHandler for SyncHandler {
                         .await
                 }
                 SyncWireRequest::PullRecord { record } => {
-                    self.handle_pull(record, &mut send, &mut receive).await
+                    self.handle_pull(peer, record, &mut send, &mut receive)
+                        .await
                 }
                 SyncWireRequest::PushRecord { record, manifest } => {
-                    self.handle_push_record(record, manifest, &mut send, &mut receive)
+                    self.handle_push_record(peer, record, manifest, &mut send, &mut receive)
                         .await
                 }
                 SyncWireRequest::ApplyMetadata { record } => {
@@ -1389,6 +1585,7 @@ impl SyncHandler {
 
     async fn handle_pull(
         &self,
+        _peer: EndpointId,
         expected: SyncRecord,
         send: &mut SendStream,
         receive: &mut RecvStream,
@@ -1450,6 +1647,7 @@ impl SyncHandler {
 
     async fn handle_push_record(
         &self,
+        peer: EndpointId,
         record: SyncRecord,
         manifest: FileManifest,
         send: &mut SendStream,
@@ -1487,6 +1685,11 @@ impl SyncHandler {
             .iter()
             .filter(|chunk| !missing_set.contains(&chunk.hash))
             .count();
+        let unique_bytes = quota::unique_missing_bytes(&manifest, &missing);
+        let mut reservation = match self.quota.as_ref() {
+            Some(quota) => Some(quota.reserve_storage(unique_bytes)?),
+            None => None,
+        };
         write_frame(
             send,
             &SyncWireResponse::NeedChunks {
@@ -1495,7 +1698,18 @@ impl SyncHandler {
         )
         .await?;
 
-        let transferred_bytes = receive_chunks(&self.store, receive, &manifest, missing).await?;
+        let (transferred_bytes, newly_written) = receive_chunks(
+            &self.store,
+            self.quota.as_ref(),
+            peer,
+            receive,
+            &manifest,
+            missing,
+        )
+        .await?;
+        if let Some(reservation) = reservation.as_mut() {
+            reservation.commit(newly_written)?;
+        }
         let _apply_guard = self.apply_lock.lock().await;
         let index = Arc::clone(&self.index);
         let candidate = record.clone();
@@ -1646,18 +1860,35 @@ fn prepare_destination_kind(
     Ok(())
 }
 
+async fn pace_bandwidth(
+    quota: Option<&Arc<quota::QuotaAccountant>>,
+    peer: EndpointId,
+    bytes: u64,
+) -> Result<()> {
+    let Some(quota) = quota else {
+        return Ok(());
+    };
+    if let Some(wait) = quota.consume_bandwidth(peer, bytes, Instant::now())? {
+        tokio::time::sleep(wait).await;
+    }
+    Ok(())
+}
+
 async fn receive_chunks(
     store: &Arc<Store>,
+    quota: Option<&Arc<quota::QuotaAccountant>>,
+    peer: EndpointId,
     receive: &mut RecvStream,
     manifest: &FileManifest,
     missing: Vec<Hash32>,
-) -> Result<u64> {
+) -> Result<(u64, u64)> {
     let descriptor_by_hash: HashMap<_, _> = manifest
         .chunks
         .iter()
         .map(|chunk| (chunk.hash, chunk.clone()))
         .collect();
     let mut transferred_bytes = 0_u64;
+    let mut newly_written = 0_u64;
     for expected_hash in missing {
         let header: ChunkHeader = read_frame(receive).await?;
         ensure!(
@@ -1673,6 +1904,7 @@ async fn receive_chunks(
             header.length <= manifest.profile.max_size,
             "chunk exceeds configured maximum"
         );
+        pace_bandwidth(quota, peer, u64::from(header.length)).await?;
         transferred_bytes = transferred_bytes
             .checked_add(u64::from(header.length))
             .context("transfer byte count overflow")?;
@@ -1680,11 +1912,18 @@ async fn receive_chunks(
         receive.read_exact(&mut bytes).await?;
         verify_chunk(descriptor, &bytes)?;
         let chunk_store = Arc::clone(store);
-        tokio::task::spawn_blocking(move || chunk_store.chunks().put_verified(header.hash, &bytes))
-            .await
-            .context("chunk-store task failed")??;
+        let written = tokio::task::spawn_blocking(move || {
+            chunk_store.chunks().put_verified(header.hash, &bytes)
+        })
+        .await
+        .context("chunk-store task failed")??;
+        if written {
+            newly_written = newly_written
+                .checked_add(u64::from(header.length))
+                .context("unique-byte counter overflow")?;
+        }
     }
-    Ok(transferred_bytes)
+    Ok((transferred_bytes, newly_written))
 }
 
 fn sync_local_path(root: &Path, path: &WirePath) -> PathBuf {
@@ -1754,6 +1993,18 @@ enum SyncWireResponse {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+struct PairingWireRequest {
+    ticket: access::PairingTicket,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+enum PairingWireResponse {
+    Paired,
+    AlreadyPaired,
+    Rejected,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 enum WireRequest {
     Push {
         path: WirePath,
@@ -1798,6 +2049,10 @@ async fn read_frame<T: DeserializeOwned>(receive: &mut RecvStream) -> Result<T> 
     postcard::from_bytes(&bytes).context("malformed control frame")
 }
 
+fn accept_err(error: impl fmt::Display) -> AcceptError {
+    AcceptError::from_err(std::io::Error::other(error.to_string()))
+}
+
 fn truncate_error(message: &str) -> String {
     const LIMIT: usize = 1024;
     if message.len() <= LIMIT {
@@ -1814,7 +2069,7 @@ fn truncate_error(message: &str) -> String {
 mod tests {
     use std::{collections::HashSet, fs};
 
-    use deltaweave_core::{SYNC_RECORD_SCHEMA_V1, VersionVector};
+    use deltaweave_core::{ReplicaId, SYNC_RECORD_SCHEMA_V1, VersionVector};
     use tempfile::TempDir;
 
     use super::*;
@@ -1865,6 +2120,8 @@ mod tests {
             state_root: state.path().to_path_buf(),
             peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
             network_mode: NetworkMode::DirectOnly,
+            quota_policy: None,
+            bind: None,
         })
         .await
         .expect("server can start");
@@ -1945,6 +2202,33 @@ mod tests {
         server.shutdown().await.expect("server shuts down");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn server_rejects_symbolic_link_roots() {
+        use std::os::unix::fs::symlink;
+
+        let parent = TempDir::new().expect("root parent can be created");
+        let destination = TempDir::new().expect("destination can be created");
+        let state = TempDir::new().expect("state can be created");
+        let destination_link = parent.path().join("destination");
+        let state_link = parent.path().join("state");
+        symlink(destination.path(), &destination_link).expect("destination symlink can be created");
+        symlink(state.path(), &state_link).expect("state symlink can be created");
+
+        let result = start_server(ServerConfig {
+            secret_key: SecretKey::generate(),
+            destination_root: destination_link,
+            state_root: state_link,
+            peer_policy: PeerPolicy::AllowListed(HashSet::new()),
+            network_mode: NetworkMode::DirectOnly,
+            quota_policy: None,
+            bind: None,
+        })
+        .await;
+
+        assert!(result.is_err());
+    }
+
     #[tokio::test]
     async fn server_rejects_overlapping_destination_and_state_roots() {
         let root = TempDir::new().expect("root can be created");
@@ -1954,6 +2238,8 @@ mod tests {
             state_root: root.path().join("state"),
             peer_policy: PeerPolicy::AllowListed(HashSet::new()),
             network_mode: NetworkMode::DirectOnly,
+            quota_policy: None,
+            bind: None,
         })
         .await;
 
@@ -1970,6 +2256,8 @@ mod tests {
             state_root: state.path().to_path_buf(),
             peer_policy: PeerPolicy::AllowListed(HashSet::new()),
             network_mode: NetworkMode::DirectOnly,
+            quota_policy: None,
+            bind: None,
         })
         .await
         .expect("server can start");
@@ -1991,6 +2279,8 @@ mod tests {
             state_root: state.path().to_path_buf(),
             peer_policy: PeerPolicy::AllowListed(HashSet::from([SecretKey::generate().public()])),
             network_mode: NetworkMode::DirectOnly,
+            quota_policy: None,
+            bind: None,
         })
         .await
         .expect("server can start");
@@ -2038,6 +2328,8 @@ mod tests {
             state_root: server_state.path().to_path_buf(),
             peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
             network_mode: NetworkMode::DirectOnly,
+            quota_policy: None,
+            bind: None,
         })
         .await
         .expect("server can start");
@@ -2191,5 +2483,192 @@ mod tests {
                 && record.content_hash == Some(Hash32::digest(&second_bytes))
         }));
         server.shutdown().await.expect("server shuts down");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pairing_ticket_authorizes_push_and_rejects_replay() {
+        let state = TempDir::new().expect("server state can be created");
+        let destination = TempDir::new().expect("server root can be created");
+        let sources = TempDir::new().expect("source directory can be created");
+        let access = Arc::new(
+            access::AccessStore::open(state.path().join("access.redb"))
+                .expect("access store opens"),
+        );
+        let server_key = SecretKey::generate();
+        let client_key = SecretKey::generate();
+        let server = start_server(ServerConfig {
+            secret_key: server_key.clone(),
+            destination_root: destination.path().to_path_buf(),
+            state_root: state.path().to_path_buf(),
+            peer_policy: PeerPolicy::Durable(Arc::clone(&access)),
+            network_mode: NetworkMode::DirectOnly,
+            quota_policy: None,
+            bind: None,
+        })
+        .await
+        .expect("durable server can start");
+
+        let address = server.endpoint_addr();
+        let direct = address
+            .ip_addrs()
+            .next()
+            .expect("direct address is advertised")
+            .to_string();
+        let ticket = access
+            .issue_ticket(&server_key.public(), &direct, access::unix_now() + 600)
+            .expect("ticket can be issued");
+
+        let before = access
+            .is_authorized(client_key.public())
+            .expect("authorization is readable");
+        assert!(!before, "client is not authorized before pairing");
+
+        let outcome =
+            redeem_pairing_ticket(client_key.clone(), ticket.clone(), NetworkMode::DirectOnly)
+                .await
+                .expect("ticket redeems");
+        assert_eq!(outcome, access::RedeemOutcome::Paired);
+        assert!(
+            access
+                .is_authorized(client_key.public())
+                .expect("authorization is readable")
+        );
+
+        let source = sources.path().join("paired.bin");
+        fs::write(&source, b"authorized after pairing").expect("source can be written");
+        let pushed = push_file(PushOptions {
+            secret_key: client_key.clone(),
+            source,
+            remote_path: WirePath::new("paired.bin").expect("path is portable"),
+            remote: server.endpoint_addr(),
+            profile: ChunkingProfile::DEFAULT,
+            network_mode: NetworkMode::DirectOnly,
+        })
+        .await
+        .expect("authorized push succeeds");
+        assert!(pushed.transferred_bytes > 0);
+        assert_eq!(
+            fs::read(destination.path().join("paired.bin"))
+                .expect("paired destination can be read"),
+            b"authorized after pairing".to_vec()
+        );
+
+        let replay =
+            redeem_pairing_ticket(client_key.clone(), ticket, NetworkMode::DirectOnly).await;
+        assert!(
+            replay.is_err(),
+            "a consumed ticket cannot be redeemed twice"
+        );
+
+        let stranger = SecretKey::generate();
+        let stranger_source = sources.path().join("stranger.bin");
+        fs::write(&stranger_source, b"never paired").expect("source can be written");
+        let rejected = push_file(PushOptions {
+            secret_key: stranger,
+            source: stranger_source,
+            remote_path: WirePath::new("stranger.bin").expect("path is portable"),
+            remote: server.endpoint_addr(),
+            profile: ChunkingProfile::DEFAULT,
+            network_mode: NetworkMode::DirectOnly,
+        })
+        .await;
+        assert!(rejected.is_err(), "unpaired peers stay rejected");
+        assert!(!destination.path().join("stranger.bin").exists());
+
+        access
+            .revoke(client_key.public())
+            .expect("peer can be revoked");
+        let revocation_source = sources.path().join("revoked.bin");
+        fs::write(&revocation_source, b"revoked").expect("source can be written");
+        let revoked = push_file(PushOptions {
+            secret_key: client_key.clone(),
+            source: revocation_source,
+            remote_path: WirePath::new("revoked.bin").expect("path is portable"),
+            remote: server.endpoint_addr(),
+            profile: ChunkingProfile::DEFAULT,
+            network_mode: NetworkMode::DirectOnly,
+        })
+        .await;
+        assert!(revoked.is_err(), "revoked peers lose authorization");
+        assert!(!destination.path().join("revoked.bin").exists());
+
+        server.shutdown().await.expect("server shuts down");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bound_port_survives_restart_so_issued_ticket_still_redeems() {
+        let reserved = std::net::UdpSocket::bind("127.0.0.1:0").expect("can reserve a UDP port");
+        let bind = reserved.local_addr().expect("reserved address is readable");
+        drop(reserved);
+
+        let state = TempDir::new().expect("server state can be created");
+        let destination = TempDir::new().expect("server root can be created");
+        let server_key = SecretKey::generate();
+        let client_key = SecretKey::generate();
+        let access = Arc::new(
+            access::AccessStore::open(state.path().join("access.redb"))
+                .expect("access store opens"),
+        );
+        let config = ServerConfig {
+            secret_key: server_key.clone(),
+            destination_root: destination.path().to_path_buf(),
+            state_root: state.path().to_path_buf(),
+            peer_policy: PeerPolicy::Durable(Arc::clone(&access)),
+            network_mode: NetworkMode::DirectOnly,
+            quota_policy: None,
+            bind: Some(bind),
+        };
+        let server = start_server(config.clone())
+            .await
+            .expect("bound server can start");
+        assert!(
+            advertised_ports(&server).contains(&bind.port()),
+            "first bind must advertise UDP port {}",
+            bind.port()
+        );
+        let ticket = access
+            .issue_ticket(
+                &server_key.public(),
+                &bind.to_string(),
+                access::unix_now() + 600,
+            )
+            .expect("ticket can be issued against the bound address");
+        server.shutdown().await.expect("bound server shuts down");
+
+        let restarted = start_server(config)
+            .await
+            .expect("server restarts on the same UDP port");
+        assert!(
+            advertised_ports(&restarted).contains(&bind.port()),
+            "restart must keep UDP port {}",
+            bind.port()
+        );
+        let outcome = redeem_pairing_ticket(client_key.clone(), ticket, NetworkMode::DirectOnly)
+            .await
+            .expect("ticket issued before restart still redeems on the same port");
+        assert_eq!(outcome, access::RedeemOutcome::Paired);
+        assert!(
+            access
+                .is_authorized(client_key.public())
+                .expect("authorization is readable")
+        );
+        restarted
+            .shutdown()
+            .await
+            .expect("restarted server shuts down");
+    }
+
+    fn advertised_ports(server: &Server) -> Vec<u16> {
+        server
+            .address_info()
+            .direct_addresses
+            .iter()
+            .filter_map(|address| {
+                address
+                    .parse::<SocketAddr>()
+                    .ok()
+                    .map(|socket| socket.port())
+            })
+            .collect()
     }
 }

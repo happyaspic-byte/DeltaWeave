@@ -1,0 +1,39 @@
+[package]
+name = "deltaweave-daemon"
+description = "Single-owner DeltaWeave daemon that owns redb, watchers, and iroh"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "deltaweave-daemon"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+deltaweave-core = { path = "../deltaweave-core" }
+deltaweave-daemon-api = { path = "../deltaweave-daemon-api" }
+deltaweave-net = { path = "../deltaweave-net" }
+deltaweave-reconcile = { path = "../deltaweave-reconcile" }
+deltaweave-sync = { path = "../deltaweave-sync" }
+postcard.workspace = true
+redb.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = [
+  "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"
+] }
+
+[target.'cfg(windows)'.dependencies]
+windows-acl = "0.3.0"
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

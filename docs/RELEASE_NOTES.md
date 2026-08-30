@@ -65,6 +65,13 @@ result terminal frames and a GIF made from an actual v0.3 `sync-once` scenario:
 initial two-way exchange, simultaneous edits, conflict copy, deletion, and a
 zero-byte no-change retry.
 
+## Windows GUI installer
+
+The first GUI bundle is an unsigned current-user NSIS installer plus the
+existing portable ZIP. Windows SmartScreen will warn until a trusted
+code-signing certificate is used. Unsigned artifacts are allowed only for
+controlled hardware soak.
+
 ## Known limits
 
 - Long-running physical Windows/Synology soak remains a field validation gate.

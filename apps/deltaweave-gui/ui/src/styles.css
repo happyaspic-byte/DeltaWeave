@@ -1,0 +1,75 @@
+:root {
+  color: #1b2430;
+  background: #f3f5f7;
+  font-family: "Segoe UI", sans-serif;
+}
+
+body {
+  margin: 0;
+  background: #f3f5f7;
+  color: #1b2430;
+}
+
+.transfer,
+.conflicts {
+  padding: 16px 24px;
+}
+
+.speed {
+  font-size: 28px;
+  font-weight: 600;
+}
+
+h2 {
+  font-size: 16px;
+  margin: 0 0 8px;
+}
+
+.wizard {
+  margin: 16px 24px;
+  padding: 20px;
+  border: 1px solid #d4d9df;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.wizard label {
+  display: block;
+  margin: 12px 0;
+}
+
+.wizard input[type="text"],
+.wizard input:not([type]) {
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 520px;
+  padding: 8px;
+}
+
+.wizard-step,
+.wizard small {
+  color: #56616f;
+}
+
+.conflicts button {
+  margin-right: 8px;
+  margin-bottom: 8px;
+}
+
+.jobs {
+  padding: 16px 24px;
+}
+
+.job {
+  display: grid;
+  gap: 4px;
+  margin: 12px 0;
+  padding: 12px;
+  border: 1px solid #d4d9df;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.job small {
+  color: #56616f;
+}

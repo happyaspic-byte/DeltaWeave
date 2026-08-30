@@ -10,6 +10,7 @@ use std::{
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use thiserror::Error;
+use unicode_normalization::UnicodeNormalization;
 
 /// Current on-disk and wire manifest schema.
 pub const MANIFEST_SCHEMA_V1: u16 = 1;
@@ -401,6 +402,59 @@ impl<'de> Deserialize<'de> for WirePath {
     }
 }
 
+fn is_disallowed_path_char(character: char) -> bool {
+    const ILLEGAL: [char; 9] = ['<', '>', ':', '"', '|', '?', '*', '\0', '\r'];
+    character.is_control()
+        || character.is_whitespace() && character != ' '
+        || matches!(
+            character,
+            '\u{061c}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2060}'..='\u{206f}'
+                | '\u{fe00}'..='\u{fe0f}'
+                | '\u{feff}'
+                | '\u{e0100}'..='\u{e01ef}'
+        )
+        || ILLEGAL.contains(&character)
+        || matches!(character, '\u{ff0e}' | '\u{ff0f}' | '\u{2215}')
+}
+
+fn reserved_stem(component: &str) -> String {
+    component
+        .split('.')
+        .next()
+        .unwrap_or(component)
+        .chars()
+        .filter(|character| {
+            !character.is_whitespace()
+                && !matches!(
+                    *character,
+                    '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{feff}'
+                )
+        })
+        .collect::<String>()
+        .trim_end_matches([' ', '.'])
+        .to_owned()
+}
+
+fn is_reserved_windows_name(stem: &str) -> bool {
+    const RESERVED_BASE: [&str; 7] = ["CON", "PRN", "AUX", "NUL", "CLOCK$", "CONIN$", "CONOUT$"];
+    let upper_stem = stem.to_ascii_uppercase();
+    let numbered_device = ["COM", "LPT"].iter().any(|prefix| {
+        upper_stem.strip_prefix(prefix).is_some_and(|suffix| {
+            matches!(
+                suffix,
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+            )
+        })
+    });
+    RESERVED_BASE
+        .iter()
+        .any(|reserved| stem.eq_ignore_ascii_case(reserved))
+        || numbered_device
+}
+
 fn validate_wire_path(value: &str) -> Result<(), WirePathError> {
     if value.is_empty() {
         return Err(WirePathError::Empty);
@@ -411,9 +465,9 @@ fn validate_wire_path(value: &str) -> Result<(), WirePathError> {
     if value.starts_with('/') || value.contains('\\') {
         return Err(WirePathError::NotRelative);
     }
-
-    const ILLEGAL: [char; 9] = ['<', '>', ':', '"', '|', '?', '*', '\0', '\r'];
-    const RESERVED_BASE: [&str; 7] = ["CON", "PRN", "AUX", "NUL", "CLOCK$", "CONIN$", "CONOUT$"];
+    if value.nfc().collect::<String>() != value {
+        return Err(WirePathError::NotCanonical);
+    }
 
     for component in value.split('/') {
         if component.is_empty() || component == "." || component == ".." {
@@ -422,34 +476,14 @@ fn validate_wire_path(value: &str) -> Result<(), WirePathError> {
         if component.len() > 255 {
             return Err(WirePathError::ComponentTooLong(component.to_owned()));
         }
-        if component.ends_with('.') || component.ends_with(' ') {
-            return Err(WirePathError::InvalidComponent(component.to_owned()));
-        }
-        if component
-            .chars()
-            .any(|character| character.is_control() || ILLEGAL.contains(&character))
+        if component.starts_with(' ')
+            || component.ends_with('.')
+            || component.ends_with(' ')
+            || component.chars().any(is_disallowed_path_char)
         {
             return Err(WirePathError::InvalidComponent(component.to_owned()));
         }
-        let stem = component
-            .split('.')
-            .next()
-            .unwrap_or(component)
-            .trim_end_matches([' ', '.']);
-        let upper_stem = stem.to_ascii_uppercase();
-        let numbered_device = ["COM", "LPT"].iter().any(|prefix| {
-            upper_stem.strip_prefix(prefix).is_some_and(|suffix| {
-                matches!(
-                    suffix,
-                    "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
-                )
-            })
-        });
-        if RESERVED_BASE
-            .iter()
-            .any(|reserved| stem.eq_ignore_ascii_case(reserved))
-            || numbered_device
-        {
+        if is_reserved_windows_name(&reserved_stem(component)) {
             return Err(WirePathError::ReservedName(component.to_owned()));
         }
     }
@@ -465,6 +499,9 @@ pub enum WirePathError {
     /// Absolute paths and backslashes are forbidden on the wire.
     #[error("path must be relative and use '/' separators")]
     NotRelative,
+    /// Paths must already be NFC so peers cannot alias the same name.
+    #[error("path is not NFC-normalized")]
+    NotCanonical,
     /// The complete path is unreasonably long.
     #[error("path exceeds 4096 UTF-8 bytes")]
     TooLong,
@@ -785,9 +822,86 @@ mod tests {
     }
 
     #[test]
+    fn wire_paths_reject_non_nfc_aliases() {
+        assert_eq!(
+            WirePath::new("cafe\u{0301}.txt"),
+            Err(WirePathError::NotCanonical)
+        );
+        assert_eq!(
+            WirePath::new("café.txt")
+                .expect("NFC latin-1 is portable")
+                .as_str(),
+            "café.txt"
+        );
+    }
+
+    #[test]
+    fn wire_paths_reject_unicode_whitespace_and_dot_lookalikes() {
+        assert!(matches!(
+            WirePath::new("file\u{00a0}name.txt"),
+            Err(WirePathError::InvalidComponent(_))
+        ));
+        assert!(matches!(
+            WirePath::new("file.txt\u{00a0}"),
+            Err(WirePathError::InvalidComponent(_))
+        ));
+        assert!(matches!(
+            WirePath::new("\u{00a0}file.txt"),
+            Err(WirePathError::InvalidComponent(_))
+        ));
+        assert!(matches!(
+            WirePath::new("dir/\u{3000}wide"),
+            Err(WirePathError::InvalidComponent(_))
+        ));
+        assert!(matches!(
+            WirePath::new("foo/\u{FF0E}\u{FF0E}"),
+            Err(WirePathError::InvalidComponent(_))
+        ));
+        assert!(matches!(
+            WirePath::new(" foo.txt"),
+            Err(WirePathError::InvalidComponent(_))
+        ));
+        assert!(WirePath::new("my file.txt").is_ok());
+    }
+
+    #[test]
+    fn wire_paths_reject_reserved_names_with_unicode_padding() {
+        assert!(matches!(
+            WirePath::new("CON\u{00a0}.txt"),
+            Err(WirePathError::InvalidComponent(_))
+        ));
+        assert!(matches!(
+            WirePath::new("com1\u{200b}.log"),
+            Err(WirePathError::InvalidComponent(_))
+        ));
+    }
+
+    #[test]
+    fn wire_paths_reject_directional_and_invisible_format_controls() {
+        for value in [
+            "safe\u{061c}.txt",
+            "safe\u{200e}.txt",
+            "safe\u{202e}cod.exe",
+            "safe\u{2066}.txt",
+            "safe\u{2069}.txt",
+            "safe\u{fe00}.txt",
+        ] {
+            assert!(
+                matches!(
+                    WirePath::new(value),
+                    Err(WirePathError::InvalidComponent(_))
+                ),
+                "accepted spoofing control {value:?}"
+            );
+        }
+    }
+
+    #[test]
     fn wire_path_deserialization_cannot_bypass_validation() {
         assert!(serde_json::from_str::<WirePath>(r#""safe/file.txt""#).is_ok());
         assert!(serde_json::from_str::<WirePath>(r#""../escape.txt""#).is_err());
+        assert!(serde_json::from_str::<WirePath>(r#""café.txt""#).is_err());
+        assert!(serde_json::from_str::<WirePath>("\"file.txt\\u00a0\"").is_err());
     }
 
     #[test]

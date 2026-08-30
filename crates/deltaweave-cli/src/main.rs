@@ -6,8 +6,9 @@ use std::{
     collections::HashSet,
     fs,
     io::Write,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr, UdpSocket},
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -18,12 +19,23 @@ use deltaweave_core::{ChunkingProfile, Hash32, ReplicaId, WirePath};
 use deltaweave_index::{IndexOptions, LocalIndex, ScanChange, WatchService};
 use deltaweave_net::{
     NetworkMode, PeerPolicy, PushOptions, Server, ServerConfig, SyncClient, TransferReceipt,
-    endpoint_addr, load_or_create_identity, push_file, start_server,
+    access::{AccessStore, PairingTicket, unix_now},
+    endpoint_addr, load_or_create_identity, push_file,
+    quota::QuotaPolicy,
+    redeem_pairing_ticket, start_server,
 };
 use deltaweave_sync::{SyncConfig, SyncEngine};
 use iroh::{EndpointId, SecretKey};
 use serde_json::json;
 use tracing_subscriber::EnvFilter;
+
+const QUICK_PROFILE_NAME: &str = "profile.json";
+const QUICK_SHARE_QUOTA: QuotaPolicy = QuotaPolicy {
+    bytes_per_second: 8 * 1024 * 1024,
+    burst_bytes: 16 * 1024 * 1024,
+    max_concurrent_operations_per_peer: 4,
+    max_storage_bytes: 10 * 1024 * 1024 * 1024,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -55,6 +67,31 @@ enum Command {
     SyncOnce(SyncTargetArgs),
     /// Continuously reconcile a local folder with retry/backoff until stopped.
     Sync(SyncArgs),
+    /// Manage pairing tickets, authorized peers, and identity rotation.
+    Pair(PairArgs),
+    /// Attach to or run the local daemon.
+    Daemon(DaemonArgs),
+    /// Pair this PC using one ticket and remember the peer.
+    Connect {
+        /// Printable `dwpair1:` ticket.
+        ticket: String,
+    },
+    /// Synchronize one folder using the remembered peer.
+    SyncFolder {
+        /// Local folder to synchronize.
+        folder: PathBuf,
+        /// Keep synchronizing until Ctrl-C.
+        #[arg(long)]
+        watch: bool,
+    },
+    /// Share one folder and accept paired peers.
+    Share {
+        /// Local folder to share.
+        folder: PathBuf,
+        /// Fixed UDP listen address.
+        #[arg(long, default_value = "0.0.0.0:17891")]
+        bind: SocketAddr,
+    },
     /// Run an isolated local end-to-end transfer and delta-reuse check.
     SelfTest,
 }
@@ -108,6 +145,9 @@ struct ServeArgs {
     /// Private metadata, chunk, journal, and trash directory.
     #[arg(long, default_value = ".deltaweave/state")]
     state: PathBuf,
+    /// Durable peer authorization and stable replica database.
+    #[arg(long, default_value = ".deltaweave/state/access.redb")]
+    access: PathBuf,
     /// Persistent secret-key file.
     #[arg(long, default_value = ".deltaweave/identity.key")]
     identity: PathBuf,
@@ -120,6 +160,91 @@ struct ServeArgs {
     /// Disable discovery and relay services; advertise direct addresses only.
     #[arg(long)]
     direct_only: bool,
+    /// Resolve peer authorization from durable state instead of CLI flags.
+    #[arg(long, conflicts_with_all = ["allowed_peers", "allow_any_authenticated"])]
+    durable_access: bool,
+    /// Sustained per-peer receive rate in bytes per second; 0 disables pacing.
+    #[arg(long, default_value_t = 0)]
+    rate_bytes_per_second: u64,
+    /// Token-bucket burst above the sustained rate in bytes.
+    #[arg(long, default_value_t = 0)]
+    burst_bytes: u64,
+    /// Simultaneous in-flight operations per peer; 0 means unlimited.
+    #[arg(long, default_value_t = 0)]
+    max_concurrent_operations: u32,
+    /// Maximum unique CAS bytes stored by this node; 0 means unlimited.
+    #[arg(long, default_value_t = 0)]
+    max_storage_bytes: u64,
+    /// Fixed UDP bind address so pairing tickets survive server restart.
+    #[arg(long)]
+    bind: Option<SocketAddr>,
+}
+
+#[derive(Debug, Args)]
+struct DaemonArgs {
+    #[command(subcommand)]
+    command: DaemonCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum DaemonCommand {
+    /// Run the daemon in the foreground.
+    Run,
+    /// Print Hello from a live daemon.
+    Status,
+}
+
+#[derive(Debug, Args)]
+struct PairArgs {
+    #[command(subcommand)]
+    command: PairCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum PairCommand {
+    /// Issue a single-use pairing ticket bound to this server's address.
+    Issue {
+        /// Ticket lifetime in seconds.
+        #[arg(long, default_value_t = 600)]
+        ttl_seconds: u64,
+        /// Server direct UDP address embedded in the ticket.
+        #[arg(long)]
+        direct_address: SocketAddr,
+        /// Durable access database.
+        #[arg(long, default_value = ".deltaweave/state/access.redb")]
+        access: PathBuf,
+        /// Server identity whose endpoint ID is embedded in the ticket.
+        #[arg(long, default_value = ".deltaweave/identity.key")]
+        identity: PathBuf,
+    },
+    /// Redeem a ticket code, authorizing this endpoint with the server.
+    Redeem {
+        /// Printable ticket code (dwpair1:...).
+        code: String,
+        /// Local secret-key file used when redeeming.
+        #[arg(long, default_value = ".deltaweave/identity.key")]
+        identity: PathBuf,
+    },
+    /// List authorized peers.
+    List {
+        /// Durable access database.
+        #[arg(long, default_value = ".deltaweave/state/access.redb")]
+        access: PathBuf,
+    },
+    /// Revoke an authorized endpoint.
+    Revoke {
+        /// Durable access database.
+        #[arg(long, default_value = ".deltaweave/state/access.redb")]
+        access: PathBuf,
+        /// Endpoint ID to revoke.
+        endpoint_id: String,
+    },
+    /// Rotate the transport identity, keeping the stable replica identity.
+    Rotate {
+        /// Identity file to replace.
+        #[arg(long, default_value = ".deltaweave/identity.key")]
+        identity: PathBuf,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -183,6 +308,9 @@ struct IndexArgs {
     /// Private redb index file. If beneath root, its parent is excluded automatically.
     #[arg(long, default_value = ".deltaweave/index.redb")]
     state: PathBuf,
+    /// Durable peer authorization and stable replica database.
+    #[arg(long, default_value = ".deltaweave/state/access.redb")]
+    access: PathBuf,
     /// Persistent node identity used to derive a stable replica ID.
     #[arg(long, default_value = ".deltaweave/identity.key")]
     identity: PathBuf,
@@ -202,13 +330,15 @@ struct SyncTargetArgs {
     /// Private local index, CAS, journal, and recovery directory outside `root`.
     #[arg(long, default_value = ".deltaweave/sync-state")]
     state: PathBuf,
+    /// Durable peer authorization and stable replica database.
+    #[arg(long, default_value = ".deltaweave/state/access.redb")]
+    access: PathBuf,
     /// Persistent local endpoint identity outside `root`.
     #[arg(long, default_value = ".deltaweave/identity.key")]
     identity: PathBuf,
     /// Remote receiver endpoint ID.
     #[arg(long)]
     peer: String,
-    /// Remote direct UDP address; repeat when multiple addresses are advertised.
     #[arg(long = "direct")]
     direct_addresses: Vec<SocketAddr>,
     /// Remote relay URL; repeat when multiple relays are advertised.
@@ -255,8 +385,286 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Watch(args) => watch(args).await,
         Command::SyncOnce(args) => sync_once(args).await,
         Command::Sync(args) => sync_forever(args).await,
+        Command::Pair(args) => pair(args).await,
+        Command::Daemon(args) => daemon(args).await,
+        Command::Connect { ticket } => quick_connect(&ticket).await,
+        Command::SyncFolder { folder, watch } => quick_sync_folder(folder, watch).await,
+        Command::Share { folder, bind } => quick_share(folder, bind).await,
         Command::SelfTest => self_test().await,
     }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct QuickProfile {
+    peer_endpoint_id: String,
+    peer_address: String,
+}
+
+fn quick_data_dir() -> Result<PathBuf> {
+    let dir = deltaweave_daemon::default_data_dir()?.join("quick");
+    fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+fn quick_profile_path() -> Result<PathBuf> {
+    Ok(quick_data_dir()?.join(QUICK_PROFILE_NAME))
+}
+
+fn save_quick_profile(profile: &QuickProfile) -> Result<()> {
+    save_quick_profile_at(&quick_profile_path()?, profile)
+}
+
+fn save_quick_profile_at(path: &Path, profile: &QuickProfile) -> Result<()> {
+    let nonce =
+        Hash32::digest(SecretKey::generate().to_bytes().as_slice()).to_hex()[..12].to_string();
+    let temp = path.with_file_name(format!(".profile.{nonce}.tmp"));
+    let mut options = fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let write_result = (|| -> Result<()> {
+        let mut file = options
+            .open(&temp)
+            .with_context(|| format!("failed to create {}", temp.display()))?;
+        serde_json::to_writer(&mut file, profile)?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temp);
+        return Err(error);
+    }
+    if let Some(parent) = path.parent()
+        && let Err(error) = sync_dir(parent)
+    {
+        let _ = fs::remove_file(&temp);
+        return Err(error);
+    }
+    replace_quick_profile(path, &temp, &nonce)
+}
+
+#[cfg(unix)]
+fn replace_quick_profile(path: &Path, temp: &Path, _nonce: &str) -> Result<()> {
+    if let Err(error) = fs::rename(temp, path) {
+        let _ = fs::remove_file(temp);
+        return Err(error).with_context(|| format!("failed to replace {}", path.display()));
+    }
+    if let Some(parent) = path.parent() {
+        let _ = sync_dir(parent);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn replace_quick_profile(path: &Path, temp: &Path, nonce: &str) -> Result<()> {
+    let backup = path.with_file_name(format!(".profile.{nonce}.bak"));
+    if backup.exists() {
+        fs::remove_file(&backup)?;
+    }
+    if path.exists()
+        && let Err(error) = fs::rename(path, &backup)
+    {
+        let _ = fs::remove_file(temp);
+        return Err(error).with_context(|| format!("failed to back up {}", path.display()));
+    }
+    if let Err(error) = fs::rename(temp, path) {
+        if backup.exists() {
+            let _ = fs::rename(&backup, path);
+        }
+        let _ = fs::remove_file(temp);
+        return Err(error).with_context(|| format!("failed to replace {}", path.display()));
+    }
+    if backup.exists() {
+        fs::remove_file(&backup)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_dir(path: &Path) -> Result<()> {
+    let file = fs::File::open(path)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn quick_folder_id(folder: &Path) -> Result<String> {
+    let canonical = fs::canonicalize(folder)?;
+    Ok(Hash32::digest(canonical.to_string_lossy().as_bytes()).to_hex()[..16].to_string())
+}
+
+fn quick_folder_state(folder: &Path) -> Result<PathBuf> {
+    Ok(quick_data_dir()?
+        .join("folders")
+        .join(quick_folder_id(folder)?))
+}
+
+fn quick_lan_ip() -> Result<IpAddr> {
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    socket.connect("1.1.1.1:53")?;
+    Ok(socket.local_addr()?.ip())
+}
+
+fn load_quick_profile() -> Result<QuickProfile> {
+    let path = quick_profile_path()?;
+    let file = fs::File::open(&path).with_context(|| {
+        format!(
+            "run 'deltaweave connect <dwpair1:...>' first ({})",
+            path.display()
+        )
+    })?;
+    Ok(serde_json::from_reader(file)?)
+}
+
+fn print_connect_card(endpoint_id: &str, peer_address: &str) -> Result<()> {
+    let mut out = std::io::stdout().lock();
+    writeln!(out, "\n┌ DeltaWeave 페어링 완료")?;
+    writeln!(out, "├ 이 PC ID     {endpoint_id}")?;
+    writeln!(out, "├ 서버 주소    {peer_address}")?;
+    writeln!(out, "└ 다음: deltaweave sync-folder <폴더>")?;
+    Ok(())
+}
+
+fn print_sync_card(report: &deltaweave_sync::SyncReport) -> Result<()> {
+    let mut out = std::io::stdout().lock();
+    writeln!(out, "\n┌ DeltaWeave 동기화 {}", report.status)?;
+    writeln!(out, "├ 보낸 바이트      {}", report.pushed_bytes)?;
+    writeln!(out, "├ 받은 바이트      {}", report.pulled_bytes)?;
+    writeln!(out, "├ 로컬 변경        {}", report.local_actions)?;
+    writeln!(out, "├ 원격 변경        {}", report.remote_actions)?;
+    writeln!(out, "├ 충돌             {}", report.conflicts.len())?;
+    writeln!(out, "└ 검증 루트        {}", report.verified_local_root)?;
+    Ok(())
+}
+
+async fn quick_connect(ticket_code: &str) -> Result<()> {
+    let dir = quick_data_dir()?;
+    let identity_path = dir.join("identity.key");
+    let identity = load_or_create_identity(&identity_path)?;
+    let ticket = PairingTicket::from_code(ticket_code)?;
+    let endpoint_id = ticket.server_endpoint_id.clone();
+    let address = ticket.server_direct_address.clone();
+    redeem_pairing_ticket(identity.secret_key.clone(), ticket, NetworkMode::DirectOnly).await?;
+    save_quick_profile(&QuickProfile {
+        peer_endpoint_id: endpoint_id,
+        peer_address: address.clone(),
+    })?;
+    print_connect_card(&identity.endpoint_id().to_string(), &address)
+}
+
+fn quick_sync_engine_args(folder: &Path) -> Result<SyncTargetArgs> {
+    let profile = load_quick_profile()?;
+    let dir = quick_data_dir()?;
+    let state_root = quick_folder_state(folder)?;
+    fs::create_dir_all(&state_root)?;
+    Ok(SyncTargetArgs {
+        root: folder.to_path_buf(),
+        state: state_root,
+        access: dir.join("access.redb"),
+        identity: dir.join("identity.key"),
+        peer: profile.peer_endpoint_id,
+        direct_addresses: vec![profile.peer_address.parse()?],
+        relay_urls: Vec::new(),
+        direct_only: true,
+        chunking: ChunkingArgs {
+            min_chunk: ChunkingProfile::DEFAULT.min_size,
+            avg_chunk: ChunkingProfile::DEFAULT.avg_size,
+            max_chunk: ChunkingProfile::DEFAULT.max_size,
+        },
+    })
+}
+
+async fn quick_sync_folder(folder: PathBuf, watch: bool) -> Result<()> {
+    let args = quick_sync_engine_args(&folder)?;
+    if !watch {
+        let engine = open_sync_engine(args)?;
+        let report = engine.sync_once().await?;
+        return print_sync_card(&report);
+    }
+    let engine = open_sync_engine(args)?;
+    let mut out = std::io::stdout().lock();
+    writeln!(out, "\n┌ DeltaWeave 자동 동기화")?;
+    writeln!(out, "├ 폴더      {}", folder.display())?;
+    writeln!(out, "├ 간격      5초")?;
+    writeln!(out, "└ 실행 중… Ctrl-C로 중지")?;
+    drop(out);
+    loop {
+        tokio::select! {
+            result = wait_for_shutdown_signal() => {
+                result?;
+                let mut out = std::io::stdout().lock();
+                writeln!(out, "\n└ 자동 동기화 종료")?;
+                return Ok(());
+            }
+            result = engine.sync_once() => {
+                match result {
+                    Ok(report) => print_sync_card(&report)?,
+                    Err(error) => {
+                        let mut out = std::io::stdout().lock();
+                        writeln!(out, "\n┌ 동기화 재시도")?;
+                        writeln!(out, "├ 오류      {error}")?;
+                        writeln!(out, "└ 5초 뒤 재시도")?;
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
+async fn quick_share(folder: PathBuf, bind: SocketAddr) -> Result<()> {
+    let dir = quick_data_dir()?;
+    let share_dir = dir.join("share");
+    let state_dir = share_dir.join("folders").join(quick_folder_id(&folder)?);
+    let access_path = share_dir.join("access.redb");
+    let identity_path = share_dir.join("identity.key");
+    fs::create_dir_all(&state_dir)?;
+    let identity = load_or_create_identity(&identity_path)?;
+    ensure_identity_outside_destination(&identity_path, &folder)?;
+    let advertised_ip = if bind.ip().is_unspecified() {
+        quick_lan_ip()?
+    } else {
+        bind.ip()
+    };
+    let advertised = SocketAddr::new(advertised_ip, bind.port());
+    let access = Arc::new(AccessStore::open(&access_path)?);
+    let server = start_server(ServerConfig {
+        secret_key: identity.secret_key.clone(),
+        destination_root: folder.clone(),
+        state_root: state_dir,
+        peer_policy: PeerPolicy::Durable(Arc::clone(&access)),
+        network_mode: NetworkMode::DirectOnly,
+        quota_policy: Some(QUICK_SHARE_QUOTA),
+        bind: Some(bind),
+    })
+    .await?;
+    if !server.wait_online(Duration::from_secs(20)).await {
+        server.shutdown().await?;
+        bail!("공유 서버를 20초 안에 열지 못했습니다");
+    }
+    let expires_at = unix_now()
+        .checked_add(600)
+        .context("pairing ticket expiry overflow")?;
+    let ticket =
+        access.issue_ticket(&identity.endpoint_id(), &advertised.to_string(), expires_at)?;
+    let mut out = std::io::stdout().lock();
+    writeln!(out, "\n┌ DeltaWeave 공유 시작")?;
+    writeln!(out, "├ 폴더      {}", folder.display())?;
+    writeln!(out, "├ 내 ID     {}", identity.endpoint_id())?;
+    writeln!(out, "├ 주소      {advertised}")?;
+    writeln!(out, "├ 티켓      {}", ticket.to_code())?;
+    writeln!(out, "├ 만료      10분 · 1회용")?;
+    writeln!(out, "└ 대기 중… Ctrl-C로 중지")?;
+    out.flush()?;
+    wait_for_shutdown_signal().await?;
+    server.shutdown().await
 }
 
 fn initialize(args: InitArgs) -> Result<()> {
@@ -274,12 +682,15 @@ fn print_manifest(args: ManifestArgs) -> Result<()> {
 }
 
 async fn serve(args: ServeArgs) -> Result<()> {
-    if args.allowed_peers.is_empty() && !args.allow_any_authenticated {
-        bail!("serve requires at least one --allow-peer, or explicit --allow-any-authenticated");
+    if args.allowed_peers.is_empty() && !args.allow_any_authenticated && !args.durable_access {
+        bail!("serve requires --allow-peer, --allow-any-authenticated, or --durable-access");
     }
     let identity = load_or_create_identity(&args.identity)?;
     ensure_identity_outside_destination(&args.identity, &args.root)?;
-    let peer_policy = if args.allow_any_authenticated {
+    let peer_policy = if args.durable_access {
+        let access = AccessStore::open(&args.access)?;
+        PeerPolicy::Durable(Arc::new(access))
+    } else if args.allow_any_authenticated {
         PeerPolicy::AnyAuthenticated
     } else {
         let peers = args
@@ -292,6 +703,12 @@ async fn serve(args: ServeArgs) -> Result<()> {
             .collect::<Result<HashSet<_>>>()?;
         PeerPolicy::AllowListed(peers)
     };
+    let quota_policy = QuotaPolicy {
+        bytes_per_second: args.rate_bytes_per_second,
+        burst_bytes: args.burst_bytes,
+        max_concurrent_operations_per_peer: args.max_concurrent_operations,
+        max_storage_bytes: args.max_storage_bytes,
+    };
 
     let server = start_server(ServerConfig {
         secret_key: identity.secret_key,
@@ -299,6 +716,12 @@ async fn serve(args: ServeArgs) -> Result<()> {
         state_root: args.state,
         peer_policy,
         network_mode: network_mode(args.direct_only),
+        quota_policy: if quota_policy == QuotaPolicy::UNLIMITED {
+            None
+        } else {
+            Some(quota_policy)
+        },
+        bind: args.bind,
     })
     .await?;
     if !server.wait_online(Duration::from_secs(20)).await {
@@ -361,6 +784,85 @@ async fn wait_for_shutdown_signal() -> Result<()> {
         .context("failed to wait for Ctrl-C")
 }
 
+async fn daemon(args: DaemonArgs) -> Result<()> {
+    match args.command {
+        DaemonCommand::Run => deltaweave_daemon::run().await,
+        DaemonCommand::Status => daemon_status().await,
+    }
+}
+
+async fn daemon_status() -> Result<()> {
+    let data_dir = deltaweave_daemon::default_data_dir()?;
+    let socket = deltaweave_daemon::ipc_path(&data_dir);
+    let hello = deltaweave_daemon::connect_and_hello(&socket)
+        .await
+        .with_context(|| format!("failed to attach to {}", socket.display()))?;
+    print_json(&json!({
+        "instance_id": hello.instance_id,
+        "local_endpoint_id": hello.local_endpoint_id,
+        "protocol_version": {
+            "major": hello.protocol_version.major,
+            "minor": hello.protocol_version.minor,
+        },
+    }))
+}
+
+async fn pair(args: PairArgs) -> Result<()> {
+    match args.command {
+        PairCommand::Issue {
+            ttl_seconds,
+            direct_address,
+            access,
+            identity,
+        } => {
+            ensure!(ttl_seconds > 0, "--ttl-seconds must be greater than zero");
+            let identity = load_or_create_identity(identity)?;
+            let expires_at = unix_now()
+                .checked_add(ttl_seconds)
+                .context("pairing ticket expiry overflow")?;
+            let access = AccessStore::open(access)?;
+            let ticket = access.issue_ticket(
+                &identity.endpoint_id(),
+                &direct_address.to_string(),
+                expires_at,
+            )?;
+            print_json(&json!({
+                "code": ticket.to_code(),
+                "expires_at": ticket.expires_at,
+                "server_endpoint_id": ticket.server_endpoint_id,
+            }))
+        }
+        PairCommand::Redeem { code, identity } => {
+            let ticket = PairingTicket::from_code(&code)?;
+            let identity = load_or_create_identity(identity)?;
+            let outcome =
+                redeem_pairing_ticket(identity.secret_key, ticket, NetworkMode::DirectOnly).await?;
+            print_json(&json!({"outcome": format!("{outcome:?}")}))
+        }
+        PairCommand::List { access } => {
+            let peers = AccessStore::open(access)?.list_peers()?;
+            print_json(&peers)
+        }
+        PairCommand::Revoke {
+            access,
+            endpoint_id,
+        } => {
+            let endpoint_id = endpoint_id
+                .parse::<EndpointId>()
+                .context("invalid endpoint ID")?;
+            let revoked = AccessStore::open(access)?.revoke(endpoint_id)?;
+            print_json(&json!({"endpoint_id": endpoint_id.to_string(), "revoked": revoked}))
+        }
+        PairCommand::Rotate { identity } => {
+            let rotation = AccessStore::rotate_identity(&identity)?;
+            print_json(&json!({
+                "new_endpoint_id": rotation.new_endpoint_id.to_string(),
+                "previous_endpoint_id": rotation.previous_endpoint_id.to_string(),
+            }))
+        }
+    }
+}
+
 async fn push(args: PushArgs) -> Result<()> {
     if args.direct_only && args.direct_addresses.is_empty() {
         bail!("--direct-only requires at least one --direct address");
@@ -387,7 +889,8 @@ fn open_sync_engine(args: SyncTargetArgs) -> Result<SyncEngine> {
     ensure_identity_outside_destination(&args.identity, &args.root)?;
     let profile = args.chunking.profile()?;
     let remote = endpoint_addr(&args.peer, &args.direct_addresses, &args.relay_urls)?;
-    let replica = ReplicaId(Hash32::digest(identity.endpoint_id().as_bytes()));
+    let access = AccessStore::open(&args.access)?;
+    let replica = access.stable_replica_id(&identity.secret_key)?;
     SyncEngine::open(SyncConfig {
         root: args.root,
         state_root: args.state,
@@ -615,7 +1118,7 @@ async fn watch(args: WatchArgs) -> Result<()> {
 
 fn open_index(mut args: IndexArgs) -> Result<LocalIndex> {
     let identity = load_or_create_identity(&args.identity)?;
-    let replica = ReplicaId(Hash32::digest(identity.endpoint_id().as_bytes()));
+    let replica = AccessStore::open(&args.access)?.stable_replica_id(&identity.secret_key)?;
     args.ignored_paths.push(args.identity.clone());
     let mut options = IndexOptions {
         ignored_paths: args.ignored_paths,
@@ -642,6 +1145,8 @@ async fn self_test() -> Result<()> {
         state_root: state,
         peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
         network_mode: NetworkMode::DirectOnly,
+        quota_policy: None,
+        bind: None,
     })
     .await
     .context("self-test receiver failed to start")?;
@@ -965,6 +1470,192 @@ mod tests {
     use super::*;
 
     #[test]
+    fn quick_share_quota_bounds_disk_and_bandwidth() {
+        let quota = QUICK_SHARE_QUOTA;
+        assert!(
+            quota.max_storage_bytes > 0,
+            "quick share must cap stored bytes instead of unlimited"
+        );
+        assert!(
+            quota.bytes_per_second > 0,
+            "quick share must cap receive rate instead of unlimited"
+        );
+        assert!(
+            quota.max_concurrent_operations_per_peer > 0,
+            "quick share must cap per-peer concurrency instead of unlimited"
+        );
+        assert_ne!(quota, QuotaPolicy::UNLIMITED);
+        assert!(
+            quota.max_storage_bytes <= 16 * 1024 * 1024 * 1024,
+            "quick share storage cap must stay small enough to protect a laptop disk"
+        );
+        assert!(
+            quota.bytes_per_second <= 16 * 1024 * 1024,
+            "quick share rate must stay below LAN saturation"
+        );
+    }
+
+    #[test]
+    fn parses_quick_user_commands() {
+        let connect = Cli::try_parse_from(["deltaweave", "connect", "dwpair1:abc"])
+            .expect("quick connect parses");
+        assert!(matches!(connect.command, Command::Connect { ticket } if ticket == "dwpair1:abc"));
+
+        let sync = Cli::try_parse_from(["deltaweave", "sync-folder", r"C:\Sync"])
+            .expect("quick sync parses");
+        assert!(
+            matches!(sync.command, Command::SyncFolder { folder, watch: false } if folder == Path::new(r"C:\Sync"))
+        );
+
+        let share =
+            Cli::try_parse_from(["deltaweave", "share", r"C:\Shared"]).expect("quick share parses");
+        assert!(
+            matches!(share.command, Command::Share { folder, bind } if folder == Path::new(r"C:\Shared") && bind == "0.0.0.0:17891".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn quick_profile_round_trip_never_stores_ticket_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile_path = dir.path().join("profile.json");
+        let profile = QuickProfile {
+            peer_endpoint_id: "ab".repeat(32),
+            peer_address: "172.30.1.22:17892".into(),
+        };
+        let encoded = serde_json::to_string(&profile).unwrap();
+        assert!(!encoded.contains("dwpair1:"));
+        std::fs::write(&profile_path, &encoded).unwrap();
+        let decoded: QuickProfile =
+            serde_json::from_reader(std::fs::File::open(&profile_path).unwrap()).unwrap();
+        assert_eq!(decoded.peer_endpoint_id, profile.peer_endpoint_id);
+        assert_eq!(decoded.peer_address, profile.peer_address);
+    }
+
+    #[test]
+    fn quick_profile_replaces_existing_file_like_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile_path = dir.path().join("profile.json");
+        let first = QuickProfile {
+            peer_endpoint_id: "aa".repeat(32),
+            peer_address: "172.30.1.22:17891".into(),
+        };
+        save_quick_profile_at(&profile_path, &first).unwrap();
+        let second = QuickProfile {
+            peer_endpoint_id: "bb".repeat(32),
+            peer_address: "172.30.1.22:17892".into(),
+        };
+        save_quick_profile_at(&profile_path, &second).unwrap();
+        let decoded: QuickProfile =
+            serde_json::from_reader(std::fs::File::open(&profile_path).unwrap()).unwrap();
+        assert_eq!(decoded.peer_endpoint_id, second.peer_endpoint_id);
+        assert_eq!(decoded.peer_address, second.peer_address);
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .filter(|name| name != "profile.json")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temporary profile files must be gone, leftover={leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn quick_folder_state_separates_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("folder-a");
+        let second = dir.path().join("folder-b");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let first_id = super::quick_folder_id(&first).unwrap();
+        let second_id = super::quick_folder_id(&second).unwrap();
+        assert_ne!(first_id, second_id);
+        assert_eq!(first_id, super::quick_folder_id(&first).unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn quick_share_issues_a_ticket_the_client_can_redeem() {
+        let base = tempfile::tempdir().unwrap();
+        let shared = base.path().join("shared");
+        let client_root = base.path().join("client");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::create_dir_all(&client_root).unwrap();
+        std::fs::write(shared.join("from-server.txt"), "server").unwrap();
+
+        let server_state = base.path().join("server-state");
+        let client_state = base.path().join("client-state");
+        std::fs::create_dir_all(&server_state).unwrap();
+        std::fs::create_dir_all(&client_state).unwrap();
+
+        let server_identity_path = base.path().join("server.key");
+        let client_identity_path = base.path().join("client.key");
+        let server_identity = load_or_create_identity(&server_identity_path).unwrap();
+        let client_identity = load_or_create_identity(&client_identity_path).unwrap();
+
+        let access = Arc::new(AccessStore::open(base.path().join("access.redb")).unwrap());
+        let server = start_server(ServerConfig {
+            secret_key: server_identity.secret_key.clone(),
+            destination_root: shared.clone(),
+            state_root: server_state,
+            peer_policy: PeerPolicy::Durable(Arc::clone(&access)),
+            network_mode: NetworkMode::DirectOnly,
+            quota_policy: None,
+            bind: Some("127.0.0.1:0".parse().unwrap()),
+        })
+        .await
+        .unwrap();
+        assert!(
+            server.wait_online(Duration::from_secs(20)).await,
+            "share server never advertised an address"
+        );
+        let address = server
+            .endpoint_addr()
+            .ip_addrs()
+            .next()
+            .unwrap()
+            .to_string();
+
+        let expires_at = unix_now().checked_add(600).unwrap();
+        let ticket = access
+            .issue_ticket(&server_identity.endpoint_id(), &address, expires_at)
+            .unwrap();
+
+        let outcome = redeem_pairing_ticket(
+            client_identity.secret_key.clone(),
+            ticket.clone(),
+            NetworkMode::DirectOnly,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, deltaweave_net::access::RedeemOutcome::Paired);
+
+        let client_access = base.path().join("client-access.redb");
+        let engine = open_sync_engine(SyncTargetArgs {
+            root: client_root.clone(),
+            state: client_state,
+            access: client_access,
+            identity: client_identity_path,
+            peer: ticket.server_endpoint_id,
+            direct_addresses: vec![address.parse().unwrap()],
+            relay_urls: Vec::new(),
+            direct_only: true,
+            chunking: ChunkingArgs {
+                min_chunk: ChunkingProfile::DEFAULT.min_size,
+                avg_chunk: ChunkingProfile::DEFAULT.avg_size,
+                max_chunk: ChunkingProfile::DEFAULT.max_size,
+            },
+        })
+        .unwrap();
+        let report = engine.sync_once().await.unwrap();
+        assert_eq!(report.status, "pass");
+        assert_eq!(report.conflicts.len(), 0);
+        let copied = client_root.join("from-server.txt");
+        assert_eq!(std::fs::read(&copied).unwrap(), b"server");
+        server.shutdown().await.unwrap();
+    }
+
+    #[test]
     fn parses_manifest_defaults() {
         let cli = Cli::try_parse_from(["deltaweave", "manifest", "input.bin"])
             .expect("default manifest command parses");
@@ -1071,6 +1762,165 @@ mod tests {
         assert_eq!(args.debounce_ms, 750);
         assert_eq!(args.max_debounce_ms, 5_000);
         assert_eq!(args.max_backoff_seconds, 300);
+    }
+
+    #[test]
+    fn daemon_status_parses() {
+        let cli = Cli::try_parse_from(["deltaweave", "daemon", "status"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Daemon(DaemonArgs {
+                command: DaemonCommand::Status
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_pairing_lifecycle_commands() {
+        let issue = Cli::try_parse_from([
+            "deltaweave",
+            "pair",
+            "issue",
+            "--ttl-seconds",
+            "90",
+            "--direct-address",
+            "127.0.0.1:4000",
+            "--access",
+            "access.redb",
+            "--identity",
+            "server.key",
+        ])
+        .expect("pair issue parses");
+        let Command::Pair(PairArgs {
+            command:
+                PairCommand::Issue {
+                    ttl_seconds,
+                    direct_address,
+                    access,
+                    identity,
+                },
+        }) = issue.command
+        else {
+            panic!("pair issue expected");
+        };
+        assert_eq!(ttl_seconds, 90);
+        assert_eq!(
+            direct_address,
+            "127.0.0.1:4000".parse().expect("valid address")
+        );
+        assert_eq!(access, PathBuf::from("access.redb"));
+        assert_eq!(identity, PathBuf::from("server.key"));
+
+        let redeem = Cli::try_parse_from([
+            "deltaweave",
+            "pair",
+            "redeem",
+            "dwpair1:00",
+            "--identity",
+            "client.key",
+        ])
+        .expect("pair redeem parses");
+        let Command::Pair(PairArgs {
+            command: PairCommand::Redeem { code, identity },
+        }) = redeem.command
+        else {
+            panic!("pair redeem expected");
+        };
+        assert_eq!(code, "dwpair1:00");
+        assert_eq!(identity, PathBuf::from("client.key"));
+
+        let list = Cli::try_parse_from(["deltaweave", "pair", "list", "--access", "access.redb"])
+            .expect("pair list parses");
+        assert!(matches!(
+            list.command,
+            Command::Pair(PairArgs {
+                command: PairCommand::List { access }
+            }) if access == *"access.redb"
+        ));
+
+        let peer = SecretKey::generate().public().to_string();
+        let revoke = Cli::try_parse_from([
+            "deltaweave",
+            "pair",
+            "revoke",
+            "--access",
+            "access.redb",
+            &peer,
+        ])
+        .expect("pair revoke parses");
+        assert!(matches!(
+            revoke.command,
+            Command::Pair(PairArgs {
+                command: PairCommand::Revoke { access, endpoint_id }
+            }) if access == *"access.redb" && endpoint_id == peer
+        ));
+
+        let rotate =
+            Cli::try_parse_from(["deltaweave", "pair", "rotate", "--identity", "node.key"])
+                .expect("pair rotate parses");
+        assert!(matches!(
+            rotate.command,
+            Command::Pair(PairArgs {
+                command: PairCommand::Rotate { identity }
+            }) if identity == *"node.key"
+        ));
+    }
+
+    #[test]
+    fn serve_parses_fixed_udp_bind() {
+        let cli = Cli::try_parse_from([
+            "deltaweave",
+            "serve",
+            "--root",
+            "output",
+            "--direct-only",
+            "--bind",
+            "127.0.0.1:4433",
+        ])
+        .expect("serve --bind parses");
+        let Command::Serve(args) = cli.command else {
+            panic!("serve command expected");
+        };
+        assert_eq!(
+            args.bind,
+            Some("127.0.0.1:4433".parse().expect("valid address"))
+        );
+    }
+
+    #[test]
+    fn serve_and_sync_accept_a_shared_access_database_path() {
+        let serve = Cli::try_parse_from([
+            "deltaweave",
+            "serve",
+            "--root",
+            "output",
+            "--durable-access",
+            "--access",
+            "access.redb",
+        ])
+        .expect("durable serve parses");
+        assert!(matches!(
+            serve.command,
+            Command::Serve(ServeArgs { access, durable_access: true, bind: None, .. })
+                if access == *"access.redb"
+        ));
+
+        let sync = Cli::try_parse_from([
+            "deltaweave",
+            "sync-once",
+            "--root",
+            "data",
+            "--peer",
+            "peer-id",
+            "--access",
+            "access.redb",
+        ])
+        .expect("sync-once parses");
+        assert!(matches!(
+            sync.command,
+            Command::SyncOnce(SyncTargetArgs { access, .. })
+                if access == *"access.redb"
+        ));
     }
 
     #[test]
