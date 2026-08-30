@@ -29,6 +29,8 @@ use iroh::{EndpointId, SecretKey};
 use serde_json::json;
 use tracing_subscriber::EnvFilter;
 
+const QUICK_PROFILE_NAME: &str = "profile.json";
+
 #[derive(Debug, Parser)]
 #[command(
     name = "deltaweave",
@@ -63,6 +65,27 @@ enum Command {
     Pair(PairArgs),
     /// Attach to or run the local daemon.
     Daemon(DaemonArgs),
+    /// Pair this PC using one ticket and remember the peer.
+    Connect {
+        /// Printable `dwpair1:` ticket.
+        ticket: String,
+    },
+    /// Synchronize one folder using the remembered peer.
+    SyncFolder {
+        /// Local folder to synchronize.
+        folder: PathBuf,
+        /// Keep synchronizing until Ctrl-C.
+        #[arg(long)]
+        watch: bool,
+    },
+    /// Share one folder and accept paired peers.
+    Share {
+        /// Local folder to share.
+        folder: PathBuf,
+        /// Fixed UDP listen address.
+        #[arg(long, default_value = "0.0.0.0:17891")]
+        bind: SocketAddr,
+    },
     /// Run an isolated local end-to-end transfer and delta-reuse check.
     SelfTest,
 }
@@ -358,8 +381,153 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Sync(args) => sync_forever(args).await,
         Command::Pair(args) => pair(args).await,
         Command::Daemon(args) => daemon(args).await,
+        Command::Connect { ticket } => quick_connect(&ticket).await,
+        Command::SyncFolder { folder, watch } => quick_sync_folder(folder, watch).await,
+        Command::Share { folder, bind } => quick_share(folder, bind).await,
         Command::SelfTest => self_test().await,
     }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct QuickProfile {
+    peer_endpoint_id: String,
+    peer_address: String,
+}
+
+fn quick_data_dir() -> Result<PathBuf> {
+    let dir = deltaweave_daemon::default_data_dir()?.join("quick");
+    fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+fn quick_profile_path() -> Result<PathBuf> {
+    Ok(quick_data_dir()?.join(QUICK_PROFILE_NAME))
+}
+
+fn save_quick_profile(profile: &QuickProfile) -> Result<()> {
+    let path = quick_profile_path()?;
+    let temp = path.with_extension("tmp");
+    {
+        let mut file = fs::File::create(&temp)?;
+        serde_json::to_writer(&mut file, profile)?;
+        file.flush()?;
+    }
+    fs::rename(&temp, &path)?;
+    Ok(())
+}
+
+fn load_quick_profile() -> Result<QuickProfile> {
+    let path = quick_profile_path()?;
+    let file = fs::File::open(&path).with_context(|| {
+        format!(
+            "run 'deltaweave connect <dwpair1:...>' first ({})",
+            path.display()
+        )
+    })?;
+    Ok(serde_json::from_reader(file)?)
+}
+
+fn print_connect_card(endpoint_id: &str, peer_address: &str) -> Result<()> {
+    let mut out = std::io::stdout().lock();
+    writeln!(out, "\n┌ DeltaWeave 페어링 완료")?;
+    writeln!(out, "├ 이 PC ID     {endpoint_id}")?;
+    writeln!(out, "├ 서버 주소    {peer_address}")?;
+    writeln!(out, "└ 다음: deltaweave sync-folder <폴더>")?;
+    Ok(())
+}
+
+fn print_sync_card(report: &deltaweave_sync::SyncReport) -> Result<()> {
+    let mut out = std::io::stdout().lock();
+    writeln!(out, "\n┌ DeltaWeave 동기화 {}", report.status)?;
+    writeln!(out, "├ 보낸 바이트      {}", report.pushed_bytes)?;
+    writeln!(out, "├ 받은 바이트      {}", report.pulled_bytes)?;
+    writeln!(out, "├ 로컬 변경        {}", report.local_actions)?;
+    writeln!(out, "├ 원격 변경        {}", report.remote_actions)?;
+    writeln!(out, "├ 충돌             {}", report.conflicts.len())?;
+    writeln!(out, "└ 검증 루트        {}", report.verified_local_root)?;
+    Ok(())
+}
+
+async fn quick_connect(ticket_code: &str) -> Result<()> {
+    let dir = quick_data_dir()?;
+    let identity_path = dir.join("identity.key");
+    let identity = load_or_create_identity(&identity_path)?;
+    let ticket = PairingTicket::from_code(ticket_code)?;
+    let endpoint_id = ticket.server_endpoint_id.clone();
+    let address = ticket.server_direct_address.clone();
+    redeem_pairing_ticket(identity.secret_key.clone(), ticket, NetworkMode::DirectOnly).await?;
+    save_quick_profile(&QuickProfile {
+        peer_endpoint_id: endpoint_id,
+        peer_address: address.clone(),
+    })?;
+    print_connect_card(&identity.endpoint_id().to_string(), &address)
+}
+
+fn quick_sync_engine_args(folder: &Path) -> Result<SyncTargetArgs> {
+    let profile = load_quick_profile()?;
+    let dir = quick_data_dir()?;
+    let state_root = dir.join("state");
+    fs::create_dir_all(&state_root)?;
+    Ok(SyncTargetArgs {
+        root: folder.to_path_buf(),
+        state: state_root,
+        access: dir.join("access.redb"),
+        identity: dir.join("identity.key"),
+        peer: profile.peer_endpoint_id,
+        direct_addresses: vec![profile.peer_address.parse()?],
+        relay_urls: Vec::new(),
+        direct_only: true,
+        chunking: ChunkingArgs {
+            min_chunk: ChunkingProfile::DEFAULT.min_size,
+            avg_chunk: ChunkingProfile::DEFAULT.avg_size,
+            max_chunk: ChunkingProfile::DEFAULT.max_size,
+        },
+    })
+}
+
+async fn quick_sync_folder(folder: PathBuf, watch: bool) -> Result<()> {
+    let args = quick_sync_engine_args(&folder)?;
+    if !watch {
+        let engine = open_sync_engine(args)?;
+        let report = engine.sync_once().await?;
+        return print_sync_card(&report);
+    }
+    sync_forever(SyncArgs {
+        target: args,
+        interval_seconds: 5,
+        debounce_ms: 750,
+        max_debounce_ms: 5_000,
+        max_backoff_seconds: 300,
+    })
+    .await
+}
+
+async fn quick_share(folder: PathBuf, bind: SocketAddr) -> Result<()> {
+    let dir = quick_data_dir()?;
+    let identity = load_or_create_identity(dir.join("identity.key"))?;
+    let peer = identity.endpoint_id().to_string();
+    let mut out = std::io::stdout().lock();
+    writeln!(out, "\n┌ DeltaWeave 공유 시작")?;
+    writeln!(out, "├ 폴더      {}", folder.display())?;
+    writeln!(out, "├ 내 ID     {peer}")?;
+    writeln!(out, "└ 대기 중… Ctrl-C로 중지")?;
+    out.flush()?;
+    let args = ServeArgs {
+        root: folder,
+        state: dir.join("state"),
+        access: dir.join("state").join("access.redb"),
+        identity: dir.join("identity.key"),
+        allowed_peers: Vec::new(),
+        allow_any_authenticated: false,
+        direct_only: false,
+        durable_access: true,
+        rate_bytes_per_second: 0,
+        burst_bytes: 0,
+        max_concurrent_operations: 0,
+        max_storage_bytes: 0,
+        bind: Some(bind),
+    };
+    serve(args).await
 }
 
 fn initialize(args: InitArgs) -> Result<()> {
@@ -1163,6 +1331,42 @@ mod tests {
     use clap::Parser;
 
     use super::*;
+
+    #[test]
+    fn parses_quick_user_commands() {
+        let connect = Cli::try_parse_from(["deltaweave", "connect", "dwpair1:abc"])
+            .expect("quick connect parses");
+        assert!(matches!(connect.command, Command::Connect { ticket } if ticket == "dwpair1:abc"));
+
+        let sync = Cli::try_parse_from(["deltaweave", "sync-folder", r"C:\Sync"])
+            .expect("quick sync parses");
+        assert!(
+            matches!(sync.command, Command::SyncFolder { folder, watch: false } if folder == Path::new(r"C:\Sync"))
+        );
+
+        let share =
+            Cli::try_parse_from(["deltaweave", "share", r"C:\Shared"]).expect("quick share parses");
+        assert!(
+            matches!(share.command, Command::Share { folder, bind } if folder == Path::new(r"C:\Shared") && bind == "0.0.0.0:17891".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn quick_profile_round_trip_never_stores_ticket_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile_path = dir.path().join("profile.json");
+        let profile = QuickProfile {
+            peer_endpoint_id: "ab".repeat(32),
+            peer_address: "172.30.1.22:17892".into(),
+        };
+        let encoded = serde_json::to_string(&profile).unwrap();
+        assert!(!encoded.contains("dwpair1:"));
+        std::fs::write(&profile_path, &encoded).unwrap();
+        let decoded: QuickProfile =
+            serde_json::from_reader(std::fs::File::open(&profile_path).unwrap()).unwrap();
+        assert_eq!(decoded.peer_endpoint_id, profile.peer_endpoint_id);
+        assert_eq!(decoded.peer_address, profile.peer_address);
+    }
 
     #[test]
     fn parses_manifest_defaults() {
