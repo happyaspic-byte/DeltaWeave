@@ -1,0 +1,85 @@
+name: Windows GUI soak
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [phase-4-chaos-soak]
+    paths:
+      - "apps/deltaweave-gui/**"
+      - "crates/deltaweave-daemon/**"
+      - "crates/deltaweave-daemon-api/**"
+      - "scripts/package-windows-gui.sh"
+      - ".github/workflows/windows-gui.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-gui-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  nsis:
+    name: Unsigned NSIS installer
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@1.91.0
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/deltaweave-gui/package-lock.json
+      - name: Install GUI frontend dependencies
+        run: npm ci --prefix apps/deltaweave-gui
+      - name: Build daemon sidecar
+        run: cargo build --locked --release --target x86_64-pc-windows-msvc -p deltaweave-daemon
+      - name: Stage sidecar for Tauri
+        shell: bash
+        run: bash scripts/package-windows-gui.sh x86_64-pc-windows-msvc
+      - name: Fail if sidecar binary missing
+        shell: bash
+        run: test -f apps/deltaweave-gui/src-tauri/binaries/deltaweave-daemon-x86_64-pc-windows-msvc.exe
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --locked --version 2.11.4
+      - name: Build unsigned NSIS installer
+        working-directory: apps/deltaweave-gui
+        run: cargo tauri build --bundles nsis
+      - name: Collect installer
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $nsis = Get-ChildItem -Recurse -Filter "*setup.exe" apps/deltaweave-gui/src-tauri/target
+          if (-not $nsis) {
+            $nsis = Get-ChildItem -Recurse -Filter "*setup.exe" target
+          }
+          if (-not $nsis) {
+            throw "NSIS installer not found"
+          }
+          Copy-Item $nsis[0].FullName "dist/DeltaWeave-windows-x86_64-setup-unsigned.exe"
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: windows-gui-nsis
+          path: dist/*unsigned.exe
+          if-no-files-found: error
+      - name: Publish soak prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          tag="windows-gui-soak"
+          notes="Unsigned current-user NSIS from ${GITHUB_SHA}. SmartScreen will warn. Not a signed product release."
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/DeltaWeave-windows-x86_64-setup-unsigned.exe --clobber --repo "$GITHUB_REPOSITORY"
+            gh release edit "$tag" --prerelease --notes "$notes" --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$tag" dist/DeltaWeave-windows-x86_64-setup-unsigned.exe \
+              --prerelease \
+              --title "Windows GUI soak (unsigned)" \
+              --notes "$notes" \
+              --repo "$GITHUB_REPOSITORY"
+          fi
