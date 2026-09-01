@@ -5,6 +5,11 @@ Versioning after its first stable release.
 
 ## [Unreleased]
 
+### Security
+
+- Replace yanked `chacha20 0.10.1` with `0.10.2` so `cargo audit --deny warnings`
+  on `main` no longer fails the weekly Security workflow.
+
 ## [0.3.0] - 2026-08-26
 
 ### Added
