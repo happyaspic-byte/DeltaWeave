@@ -5,6 +5,12 @@ Versioning after its first stable release.
 
 ## [Unreleased]
 
+### Changed
+
+- Persist received chunks through a bounded overlapping write pipeline so durable
+  stores no longer wait on one blocking task per chunk, and drain in-flight writes
+  before returning a partial-failure error.
+
 ### Security
 
 - Replace yanked `chacha20 0.10.1` with `0.10.2` so `cargo audit --deny warnings`
