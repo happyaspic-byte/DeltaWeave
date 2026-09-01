@@ -41,6 +41,7 @@ const MAX_CHUNKS_PER_FILE: usize = 250_000;
 const MAX_FILE_SIZE: u64 = 16 * 1024 * 1024 * 1024 * 1024;
 const CHUNK_WRITE_BATCH: usize = 8;
 const CHUNK_WRITE_CONCURRENCY: usize = 8;
+const CHUNK_WRITE_MAX_QUEUED_BYTES: usize = 32 * 1024 * 1024;
 
 /// Whether an endpoint uses internet discovery/relays or direct addresses only.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1651,26 +1652,55 @@ fn prepare_destination_kind(
     Ok(())
 }
 
+struct InflightWrite {
+    bytes: usize,
+    task: tokio::task::JoinHandle<Result<usize>>,
+}
+
 struct ChunkWritePipeline {
     store: Arc<Store>,
     max_inflight: usize,
-    inflight: Vec<tokio::task::JoinHandle<Result<usize>>>,
+    max_queued_bytes: usize,
+    inflight: Vec<InflightWrite>,
     pending: Vec<(Hash32, Vec<u8>)>,
 }
 
 impl ChunkWritePipeline {
     fn new(store: Arc<Store>, max_inflight: usize) -> Self {
+        Self::with_limits(store, max_inflight, CHUNK_WRITE_MAX_QUEUED_BYTES)
+    }
+
+    fn with_limits(store: Arc<Store>, max_inflight: usize, max_queued_bytes: usize) -> Self {
         Self {
             store,
             max_inflight: max_inflight.max(1),
+            max_queued_bytes: max_queued_bytes.max(1),
             inflight: Vec::new(),
             pending: Vec::new(),
         }
     }
 
+    fn queued_bytes(&self) -> usize {
+        self.pending
+            .iter()
+            .map(|(_, bytes)| bytes.len())
+            .sum::<usize>()
+            + self.inflight.iter().map(|write| write.bytes).sum::<usize>()
+    }
+
     async fn push(&mut self, hash: Hash32, bytes: Vec<u8>) -> Result<()> {
+        while self.queued_bytes() + bytes.len() > self.max_queued_bytes {
+            if !self.pending.is_empty() && self.inflight.len() < self.max_inflight {
+                self.flush_pending().await?;
+                continue;
+            }
+            if self.inflight.is_empty() {
+                break;
+            }
+            self.join_oldest().await?;
+        }
         self.pending.push((hash, bytes));
-        if self.pending.len() >= CHUNK_WRITE_BATCH {
+        if self.pending.len() >= CHUNK_WRITE_BATCH || self.queued_bytes() > self.max_queued_bytes {
             self.flush_pending().await?;
         }
         Ok(())
@@ -1683,7 +1713,11 @@ impl ChunkWritePipeline {
         {
             first_error = Some(error);
         }
-        if let Err(error) = drain_chunk_tasks(std::mem::take(&mut self.inflight)).await {
+        let rest = std::mem::take(&mut self.inflight)
+            .into_iter()
+            .map(|write| write.task)
+            .collect();
+        if let Err(error) = drain_chunk_tasks(rest).await {
             first_error.get_or_insert(error);
         }
         match first_error {
@@ -1692,23 +1726,33 @@ impl ChunkWritePipeline {
         }
     }
 
+    async fn join_oldest(&mut self) -> Result<()> {
+        let InflightWrite { task, .. } = self.inflight.remove(0);
+        if let Err(error) = join_chunk_task(task).await {
+            let rest = std::mem::take(&mut self.inflight)
+                .into_iter()
+                .map(|write| write.task)
+                .collect();
+            let drain = drain_chunk_tasks(rest).await;
+            return match drain {
+                Ok(()) => Err(error),
+                Err(drain_error) => Err(error.context(drain_error)),
+            };
+        }
+        Ok(())
+    }
+
     async fn flush_pending(&mut self) -> Result<()> {
         if self.inflight.len() >= self.max_inflight {
-            let task = self.inflight.remove(0);
-            if let Err(error) = join_chunk_task(task).await {
-                let rest = std::mem::take(&mut self.inflight);
-                let drain = drain_chunk_tasks(rest).await;
-                return match drain {
-                    Ok(()) => Err(error),
-                    Err(drain_error) => Err(error.context(drain_error)),
-                };
-            }
+            self.join_oldest().await?;
         }
         let batch = std::mem::take(&mut self.pending);
+        let bytes = batch.iter().map(|(_, chunk)| chunk.len()).sum();
         let store = Arc::clone(&self.store);
-        self.inflight.push(tokio::task::spawn_blocking(move || {
-            store.chunks().put_verified_batch(batch)
-        }));
+        self.inflight.push(InflightWrite {
+            bytes,
+            task: tokio::task::spawn_blocking(move || store.chunks().put_verified_batch(batch)),
+        });
         Ok(())
     }
 }
@@ -2013,6 +2057,52 @@ mod tests {
                 bytes
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn chunk_writer_flushes_when_queued_bytes_exceed_budget() {
+        let state = TempDir::new().expect("state directory can be created");
+        let store = Arc::new(Store::open(state.path()).expect("store can open"));
+        let first = fixture(64 * 1024);
+        let first_hash = Hash32::digest(&first);
+        let second = fixture(64 * 1024 + 1);
+        let second_hash = Hash32::digest(&second);
+        let mut writer = ChunkWritePipeline::with_limits(Arc::clone(&store), 1, first.len() + 1);
+
+        writer
+            .push(first_hash, first.clone())
+            .await
+            .expect("first chunk stays pending under the byte budget");
+        assert_eq!(writer.inflight.len(), 0);
+        assert_eq!(writer.pending.len(), 1);
+
+        writer
+            .push(second_hash, second.clone())
+            .await
+            .expect("second chunk flushes the pending batch to stay in budget");
+        assert!(
+            writer.queued_bytes() <= first.len() + 1,
+            "pipeline stays at or under the configured byte budget after enqueue"
+        );
+        writer
+            .finish()
+            .await
+            .expect("budget-limited pipeline persists both chunks");
+
+        assert_eq!(
+            store
+                .chunks()
+                .read_verified(first_hash)
+                .expect("first budgeted chunk can be read"),
+            first
+        );
+        assert_eq!(
+            store
+                .chunks()
+                .read_verified(second_hash)
+                .expect("second budgeted chunk can be read"),
+            second
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

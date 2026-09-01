@@ -8,8 +8,8 @@ Versioning after its first stable release.
 ### Changed
 
 - Persist received chunks through a bounded overlapping write pipeline so durable
-  stores no longer wait on one blocking task per chunk, and drain in-flight writes
-  before returning a partial-failure error.
+  stores no longer wait on one blocking task per chunk, cap queued receive bytes,
+  and drain in-flight writes before returning a partial-failure error.
 
 ### Security
 
