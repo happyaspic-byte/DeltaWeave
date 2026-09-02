@@ -22,7 +22,7 @@ use deltaweave_core::{
 };
 use deltaweave_index::{IndexOptions, LocalIndex};
 use deltaweave_reconcile::{MerkleNodeSummary, MerkleTree};
-use deltaweave_store::Store;
+use deltaweave_store::{Store, VerifiedChunk};
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayUrl, SecretKey, TransportAddr, Watcher,
     endpoint::{Connection, RecvStream, SendStream, presets},
@@ -785,8 +785,9 @@ impl SyncClient {
                 );
                 let mut bytes = vec![0_u8; header.length as usize];
                 receive.read_exact(&mut bytes).await?;
-                verify_chunk(descriptor, &bytes)?;
-                writer.push(header.hash, bytes).await?;
+                writer
+                    .push(VerifiedChunk::validate(descriptor, bytes)?)
+                    .await?;
                 transferred_bytes = transferred_bytes
                     .checked_add(u64::from(header.length))
                     .context("pulled-byte counter overflow")?;
@@ -1244,8 +1245,9 @@ impl PushHandler {
                 );
                 let mut bytes = vec![0_u8; header.length as usize];
                 receive.read_exact(&mut bytes).await?;
-                verify_chunk(descriptor, &bytes)?;
-                writer.push(header.hash, bytes).await?;
+                writer
+                    .push(VerifiedChunk::validate(descriptor, bytes)?)
+                    .await?;
                 transferred_bytes = transferred_bytes
                     .checked_add(u64::from(header.length))
                     .context("transferred-byte counter overflow")?;
@@ -1671,7 +1673,7 @@ struct ChunkWritePipeline {
     max_inflight: usize,
     max_queued_bytes: usize,
     inflight: Vec<InflightWrite>,
-    pending: Vec<(Hash32, Vec<u8>)>,
+    pending: Vec<VerifiedChunk>,
 }
 
 impl ChunkWritePipeline {
@@ -1692,13 +1694,13 @@ impl ChunkWritePipeline {
     fn queued_bytes(&self) -> usize {
         self.pending
             .iter()
-            .map(|(_, bytes)| bytes.len())
+            .map(|chunk| chunk.bytes().len())
             .sum::<usize>()
             + self.inflight.iter().map(|write| write.bytes).sum::<usize>()
     }
 
-    async fn push(&mut self, hash: Hash32, bytes: Vec<u8>) -> Result<()> {
-        while self.queued_bytes() + bytes.len() > self.max_queued_bytes {
+    async fn push(&mut self, chunk: VerifiedChunk) -> Result<()> {
+        while self.queued_bytes() + chunk.bytes().len() > self.max_queued_bytes {
             if !self.pending.is_empty() && self.inflight.len() < self.max_inflight {
                 self.flush_pending().await?;
                 continue;
@@ -1708,7 +1710,7 @@ impl ChunkWritePipeline {
             }
             self.join_oldest().await?;
         }
-        self.pending.push((hash, bytes));
+        self.pending.push(chunk);
         if self.pending.len() >= CHUNK_WRITE_BATCH || self.queued_bytes() > self.max_queued_bytes {
             self.flush_pending().await?;
         }
@@ -1756,11 +1758,11 @@ impl ChunkWritePipeline {
             self.join_oldest().await?;
         }
         let batch = std::mem::take(&mut self.pending);
-        let bytes = batch.iter().map(|(_, chunk)| chunk.len()).sum();
+        let bytes = batch.iter().map(|chunk| chunk.bytes().len()).sum();
         let store = Arc::clone(&self.store);
         self.inflight.push(InflightWrite {
             bytes,
-            task: tokio::task::spawn_blocking(move || store.chunks().put_verified_batch(batch)),
+            task: tokio::task::spawn_blocking(move || store.chunks().put_validated_batch(batch)),
         });
         Ok(())
     }
@@ -1832,8 +1834,9 @@ async fn receive_chunks(
                 .context("transfer byte count overflow")?;
             let mut bytes = vec![0_u8; header.length as usize];
             receive.read_exact(&mut bytes).await?;
-            verify_chunk(descriptor, &bytes)?;
-            writer.push(header.hash, bytes).await?;
+            writer
+                .push(VerifiedChunk::validate(descriptor, bytes)?)
+                .await?;
         }
         Ok(transferred_bytes)
     }
@@ -1985,6 +1988,15 @@ mod tests {
             .collect()
     }
 
+    fn verified_chunk(bytes: Vec<u8>) -> VerifiedChunk {
+        let descriptor = deltaweave_core::ChunkDescriptor {
+            offset: 0,
+            length: u32::try_from(bytes.len()).expect("test chunk length fits in u32"),
+            hash: Hash32::digest(&bytes),
+        };
+        VerifiedChunk::validate(&descriptor, bytes).expect("test chunk validates")
+    }
+
     fn version(label: &[u8], counter: u64) -> VersionVector {
         let replica = ReplicaId(Hash32::digest(label));
         let mut version = VersionVector::default();
@@ -2026,37 +2038,50 @@ mod tests {
     async fn chunk_writer_flush_drains_remaining_after_oldest_fails() {
         let state = TempDir::new().expect("state directory can be created");
         let store = Arc::new(Store::open(state.path()).expect("store can open"));
+        let first_bytes = fixture(64 * 1024);
+        let first_hash = Hash32::digest(&first_bytes);
+        let blocked_parent = state.path().join("chunks").join(&first_hash.to_hex()[..2]);
+        fs::create_dir_all(blocked_parent.parent().expect("chunks directory exists"))
+            .expect("chunk store parent can be created");
+        fs::write(&blocked_parent, b"not a directory").expect("chunk parent is blocked");
         let mut writer = ChunkWritePipeline::new(Arc::clone(&store), 2);
-        let invalid = Hash32::digest(b"not-the-payload");
-        for index in 0..CHUNK_WRITE_BATCH {
-            let bytes = fixture(64 * 1024 + index);
-            writer
-                .push(invalid, bytes)
-                .await
-                .expect("invalid batch is queued before persistence");
+        writer
+            .push(verified_chunk(first_bytes))
+            .await
+            .expect("failing batch is queued before persistence");
+        writer
+            .flush_pending()
+            .await
+            .expect("failing task is spawned");
+
+        let mut good = Vec::new();
+        let mut next = 65 * 1024;
+        while good.len() < CHUNK_WRITE_BATCH {
+            let bytes = fixture(next);
+            next += 1;
+            let hash = Hash32::digest(&bytes);
+            if hash.to_hex()[..2] == first_hash.to_hex()[..2] {
+                continue;
+            }
+            good.push((hash, bytes));
         }
-        let good: Vec<_> = (CHUNK_WRITE_BATCH..CHUNK_WRITE_BATCH * 2)
-            .map(|index| {
-                let bytes = fixture(64 * 1024 + index);
-                (Hash32::digest(&bytes), bytes)
-            })
-            .collect();
-        for (hash, bytes) in &good {
+        for (_, bytes) in &good {
             writer
-                .push(*hash, bytes.clone())
+                .push(verified_chunk(bytes.clone()))
                 .await
                 .expect("second batch is queued before the oldest task is joined");
         }
+
         let mut result = Ok(());
-        for index in CHUNK_WRITE_BATCH * 2..CHUNK_WRITE_BATCH * 3 {
-            let bytes = fixture(64 * 1024 + index);
-            if let Err(error) = writer.push(Hash32::digest(&bytes), bytes).await {
+        for index in 0..CHUNK_WRITE_BATCH {
+            let bytes = fixture(70 * 1024 + index);
+            if let Err(error) = writer.push(verified_chunk(bytes)).await {
                 result = Err(error);
                 break;
             }
         }
 
-        assert!(result.is_err(), "oldest invalid batch must fail the flush");
+        assert!(result.is_err(), "oldest failed batch must fail the flush");
         for (hash, bytes) in good {
             assert_eq!(
                 store
@@ -2079,14 +2104,14 @@ mod tests {
         let mut writer = ChunkWritePipeline::with_limits(Arc::clone(&store), 1, first.len() + 1);
 
         writer
-            .push(first_hash, first.clone())
+            .push(verified_chunk(first.clone()))
             .await
             .expect("first chunk stays pending under the byte budget");
         assert_eq!(writer.inflight.len(), 0);
         assert_eq!(writer.pending.len(), 1);
 
         writer
-            .push(second_hash, second.clone())
+            .push(verified_chunk(second.clone()))
             .await
             .expect("second chunk flushes the pending batch to stay in budget");
         assert!(
@@ -2126,9 +2151,9 @@ mod tests {
             .collect();
         let mut writer = ChunkWritePipeline::new(Arc::clone(&store), 4);
 
-        for (hash, bytes) in &chunks {
+        for (_hash, bytes) in &chunks {
             writer
-                .push(*hash, bytes.clone())
+                .push(verified_chunk(bytes.clone()))
                 .await
                 .expect("verified chunk can enter the write pipeline");
         }

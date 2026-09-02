@@ -123,6 +123,30 @@ impl ChunkingProfile {
         max_size: 1024 * 1024,
     };
 
+    /// Profile used automatically for files of at least 8 GiB.
+    pub const LARGE_FILE: Self = Self {
+        version: 1,
+        min_size: 512 * 1024,
+        avg_size: 1024 * 1024,
+        max_size: 4 * 1024 * 1024,
+    };
+
+    /// Selects a larger profile for large files when the caller uses the default profile.
+    #[must_use]
+    pub const fn for_file_size(self, size: u64) -> Self {
+        const LARGE_FILE_THRESHOLD: u64 = 8 * 1024 * 1024 * 1024;
+        if self.version == Self::DEFAULT.version
+            && self.min_size == Self::DEFAULT.min_size
+            && self.avg_size == Self::DEFAULT.avg_size
+            && self.max_size == Self::DEFAULT.max_size
+            && size >= LARGE_FILE_THRESHOLD
+        {
+            Self::LARGE_FILE
+        } else {
+            self
+        }
+    }
+
     /// Validates the profile against FastCDC v2020 limits and DeltaWeave invariants.
     pub fn validate(self) -> Result<(), ProfileError> {
         if self.version != 1 {
@@ -697,6 +721,34 @@ mod tests {
             length: u32::try_from(bytes.len()).expect("test data fits in u32"),
             hash: Hash32::digest(bytes),
         }
+    }
+
+    #[test]
+    fn large_files_use_the_large_profile_only_for_default_settings() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        assert_eq!(
+            ChunkingProfile::DEFAULT.for_file_size(8 * GIB - 1),
+            ChunkingProfile::DEFAULT
+        );
+        assert_eq!(
+            ChunkingProfile::DEFAULT.for_file_size(8 * GIB),
+            ChunkingProfile::LARGE_FILE
+        );
+
+        let custom = ChunkingProfile {
+            version: 1,
+            min_size: 256 * 1024,
+            avg_size: 1024 * 1024,
+            max_size: 4 * 1024 * 1024,
+        };
+        assert_eq!(custom.for_file_size(70 * GIB), custom);
+
+        let unsupported = ChunkingProfile {
+            version: 2,
+            ..ChunkingProfile::DEFAULT
+        };
+        assert_eq!(unsupported.for_file_size(70 * GIB), unsupported);
+        assert_eq!(ChunkingProfile::LARGE_FILE.validate(), Ok(()));
     }
 
     #[test]

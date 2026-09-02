@@ -186,6 +186,11 @@ deltaweave push ./large-file.bin \
   --direct-only
 ```
 
+Files of at least 8 GiB automatically use larger FastCDC chunks when all three
+chunk sizes equal the default profile. This keeps 10–70 GiB manifests within
+protocol limits and reduces durable chunk-store overhead. Any non-default
+`--min-chunk`, `--avg-chunk`, or `--max-chunk` value disables this selection.
+
 Run the command again after editing the source. The receiver requests only
 unique chunks not already present and returns a JSON receipt with transferred
 bytes and reused extents.
