@@ -72,7 +72,8 @@ pub fn manifest_from_path(
     profile: ChunkingProfile,
 ) -> Result<FileManifest, CdcError> {
     let file = File::open(path).map_err(CdcError::Io)?;
-    manifest_from_reader(file, profile)
+    let size = file.metadata().map_err(CdcError::Io)?.len();
+    manifest_from_reader(file, profile.for_file_size(size))
 }
 
 /// Reads and verifies exactly one manifest chunk from a seekable source.
@@ -277,6 +278,18 @@ mod tests {
             .map(|chunk| (chunk.hash, chunk.length))
             .collect();
         assert_eq!(plan.missing.len(), unique.len());
+    }
+
+    #[test]
+    fn small_files_keep_the_requested_default_profile() {
+        let directory = tempfile::tempdir().expect("temporary directory can be created");
+        let path = directory.path().join("small.bin");
+        std::fs::write(&path, fixture(1024)).expect("small file can be written");
+
+        let manifest =
+            manifest_from_path(&path, ChunkingProfile::DEFAULT).expect("small file can be chunked");
+        assert_eq!(manifest.profile, ChunkingProfile::DEFAULT);
+        assert_eq!(manifest.size, 1024);
     }
 
     #[test]

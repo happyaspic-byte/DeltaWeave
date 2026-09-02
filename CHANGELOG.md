@@ -11,6 +11,11 @@ Versioning after its first stable release.
 
 ### Changed
 
+- Automatically use a measured 512 KiB / 1 MiB / 4 MiB FastCDC profile for files
+  of at least 8 GiB when default chunk settings are selected, keeping 10–70 GiB
+  manifests below protocol limits while reducing chunk-file and fsync overhead.
+- Receive validated chunks through a sealed `VerifiedChunk` so newly supplied
+  payload is hashed once at the network boundary instead of three times.
 - Persist received chunks through a bounded overlapping write pipeline so durable
   stores no longer wait on one blocking task per chunk, cap queued receive bytes,
   and drain in-flight writes before returning a partial-failure error.
