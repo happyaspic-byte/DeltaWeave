@@ -17,6 +17,9 @@ postcard.workspace = true
 redb.workspace = true
 serde.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+winapi-util.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
 

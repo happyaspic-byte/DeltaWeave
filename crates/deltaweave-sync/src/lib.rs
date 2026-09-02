@@ -331,8 +331,10 @@ impl SyncEngine {
                 .get(&hash)
                 .with_context(|| format!("required content {hash} was not staged"))?;
             let outcome = self.store.materialize(manifest, &record.path, &self.root)?;
-            apply_readonly(&outcome.destination, record.readonly)?;
-            self.index.adopt_verified_record(record)?;
+            let observation = outcome
+                .observation
+                .after_readonly_update(&outcome.destination, record.readonly)?;
+            self.index.adopt_materialized_record(record, &observation)?;
         }
         Ok(())
     }

@@ -186,6 +186,13 @@ deltaweave push ./large-file.bin \
   --direct-only
 ```
 
+Add `--state ./private/sender-state` to persist manifests for unchanged files
+when a stable identity and reliable change-time (Unix inode ctime) are
+available; omit it to run without a sender cache. Windows and other platforms
+without that change-time token skip the cache and fresh-generate. Direct-push
+adoption also requires a reliable change-time before skipping rehash; otherwise
+it verifies with `hash_stable_file`.
+
 Files of at least 8 GiB automatically use larger FastCDC chunks when all three
 chunk sizes equal the default profile. This keeps 10–70 GiB manifests within
 protocol limits and reduces durable chunk-store overhead. Any non-default

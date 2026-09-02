@@ -649,6 +649,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "deltaweave-core",
+ "deltaweave-store",
  "icu_casemap",
  "notify",
  "postcard",
@@ -673,10 +674,12 @@ dependencies = [
  "hex",
  "iroh",
  "postcard",
+ "redb",
  "serde",
  "tempfile",
  "tokio",
  "tracing",
+ "winapi-util",
 ]
 
 [[package]]
@@ -702,6 +705,7 @@ dependencies = [
  "redb",
  "serde",
  "tempfile",
+ "winapi-util",
 ]
 
 [[package]]

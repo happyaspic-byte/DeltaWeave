@@ -5,7 +5,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fmt,
-    fs::{self, OpenOptions},
+    fs::{self, File, Metadata, OpenOptions},
     io::Write,
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -15,7 +15,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use deltaweave_cdc::{manifest_from_path, verify_chunk};
+use deltaweave_cdc::{manifest_from_path, manifest_from_reader, verify_chunk};
 use deltaweave_core::{
     CausalRelation, ChunkingProfile, FileManifest, Hash32, ReplicaId, SyncEntryKind, SyncRecord,
     WirePath,
@@ -28,6 +28,7 @@ use iroh::{
     endpoint::{Connection, RecvStream, SendStream, presets},
     protocol::{AcceptError, ProtocolHandler, Router},
 };
+use redb::{Database, ReadableDatabase, TableDefinition};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tracing::{info, warn};
@@ -371,6 +372,8 @@ pub struct PushOptions {
     pub profile: ChunkingProfile,
     /// Discovery and relay behavior for the sender.
     pub network_mode: NetworkMode,
+    /// Optional private sender state directory for a persistent manifest cache.
+    pub state_root: Option<PathBuf>,
 }
 
 /// Builds an iroh endpoint address from CLI-friendly values.
@@ -954,15 +957,199 @@ fn insert_snapshot_record(
     Ok(())
 }
 
+const MANIFEST_CACHE_SCHEMA_V1: u16 = 1;
+const MANIFEST_GENERATOR_V1: u16 = 1;
+const SENDER_MANIFESTS: TableDefinition<&str, &[u8]> = TableDefinition::new("sender_manifests");
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct SourceFingerprint {
+    identity: Option<(u64, u64)>,
+    size: u64,
+    modified_ns: Option<u128>,
+    changed_ns: Option<u128>,
+    readonly: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct CachedManifest {
+    schema_version: u16,
+    generator_version: u16,
+    profile: ChunkingProfile,
+    fingerprint: SourceFingerprint,
+    manifest: FileManifest,
+}
+
+fn prepare_sender_manifest(
+    source: &Path,
+    requested_profile: ChunkingProfile,
+    state_root: Option<&Path>,
+) -> Result<FileManifest> {
+    let mut file = File::open(source)
+        .with_context(|| format!("failed to open source {}", source.display()))?;
+    let before_metadata = file.metadata()?;
+    ensure!(before_metadata.is_file(), "source is not a regular file");
+    let before = source_fingerprint(&file, &before_metadata);
+    let profile = requested_profile.for_file_size(before.size);
+    let cache_key = fs::canonicalize(source)
+        .unwrap_or_else(|_| source.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
+
+    let cache = state_root.and_then(|root| SenderManifestCache::open(root).ok());
+    if sender_cache_eligible(&before)
+        && let Some(cache) = &cache
+        && let Some(cached) = cache.get(&cache_key)
+        && cached_manifest_matches(&cached, profile, before)
+    {
+        let after_metadata = file.metadata()?;
+        let after = source_fingerprint(&file, &after_metadata);
+        if manifest_fingerprints_match(&cached.manifest, before, after) {
+            return Ok(cached.manifest);
+        }
+    }
+
+    let manifest = manifest_from_reader(&mut file, profile)?;
+    let after_metadata = file.metadata()?;
+    let after = source_fingerprint(&file, &after_metadata);
+    ensure!(
+        manifest_fingerprints_match(&manifest, before, after),
+        "source changed while preparing manifest"
+    );
+    if sender_cache_eligible(&after)
+        && let Some(cache) = cache
+    {
+        let _ = cache.put(
+            &cache_key,
+            &CachedManifest {
+                schema_version: MANIFEST_CACHE_SCHEMA_V1,
+                generator_version: MANIFEST_GENERATOR_V1,
+                profile,
+                fingerprint: after,
+                manifest: manifest.clone(),
+            },
+        );
+    }
+    Ok(manifest)
+}
+
+fn sender_cache_eligible(fingerprint: &SourceFingerprint) -> bool {
+    fingerprint.identity.is_some() && fingerprint.changed_ns.is_some()
+}
+
+fn cached_manifest_matches(
+    cached: &CachedManifest,
+    profile: ChunkingProfile,
+    before: SourceFingerprint,
+) -> bool {
+    cached.schema_version == MANIFEST_CACHE_SCHEMA_V1
+        && cached.generator_version == MANIFEST_GENERATOR_V1
+        && cached.profile == profile
+        && cached.fingerprint == before
+        && cached.manifest.validate().is_ok()
+}
+
+fn manifest_fingerprints_match(
+    manifest: &FileManifest,
+    before: SourceFingerprint,
+    after: SourceFingerprint,
+) -> bool {
+    before == after && manifest.size == before.size && manifest.size == after.size
+}
+
+struct SenderManifestCache {
+    database: Database,
+}
+
+impl SenderManifestCache {
+    fn open(root: impl AsRef<Path>) -> Result<Self> {
+        let root = root.as_ref();
+        fs::create_dir_all(root)?;
+        let database = Database::create(root.join("sender-manifests.redb"))?;
+        let write = database.begin_write()?;
+        {
+            let _ = write.open_table(SENDER_MANIFESTS)?;
+        }
+        write.commit()?;
+        Ok(Self { database })
+    }
+
+    fn get(&self, key: &str) -> Option<CachedManifest> {
+        let read = self.database.begin_read().ok()?;
+        let table = read.open_table(SENDER_MANIFESTS).ok()?;
+        let encoded = table.get(key).ok()??.value().to_vec();
+        postcard::from_bytes(&encoded).ok()
+    }
+
+    fn put(&self, key: &str, entry: &CachedManifest) -> Result<()> {
+        let encoded = postcard::to_stdvec(entry)?;
+        let write = self.database.begin_write()?;
+        {
+            let mut table = write.open_table(SENDER_MANIFESTS)?;
+            table.insert(key, encoded.as_slice())?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+}
+
+fn source_fingerprint(file: &File, metadata: &Metadata) -> SourceFingerprint {
+    SourceFingerprint {
+        identity: source_identity(file, metadata),
+        size: metadata.len(),
+        modified_ns: metadata_time_ns(metadata.modified().ok()),
+        changed_ns: change_time_ns(metadata),
+        readonly: metadata.permissions().readonly(),
+    }
+}
+
+fn metadata_time_ns(time: Option<std::time::SystemTime>) -> Option<u128> {
+    time?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_nanos())
+}
+
+#[cfg(unix)]
+fn change_time_ns(metadata: &Metadata) -> Option<u128> {
+    use std::os::unix::fs::MetadataExt;
+    let seconds = u128::try_from(metadata.ctime()).ok()?;
+    let nanos = u128::try_from(metadata.ctime_nsec()).ok()?;
+    Some(seconds.saturating_mul(1_000_000_000).saturating_add(nanos))
+}
+
+#[cfg(not(unix))]
+fn change_time_ns(_metadata: &Metadata) -> Option<u128> {
+    None
+}
+
+#[cfg(unix)]
+fn source_identity(_file: &File, metadata: &Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    (metadata.ino() != 0).then_some((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(windows)]
+fn source_identity(file: &File, _metadata: &Metadata) -> Option<(u64, u64)> {
+    let information = winapi_util::file::information(file).ok()?;
+    (information.file_index() != 0)
+        .then_some((information.volume_serial_number(), information.file_index()))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn source_identity(_file: &File, _metadata: &Metadata) -> Option<(u64, u64)> {
+    None
+}
+
 /// Sends one file, transmitting only chunks the receiver reports missing.
 pub async fn push_file(options: PushOptions) -> Result<TransferReceipt> {
-    ensure!(options.source.is_file(), "source is not a regular file");
     let source_for_manifest = options.source.clone();
     let profile = options.profile;
-    let manifest =
-        tokio::task::spawn_blocking(move || manifest_from_path(source_for_manifest, profile))
-            .await
-            .context("manifest task failed")??;
+    let state_root = options.state_root.clone();
+    let manifest = tokio::task::spawn_blocking(move || {
+        prepare_sender_manifest(&source_for_manifest, profile, state_root.as_deref())
+    })
+    .await
+    .context("manifest task failed")??;
 
     let endpoint = bind_endpoint(options.secret_key, options.network_mode, None, None).await?;
     let result = push_connected(
@@ -1262,7 +1449,7 @@ impl PushHandler {
         let root = self.destination_root.clone();
         let materialize_manifest = manifest.clone();
         let materialize_path = path.clone();
-        tokio::task::spawn_blocking(move || {
+        let outcome = tokio::task::spawn_blocking(move || {
             prepare_destination_kind(
                 &store,
                 &materialize_path,
@@ -1276,13 +1463,12 @@ impl PushHandler {
         .context("materialization task failed")??;
 
         let index = Arc::clone(&self.index);
+        let adopted_path = path.clone();
         tokio::task::spawn_blocking(move || {
-            let report = index.scan()?;
-            ensure_index_report_safe(&report)?;
-            Ok::<_, anyhow::Error>(report)
+            index.adopt_materialized_file(&adopted_path, &outcome.observation)
         })
         .await
-        .context("receiver index task failed")??;
+        .context("receiver index adoption task failed")??;
 
         write_frame(
             send,
@@ -1524,19 +1710,22 @@ impl SyncHandler {
         let path = record.path.clone();
         let operation_hash = record.logical_hash();
         let materialize_manifest = manifest;
-        tokio::task::spawn_blocking(move || {
+        let outcome = tokio::task::spawn_blocking(move || {
             prepare_destination_kind(&store, &path, &root, SyncEntryKind::File, operation_hash)?;
             store.materialize(&materialize_manifest, &path, root)
         })
         .await
         .context("causal materialization task failed")??;
-        let installed = sync_local_path(&self.destination_root, &record.path);
-        apply_readonly(&installed, record.readonly)?;
+        let observation = outcome
+            .observation
+            .after_readonly_update(&outcome.destination, record.readonly)?;
         let index = Arc::clone(&self.index);
         let adopted = record.clone();
-        tokio::task::spawn_blocking(move || index.adopt_verified_record(&adopted))
-            .await
-            .context("causal index adoption task failed")??;
+        tokio::task::spawn_blocking(move || {
+            index.adopt_materialized_record(&adopted, &observation)
+        })
+        .await
+        .context("causal index adoption task failed")??;
         write_frame(
             send,
             &SyncWireResponse::Applied(SyncApplyReceipt {
@@ -2202,6 +2391,7 @@ mod tests {
             remote: server.endpoint_addr(),
             profile: ChunkingProfile::DEFAULT,
             network_mode: NetworkMode::DirectOnly,
+            state_root: None,
         })
         .await
         .expect("first transfer succeeds");
@@ -2222,6 +2412,7 @@ mod tests {
             remote: server.endpoint_addr(),
             profile: ChunkingProfile::DEFAULT,
             network_mode: NetworkMode::DirectOnly,
+            state_root: None,
         })
         .await
         .expect("delta transfer succeeds");
@@ -2240,6 +2431,7 @@ mod tests {
             remote: server.endpoint_addr(),
             profile: ChunkingProfile::DEFAULT,
             network_mode: NetworkMode::DirectOnly,
+            state_root: None,
         })
         .await
         .expect("unchanged retry succeeds");
@@ -2255,6 +2447,7 @@ mod tests {
             remote: server.endpoint_addr(),
             profile: ChunkingProfile::DEFAULT,
             network_mode: NetworkMode::DirectOnly,
+            state_root: None,
         })
         .await
         .expect("empty transfer succeeds");
@@ -2266,6 +2459,129 @@ mod tests {
             Vec::<u8>::new()
         );
         server.shutdown().await.expect("server shuts down");
+    }
+
+    #[test]
+    fn sender_manifest_cache_reuses_unchanged_files_and_invalidates_on_metadata() {
+        let root = TempDir::new().expect("temporary directory can be created");
+        let cache = root.path().join("sender-state");
+        let source = root.path().join("payload.bin");
+        fs::write(&source, fixture(128 * 1024)).expect("source can be written");
+
+        let first = prepare_sender_manifest(&source, ChunkingProfile::DEFAULT, Some(&cache))
+            .expect("first manifest can be built");
+        let cached = prepare_sender_manifest(&source, ChunkingProfile::DEFAULT, Some(&cache))
+            .expect("cached manifest can be reused");
+        assert_eq!(first, cached);
+
+        let mut permissions = fs::metadata(&source)
+            .expect("source metadata can be read")
+            .permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&source, permissions).expect("source can be marked readonly");
+        let after_readonly =
+            prepare_sender_manifest(&source, ChunkingProfile::DEFAULT, Some(&cache))
+                .expect("readonly change rebuilds the manifest");
+        assert_eq!(after_readonly.file_hash, first.file_hash);
+
+        let mut permissions = fs::metadata(&source)
+            .expect("source metadata can be read")
+            .permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(permissions.mode() | 0o200);
+        }
+        #[cfg(not(unix))]
+        permissions.set_readonly(false);
+        fs::set_permissions(&source, permissions).expect("source can be made writable");
+        let mut mutated = fixture(128 * 1024);
+        mutated[0] ^= 1;
+        fs::write(&source, mutated).expect("same-size source can be rewritten");
+        let rebuilt = prepare_sender_manifest(&source, ChunkingProfile::DEFAULT, Some(&cache))
+            .expect("same-size mutation rebuilds the manifest");
+        assert_ne!(rebuilt.file_hash, first.file_hash);
+        assert_eq!(rebuilt.size, first.size);
+    }
+
+    #[test]
+    fn cached_manifest_requires_matching_before_and_after_handle_fingerprints() {
+        let fingerprint = SourceFingerprint {
+            identity: Some((1, 2)),
+            size: 128,
+            modified_ns: Some(3),
+            changed_ns: Some(5),
+            readonly: false,
+        };
+        let changed = SourceFingerprint {
+            modified_ns: Some(4),
+            ..fingerprint
+        };
+        let changed_ctime = SourceFingerprint {
+            changed_ns: Some(6),
+            ..fingerprint
+        };
+        let without_identity = SourceFingerprint {
+            identity: None,
+            ..fingerprint
+        };
+        let without_changed_ns = SourceFingerprint {
+            changed_ns: None,
+            ..fingerprint
+        };
+        let manifest = FileManifest {
+            schema_version: deltaweave_core::MANIFEST_SCHEMA_V1,
+            size: 128,
+            file_hash: Hash32::digest(&[0_u8; 128]),
+            profile: ChunkingProfile::DEFAULT,
+            chunks: vec![deltaweave_core::ChunkDescriptor {
+                offset: 0,
+                length: 128,
+                hash: Hash32::digest(&[0_u8; 128]),
+            }],
+        };
+
+        assert!(manifest_fingerprints_match(
+            &manifest,
+            fingerprint,
+            fingerprint
+        ));
+        assert!(!manifest_fingerprints_match(
+            &manifest,
+            fingerprint,
+            changed
+        ));
+        assert!(!manifest_fingerprints_match(
+            &manifest,
+            fingerprint,
+            changed_ctime
+        ));
+        assert!(!manifest_fingerprints_match(
+            &FileManifest {
+                size: 127,
+                ..manifest
+            },
+            fingerprint,
+            fingerprint
+        ));
+        assert!(sender_cache_eligible(&fingerprint));
+        assert!(!sender_cache_eligible(&without_identity));
+        assert!(!sender_cache_eligible(&without_changed_ns));
+    }
+
+    #[test]
+    fn sender_manifest_cache_fails_open_when_the_database_cannot_be_locked() {
+        let root = TempDir::new().expect("temporary directory can be created");
+        let cache = root.path().join("sender-state");
+        let source = root.path().join("payload.bin");
+        fs::write(&source, fixture(64 * 1024)).expect("source can be written");
+        fs::create_dir_all(&cache).expect("cache directory can be created");
+        fs::write(cache.join("sender-manifests.redb"), b"not a database")
+            .expect("corrupt cache can be written");
+
+        let manifest = prepare_sender_manifest(&source, ChunkingProfile::DEFAULT, Some(&cache))
+            .expect("corrupt cache is ignored");
+        assert_eq!(manifest.size, 64 * 1024);
     }
 
     #[tokio::test]
@@ -2395,6 +2711,7 @@ mod tests {
             remote: server.endpoint_addr(),
             profile: ChunkingProfile::DEFAULT,
             network_mode: NetworkMode::DirectOnly,
+            state_root: None,
         })
         .await;
         assert!(result.is_err());

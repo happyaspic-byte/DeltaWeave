@@ -15,6 +15,7 @@ use anyhow::{Context, Result, bail, ensure};
 use deltaweave_core::{
     Hash32, ReplicaId, SYNC_RECORD_SCHEMA_V1, SyncEntryKind, SyncRecord, VersionVector, WirePath,
 };
+use deltaweave_store::MaterializationObservation;
 use icu_casemap::CaseMapper;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
@@ -480,6 +481,57 @@ impl LocalIndex {
             .transpose()
     }
 
+    /// Adopts a verified direct-push file as a local index change without rehashing it.
+    pub fn adopt_materialized_file(
+        &self,
+        path: &WirePath,
+        observation: &MaterializationObservation,
+    ) -> Result<()> {
+        let previous = self.get(path)?;
+        let mut version = previous
+            .as_ref()
+            .map_or_else(VersionVector::default, |record| record.version.clone());
+        let counter = next_replica_counter(
+            self.metadata_value(REPLICA_COUNTER_KEY)?,
+            &version,
+            self.replica,
+        )?;
+        version.observe(self.replica, counter);
+        let record = SyncRecord {
+            schema_version: SYNC_RECORD_SCHEMA_V1,
+            path: path.clone(),
+            kind: SyncEntryKind::File,
+            size: observation.size(),
+            content_hash: Some(observation.file_hash()),
+            readonly: observation.readonly(),
+            version,
+            tombstone: false,
+        };
+        self.commit_adopted_record(&record, Some(observation))
+    }
+
+    /// Adopts a live file using a locally produced materialization observation.
+    ///
+    /// The observation is trusted only as a content digest produced by this process. Current
+    /// metadata and fingerprint must still match before the causal record is stored.
+    pub fn adopt_materialized_record(
+        &self,
+        record: &SyncRecord,
+        observation: &MaterializationObservation,
+    ) -> Result<()> {
+        record.validate()?;
+        ensure!(
+            !record.tombstone && record.kind == SyncEntryKind::File,
+            "materialized adoption requires a live file record"
+        );
+        ensure!(
+            observation.size() == record.size
+                && Some(observation.file_hash()) == record.content_hash,
+            "materialization observation does not match causal record"
+        );
+        self.commit_adopted_record(record, Some(observation))
+    }
+
     /// Adopts a verified filesystem state with the exact causal version received from peers.
     ///
     /// The caller must materialize or delete the local object first. This method re-inspects and
@@ -487,6 +539,14 @@ impl LocalIndex {
     /// being attached to bytes that were not actually installed.
     pub fn adopt_verified_record(&self, record: &SyncRecord) -> Result<()> {
         record.validate()?;
+        self.commit_adopted_record(record, None)
+    }
+
+    fn commit_adopted_record(
+        &self,
+        record: &SyncRecord,
+        observation: Option<&MaterializationObservation>,
+    ) -> Result<()> {
         let generation = self
             .metadata_value(GENERATION_KEY)?
             .checked_add(1)
@@ -496,6 +556,10 @@ impl LocalIndex {
         let local_path = local_path(&self.root, &record.path);
 
         let adopted = if record.tombstone {
+            ensure!(
+                observation.is_none(),
+                "tombstones cannot be adopted from a materialization observation"
+            );
             ensure!(
                 fs::symlink_metadata(&local_path)
                     .is_err_and(|error| { error.kind() == std::io::ErrorKind::NotFound }),
@@ -544,20 +608,38 @@ impl LocalIndex {
                 local_path.display()
             );
             let content_hash = if kind == EntryKind::File {
-                let hash = hash_stable_file(&local_path, fingerprint).map_err(|failure| {
-                    anyhow::anyhow!(
-                        "failed to verify materialized remote file {}: {}",
-                        local_path.display(),
-                        failure.message
-                    )
-                })?;
-                ensure!(
-                    fingerprint.size == record.size && Some(hash) == record.content_hash,
-                    "materialized content at {} does not match remote record",
-                    local_path.display()
-                );
-                Some(hash)
+                match observation {
+                    Some(observation)
+                        if observation_trusts_no_rehash(
+                            Some(observation),
+                            &fingerprint,
+                            record,
+                        ) =>
+                    {
+                        Some(observation.file_hash())
+                    }
+                    _ => {
+                        let hash =
+                            hash_stable_file(&local_path, fingerprint).map_err(|failure| {
+                                anyhow::anyhow!(
+                                    "failed to verify materialized remote file {}: {}",
+                                    local_path.display(),
+                                    failure.message
+                                )
+                            })?;
+                        ensure!(
+                            fingerprint.size == record.size && Some(hash) == record.content_hash,
+                            "materialized content at {} does not match remote record",
+                            local_path.display()
+                        );
+                        Some(hash)
+                    }
+                }
             } else {
+                ensure!(
+                    observation.is_none(),
+                    "materialization observations apply only to regular files"
+                );
                 None
             };
             PathRecord {
@@ -900,6 +982,7 @@ struct MetadataFingerprint {
     identity: Option<FileIdentity>,
     size: u64,
     modified_ns: Option<u128>,
+    changed_ns: Option<u128>,
     readonly: bool,
 }
 
@@ -1196,6 +1279,9 @@ fn metadata_fingerprint(path: &Path, metadata: &Metadata, kind: EntryKind) -> Me
         modified_ns: (kind == EntryKind::File)
             .then(|| modified_ns(metadata))
             .flatten(),
+        changed_ns: (kind == EntryKind::File)
+            .then(|| change_time_ns(metadata))
+            .flatten(),
         readonly: kind == EntryKind::File && metadata.permissions().readonly(),
     }
 }
@@ -1207,6 +1293,19 @@ fn modified_ns(metadata: &Metadata) -> Option<u128> {
         .duration_since(UNIX_EPOCH)
         .ok()
         .map(|duration| duration.as_nanos())
+}
+
+#[cfg(unix)]
+fn change_time_ns(metadata: &Metadata) -> Option<u128> {
+    use std::os::unix::fs::MetadataExt;
+    let seconds = u128::try_from(metadata.ctime()).ok()?;
+    let nanos = u128::try_from(metadata.ctime_nsec()).ok()?;
+    Some(seconds.saturating_mul(1_000_000_000).saturating_add(nanos))
+}
+
+#[cfg(not(unix))]
+fn change_time_ns(_metadata: &Metadata) -> Option<u128> {
+    None
 }
 
 #[cfg(unix)]
@@ -1386,6 +1485,33 @@ fn record_fingerprint_matches(record: &PathRecord, entry: &RawEntry) -> bool {
         && record.size == entry.fingerprint.size
         && record.modified_ns == entry.fingerprint.modified_ns
         && record.readonly == entry.fingerprint.readonly
+}
+
+fn reliable_changed_ns_match(observed: Option<u128>, current: Option<u128>) -> bool {
+    matches!((observed, current), (Some(observed), Some(current)) if observed == current)
+}
+
+fn observation_trusts_no_rehash(
+    observation: Option<&MaterializationObservation>,
+    fingerprint: &MetadataFingerprint,
+    record: &SyncRecord,
+) -> bool {
+    let Some(observation) = observation else {
+        return false;
+    };
+    if !reliable_changed_ns_match(observation.changed_ns(), fingerprint.changed_ns) {
+        return false;
+    }
+    observation.file_hash() == record.content_hash.unwrap_or_default()
+        && observation.size() == fingerprint.size
+        && observation.size() == record.size
+        && observation.modified_ns() == fingerprint.modified_ns
+        && observation.readonly() == fingerprint.readonly
+        && observation.readonly() == record.readonly
+        && observation.identity()
+            == fingerprint
+                .identity
+                .map(|identity| (identity.namespace, identity.object))
 }
 
 fn next_replica_counter(global: u64, version: &VersionVector, replica: ReplicaId) -> Result<u64> {
@@ -1688,6 +1814,15 @@ mod tests {
     }
 
     #[test]
+    fn no_rehash_requires_matching_reliable_change_times() {
+        assert!(reliable_changed_ns_match(Some(7), Some(7)));
+        assert!(!reliable_changed_ns_match(Some(7), Some(8)));
+        assert!(!reliable_changed_ns_match(None, Some(7)));
+        assert!(!reliable_changed_ns_match(Some(7), None));
+        assert!(!reliable_changed_ns_match(None, None));
+    }
+
+    #[test]
     fn initial_scan_persists_files_and_directories() {
         let root = TempDir::new().expect("root can be created");
         let state = TempDir::new().expect("state can be created");
@@ -1807,6 +1942,133 @@ mod tests {
             index.sync_records().expect("snapshot loads"),
             vec![tombstone]
         );
+    }
+
+    #[test]
+    fn verified_materialization_observation_adopts_without_rehash_and_rejects_mutation() {
+        let root = TempDir::new().expect("root can be created");
+        let state = TempDir::new().expect("state can be created");
+        let bytes = vec![0_u8; 64 * 1024];
+        let store_state = TempDir::new().expect("store state can be created");
+        let store = deltaweave_store::Store::open(store_state.path()).expect("store can open");
+        let hash = Hash32::digest(&bytes);
+        let manifest = deltaweave_core::FileManifest {
+            schema_version: deltaweave_core::MANIFEST_SCHEMA_V1,
+            size: bytes.len() as u64,
+            file_hash: hash,
+            profile: deltaweave_core::ChunkingProfile::DEFAULT,
+            chunks: vec![deltaweave_core::ChunkDescriptor {
+                offset: 0,
+                length: bytes.len() as u32,
+                hash,
+            }],
+        };
+        store
+            .chunks()
+            .put_verified(hash, &bytes)
+            .expect("chunk can be stored");
+        let index = open_index(root.path(), state.path(), 1_000);
+        let path = WirePath::new("report.txt").expect("path is portable");
+        let observation = store
+            .materialize(&manifest, &path, root.path())
+            .expect("file can be materialized")
+            .observation;
+        let record = SyncRecord {
+            schema_version: SYNC_RECORD_SCHEMA_V1,
+            path: path.clone(),
+            kind: SyncEntryKind::File,
+            size: bytes.len() as u64,
+            content_hash: Some(hash),
+            readonly: false,
+            version: VersionVector::default(),
+            tombstone: false,
+        };
+        index
+            .adopt_materialized_record(&record, &observation)
+            .expect("matching observation can be adopted");
+        let stored = index
+            .get(&path)
+            .expect("record can be read")
+            .expect("record exists");
+        assert_eq!(stored.content_hash, Some(hash));
+        assert_eq!(stored.size, bytes.len() as u64);
+
+        fs::write(root.path().join("report.txt"), vec![1_u8; bytes.len()])
+            .expect("same-size materialized file can be changed");
+        assert!(
+            index
+                .adopt_materialized_record(&record, &observation)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn missing_change_time_falls_back_to_stable_hash_verification() {
+        let root = TempDir::new().expect("root can be created");
+        let state = TempDir::new().expect("state can be created");
+        let bytes = vec![0_u8; 64 * 1024];
+        let store_state = TempDir::new().expect("store state can be created");
+        let store = deltaweave_store::Store::open(store_state.path()).expect("store can open");
+        let hash = Hash32::digest(&bytes);
+        let manifest = deltaweave_core::FileManifest {
+            schema_version: deltaweave_core::MANIFEST_SCHEMA_V1,
+            size: bytes.len() as u64,
+            file_hash: hash,
+            profile: deltaweave_core::ChunkingProfile::DEFAULT,
+            chunks: vec![deltaweave_core::ChunkDescriptor {
+                offset: 0,
+                length: bytes.len() as u32,
+                hash,
+            }],
+        };
+        store
+            .chunks()
+            .put_verified(hash, &bytes)
+            .expect("chunk can be stored");
+        let index = open_index(root.path(), state.path(), 1_000);
+        let path = WirePath::new("report.txt").expect("path is portable");
+        let observation = store
+            .materialize(&manifest, &path, root.path())
+            .expect("file can be materialized")
+            .observation;
+        let local_path = root.path().join("report.txt");
+        let metadata = fs::symlink_metadata(&local_path).expect("metadata can be read");
+        let fingerprint = metadata_fingerprint(&local_path, &metadata, EntryKind::File);
+        let record = SyncRecord {
+            schema_version: SYNC_RECORD_SCHEMA_V1,
+            path: path.clone(),
+            kind: SyncEntryKind::File,
+            size: bytes.len() as u64,
+            content_hash: Some(hash),
+            readonly: false,
+            version: VersionVector::default(),
+            tombstone: false,
+        };
+        assert!(!observation_trusts_no_rehash(
+            Some(&observation),
+            &MetadataFingerprint {
+                changed_ns: None,
+                ..fingerprint
+            },
+            &record
+        ));
+        assert!(!observation_trusts_no_rehash(None, &fingerprint, &record));
+        if fingerprint.changed_ns.is_some() && observation.changed_ns().is_some() {
+            assert!(observation_trusts_no_rehash(
+                Some(&observation),
+                &fingerprint,
+                &record
+            ));
+        }
+        index
+            .adopt_materialized_record(&record, &observation)
+            .expect("materialized observation can be adopted");
+        let stored = index
+            .get(&path)
+            .expect("record can be read")
+            .expect("record exists");
+        assert_eq!(stored.content_hash, Some(hash));
+        assert_eq!(stored.size, bytes.len() as u64);
     }
 
     #[test]

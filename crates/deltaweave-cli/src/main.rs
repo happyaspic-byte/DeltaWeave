@@ -144,6 +144,9 @@ struct PushArgs {
     /// Persistent sender secret-key file.
     #[arg(long, default_value = ".deltaweave/identity.key")]
     identity: PathBuf,
+    /// Optional private sender manifest-cache directory.
+    #[arg(long)]
+    state: Option<PathBuf>,
     /// Disable discovery and relay services; use supplied direct addresses only.
     #[arg(long)]
     direct_only: bool,
@@ -378,6 +381,7 @@ async fn push(args: PushArgs) -> Result<()> {
         remote,
         profile: args.chunking.profile()?,
         network_mode: network_mode(args.direct_only),
+        state_root: args.state,
     })
     .await?;
     print_json(&receipt)
@@ -881,6 +885,7 @@ async fn exercise_self_test(
         remote: server.endpoint_addr(),
         profile: ChunkingProfile::DEFAULT,
         network_mode: NetworkMode::DirectOnly,
+        state_root: None,
     })
     .await
     .context("self-test initial transfer failed")?;
@@ -903,6 +908,7 @@ async fn exercise_self_test(
         remote: server.endpoint_addr(),
         profile: ChunkingProfile::DEFAULT,
         network_mode: NetworkMode::DirectOnly,
+        state_root: None,
     })
     .await
     .context("self-test delta transfer failed")?;
@@ -996,6 +1002,44 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn parses_push_state_directory() {
+        let cli = Cli::try_parse_from([
+            "deltaweave",
+            "push",
+            "input.bin",
+            "--remote-path",
+            "docs/input.bin",
+            "--peer",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--state",
+            "./private/sender-state",
+        ])
+        .expect("push state command parses");
+        let Command::Push(args) = cli.command else {
+            panic!("push command expected");
+        };
+        assert_eq!(args.state, Some(PathBuf::from("./private/sender-state")));
+    }
+
+    #[test]
+    fn omits_push_state_directory() {
+        let cli = Cli::try_parse_from([
+            "deltaweave",
+            "push",
+            "input.bin",
+            "--remote-path",
+            "docs/input.bin",
+            "--peer",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ])
+        .expect("push without --state parses");
+        let Command::Push(args) = cli.command else {
+            panic!("push command expected");
+        };
+        assert_eq!(args.state, None);
     }
 
     #[test]
