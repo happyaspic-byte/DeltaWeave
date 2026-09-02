@@ -117,6 +117,9 @@ struct ServeArgs {
     /// Accept any cryptographically authenticated peer (unsafe on public networks).
     #[arg(long, conflicts_with = "allowed_peers")]
     allow_any_authenticated: bool,
+    /// Bind the receiver to a stable local UDP socket address.
+    #[arg(long)]
+    bind: Option<SocketAddr>,
     /// Disable discovery and relay services; advertise direct addresses only.
     #[arg(long)]
     direct_only: bool,
@@ -299,6 +302,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
         state_root: args.state,
         peer_policy,
         network_mode: network_mode(args.direct_only),
+        bind_address: args.bind,
     })
     .await?;
     if !server.wait_online(Duration::from_secs(20)).await {
@@ -642,6 +646,7 @@ async fn self_test() -> Result<()> {
         state_root: state,
         peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
         network_mode: NetworkMode::DirectOnly,
+        bind_address: None,
     })
     .await
     .context("self-test receiver failed to start")?;
@@ -991,6 +996,30 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn parses_serve_bind_address() {
+        let cli = Cli::try_parse_from([
+            "deltaweave",
+            "serve",
+            "--root",
+            "output",
+            "--allow-peer",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--bind",
+            "172.30.1.21:49170",
+            "--direct-only",
+        ])
+        .expect("serve bind command parses");
+        let Command::Serve(args) = cli.command else {
+            panic!("serve command expected");
+        };
+        assert_eq!(
+            args.bind,
+            Some("172.30.1.21:49170".parse().expect("bind address is valid"))
+        );
+        assert!(args.direct_only);
     }
 
     #[test]

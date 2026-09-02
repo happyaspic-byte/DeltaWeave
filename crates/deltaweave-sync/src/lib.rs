@@ -530,6 +530,7 @@ mod tests {
             state_root: remote_state.path().to_path_buf(),
             peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
             network_mode: NetworkMode::DirectOnly,
+            bind_address: None,
         })
         .await
         .expect("server can start");

@@ -169,11 +169,13 @@ deltaweave serve \
   --state ./receiver-state \
   --identity receiver.key \
   --allow-peer <SENDER_ENDPOINT_ID> \
+  --bind 0.0.0.0:49152 \
   --direct-only
 ```
 
-Copy the receiver's `endpoint_id` and one `direct_addresses` value from its JSON
-output, then push a file:
+`--bind` keeps the receiver UDP port stable across restarts. Open that UDP port in
+the host firewall, then copy the receiver's `endpoint_id` and one
+`direct_addresses` value from its JSON output before pushing a file:
 
 ```bash
 deltaweave push ./large-file.bin \

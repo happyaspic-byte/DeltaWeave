@@ -164,6 +164,8 @@ pub struct ServerConfig {
     pub peer_policy: PeerPolicy,
     /// Discovery and relay behavior.
     pub network_mode: NetworkMode,
+    /// Optional local UDP socket address for stable direct connectivity.
+    pub bind_address: Option<SocketAddr>,
 }
 
 /// A running DeltaWeave protocol router.
@@ -228,6 +230,7 @@ pub async fn start_server(config: ServerConfig) -> Result<Server> {
         state_root,
         peer_policy,
         network_mode,
+        bind_address,
     } = config;
     let replica = ReplicaId(Hash32::digest(secret_key.public().as_bytes()));
     let (destination_root, state_root) = prepare_server_roots(&destination_root, &state_root)?;
@@ -243,6 +246,7 @@ pub async fn start_server(config: ServerConfig) -> Result<Server> {
         secret_key,
         network_mode,
         Some(vec![ALPN_V1.to_vec(), ALPN_V2.to_vec()]),
+        bind_address,
     )
     .await?;
     let push_handler = PushHandler {
@@ -336,6 +340,7 @@ async fn bind_endpoint(
     secret_key: SecretKey,
     mode: NetworkMode,
     alpns: Option<Vec<Vec<u8>>>,
+    bind_address: Option<SocketAddr>,
 ) -> Result<Endpoint> {
     let mut builder = match mode {
         NetworkMode::Internet => Endpoint::builder(presets::N0),
@@ -344,6 +349,9 @@ async fn bind_endpoint(
     .secret_key(secret_key);
     if let Some(alpns) = alpns {
         builder = builder.alpns(alpns);
+    }
+    if let Some(bind_address) = bind_address {
+        builder = builder.clear_ip_transports().bind_addr(bind_address)?;
     }
     builder.bind().await.context("failed to bind iroh endpoint")
 }
@@ -478,7 +486,8 @@ pub struct PullReceipt {
 impl SyncClient {
     /// Opens one authenticated local endpoint that can serve all calls in a sync pass.
     pub async fn open_session(&self) -> Result<SyncSession> {
-        let endpoint = bind_endpoint(self.secret_key.clone(), self.network_mode, None).await?;
+        let endpoint =
+            bind_endpoint(self.secret_key.clone(), self.network_mode, None, None).await?;
         Ok(SyncSession {
             client: self.clone(),
             endpoint,
@@ -954,7 +963,7 @@ pub async fn push_file(options: PushOptions) -> Result<TransferReceipt> {
             .await
             .context("manifest task failed")??;
 
-    let endpoint = bind_endpoint(options.secret_key, options.network_mode, None).await?;
+    let endpoint = bind_endpoint(options.secret_key, options.network_mode, None, None).await?;
     let result = push_connected(
         &endpoint,
         &options.source,
@@ -2153,6 +2162,7 @@ mod tests {
             state_root: state.path().to_path_buf(),
             peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
             network_mode: NetworkMode::DirectOnly,
+            bind_address: Some("127.0.0.1:0".parse().expect("ephemeral bind is valid")),
         })
         .await
         .expect("server can start");
@@ -2242,10 +2252,79 @@ mod tests {
             state_root: root.path().join("state"),
             peer_policy: PeerPolicy::AllowListed(HashSet::new()),
             network_mode: NetworkMode::DirectOnly,
+            bind_address: None,
         })
         .await;
 
         assert!(result.is_err());
+    }
+
+    fn advertised_socket(server: &Server) -> SocketAddr {
+        server
+            .address_info()
+            .direct_addresses
+            .first()
+            .expect("server advertises a direct address")
+            .parse()
+            .expect("advertised address is a socket address")
+    }
+
+    #[tokio::test]
+    async fn direct_server_reuses_configured_port_after_restart() {
+        let state = TempDir::new().expect("state directory can be created");
+        let destination = TempDir::new().expect("destination can be created");
+        let secret_key = SecretKey::generate();
+        let first = start_server(ServerConfig {
+            secret_key: secret_key.clone(),
+            destination_root: destination.path().to_path_buf(),
+            state_root: state.path().to_path_buf(),
+            peer_policy: PeerPolicy::AllowListed(HashSet::new()),
+            network_mode: NetworkMode::DirectOnly,
+            bind_address: Some("127.0.0.1:0".parse().expect("ephemeral bind is valid")),
+        })
+        .await
+        .expect("server can bind an ephemeral local address");
+        let bind_address = advertised_socket(&first);
+        assert_eq!(bind_address.ip(), std::net::Ipv4Addr::LOCALHOST);
+        assert_ne!(bind_address.port(), 0);
+        first.shutdown().await.expect("first server shuts down");
+
+        let second = start_server(ServerConfig {
+            secret_key,
+            destination_root: destination.path().to_path_buf(),
+            state_root: state.path().to_path_buf(),
+            peer_policy: PeerPolicy::AllowListed(HashSet::new()),
+            network_mode: NetworkMode::DirectOnly,
+            bind_address: Some(bind_address),
+        })
+        .await
+        .expect("server can rebind the previously assigned address");
+        assert_eq!(
+            second.address_info().direct_addresses,
+            vec![bind_address.to_string()]
+        );
+        second.shutdown().await.expect("second server shuts down");
+    }
+
+    #[tokio::test]
+    async fn configured_bind_address_fails_when_the_udp_port_is_already_taken() {
+        let state = TempDir::new().expect("state directory can be created");
+        let destination = TempDir::new().expect("destination can be created");
+        let occupied = std::net::UdpSocket::bind("127.0.0.1:0").expect("occupied socket can bind");
+        let bind_address = occupied
+            .local_addr()
+            .expect("occupied socket has a local address");
+        let result = start_server(ServerConfig {
+            secret_key: SecretKey::generate(),
+            destination_root: destination.path().to_path_buf(),
+            state_root: state.path().to_path_buf(),
+            peer_policy: PeerPolicy::AllowListed(HashSet::new()),
+            network_mode: NetworkMode::DirectOnly,
+            bind_address: Some(bind_address),
+        })
+        .await;
+        assert!(result.is_err());
+        drop(occupied);
     }
 
     #[tokio::test]
@@ -2258,6 +2337,7 @@ mod tests {
             state_root: state.path().to_path_buf(),
             peer_policy: PeerPolicy::AllowListed(HashSet::new()),
             network_mode: NetworkMode::DirectOnly,
+            bind_address: None,
         })
         .await
         .expect("server can start");
@@ -2279,6 +2359,7 @@ mod tests {
             state_root: state.path().to_path_buf(),
             peer_policy: PeerPolicy::AllowListed(HashSet::from([SecretKey::generate().public()])),
             network_mode: NetworkMode::DirectOnly,
+            bind_address: None,
         })
         .await
         .expect("server can start");
@@ -2326,6 +2407,7 @@ mod tests {
             state_root: server_state.path().to_path_buf(),
             peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
             network_mode: NetworkMode::DirectOnly,
+            bind_address: None,
         })
         .await
         .expect("server can start");
