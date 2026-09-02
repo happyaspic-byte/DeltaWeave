@@ -39,6 +39,9 @@ pub const ALPN_V2: &[u8] = b"deltaweave/sync/2";
 const MAX_CONTROL_FRAME: usize = 16 * 1024 * 1024;
 const MAX_CHUNKS_PER_FILE: usize = 250_000;
 const MAX_FILE_SIZE: u64 = 16 * 1024 * 1024 * 1024 * 1024;
+const CHUNK_WRITE_BATCH: usize = 8;
+const CHUNK_WRITE_CONCURRENCY: usize = 8;
+const CHUNK_WRITE_MAX_QUEUED_BYTES: usize = 32 * 1024 * 1024;
 
 /// Whether an endpoint uses internet discovery/relays or direct addresses only.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -755,33 +758,34 @@ impl SyncClient {
             .iter()
             .map(|chunk| (chunk.hash, chunk.clone()))
             .collect();
-        let mut transferred_bytes = 0_u64;
-        for expected_hash in missing {
-            let header: ChunkHeader = read_frame(&mut receive).await?;
-            ensure!(
-                header.hash == expected_hash,
-                "remote sent an out-of-order chunk"
-            );
-            let descriptor = descriptors
-                .get(&header.hash)
-                .context("remote sent a chunk absent from its manifest")?;
-            ensure!(
-                header.length == descriptor.length,
-                "remote chunk length mismatch"
-            );
-            let mut bytes = vec![0_u8; header.length as usize];
-            receive.read_exact(&mut bytes).await?;
-            verify_chunk(descriptor, &bytes)?;
-            let chunk_store = Arc::clone(&store);
-            tokio::task::spawn_blocking(move || {
-                chunk_store.chunks().put_verified(header.hash, &bytes)
-            })
-            .await
-            .context("local chunk-store task failed")??;
-            transferred_bytes = transferred_bytes
-                .checked_add(u64::from(header.length))
-                .context("pulled-byte counter overflow")?;
+        let mut writer = ChunkWritePipeline::new(Arc::clone(&store), CHUNK_WRITE_CONCURRENCY);
+        let receive_result = async {
+            let mut transferred_bytes = 0_u64;
+            for expected_hash in missing {
+                let header: ChunkHeader = read_frame(&mut receive).await?;
+                ensure!(
+                    header.hash == expected_hash,
+                    "remote sent an out-of-order chunk"
+                );
+                let descriptor = descriptors
+                    .get(&header.hash)
+                    .context("remote sent a chunk absent from its manifest")?;
+                ensure!(
+                    header.length == descriptor.length,
+                    "remote chunk length mismatch"
+                );
+                let mut bytes = vec![0_u8; header.length as usize];
+                receive.read_exact(&mut bytes).await?;
+                verify_chunk(descriptor, &bytes)?;
+                writer.push(header.hash, bytes).await?;
+                transferred_bytes = transferred_bytes
+                    .checked_add(u64::from(header.length))
+                    .context("pulled-byte counter overflow")?;
+            }
+            Ok(transferred_bytes)
         }
+        .await;
+        let transferred_bytes = finish_chunk_writes(writer, receive_result).await?;
         let receipt = match read_frame::<SyncWireResponse>(&mut receive).await? {
             SyncWireResponse::Applied(receipt) => receipt,
             SyncWireResponse::Error { message } => bail!("remote causal pull failed: {message}"),
@@ -1208,37 +1212,39 @@ impl PushHandler {
             .iter()
             .map(|chunk| (chunk.hash, chunk.clone()))
             .collect();
-        let mut transferred_bytes = 0_u64;
-        for expected_hash in missing {
-            let header: ChunkHeader = read_frame(receive).await?;
-            ensure!(
-                header.hash == expected_hash,
-                "out-of-order chunk: expected {expected_hash}, got {}",
-                header.hash
-            );
-            let descriptor = descriptor_by_hash
-                .get(&header.hash)
-                .context("requested hash disappeared from manifest")?;
-            ensure!(
-                header.length == descriptor.length,
-                "chunk header length does not match manifest"
-            );
-            ensure!(
-                header.length <= manifest.profile.max_size,
-                "chunk exceeds configured maximum"
-            );
-            let mut bytes = vec![0_u8; header.length as usize];
-            receive.read_exact(&mut bytes).await?;
-            verify_chunk(descriptor, &bytes)?;
-
-            let store = Arc::clone(&self.store);
-            tokio::task::spawn_blocking(move || store.chunks().put_verified(header.hash, &bytes))
-                .await
-                .context("chunk-store task failed")??;
-            transferred_bytes = transferred_bytes
-                .checked_add(u64::from(header.length))
-                .context("transferred-byte counter overflow")?;
+        let mut writer = ChunkWritePipeline::new(Arc::clone(&self.store), CHUNK_WRITE_CONCURRENCY);
+        let receive_result = async {
+            let mut transferred_bytes = 0_u64;
+            for expected_hash in missing {
+                let header: ChunkHeader = read_frame(receive).await?;
+                ensure!(
+                    header.hash == expected_hash,
+                    "out-of-order chunk: expected {expected_hash}, got {}",
+                    header.hash
+                );
+                let descriptor = descriptor_by_hash
+                    .get(&header.hash)
+                    .context("requested hash disappeared from manifest")?;
+                ensure!(
+                    header.length == descriptor.length,
+                    "chunk header length does not match manifest"
+                );
+                ensure!(
+                    header.length <= manifest.profile.max_size,
+                    "chunk exceeds configured maximum"
+                );
+                let mut bytes = vec![0_u8; header.length as usize];
+                receive.read_exact(&mut bytes).await?;
+                verify_chunk(descriptor, &bytes)?;
+                writer.push(header.hash, bytes).await?;
+                transferred_bytes = transferred_bytes
+                    .checked_add(u64::from(header.length))
+                    .context("transferred-byte counter overflow")?;
+            }
+            Ok(transferred_bytes)
         }
+        .await;
+        let transferred_bytes = finish_chunk_writes(writer, receive_result).await?;
 
         let _apply_guard = self.apply_lock.lock().await;
         let store = Arc::clone(&self.store);
@@ -1646,6 +1652,143 @@ fn prepare_destination_kind(
     Ok(())
 }
 
+struct InflightWrite {
+    bytes: usize,
+    task: tokio::task::JoinHandle<Result<usize>>,
+}
+
+struct ChunkWritePipeline {
+    store: Arc<Store>,
+    max_inflight: usize,
+    max_queued_bytes: usize,
+    inflight: Vec<InflightWrite>,
+    pending: Vec<(Hash32, Vec<u8>)>,
+}
+
+impl ChunkWritePipeline {
+    fn new(store: Arc<Store>, max_inflight: usize) -> Self {
+        Self::with_limits(store, max_inflight, CHUNK_WRITE_MAX_QUEUED_BYTES)
+    }
+
+    fn with_limits(store: Arc<Store>, max_inflight: usize, max_queued_bytes: usize) -> Self {
+        Self {
+            store,
+            max_inflight: max_inflight.max(1),
+            max_queued_bytes: max_queued_bytes.max(1),
+            inflight: Vec::new(),
+            pending: Vec::new(),
+        }
+    }
+
+    fn queued_bytes(&self) -> usize {
+        self.pending
+            .iter()
+            .map(|(_, bytes)| bytes.len())
+            .sum::<usize>()
+            + self.inflight.iter().map(|write| write.bytes).sum::<usize>()
+    }
+
+    async fn push(&mut self, hash: Hash32, bytes: Vec<u8>) -> Result<()> {
+        while self.queued_bytes() + bytes.len() > self.max_queued_bytes {
+            if !self.pending.is_empty() && self.inflight.len() < self.max_inflight {
+                self.flush_pending().await?;
+                continue;
+            }
+            if self.inflight.is_empty() {
+                break;
+            }
+            self.join_oldest().await?;
+        }
+        self.pending.push((hash, bytes));
+        if self.pending.len() >= CHUNK_WRITE_BATCH || self.queued_bytes() > self.max_queued_bytes {
+            self.flush_pending().await?;
+        }
+        Ok(())
+    }
+
+    async fn finish(mut self) -> Result<()> {
+        let mut first_error = None;
+        if !self.pending.is_empty()
+            && let Err(error) = self.flush_pending().await
+        {
+            first_error = Some(error);
+        }
+        let rest = std::mem::take(&mut self.inflight)
+            .into_iter()
+            .map(|write| write.task)
+            .collect();
+        if let Err(error) = drain_chunk_tasks(rest).await {
+            first_error.get_or_insert(error);
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    async fn join_oldest(&mut self) -> Result<()> {
+        let InflightWrite { task, .. } = self.inflight.remove(0);
+        if let Err(error) = join_chunk_task(task).await {
+            let rest = std::mem::take(&mut self.inflight)
+                .into_iter()
+                .map(|write| write.task)
+                .collect();
+            let drain = drain_chunk_tasks(rest).await;
+            return match drain {
+                Ok(()) => Err(error),
+                Err(drain_error) => Err(error.context(drain_error)),
+            };
+        }
+        Ok(())
+    }
+
+    async fn flush_pending(&mut self) -> Result<()> {
+        if self.inflight.len() >= self.max_inflight {
+            self.join_oldest().await?;
+        }
+        let batch = std::mem::take(&mut self.pending);
+        let bytes = batch.iter().map(|(_, chunk)| chunk.len()).sum();
+        let store = Arc::clone(&self.store);
+        self.inflight.push(InflightWrite {
+            bytes,
+            task: tokio::task::spawn_blocking(move || store.chunks().put_verified_batch(batch)),
+        });
+        Ok(())
+    }
+}
+
+async fn finish_chunk_writes(writer: ChunkWritePipeline, result: Result<u64>) -> Result<u64> {
+    let persist = writer.finish().await;
+    match (result, persist) {
+        (Ok(bytes), Ok(())) => Ok(bytes),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(persist_error)) => {
+            Err(error.context(format!("chunk-store drain also failed: {persist_error:#}")))
+        }
+    }
+}
+
+async fn join_chunk_task(task: tokio::task::JoinHandle<Result<usize>>) -> Result<usize> {
+    match task.await.context("chunk-store task failed") {
+        Ok(Ok(written)) => Ok(written),
+        Ok(Err(error)) | Err(error) => Err(error),
+    }
+}
+
+async fn drain_chunk_tasks(tasks: Vec<tokio::task::JoinHandle<Result<usize>>>) -> Result<()> {
+    let mut first_error = None;
+    for task in tasks {
+        if let Err(error) = join_chunk_task(task).await {
+            first_error.get_or_insert(error);
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
 async fn receive_chunks(
     store: &Arc<Store>,
     receive: &mut RecvStream,
@@ -1657,34 +1800,36 @@ async fn receive_chunks(
         .iter()
         .map(|chunk| (chunk.hash, chunk.clone()))
         .collect();
-    let mut transferred_bytes = 0_u64;
-    for expected_hash in missing {
-        let header: ChunkHeader = read_frame(receive).await?;
-        ensure!(
-            header.hash == expected_hash,
-            "out-of-order chunk: expected {expected_hash}, got {}",
-            header.hash
-        );
-        let descriptor = descriptor_by_hash
-            .get(&header.hash)
-            .context("requested hash disappeared from manifest")?;
-        ensure!(header.length == descriptor.length, "chunk length mismatch");
-        ensure!(
-            header.length <= manifest.profile.max_size,
-            "chunk exceeds configured maximum"
-        );
-        transferred_bytes = transferred_bytes
-            .checked_add(u64::from(header.length))
-            .context("transfer byte count overflow")?;
-        let mut bytes = vec![0_u8; header.length as usize];
-        receive.read_exact(&mut bytes).await?;
-        verify_chunk(descriptor, &bytes)?;
-        let chunk_store = Arc::clone(store);
-        tokio::task::spawn_blocking(move || chunk_store.chunks().put_verified(header.hash, &bytes))
-            .await
-            .context("chunk-store task failed")??;
+    let mut writer = ChunkWritePipeline::new(Arc::clone(store), CHUNK_WRITE_CONCURRENCY);
+    let receive_result = async {
+        let mut transferred_bytes = 0_u64;
+        for expected_hash in missing {
+            let header: ChunkHeader = read_frame(receive).await?;
+            ensure!(
+                header.hash == expected_hash,
+                "out-of-order chunk: expected {expected_hash}, got {}",
+                header.hash
+            );
+            let descriptor = descriptor_by_hash
+                .get(&header.hash)
+                .context("requested hash disappeared from manifest")?;
+            ensure!(header.length == descriptor.length, "chunk length mismatch");
+            ensure!(
+                header.length <= manifest.profile.max_size,
+                "chunk exceeds configured maximum"
+            );
+            transferred_bytes = transferred_bytes
+                .checked_add(u64::from(header.length))
+                .context("transfer byte count overflow")?;
+            let mut bytes = vec![0_u8; header.length as usize];
+            receive.read_exact(&mut bytes).await?;
+            verify_chunk(descriptor, &bytes)?;
+            writer.push(header.hash, bytes).await?;
+        }
+        Ok(transferred_bytes)
     }
-    Ok(transferred_bytes)
+    .await;
+    finish_chunk_writes(writer, receive_result).await
 }
 
 fn sync_local_path(root: &Path, path: &WirePath) -> PathBuf {
@@ -1848,6 +1993,149 @@ mod tests {
             readonly: false,
             version: version(label, counter),
             tombstone: false,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn chunk_writer_drain_waits_for_all_tasks_after_first_error() {
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let delayed_completed = Arc::clone(&completed);
+        let failed = tokio::task::spawn_blocking(|| bail!("expected writer failure"));
+        let delayed = tokio::task::spawn_blocking(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            delayed_completed.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(1)
+        });
+
+        let result = drain_chunk_tasks(vec![delayed, failed]).await;
+
+        assert!(result.is_err());
+        assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn chunk_writer_flush_drains_remaining_after_oldest_fails() {
+        let state = TempDir::new().expect("state directory can be created");
+        let store = Arc::new(Store::open(state.path()).expect("store can open"));
+        let mut writer = ChunkWritePipeline::new(Arc::clone(&store), 2);
+        let invalid = Hash32::digest(b"not-the-payload");
+        for index in 0..CHUNK_WRITE_BATCH {
+            let bytes = fixture(64 * 1024 + index);
+            writer
+                .push(invalid, bytes)
+                .await
+                .expect("invalid batch is queued before persistence");
+        }
+        let good: Vec<_> = (CHUNK_WRITE_BATCH..CHUNK_WRITE_BATCH * 2)
+            .map(|index| {
+                let bytes = fixture(64 * 1024 + index);
+                (Hash32::digest(&bytes), bytes)
+            })
+            .collect();
+        for (hash, bytes) in &good {
+            writer
+                .push(*hash, bytes.clone())
+                .await
+                .expect("second batch is queued before the oldest task is joined");
+        }
+        let mut result = Ok(());
+        for index in CHUNK_WRITE_BATCH * 2..CHUNK_WRITE_BATCH * 3 {
+            let bytes = fixture(64 * 1024 + index);
+            if let Err(error) = writer.push(Hash32::digest(&bytes), bytes).await {
+                result = Err(error);
+                break;
+            }
+        }
+
+        assert!(result.is_err(), "oldest invalid batch must fail the flush");
+        for (hash, bytes) in good {
+            assert_eq!(
+                store
+                    .chunks()
+                    .read_verified(hash)
+                    .expect("later in-flight batch is drained after the oldest failure"),
+                bytes
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn chunk_writer_flushes_when_queued_bytes_exceed_budget() {
+        let state = TempDir::new().expect("state directory can be created");
+        let store = Arc::new(Store::open(state.path()).expect("store can open"));
+        let first = fixture(64 * 1024);
+        let first_hash = Hash32::digest(&first);
+        let second = fixture(64 * 1024 + 1);
+        let second_hash = Hash32::digest(&second);
+        let mut writer = ChunkWritePipeline::with_limits(Arc::clone(&store), 1, first.len() + 1);
+
+        writer
+            .push(first_hash, first.clone())
+            .await
+            .expect("first chunk stays pending under the byte budget");
+        assert_eq!(writer.inflight.len(), 0);
+        assert_eq!(writer.pending.len(), 1);
+
+        writer
+            .push(second_hash, second.clone())
+            .await
+            .expect("second chunk flushes the pending batch to stay in budget");
+        assert!(
+            writer.queued_bytes() <= first.len() + 1,
+            "pipeline stays at or under the configured byte budget after enqueue"
+        );
+        writer
+            .finish()
+            .await
+            .expect("budget-limited pipeline persists both chunks");
+
+        assert_eq!(
+            store
+                .chunks()
+                .read_verified(first_hash)
+                .expect("first budgeted chunk can be read"),
+            first
+        );
+        assert_eq!(
+            store
+                .chunks()
+                .read_verified(second_hash)
+                .expect("second budgeted chunk can be read"),
+            second
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bounded_chunk_writer_persists_every_verified_chunk() {
+        let state = TempDir::new().expect("state directory can be created");
+        let store = Arc::new(Store::open(state.path()).expect("store can open"));
+        let chunks: Vec<_> = (0..32)
+            .map(|index| {
+                let bytes = fixture(64 * 1024 + index);
+                (Hash32::digest(&bytes), bytes)
+            })
+            .collect();
+        let mut writer = ChunkWritePipeline::new(Arc::clone(&store), 4);
+
+        for (hash, bytes) in &chunks {
+            writer
+                .push(*hash, bytes.clone())
+                .await
+                .expect("verified chunk can enter the write pipeline");
+        }
+        writer
+            .finish()
+            .await
+            .expect("all queued chunks are durably stored");
+
+        for (hash, bytes) in chunks {
+            assert_eq!(
+                store
+                    .chunks()
+                    .read_verified(hash)
+                    .expect("pipeline chunk can be read"),
+                bytes
+            );
         }
     }
 

@@ -60,6 +60,65 @@ impl ChunkStore {
     /// Returns `true` when new bytes were written and `false` when a verified chunk
     /// already existed.
     pub fn put_verified(&self, hash: Hash32, bytes: &[u8]) -> Result<bool> {
+        match self.install_verified_chunk(hash, bytes)? {
+            Some(parent) => {
+                sync_directory(Some(&parent))?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Stores many verified chunks, fsyncing each file and each unique parent once.
+    ///
+    /// All hashes are checked before any durable write. Returns the number of newly
+    /// installed chunks.
+    pub fn put_verified_batch(
+        &self,
+        chunks: impl IntoIterator<Item = (Hash32, Vec<u8>)>,
+    ) -> Result<usize> {
+        self.put_verified_batch_with_sync(chunks, |parent| sync_directory(Some(parent)))
+    }
+
+    fn put_verified_batch_with_sync(
+        &self,
+        chunks: impl IntoIterator<Item = (Hash32, Vec<u8>)>,
+        mut sync_parent: impl FnMut(&Path) -> Result<()>,
+    ) -> Result<usize> {
+        let chunks: Vec<_> = chunks.into_iter().collect();
+        for (hash, bytes) in &chunks {
+            let actual = Hash32::digest(bytes);
+            if actual != *hash {
+                bail!("refusing chunk {hash}: supplied bytes hash to {actual}");
+            }
+        }
+
+        let mut written = 0_usize;
+        let mut parents = std::collections::BTreeSet::new();
+        let mut install_error = None;
+        for (hash, bytes) in chunks {
+            match self.install_verified_chunk(hash, &bytes) {
+                Ok(Some(parent)) => {
+                    parents.insert(parent);
+                    written += 1;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    install_error = Some(error);
+                    break;
+                }
+            }
+        }
+        for parent in parents {
+            sync_parent(&parent)?;
+        }
+        if let Some(error) = install_error {
+            return Err(error);
+        }
+        Ok(written)
+    }
+
+    fn install_verified_chunk(&self, hash: Hash32, bytes: &[u8]) -> Result<Option<PathBuf>> {
         let actual = Hash32::digest(bytes);
         if actual != hash {
             bail!("refusing chunk {hash}: supplied bytes hash to {actual}");
@@ -68,7 +127,7 @@ impl ChunkStore {
         let destination = self.chunk_path(hash);
         if destination.is_file() {
             match self.read_verified(hash) {
-                Ok(_) => return Ok(false),
+                Ok(_) => return Ok(None),
                 Err(_) => {
                     let quarantine = self.unique_path(&self.trash, "corrupt", hash);
                     if let Some(parent) = quarantine.parent() {
@@ -105,7 +164,7 @@ impl ChunkStore {
                 existing.with_context(|| {
                     format!("chunk race left invalid destination after {error}")
                 })?;
-                return Ok(false);
+                return Ok(None);
             }
             Err(error) => {
                 let _ = fs::remove_file(&temporary);
@@ -113,8 +172,7 @@ impl ChunkStore {
                     .with_context(|| format!("failed to install chunk {}", destination.display()));
             }
         }
-        sync_directory(destination.parent())?;
-        Ok(true)
+        Ok(destination.parent().map(Path::to_path_buf))
     }
 
     /// Reads a chunk and verifies its name against its content.
@@ -663,6 +721,82 @@ mod tests {
                 .put_verified(chunk.hash, &data)
                 .expect("chunk can be stored");
         }
+    }
+
+    #[test]
+    fn chunk_store_batch_commits_verified_chunks() {
+        let temp = TempDir::new().expect("temporary directory can be created");
+        let store = ChunkStore::open(temp.path()).expect("chunk store can open");
+        let chunks: Vec<_> = (0..32)
+            .map(|index| {
+                let bytes = fixture(64 * 1024 + index);
+                (Hash32::digest(&bytes), bytes)
+            })
+            .collect();
+
+        let written = store
+            .put_verified_batch(chunks.clone())
+            .expect("verified batch can be committed");
+
+        assert_eq!(written, chunks.len());
+        for (hash, bytes) in chunks {
+            assert_eq!(
+                store.read_verified(hash).expect("batch chunk can be read"),
+                bytes
+            );
+        }
+    }
+
+    #[test]
+    fn chunk_store_batch_syncs_installed_parents_before_returning_later_error() {
+        let temp = TempDir::new().expect("temporary directory can be created");
+        let store = ChunkStore::open(temp.path()).expect("chunk store can open");
+        let first = fixture(64 * 1024);
+        let first_hash = Hash32::digest(&first);
+        let mut second = fixture(64 * 1024 + 1);
+        let second_hash = loop {
+            let hash = Hash32::digest(&second);
+            if hash.to_hex()[..2] != first_hash.to_hex()[..2] {
+                break hash;
+            }
+            second.push(1);
+        };
+        let blocked_parent = store
+            .chunk_path(second_hash)
+            .parent()
+            .expect("chunk path has a parent")
+            .to_path_buf();
+        fs::write(&blocked_parent, b"not a directory").expect("blocked parent can be created");
+        let mut synced = Vec::new();
+
+        let result = store.put_verified_batch_with_sync(
+            vec![(first_hash, first), (second_hash, second)],
+            |parent| {
+                synced.push(parent.to_path_buf());
+                Ok(())
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(store.contains(first_hash));
+        assert_eq!(synced, vec![store.chunk_path(first_hash).parent().unwrap()]);
+    }
+
+    #[test]
+    fn chunk_store_batch_rejects_before_installing_any_chunk() {
+        let temp = TempDir::new().expect("temporary directory can be created");
+        let store = ChunkStore::open(temp.path()).expect("chunk store can open");
+        let good = fixture(64 * 1024);
+        let good_hash = Hash32::digest(&good);
+        let invalid_hash = Hash32::digest(b"different");
+
+        assert!(
+            store
+                .put_verified_batch(vec![(good_hash, good), (invalid_hash, b"bad".to_vec())])
+                .is_err()
+        );
+        assert!(!store.contains(good_hash));
+        assert!(!store.contains(invalid_hash));
     }
 
     #[test]
