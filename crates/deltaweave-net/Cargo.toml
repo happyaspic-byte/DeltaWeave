@@ -18,9 +18,13 @@ deltaweave-store = { path = "../deltaweave-store" }
 hex.workspace = true
 iroh.workspace = true
 postcard.workspace = true
+redb.workspace = true
 serde.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+winapi-util.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

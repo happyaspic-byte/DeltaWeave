@@ -12,6 +12,7 @@ publish.workspace = true
 anyhow.workspace = true
 blake3.workspace = true
 deltaweave-core = { path = "../deltaweave-core" }
+deltaweave-store = { path = "../deltaweave-store" }
 icu_casemap.workspace = true
 notify.workspace = true
 postcard.workspace = true

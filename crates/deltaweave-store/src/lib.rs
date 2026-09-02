@@ -465,11 +465,13 @@ impl Store {
             let operation = committed_operation(path, manifest);
             self.metadata.put_manifest(path, manifest)?;
             self.metadata.put_operation(&operation)?;
+            let observation = materialization_observation(&destination, manifest.file_hash)?;
             return Ok(MaterializeOutcome {
                 destination,
                 bytes_written: 0,
                 replaced_existing: false,
                 already_current: true,
+                observation,
             });
         }
 
@@ -554,11 +556,13 @@ impl Store {
             ..operation
         })?;
 
+        let observation = materialization_observation(&destination, manifest.file_hash)?;
         Ok(MaterializeOutcome {
             destination,
             bytes_written: manifest.size,
             replaced_existing,
             already_current: false,
+            observation,
         })
     }
 
@@ -652,6 +656,80 @@ impl Store {
     }
 }
 
+/// Metadata captured immediately after verified local materialization.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterializationObservation {
+    file_hash: Hash32,
+    identity: Option<(u64, u64)>,
+    size: u64,
+    modified_ns: Option<u128>,
+    changed_ns: Option<u128>,
+    readonly: bool,
+}
+
+impl MaterializationObservation {
+    /// Verified whole-file digest associated with this observation.
+    #[must_use]
+    pub const fn file_hash(&self) -> Hash32 {
+        self.file_hash
+    }
+
+    /// Best-effort stable filesystem identity.
+    #[must_use]
+    pub const fn identity(&self) -> Option<(u64, u64)> {
+        self.identity
+    }
+
+    /// Observed file length.
+    #[must_use]
+    pub const fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// Observed modification time in Unix-epoch nanoseconds.
+    #[must_use]
+    pub const fn modified_ns(&self) -> Option<u128> {
+        self.modified_ns
+    }
+
+    /// Observed inode change time in Unix-epoch nanoseconds when the platform exposes it.
+    #[must_use]
+    pub const fn changed_ns(&self) -> Option<u128> {
+        self.changed_ns
+    }
+
+    /// Observed read-only state.
+    #[must_use]
+    pub const fn readonly(&self) -> bool {
+        self.readonly
+    }
+
+    /// Recaptures the observation after an intentional readonly chmod.
+    ///
+    /// Identity, size, and mtime must remain unchanged. Unix chmod updates ctime, so that field
+    /// is allowed to change. This does not exclude concurrent writers; it only rejects identity,
+    /// size, or mtime drift around the permission update.
+    pub fn after_readonly_update(&self, path: impl AsRef<Path>, readonly: bool) -> Result<Self> {
+        let path = path.as_ref();
+        let before = materialization_observation(path, self.file_hash)?;
+        if before != *self {
+            bail!("materialized file changed before readonly update");
+        }
+        apply_readonly(path, readonly)?;
+        let after = materialization_observation(path, self.file_hash)?;
+        if after.identity != before.identity
+            || after.size != before.size
+            || after.modified_ns != before.modified_ns
+        {
+            bail!("materialized file identity, size, or mtime changed during readonly update");
+        }
+        if after.readonly != readonly {
+            bail!("materialized file readonly state did not match the requested update");
+        }
+        Ok(after)
+    }
+}
+
 /// Result of safely materializing one file.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaterializeOutcome {
@@ -663,6 +741,8 @@ pub struct MaterializeOutcome {
     pub replaced_existing: bool,
     /// Whether the destination already contained the requested content.
     pub already_current: bool,
+    /// Metadata fingerprint captured after the verified file was installed.
+    pub observation: MaterializationObservation,
 }
 
 /// Result of an idempotent path deletion.
@@ -710,6 +790,93 @@ fn checked_destination(root: &Path, path: &WirePath) -> Result<PathBuf> {
         }
     }
     Ok(destination)
+}
+
+fn materialization_observation(
+    path: &Path,
+    file_hash: Hash32,
+) -> Result<MaterializationObservation> {
+    let metadata = fs::symlink_metadata(path)?;
+    ensure_regular_file(&metadata, path)?;
+    Ok(MaterializationObservation {
+        file_hash,
+        identity: file_identity(path, &metadata),
+        size: metadata.len(),
+        modified_ns: modified_ns(&metadata),
+        changed_ns: change_time_ns(&metadata),
+        readonly: metadata.permissions().readonly(),
+    })
+}
+
+fn ensure_regular_file(metadata: &std::fs::Metadata, path: &Path) -> Result<()> {
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("{} is not a regular file", path.display());
+    }
+    Ok(())
+}
+
+fn modified_ns(metadata: &std::fs::Metadata) -> Option<u128> {
+    metadata
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_nanos())
+}
+
+#[cfg(unix)]
+fn change_time_ns(metadata: &std::fs::Metadata) -> Option<u128> {
+    use std::os::unix::fs::MetadataExt;
+    let seconds = u128::try_from(metadata.ctime()).ok()?;
+    let nanos = u128::try_from(metadata.ctime_nsec()).ok()?;
+    Some(seconds.saturating_mul(1_000_000_000).saturating_add(nanos))
+}
+
+#[cfg(not(unix))]
+fn change_time_ns(_metadata: &std::fs::Metadata) -> Option<u128> {
+    None
+}
+
+fn apply_readonly(path: &Path, readonly: bool) -> Result<()> {
+    let mut permissions = fs::symlink_metadata(path)?.permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = permissions.mode();
+        permissions.set_mode(if readonly {
+            mode & !0o222
+        } else {
+            mode | 0o200
+        });
+    }
+    #[cfg(not(unix))]
+    permissions.set_readonly(readonly);
+    fs::set_permissions(path, permissions)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn file_identity(_path: &Path, metadata: &std::fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    if metadata.ino() == 0 {
+        return None;
+    }
+    Some((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(windows)]
+fn file_identity(path: &Path, _metadata: &std::fs::Metadata) -> Option<(u64, u64)> {
+    let handle = winapi_util::Handle::from_path_any(path).ok()?;
+    let information = winapi_util::file::information(&handle).ok()?;
+    if information.file_index() == 0 {
+        return None;
+    }
+    Some((information.volume_serial_number(), information.file_index()))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn file_identity(_path: &Path, _metadata: &std::fs::Metadata) -> Option<(u64, u64)> {
+    None
 }
 
 fn hash_file(path: &Path) -> Result<Hash32> {
@@ -1052,6 +1219,19 @@ mod tests {
             .expect("same file is idempotent");
         assert!(second.already_current);
         assert_eq!(second.bytes_written, 0);
+        assert_eq!(second.observation.file_hash(), manifest.file_hash);
+        assert_eq!(second.observation.size(), manifest.size);
+        assert!(!second.observation.readonly());
+
+        let readonly = second
+            .observation
+            .after_readonly_update(&second.destination, true)
+            .expect("readonly update recaptures the observation");
+        assert!(readonly.readonly());
+        assert_eq!(readonly.file_hash(), second.observation.file_hash());
+        assert_eq!(readonly.identity(), second.observation.identity());
+        assert_eq!(readonly.size(), second.observation.size());
+        assert_eq!(readonly.modified_ns(), second.observation.modified_ns());
     }
 
     #[test]

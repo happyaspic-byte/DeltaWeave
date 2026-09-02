@@ -281,6 +281,24 @@ mod tests {
     }
 
     #[test]
+    fn path_manifest_leaves_the_file_handle_usable_for_metadata() {
+        let directory = tempfile::tempdir().expect("temporary directory can be created");
+        let path = directory.path().join("handle.bin");
+        std::fs::write(&path, fixture(1024)).expect("file can be written");
+        let mut file = File::open(&path).expect("file can be opened");
+        let before = file
+            .metadata()
+            .expect("metadata can be read before chunking");
+        let manifest = manifest_from_reader(&mut file, ChunkingProfile::DEFAULT)
+            .expect("open file handle can be chunked");
+        let after = file
+            .metadata()
+            .expect("same file handle remains usable after chunking");
+        assert_eq!(manifest.size, before.len());
+        assert_eq!(after.len(), before.len());
+    }
+
+    #[test]
     fn small_files_keep_the_requested_default_profile() {
         let directory = tempfile::tempdir().expect("temporary directory can be created");
         let path = directory.path().join("small.bin");

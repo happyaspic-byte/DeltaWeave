@@ -11,6 +11,20 @@ Versioning after its first stable release.
 
 ### Changed
 
+- Adopt verified materialized files from a locally produced metadata observation
+  instead of rehashing the complete destination after a successful push. The
+  no-rehash fast path requires a reliable change-time token (Unix inode ctime)
+  on both the observation and current fingerprint. Windows and other platforms
+  without that token fall back to `hash_stable_file` and still compare the
+  expected record. Readonly recapture allows ctime to change for chmod while
+  requiring identity, size, and mtime to stay put.
+- Cache unchanged sender manifests in an optional `push --state` redb directory
+  when a stable file identity and reliable change-time are available. Cache keys
+  include generator/schema version, effective profile, identity, size, mtime,
+  Unix ctime, and readonly state. Cache hits recheck the already-opened file
+  handle. Missing identity, missing change-time (Windows/non-Unix), omitted
+  `--state`, and lock/cache errors fail open and fresh-generate; requested
+  chunks are still byte-verified.
 - Automatically use a measured 512 KiB / 1 MiB / 4 MiB FastCDC profile for files
   of at least 8 GiB when default chunk settings are selected, keeping 10–70 GiB
   manifests below protocol limits while reducing chunk-file and fsync overhead.
