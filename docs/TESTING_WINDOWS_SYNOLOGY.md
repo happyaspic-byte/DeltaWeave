@@ -127,6 +127,7 @@ mkdir -p received state
   --state ./state \
   --identity ./receiver.key \
   --allow-peer <WINDOWS_ENDPOINT_ID> \
+  --bind 0.0.0.0:49152 \
   --direct-only
 ```
 
@@ -136,7 +137,7 @@ mkdir -p received state
 - Windows에서 접근 가능한 `direct_addresses`의 `IP:UDP_PORT`
 
 같은 LAN이면 Synology LAN IP를, Tailscale을 사용하면 Synology Tailscale IP가
-포함된 주소를 선택합니다. DSM 방화벽을 사용한다면 출력된 UDP 포트를 허용합니다.
+포함된 주소를 선택합니다. DSM 방화벽을 사용한다면 `--bind`로 고정한 UDP 포트를 허용합니다.
 
 ## 6. Windows에서 실제 파일 전송
 

@@ -5,6 +5,10 @@ Versioning after its first stable release.
 
 ## [Unreleased]
 
+### Added
+
+- Add `serve --bind <IP:PORT>` for a stable receiver UDP address across restarts.
+
 ### Changed
 
 - Persist received chunks through a bounded overlapping write pipeline so durable
