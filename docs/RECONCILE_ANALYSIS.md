@@ -287,6 +287,7 @@ Hash 비교는 cryptographic commitment이지만 remote filesystem의 진실성�
 - **일부 object kind는 보존 copy 대상이 아님:** losing regular file만 conflict copy가 가능하고 symlink/special object materialization도 상위 계층에서 허용되지 않는다.
 - **metadata 범위가 제한적:** directory mtime과 directory readonly는 portable state에서 정규화되며 regular-file readonly만 유지된다.
 - **충돌 이름 namespace가 유한:** hash prefix와 10,000개 serial을 모두 점유하면 병합이 실패한다.
+- **긴 conflict 경로 생성도 실패할 수 있음:** byte budget에 맞춰 줄인 stem이 Windows 예약 이름이 되면 `WirePath::new`가 `ConflictPath` 오류를 반환한다. 예를 들어 충분히 긴 parent 아래 `config.txt`의 stem이 `con`으로 줄어드는 경우다. 이는 silent overwrite가 아니라 해당 merge round의 명시적 실패다.
 - **정확한 Byzantine proof는 아님:** 인증된 peer가 제공한 snapshot의 hash 일관성을 확인하지만, 외부 신뢰 기준으로 remote storage를 증명하지 않는다.
 
 ## 9. 복잡도와 성능 특성
@@ -300,6 +301,7 @@ Hash 비교는 cryptographic commitment이지만 remote filesystem의 진실성�
 | `different_paths` | 동일 subtree는 `O(1)` prune, 최악 `O(C)` | 출력은 changed/one-sided paths에 비례 |
 | remote snapshot | 일치 root는 1 query, 최악 node 수에 비례 | 방문 node의 immediate-child summaries + 복원 records |
 | `actions_to_reach` | diff traversal + changed path lookup | action 수는 desired와 다른 경로 수에 비례 |
+| remote apply | incoming action마다 receiver index 전체 scan | action 수가 많으면 반복 scan이 지배적 비용이 될 수 있음 |
 
 현재 구현은 snapshot과 merge를 memory에 완전히 materialize한다. Merkle protocol은 네트워크에서 불필요한 remote record 전송을 줄이지만, 양쪽 모두 local complete index와 tree를 구성하는 비용까지 없애지는 않는다.
 
@@ -317,7 +319,9 @@ Hash 비교는 cryptographic commitment이지만 remote filesystem의 진실성�
 | incoming causal precondition | 같은 파일의 `ensure_causally_applicable` |
 | stage, apply ordering, 최종 root 검증 | `crates/deltaweave-sync/src/lib.rs`의 `sync_with_session`, `apply_local`, `apply_remote` |
 
-## 11. 요약
+## 11. 코드 대조 결론
+
+현재 `deltaweave-core`, `deltaweave-reconcile`, `deltaweave-net`, `deltaweave-sync` 구현과 절별 설명을 대조한 결과, 주요 동작 설명은 코드와 일치한다. 다만 8.2와 9절의 conflict path 생성 실패 가능성과 action별 receiver 재스캔 비용은 안전성·성능 해석 시 함께 고려해야 한다.
 
 `deltaweave-reconcile`의 핵심은 **version vector로 최신 상태와 동시 상태를 구분하고, divergent concurrency는 hash 기반의 방향 독립 규칙으로 한 번만 해소하며, losing file bytes를 결정적 sibling path에 보존하는 것**이다. 해소 결과에는 양쪽 causal knowledge와 가상 resolver event가 들어가므로 다음 pass에서 다시 충돌하지 않는다.
 
