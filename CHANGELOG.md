@@ -5,8 +5,13 @@ Versioning after its first stable release.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-04
+
 ### Added
 
+- Add a deterministic `fault-test` command and wrapper that exercise real child-process termination, active-transfer network interruption, durable-state restart, Merkle convergence, and zero-action replay.
+- Preserve seed, ordered operations, peer logs, root/state paths, fault barriers, and final reports for failed fault-injection runs.
+- Add shipped-CLI integration tests covering process kills, deterministic repeated seeds, restart recovery, and failure-bundle preservation.
 - Add `serve --bind <IP:PORT>` for a stable receiver UDP address across restarts.
 
 ### Changed

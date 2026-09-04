@@ -603,7 +603,7 @@ dependencies = [
 
 [[package]]
 name = "deltaweave"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -612,6 +612,7 @@ dependencies = [
  "deltaweave-index",
  "deltaweave-net",
  "deltaweave-sync",
+ "hex",
  "iroh",
  "serde",
  "serde_json",
@@ -622,7 +623,7 @@ dependencies = [
 
 [[package]]
 name = "deltaweave-cdc"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "blake3",
  "deltaweave-core",
@@ -633,7 +634,7 @@ dependencies = [
 
 [[package]]
 name = "deltaweave-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "blake3",
  "hex",
@@ -644,7 +645,7 @@ dependencies = [
 
 [[package]]
 name = "deltaweave-index"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -663,7 +664,7 @@ dependencies = [
 
 [[package]]
 name = "deltaweave-net"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "deltaweave-cdc",
@@ -684,7 +685,7 @@ dependencies = [
 
 [[package]]
 name = "deltaweave-reconcile"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "blake3",
  "deltaweave-core",
@@ -695,7 +696,7 @@ dependencies = [
 
 [[package]]
 name = "deltaweave-store"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -710,7 +711,7 @@ dependencies = [
 
 [[package]]
 name = "deltaweave-sync"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "deltaweave-core",

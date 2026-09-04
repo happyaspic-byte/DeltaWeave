@@ -3,11 +3,12 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     fs,
     io::Write,
     net::SocketAddr,
     path::{Path, PathBuf},
+    process::{Child, Command as ProcessCommand, Stdio},
     time::{Duration, Instant},
 };
 
@@ -22,6 +23,7 @@ use deltaweave_net::{
 };
 use deltaweave_sync::{SyncConfig, SyncEngine};
 use iroh::{EndpointId, SecretKey};
+use serde::Serialize;
 use serde_json::json;
 use tracing_subscriber::EnvFilter;
 
@@ -57,6 +59,8 @@ enum Command {
     Sync(SyncArgs),
     /// Run an isolated local end-to-end transfer and delta-reuse check.
     SelfTest,
+    /// Run the deterministic restart and network fault-injection scenario.
+    FaultTest(FaultTestArgs),
 }
 
 #[derive(Debug, Args)]
@@ -228,6 +232,22 @@ struct SyncTargetArgs {
 }
 
 #[derive(Debug, Args)]
+struct FaultTestArgs {
+    /// Seed controlling identities, file bytes, and operation order.
+    #[arg(long, default_value_t = 424_242)]
+    seed: u64,
+    /// Durable evidence directory. Removed after success unless explicitly supplied.
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+    /// Payload size used to keep active-transfer barriers observable.
+    #[arg(long, default_value_t = 16)]
+    payload_mib: usize,
+    /// Deliberately fail after writing the complete reproduction bundle.
+    #[arg(long)]
+    force_failure: bool,
+}
+
+#[derive(Debug, Args)]
 struct SyncArgs {
     #[command(flatten)]
     target: SyncTargetArgs,
@@ -262,6 +282,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::SyncOnce(args) => sync_once(args).await,
         Command::Sync(args) => sync_forever(args).await,
         Command::SelfTest => self_test().await,
+        Command::FaultTest(args) => fault_test(args).await,
     }
 }
 
@@ -634,6 +655,585 @@ fn open_index(mut args: IndexArgs) -> Result<LocalIndex> {
         options.hash_workers = workers;
     }
     LocalIndex::open(args.root, args.state, replica, options)
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct FaultOperation {
+    sequence: usize,
+    peer: &'static str,
+    kind: &'static str,
+    path: String,
+    destination: Option<String>,
+    content_hash: Option<Hash32>,
+    status: &'static str,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct FaultEvidence {
+    barrier: &'static str,
+    killed_process: &'static str,
+    pid: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct FaultTestReport {
+    status: String,
+    seed: u64,
+    operations: Vec<FaultOperation>,
+    faults: Vec<FaultEvidence>,
+    peer_logs: BTreeMap<&'static str, String>,
+    roots: BTreeMap<&'static str, String>,
+    states: BTreeMap<&'static str, String>,
+    final_merkle_root: Option<Hash32>,
+    restart_local_actions: Option<usize>,
+    restart_remote_actions: Option<usize>,
+    bundle: String,
+    error: Option<String>,
+}
+
+fn seeded_bytes(seed: u64, label: &str, length: usize) -> Vec<u8> {
+    let digest = Hash32::digest(label.as_bytes());
+    let mut word = [0_u8; 8];
+    word.copy_from_slice(&digest.as_bytes()[..8]);
+    let mut value = seed ^ u64::from_le_bytes(word);
+    (0..length)
+        .map(|index| {
+            value = value
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (value >> 32) as u8 ^ index as u8
+        })
+        .collect()
+}
+
+fn seeded_key(seed: u64, label: &str) -> SecretKey {
+    let mut material = seed.to_le_bytes().to_vec();
+    material.extend_from_slice(label.as_bytes());
+    SecretKey::from_bytes(Hash32::digest(&material).as_bytes())
+}
+
+fn write_identity(path: &Path, key: &SecretKey) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, format!("{}\n", hex::encode(key.to_bytes())))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+fn executable() -> Result<PathBuf> {
+    std::env::current_exe().context("failed to locate shipped CLI executable")
+}
+
+fn append_operation(log: &Path, operation: &FaultOperation) -> Result<()> {
+    let mut file = fs::OpenOptions::new().create(true).append(true).open(log)?;
+    serde_json::to_writer(&mut file, operation)?;
+    writeln!(file)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn filesystem_snapshot(root: &Path) -> Result<BTreeMap<String, Hash32>> {
+    fn visit(base: &Path, current: &Path, output: &mut BTreeMap<String, Hash32>) -> Result<()> {
+        let mut entries = fs::read_dir(current)?.collect::<std::io::Result<Vec<_>>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            ensure!(
+                !metadata.file_type().is_symlink(),
+                "fault-test root contains a symlink"
+            );
+            if metadata.is_dir() {
+                visit(base, &path, output)?;
+            } else if metadata.is_file() {
+                let relative = path
+                    .strip_prefix(base)?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                output.insert(relative, Hash32::digest(&fs::read(path)?));
+            }
+        }
+        Ok(())
+    }
+    let mut output = BTreeMap::new();
+    visit(root, root, &mut output)?;
+    Ok(output)
+}
+
+fn reserve_udp_port() -> Result<u16> {
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0")?;
+    Ok(socket.local_addr()?.port())
+}
+
+fn spawn_server(
+    binary: &Path,
+    root: &Path,
+    state: &Path,
+    identity: &Path,
+    allowed_peer: &str,
+    port: u16,
+    log: &Path,
+) -> Result<Child> {
+    let stdout = fs::OpenOptions::new().create(true).append(true).open(log)?;
+    let stderr = stdout.try_clone()?;
+    ProcessCommand::new(binary)
+        .args(["serve", "--root"])
+        .arg(root)
+        .arg("--state")
+        .arg(state)
+        .arg("--identity")
+        .arg(identity)
+        .arg("--allow-peer")
+        .arg(allowed_peer)
+        .arg("--bind")
+        .arg(format!("127.0.0.1:{port}"))
+        .arg("--direct-only")
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .spawn()
+        .context("failed to spawn shipped serve process")
+}
+
+fn sync_command(
+    binary: &Path,
+    root: &Path,
+    state: &Path,
+    identity: &Path,
+    peer: &str,
+    port: u16,
+    log: &Path,
+) -> Result<ProcessCommand> {
+    let stdout = fs::OpenOptions::new().create(true).append(true).open(log)?;
+    let stderr = stdout.try_clone()?;
+    let mut command = ProcessCommand::new(binary);
+    command
+        .args(["sync-once", "--root"])
+        .arg(root)
+        .arg("--state")
+        .arg(state)
+        .arg("--identity")
+        .arg(identity)
+        .arg("--peer")
+        .arg(peer)
+        .arg("--direct")
+        .arg(format!("127.0.0.1:{port}"))
+        .arg("--direct-only")
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    Ok(command)
+}
+
+fn wait_for_server(child: &mut Child) -> Result<()> {
+    for _ in 0..100 {
+        ensure!(
+            child.try_wait()?.is_none(),
+            "serve process exited before readiness"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Ok(())
+}
+
+fn chunk_file_count(path: &Path) -> Result<usize> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    let mut count = 0;
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        count += if entry.file_type()?.is_dir() {
+            chunk_file_count(&entry.path())?
+        } else if entry.metadata()?.len() > 0 {
+            1
+        } else {
+            0
+        };
+    }
+    Ok(count)
+}
+
+fn chunk_exists_while_destination_absent(
+    chunks: &Path,
+    destination: &Path,
+    baseline_chunks: usize,
+) -> Result<bool> {
+    fn chunk_count(path: &Path) -> Result<usize> {
+        if !path.exists() {
+            return Ok(0);
+        }
+        let mut count = 0;
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            count += if entry.file_type()?.is_dir() {
+                chunk_count(&entry.path())?
+            } else if entry.metadata()?.len() > 0 {
+                1
+            } else {
+                0
+            };
+        }
+        Ok(count)
+    }
+    Ok(!destination.exists() && chunk_count(chunks)? > baseline_chunks)
+}
+
+fn wait_active_transfer(
+    child: &mut Child,
+    state: &Path,
+    destination: &Path,
+    baseline_chunks: usize,
+) -> Result<()> {
+    for _ in 0..3_000 {
+        ensure!(
+            child.try_wait()?.is_none(),
+            "transfer process exited before active-transfer barrier"
+        );
+        if chunk_exists_while_destination_absent(state, destination, baseline_chunks)? {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    bail!("active payload barrier was not observed")
+}
+
+fn run_sync(command: &mut ProcessCommand) -> Result<()> {
+    let status = command.status()?;
+    ensure!(
+        status.success(),
+        "shipped sync-once process failed with {status}"
+    );
+    Ok(())
+}
+
+fn write_fault_report(path: &Path, report: &FaultTestReport) -> Result<()> {
+    fs::write(path, serde_json::to_vec_pretty(report)?)?;
+    Ok(())
+}
+
+async fn fault_test(args: FaultTestArgs) -> Result<()> {
+    let temporary = if args.workspace.is_none() {
+        Some(tempfile::tempdir()?)
+    } else {
+        None
+    };
+    let workspace = args.workspace.clone().unwrap_or_else(|| {
+        temporary
+            .as_ref()
+            .expect("temporary workspace")
+            .path()
+            .to_path_buf()
+    });
+    fs::create_dir_all(&workspace)?;
+    let report_path = workspace.join("report.json");
+    let roots = BTreeMap::from([
+        ("windows", display_path(&workspace.join("roots/windows"))),
+        ("synology", display_path(&workspace.join("roots/synology"))),
+    ]);
+    let states = BTreeMap::from([
+        ("windows", display_path(&workspace.join("states/windows"))),
+        ("synology", display_path(&workspace.join("states/synology"))),
+    ]);
+    let logs = BTreeMap::from([
+        ("windows", display_path(&workspace.join("logs/windows.log"))),
+        (
+            "synology",
+            display_path(&workspace.join("logs/synology.log")),
+        ),
+    ]);
+    let mut report = FaultTestReport {
+        status: "running".into(),
+        seed: args.seed,
+        operations: Vec::new(),
+        faults: Vec::new(),
+        peer_logs: logs,
+        roots,
+        states,
+        final_merkle_root: None,
+        restart_local_actions: None,
+        restart_remote_actions: None,
+        bundle: display_path(&workspace),
+        error: None,
+    };
+    write_fault_report(&report_path, &report)?;
+    let result = fault_test_scenario(&args, &workspace, &mut report);
+    if let Err(error) = result {
+        report.status = "failed".into();
+        report.error = Some(format!("{error:#}"));
+        write_fault_report(&report_path, &report)?;
+        print_json(&report)?;
+        return Err(error);
+    }
+    report.status = if args.force_failure {
+        "forced_failure"
+    } else {
+        "pass"
+    }
+    .into();
+    write_fault_report(&report_path, &report)?;
+    print_json(&report)?;
+    if args.force_failure {
+        bail!(
+            "forced fault-test failure; reproduction bundle preserved at {}",
+            workspace.display()
+        );
+    }
+    Ok(())
+}
+
+fn fault_test_scenario(
+    args: &FaultTestArgs,
+    workspace: &Path,
+    report: &mut FaultTestReport,
+) -> Result<()> {
+    let binary = executable()?;
+    let local_root = workspace.join("roots/windows");
+    let remote_root = workspace.join("roots/synology");
+    let local_state = workspace.join("states/windows");
+    let remote_state = workspace.join("states/synology");
+    let local_log = workspace.join("logs/windows.log");
+    let remote_log = workspace.join("logs/synology.log");
+    fs::create_dir_all(&local_root)?;
+    fs::create_dir_all(&remote_root)?;
+    fs::create_dir_all(workspace.join("logs"))?;
+    let client_key = seeded_key(args.seed, "windows");
+    let server_key = seeded_key(args.seed, "synology");
+    let client_identity = workspace.join("identities/windows.key");
+    let server_identity = workspace.join("identities/synology.key");
+    write_identity(&client_identity, &client_key)?;
+    write_identity(&server_identity, &server_key)?;
+    let port = reserve_udp_port()?;
+    let mut server = spawn_server(
+        &binary,
+        &remote_root,
+        &remote_state,
+        &server_identity,
+        &client_key.public().to_string(),
+        port,
+        &remote_log,
+    )?;
+    wait_for_server(&mut server)?;
+    let peer = server_key.public().to_string();
+
+    fs::write(
+        local_root.join("shared.bin"),
+        seeded_bytes(args.seed, "shared", 1024),
+    )?;
+    fs::write(
+        local_root.join("obsolete.bin"),
+        seeded_bytes(args.seed, "obsolete", 1024),
+    )?;
+    fs::write(
+        remote_root.join("before.bin"),
+        seeded_bytes(args.seed, "rename", 1024),
+    )?;
+    run_sync(&mut sync_command(
+        &binary,
+        &local_root,
+        &local_state,
+        &client_identity,
+        &peer,
+        port,
+        &local_log,
+    )?)?;
+    let mut execute = |peer_name,
+                       kind,
+                       path: &str,
+                       destination: Option<&str>,
+                       bytes: Option<Vec<u8>>|
+     -> Result<()> {
+        let root = if peer_name == "windows" {
+            &local_root
+        } else {
+            &remote_root
+        };
+        match kind {
+            "create" | "modify" => fs::write(root.join(path), bytes.as_ref().expect("bytes"))?,
+            "delete" => fs::remove_file(root.join(path))?,
+            "rename" => fs::rename(
+                root.join(path),
+                root.join(destination.expect("destination")),
+            )?,
+            _ => bail!("unknown operation"),
+        }
+        let operation = FaultOperation {
+            sequence: report.operations.len() + 1,
+            peer: peer_name,
+            kind,
+            path: path.into(),
+            destination: destination.map(str::to_owned),
+            content_hash: bytes.as_deref().map(Hash32::digest),
+            status: "executed",
+        };
+        append_operation(
+            if peer_name == "windows" {
+                &local_log
+            } else {
+                &remote_log
+            },
+            &operation,
+        )?;
+        report.operations.push(operation);
+        write_fault_report(&workspace.join("report.json"), report)
+    };
+    execute(
+        "windows",
+        "create",
+        "created.bin",
+        None,
+        Some(seeded_bytes(args.seed, "create", 4096)),
+    )?;
+    execute(
+        "synology",
+        "modify",
+        "shared.bin",
+        None,
+        Some(seeded_bytes(args.seed, "modify", 8192)),
+    )?;
+    execute("windows", "delete", "obsolete.bin", None, None)?;
+    execute("synology", "rename", "before.bin", Some("after.bin"), None)?;
+
+    let network_path = local_root.join("network-fault.bin");
+    fs::write(
+        &network_path,
+        seeded_bytes(args.seed, "network", args.payload_mib * 1024 * 1024),
+    )?;
+    let remote_destination = remote_root.join("network-fault.bin");
+    let remote_baseline = chunk_file_count(&remote_state.join("chunks"))?;
+    let mut network_sync = sync_command(
+        &binary,
+        &local_root,
+        &local_state,
+        &client_identity,
+        &peer,
+        port,
+        &local_log,
+    )?
+    .spawn()?;
+    wait_active_transfer(
+        &mut network_sync,
+        &remote_state,
+        &remote_destination,
+        remote_baseline,
+    )?;
+    let server_pid = server.id();
+    server.kill()?;
+    let _ = server.wait();
+    let _ = network_sync.wait();
+    report.faults.push(FaultEvidence {
+        barrier: "remote_chunk_persisted_destination_absent",
+        killed_process: "serve",
+        pid: server_pid,
+    });
+    write_fault_report(&workspace.join("report.json"), report)?;
+
+    let mut server = spawn_server(
+        &binary,
+        &remote_root,
+        &remote_state,
+        &server_identity,
+        &client_key.public().to_string(),
+        port,
+        &remote_log,
+    )?;
+    wait_for_server(&mut server)?;
+    run_sync(&mut sync_command(
+        &binary,
+        &local_root,
+        &local_state,
+        &client_identity,
+        &peer,
+        port,
+        &local_log,
+    )?)?;
+    let process_path = local_root.join("process-fault.bin");
+    fs::write(
+        &process_path,
+        seeded_bytes(args.seed, "process", args.payload_mib * 1024 * 1024),
+    )?;
+    let remote_process_destination = remote_root.join("process-fault.bin");
+    let remote_process_baseline = chunk_file_count(&remote_state.join("chunks"))?;
+    let mut process_sync = sync_command(
+        &binary,
+        &local_root,
+        &local_state,
+        &client_identity,
+        &peer,
+        port,
+        &local_log,
+    )?
+    .spawn()?;
+    wait_active_transfer(
+        &mut process_sync,
+        &remote_state,
+        &remote_process_destination,
+        remote_process_baseline,
+    )?;
+    let sync_pid = process_sync.id();
+    process_sync.kill()?;
+    let _ = process_sync.wait();
+    report.faults.push(FaultEvidence {
+        barrier: "remote_chunk_persisted_destination_absent",
+        killed_process: "sync-once",
+        pid: sync_pid,
+    });
+    write_fault_report(&workspace.join("report.json"), report)?;
+    run_sync(&mut sync_command(
+        &binary,
+        &local_root,
+        &local_state,
+        &client_identity,
+        &peer,
+        port,
+        &local_log,
+    )?)?;
+
+    let mut final_command = sync_command(
+        &binary,
+        &local_root,
+        &local_state,
+        &client_identity,
+        &peer,
+        port,
+        &local_log,
+    )?;
+    final_command.stdout(Stdio::piped());
+    let output = final_command.output()?;
+    ensure!(output.status.success(), "zero-action sync failed");
+    let text = String::from_utf8(output.stdout)?;
+    let final_report: serde_json::Value = serde_json::from_str(&text)?;
+    let local_actions = final_report["local_actions"]
+        .as_u64()
+        .context("missing local_actions")? as usize;
+    let remote_actions = final_report["remote_actions"]
+        .as_u64()
+        .context("missing remote_actions")? as usize;
+    let local_root_hash: Hash32 =
+        serde_json::from_value(final_report["verified_local_root"].clone())?;
+    let remote_root_hash: Hash32 =
+        serde_json::from_value(final_report["verified_remote_root"].clone())?;
+    ensure!(
+        local_actions == 0 && remote_actions == 0,
+        "unchanged restart was not zero-action"
+    );
+    ensure!(
+        filesystem_snapshot(&local_root)? == filesystem_snapshot(&remote_root)?,
+        "peer filesystem paths or bytes differ"
+    );
+    ensure!(
+        local_root_hash == remote_root_hash,
+        "peer Merkle roots differ"
+    );
+    server.kill()?;
+    let _ = server.wait();
+    report.final_merkle_root = Some(local_root_hash);
+    report.restart_local_actions = Some(local_actions);
+    report.restart_remote_actions = Some(remote_actions);
+    Ok(())
 }
 
 async fn self_test() -> Result<()> {
@@ -1087,6 +1687,26 @@ mod tests {
         let cli =
             Cli::try_parse_from(["deltaweave", "self-test"]).expect("self-test command parses");
         assert!(matches!(cli.command, Command::SelfTest));
+    }
+
+    #[test]
+    fn parses_fault_test_reproduction_options() {
+        let cli = Cli::try_parse_from([
+            "deltaweave",
+            "fault-test",
+            "--seed",
+            "424242",
+            "--workspace",
+            "fault-evidence",
+            "--force-failure",
+        ])
+        .expect("fault-test command parses");
+        let Command::FaultTest(args) = cli.command else {
+            panic!("fault-test command selected");
+        };
+        assert_eq!(args.seed, 424242);
+        assert_eq!(args.workspace, Some(PathBuf::from("fault-evidence")));
+        assert!(args.force_failure);
     }
 
     #[test]

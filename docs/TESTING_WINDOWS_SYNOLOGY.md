@@ -1,7 +1,7 @@
 # Windows PC ↔ Synology DSM 릴리즈 테스트
 
-이 문서는 DeltaWeave v0.3.0 바이너리의 Windows PC↔Synology 양방향 폴더
-동기화를 검증하는 절차입니다. v0.3.0은 Merkle/버전 벡터 기반 pre-alpha
+이 문서는 DeltaWeave v0.4.0 바이너리의 Windows PC↔Synology 양방향 폴더
+동기화를 검증하는 절차입니다. v0.4.0은 Merkle/버전 벡터 기반 pre-alpha
 field preview이며, 중요한 데이터의 유일한 사본으로 사용하면 안 됩니다.
 
 ## 실제 실행 화면: 전·중·후·결과
@@ -19,7 +19,7 @@ field preview이며, 중요한 데이터의 유일한 사본으로 사용하면 
 
 Windows PC에서는 다음 파일을 받습니다.
 
-- `DeltaWeave-v0.3.0-windows-x86_64.zip`
+- `DeltaWeave-v0.4.0-windows-x86_64.zip`
 
 Synology에 SSH로 접속하고 CPU 아키텍처를 확인합니다.
 
@@ -29,11 +29,11 @@ uname -m
 
 | 출력 | 받을 패키지 |
 | --- | --- |
-| `x86_64` | `DeltaWeave-v0.3.0-synology-x86_64.tar.gz` |
-| `aarch64` | `DeltaWeave-v0.3.0-synology-aarch64.tar.gz` |
-| `armv7l` 등 | v0.3.0 미지원 |
+| `x86_64` | `DeltaWeave-v0.4.0-synology-x86_64.tar.gz` |
+| `aarch64` | `DeltaWeave-v0.4.0-synology-aarch64.tar.gz` |
+| `armv7l` 등 | v0.4.0 미지원 |
 
-모든 파일은 [GitHub Releases](https://github.com/happyaspic-byte/DeltaWeave/releases/tag/v0.3.0)에서
+모든 파일은 [GitHub Releases](https://github.com/happyaspic-byte/DeltaWeave/releases/tag/v0.4.0)에서
 다운로드합니다.
 
 ## 2. 다운로드 무결성 확인
@@ -43,13 +43,13 @@ uname -m
 Windows PowerShell:
 
 ```powershell
-Get-FileHash .\DeltaWeave-v0.3.0-windows-x86_64.zip -Algorithm SHA256
+Get-FileHash .\DeltaWeave-v0.4.0-windows-x86_64.zip -Algorithm SHA256
 ```
 
 Synology SSH:
 
 ```bash
-sha256sum DeltaWeave-v0.3.0-synology-*.tar.gz
+sha256sum DeltaWeave-v0.4.0-synology-*.tar.gz
 ```
 
 계산된 값이 `SHA256SUMS.txt`와 정확히 같아야 합니다.
@@ -59,7 +59,7 @@ sha256sum DeltaWeave-v0.3.0-synology-*.tar.gz
 Windows PowerShell:
 
 ```powershell
-Expand-Archive .\DeltaWeave-v0.3.0-windows-x86_64.zip -DestinationPath C:\DeltaWeave
+Expand-Archive .\DeltaWeave-v0.4.0-windows-x86_64.zip -DestinationPath C:\DeltaWeave
 cd C:\DeltaWeave
 .\deltaweave.exe self-test
 ```
@@ -68,7 +68,7 @@ Synology SSH에서는 NAS 아키텍처에 맞는 파일명을 사용합니다.
 
 ```bash
 mkdir -p /volume1/DeltaWeave
-tar --no-same-owner -xzf DeltaWeave-v0.3.0-synology-x86_64.tar.gz \
+tar --no-same-owner -xzf DeltaWeave-v0.4.0-synology-x86_64.tar.gz \
   -C /volume1/DeltaWeave --strip-components=1
 cd /volume1/DeltaWeave
 chmod 755 ./deltaweave
@@ -251,7 +251,59 @@ NAS에서만 발생한 변경은 최대 5초 안에 폴링으로 발견합니다
 
 ![실제 양방향 동기화 전, 중, 후, 결과](assets/deltaweave-sync-lifecycle.gif)
 
-## 10. 문제 해결
+## 10. 재현 가능한 장애 주입 검증
+
+실제 장비에 적용하기 전에 저장소의 Linux/CI 호스트에서 shipped CLI와 loopback
+QUIC을 사용하는 고정-seed 시나리오를 실행합니다.
+
+```bash
+./scripts/fault-test.sh /tmp/deltaweave-fault-424242
+```
+
+Windows 개발 환경에서는 PowerShell에서 같은 실행점을 직접 호출할 수 있습니다.
+
+```powershell
+cargo run --locked -p deltaweave -- fault-test --seed 424242 `
+  --workspace C:\DeltaWeave-Fault-424242
+```
+
+Synology에서 Rust toolchain과 저장소 checkout을 사용할 수 있을 때는 다음과 같습니다.
+릴리스 아카이브만 설치한 DSM은 `fault-test` 명령을 직접 실행할 수 있지만 wrapper
+script와 `cargo` 기반 release gate는 포함하지 않습니다.
+
+```bash
+./deltaweave fault-test --seed 424242 \
+  --workspace /volume1/DeltaWeave-Fault-424242
+```
+
+하네스는 두 독립 root/state에 생성·수정·삭제·이름 변경을 순서대로 적용합니다.
+실제 전송 중 새 CAS chunk가 durable state에 나타나고 목적 파일은 아직 없는 barrier를
+관측한 뒤 `serve` 자식 프로세스를 `Child::kill`로 종료합니다. 재시작·수렴 뒤 같은
+active-payload barrier에서 `sync-once` 자식 프로세스도 강제 종료합니다. 동일 state를 다시 열어 경로와 파일 bytes, 양쪽 Merkle root,
+마지막 `local_actions: 0`과 `remote_actions: 0`을 검증합니다. timeout sleep을 장애
+시점 판정으로 사용하지 않습니다.
+
+실패 증거를 확인하려면 의도적 실패를 요청합니다.
+
+```bash
+DELTAWEAVE_FORCE_FAILURE=1 ./scripts/fault-test.sh /tmp/deltaweave-fault-failure
+```
+
+`report.json`에는 seed, ordered operations, fault points, 최종 root, root/state 경로,
+peer log 경로가 기록됩니다. `logs/windows.log`, `logs/synology.log`, `roots/`,
+`states/`도 explicit workspace 아래 유지됩니다. 성공 실행도 explicit workspace를
+지정하면 보존됩니다. 실패 후 동일 `--seed`와 새 workspace로 재현합니다. 운영
+복구는 장애 전 사용한 기존 `--root`, `--state`, identity를 그대로 두고 receiver를
+먼저 재시작한 뒤 원래 `sync-once` 명령을 다시 실행합니다. state를 삭제하거나 다른
+root/replica에 재사용하지 마십시오. root/state 중첩, 불완전 scan, collision 등 기존
+안전 거부는 우회되지 않습니다.
+
+한계: 자동 검증은 한 호스트의 loopback transport와 task abort로 process crash를
+모사합니다. Windows/DSM 전원 차단, 디스크 고갈, 장시간 partition, DSM package,
+서비스 관리자의 kill semantics는 검증하지 않습니다. 실제 장비 soak와 백업은 계속
+필요합니다.
+
+## 11. 문제 해결
 
 | 증상 | 확인 사항 |
 | --- | --- |
@@ -264,7 +316,7 @@ NAS에서만 발생한 변경은 최대 5초 안에 폴링으로 발견합니다
 | `path collision` | 대소문자·Unicode 정규화 후 같은 이름이 되는 파일을 수동 변경 |
 | `causally stale` | 양쪽 최신 상태를 `sync-once`로 다시 병합하고 오래된 자동화 중지 |
 
-테스트 종료는 Synology 수신기 터미널에서 `Ctrl+C`를 누릅니다. v0.3.0에는
+테스트 종료는 Synology 수신기 터미널에서 `Ctrl+C`를 누릅니다. v0.4.0에는
 검증형 양방향 폴더 동기화가 포함되지만 DSM SPK, Windows 서비스/설치 프로그램,
 symlink materialization 또는 VFS는 포함되지 않습니다. 로컬 인덱스는
 [별도 검증 절차](TESTING_LOCAL_INDEX.md)를 따릅니다.
