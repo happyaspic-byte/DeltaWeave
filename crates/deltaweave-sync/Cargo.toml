@@ -20,6 +20,8 @@ tokio.workspace = true
 
 [dev-dependencies]
 iroh.workspace = true
+postcard.workspace = true
+redb.workspace = true
 tempfile.workspace = true
 
 [lints]

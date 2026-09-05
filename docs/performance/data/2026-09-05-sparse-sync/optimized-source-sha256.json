@@ -1,0 +1,11 @@
+{
+  "Cargo.toml": "aa500caa730e191656842b1f4007e9c6bb74dc2f34a2d5d154b321a012d15350",
+  "Cargo.lock": "1613af9f76a93403c65d49db974c7cbadeabb6cab6c46c51cf68cc66856dac07",
+  "crates/deltaweave-core/src/lib.rs": "5a873a57902ae11ef94e2e5348c454d84a75b9d0d54775fc415cec28cdc5eab7",
+  "crates/deltaweave-reconcile/src/lib.rs": "09d16821e782581fb635c5d6810f7696d96a8667fb15c3fda2f027105f855d09",
+  "crates/deltaweave-sync/examples/sparse_sync.rs": "744a649fa2fcb4e256b95e7d6c927615db4b3d8125ff9ce70a85a30bc0fe9624",
+  "crates/deltaweave-reconcile/examples/subtree_lookup.rs": "80e5613d1e1b1e75f7ce14b8894b18edae7fdc4d7cee001e660b06f432c2fcaf",
+  "target/performance/sparse-sync-after": "09b48b22e5a62875efdcd4e52741693bee6e5e1f9c3271be0771c5cc71f1abbe",
+  "target/performance/subtree-lookup-after": "e2eafaba927289f25f8ff41d9ba5d50d88e705e970e9f5bafcad8463b04fced5",
+  "target/release/deltaweave": "65aa96892d026272fce3ce7e1260988985e19ed1aadf8e6fa78de726e6e43b17"
+}

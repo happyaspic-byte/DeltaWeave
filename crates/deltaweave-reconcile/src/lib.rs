@@ -2,7 +2,10 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    ops::Bound::{Included, Unbounded},
+};
 
 use deltaweave_core::{
     CausalRelation, Hash32, ReplicaId, SyncEntryKind, SyncRecord, SyncRecordError, WirePath,
@@ -144,20 +147,21 @@ impl MerkleTree {
     }
 
     /// Returns canonical records beneath `prefix`; an empty prefix returns the full snapshot.
+    /// A nonempty query takes O(log N + K) map operations for N records and K matches.
     pub fn records_under(&self, prefix: &str) -> Result<Vec<SyncRecord>, ReconcileError> {
         if prefix.is_empty() {
             return Ok(self.records().cloned().collect());
         }
         let prefix = WirePath::new(prefix.to_owned())?;
         let child_prefix = format!("{}/", prefix.as_str());
-        Ok(self
+        let exact = self.records.get(&prefix).into_iter();
+        // Seek descendants separately: siblings such as "docs-old" sort before "docs/".
+        let descendants = self
             .records
-            .iter()
-            .filter(|(path, _)| {
-                path.as_str() == prefix.as_str() || path.as_str().starts_with(&child_prefix)
-            })
-            .map(|(_, record)| record.clone())
-            .collect())
+            .range::<str, _>((Included(child_prefix.as_str()), Unbounded))
+            .take_while(|(path, _)| path.as_str().starts_with(&child_prefix))
+            .map(|(_, record)| record);
+        Ok(exact.chain(descendants).cloned().collect())
     }
 
     /// Descends only mismatched Merkle subtrees and returns their record paths.
@@ -770,6 +774,164 @@ mod tests {
                 .is_none()
         );
         assert!(tree.node_summary("../escape").is_err());
+    }
+
+    #[test]
+    fn records_under_matches_full_scan_in_canonical_order() {
+        let node = replica(b"subtree-node");
+        let tree = MerkleTree::from_records([
+            file("docs0", node, 1, b"following sibling"),
+            tombstone(file("자료/삭제.txt", node, 2, b"deleted"), node),
+            file("docs.txt", node, 3, b"punctuation sibling"),
+            directory("docs", node, 4),
+            file("implicit/nested/leaf.txt", node, 5, b"implicit directories"),
+            file("docs-old", node, 6, b"punctuation sibling"),
+            tombstone(file("docs/nested/deleted.txt", node, 7, b"deleted"), node),
+            file("자료-옛", node, 8, b"unicode sibling"),
+            file("docs/a.txt", node, 9, b"child"),
+            directory("자료", node, 10),
+            file("자료/보고서.txt", node, 11, b"unicode child"),
+            file("alpha.txt", node, 12, b"preceding sibling"),
+        ])
+        .expect("tree is valid");
+
+        let cases: &[(&str, &[&str])] = &[
+            (
+                "",
+                &[
+                    "alpha.txt",
+                    "docs",
+                    "docs-old",
+                    "docs.txt",
+                    "docs/a.txt",
+                    "docs/nested/deleted.txt",
+                    "docs0",
+                    "implicit/nested/leaf.txt",
+                    "자료",
+                    "자료-옛",
+                    "자료/보고서.txt",
+                    "자료/삭제.txt",
+                ],
+            ),
+            ("docs", &["docs", "docs/a.txt", "docs/nested/deleted.txt"]),
+            ("docs/a.txt", &["docs/a.txt"]),
+            ("docs/nested", &["docs/nested/deleted.txt"]),
+            ("docs/nested/deleted.txt", &["docs/nested/deleted.txt"]),
+            ("docs-old", &["docs-old"]),
+            ("docs.txt", &["docs.txt"]),
+            ("docs0", &["docs0"]),
+            ("implicit", &["implicit/nested/leaf.txt"]),
+            ("implicit/nested", &["implicit/nested/leaf.txt"]),
+            ("자료", &["자료", "자료/보고서.txt", "자료/삭제.txt"]),
+            ("자료/삭제.txt", &["자료/삭제.txt"]),
+            ("doc", &[]),
+            ("docs/missing", &[]),
+            ("missing", &[]),
+            ("자", &[]),
+        ];
+        for &(prefix, expected_paths) in cases {
+            let actual = tree.records_under(prefix).expect("query is valid");
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|record| record.path.as_str())
+                    .collect::<Vec<_>>(),
+                expected_paths,
+                "prefix {prefix:?} must select complete components in canonical order"
+            );
+
+            // Keep the former full-scan query as an oracle for complete record values.
+            let child_prefix = format!("{prefix}/");
+            let expected: Vec<_> = tree
+                .records()
+                .filter(|record| {
+                    prefix.is_empty()
+                        || record.path.as_str() == prefix
+                        || record.path.as_str().starts_with(&child_prefix)
+                })
+                .cloned()
+                .collect();
+            assert_eq!(actual, expected, "prefix {prefix:?} must preserve records");
+        }
+    }
+
+    #[test]
+    fn records_under_returns_empty_for_valid_queries_on_an_empty_tree() {
+        let tree = MerkleTree::from_records([]).expect("empty tree is valid");
+        for prefix in ["", "docs", "docs/nested", "자료"] {
+            assert!(
+                tree.records_under(prefix)
+                    .expect("query is valid")
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn records_under_rejects_invalid_prefixes_even_on_an_empty_tree() {
+        let node = replica(b"subtree-node");
+        let trees = [
+            MerkleTree::from_records([]).expect("empty tree is valid"),
+            MerkleTree::from_records([file("docs/child.txt", node, 1, b"child")])
+                .expect("tree is valid"),
+        ];
+        let long_component = "a".repeat(256);
+        let long_path = format!("{}/b", vec!["a".repeat(255); 16].join("/"));
+        for tree in trees {
+            for prefix in [
+                ".",
+                "../docs",
+                "docs/..",
+                "/docs",
+                "docs//nested",
+                "docs/",
+                "docs\\child",
+                "docs/CON.txt",
+                "docs/child?",
+                "docs/child\n",
+                long_component.as_str(),
+                long_path.as_str(),
+            ] {
+                assert!(
+                    matches!(
+                        tree.records_under(prefix),
+                        Err(ReconcileError::InvalidPrefix(_))
+                    ),
+                    "invalid prefix {prefix:?} must be rejected"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn records_under_accepts_maximum_length_path_prefix() {
+        let node = replica(b"subtree-node");
+        let parent = format!(
+            "{}/{}",
+            vec!["a".repeat(255); 15].join("/"),
+            "b".repeat(254)
+        );
+        let path = format!("{parent}/c");
+        assert_eq!(path.len(), 4096);
+        let record = file(&path, node, 1, b"maximum path");
+        let tree = MerkleTree::from_records([record.clone()]).expect("tree is valid");
+
+        // Appending '/' for the descendant range produces a 4097-byte bound,
+        // which is useful for seeking even though it is not a valid record path.
+        assert_eq!(
+            tree.records_under(&path).expect("maximum prefix is valid"),
+            vec![record.clone()]
+        );
+        assert_eq!(
+            tree.records_under(&parent)
+                .expect("implicit parent is valid"),
+            vec![record]
+        );
+        assert!(
+            tree.records_under(&format!("{parent}/d"))
+                .expect("missing maximum prefix is valid")
+                .is_empty()
+        );
     }
 
     #[test]

@@ -1,0 +1,19 @@
+{
+  "architecture": "x86_64",
+  "final_size": 4194335,
+  "first_transfer_bytes": 4194304,
+  "index_initial_records": 1,
+  "index_rename_detected": true,
+  "index_restart_verified": true,
+  "index_tombstones": 2,
+  "operating_system": "linux",
+  "reused_extents": 16,
+  "second_transfer_bytes": 257800,
+  "status": "pass",
+  "sync_bidirectional_verified": true,
+  "sync_conflicts_preserved": 1,
+  "sync_delete_verified": true,
+  "sync_restart_actions": 0,
+  "sync_verified_root": "1c00a9e57aefa494a6dab9f7aa06c08cdc576a8f87d7b8d5bd95cfc3f57b10fd",
+  "temporary_data": "cleaned on exit"
+}
