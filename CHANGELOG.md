@@ -9,8 +9,8 @@ Versioning after its first stable release.
 
 ### Added
 
-- Add a deterministic `fault-test` command and wrapper that exercise real child-process termination, active-transfer network interruption, durable-state restart, Merkle convergence, and zero-action replay.
-- Preserve seed, ordered operations, peer logs, root/state paths, fault barriers, and final reports for failed fault-injection runs.
+- Add a deterministic `fault-test` command and wrapper that exercise real child-process termination, connection interruption, durable-state restart, Merkle convergence, and zero-action replay. The current state-file-count barrier does not prove the kill occurred during durable payload transfer; see [the CLI limitations](docs/CLI.md#fault-injection).
+- Record seed, selected ordered operations, peer logs, root/state paths, fault markers, and final reports. An explicit `--workspace` is required to retain them after the CLI exits, including on failure.
 - Add shipped-CLI integration tests covering process kills, deterministic repeated seeds, restart recovery, and failure-bundle preservation.
 - Add `serve --bind <IP:PORT>` for a stable receiver UDP address across restarts.
 

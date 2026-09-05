@@ -11,7 +11,7 @@ synchronization. It combines an authoritative local filesystem index, FastCDC
 chunking, BLAKE3 integrity, a durable content-addressed store, and iroh's
 encrypted QUIC transport.
 
-> **Project status: pre-alpha field preview.** v0.3 connects the persistent
+> **Project status: pre-alpha field preview.** The workspace is v0.4.0. It connects the persistent
 > index to deterministic Merkle reconciliation, version-vector conflicts, and
 > verified two-way folder synchronization. Windows/Synology hardware soak,
 > installers/services, symlink materialization, and on-demand VFS are still
@@ -25,12 +25,12 @@ as **before → during → after → result**.
 
 ![DeltaWeave 실제 실행 전, 중, 후, 결과](docs/assets/deltaweave-quickstart.gif)
 
-The [verified usage gallery](docs/USAGE_GALLERY.md) includes full-size frames,
-the local-index lifecycle, and the Synology ARM64 result. Only the terminal font
-and background are normalized; status values, byte counts, and event counts come
-from verified executions.
+The [historical usage gallery](docs/USAGE_GALLERY.md) includes full-size frames,
+the local-index lifecycle, and the Linux ARM64 package result. These are rendered
+v0.2/v0.3 examples, not a fresh v0.4.0 run or evidence of physical DSM hardware
+validation. The rendering script embeds the recorded text rather than running the CLI.
 
-The next animation is a separate, actual `sync-once` run: two independent roots
+The next animation reconstructs a separate v0.3 `sync-once` run: two independent roots
 exchange files, preserve simultaneous edits, propagate a deletion, and finish
 with a one-node/no-action Merkle fast path.
 
@@ -38,14 +38,14 @@ with a one-node/no-action Merkle fast path.
 
 ## What works today
 
-| Capability | v0.3 status |
+| Capability | Workspace v0.4.0 status |
 | --- | --- |
 | Streaming FastCDC manifests | Implemented and unit-tested |
 | Chunk and whole-file BLAKE3 verification | Implemented and unit-tested |
 | Durable chunk CAS + redb metadata | Implemented with restart tests |
 | Authenticated iroh/QUIC transfer | Implemented with local P2P integration tests |
 | Missing-chunk-only re-transfer | Implemented with insertion/reuse tests |
-| Allow-listed peer authorization | Implemented; deny by default |
+| Allow-listed peer authorization | Implemented for push and folder read/write access; deny by default |
 | Safe replacement and recovery journal | Implemented baseline; old content goes to private trash |
 | Persistent local file/directory index | Implemented with restart and operation-storm tests |
 | Native watching and adaptive debounce | Implemented with full-rescan and polling fallbacks |
@@ -80,7 +80,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and
 
 ## Download a test release
 
-The pre-alpha [v0.3.0 release](https://github.com/happyaspic-byte/DeltaWeave/releases/tag/v0.3.0)
+The pre-alpha [v0.4.0 release](https://github.com/happyaspic-byte/DeltaWeave/releases/tag/v0.4.0)
 provides ready-to-run packages for:
 
 - Windows x86-64
@@ -89,10 +89,11 @@ provides ready-to-run packages for:
 
 Each package includes the executable, license, cross-device test guide, and
 local-index test guide. After extracting the correct package, run the isolated
-end-to-end check:
+end-to-end check from the extracted package directory (PowerShell uses
+`.\deltaweave.exe self-test`):
 
 ```bash
-deltaweave self-test
+./deltaweave self-test
 ```
 
 It performs encrypted delta transfers and additionally verifies bidirectional
@@ -103,31 +104,58 @@ cross-device procedure and checksum verification.
 
 For a Portainer-managed Synology receiver, an AI operator can follow the
 guardrailed [AI Portainer setup runbook](docs/AI_PORTAINER_SETUP.md). The
-repository includes a hardened Stack definition and CI-tested multi-architecture
-container image for `linux/amd64` and `linux/arm64`.
+repository includes a hardened Stack definition and a container workflow that
+builds and self-tests images for `linux/amd64` and `linux/arm64`. Check the selected
+image separately; CI configuration alone does not prove a deployment works.
 
 ## Build and test
 
-DeltaWeave currently pins Rust 1.91.
+Run from a repository checkout. Install Git, rustup, and the native linker/C/C++
+build tools for your host: on Linux a compiler toolchain such as `build-essential`,
+or on Windows the MSVC C++ Build Tools and Windows SDK. `rust-toolchain.toml`
+pins Rust **1.91.0** with rustfmt and Clippy; `Cargo.lock` fixes dependency
+resolution. Initial toolchain/dependency downloads require network access.
 
 ```bash
-cargo build --workspace
-cargo test --workspace --all-targets
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+rustup show active-toolchain
+cargo build --locked --workspace
+cargo run --locked -p deltaweave -- --help
+cargo test --locked --workspace --all-targets --all-features
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
 ```
 
-CI repeats the quality gates on Linux and runs the full test suite on Windows.
-Run the same release-oriented checks locally with `./scripts/verify-release.sh`.
-The evidence, deductions, and scoped **90.1/100** score are recorded in the
-[v0.3 quality report](docs/QUALITY_REPORT_V0.3.md).
+`cargo build` does not add the CLI to `PATH`. Use
+`cargo run --locked -p deltaweave -- <command>` during development, or install from
+this checkout for the bare `deltaweave` commands below:
+
+```bash
+cargo install --locked --path crates/deltaweave-cli
+deltaweave --version
+```
+
+The install directory is Cargo's configured `bin` directory (normally
+`~/.cargo/bin`, or `%USERPROFILE%\.cargo\bin` on Windows); it must be on `PATH`.
+Alternatively run `./target/debug/deltaweave` or `.\target\debug\deltaweave.exe`
+after a debug build. The source checkout is version `0.4.0`.
+
+CI is configured to repeat the quality gates on Linux and the full test suite on
+Windows. Run the release-oriented checks in Bash with
+`./scripts/verify-release.sh`; see [CONTRIBUTING.md](CONTRIBUTING.md) for prerequisites,
+release builds, rustdoc, and additional loopback checks. The
+[v0.3 quality report](docs/QUALITY_REPORT_V0.3.md) is a historical assessment;
+[the documentation audit](docs/DOCUMENTATION_AUDIT.md) records this checkout's
+actual checks and remaining uncertainty.
 
 ## Index or watch a folder
 
 Run one authoritative scan. Keep private state and the node identity outside the
-indexed root when practical; paths beneath the root are excluded automatically.
+indexed root. The identity file and index database (or its parent directory when
+nested under the root) are excluded automatically; other private paths require
+explicit `--ignore` options.
 
 ```bash
+mkdir -p sync-root private
 deltaweave scan \
   --root ./sync-root \
   --state ./private/index.redb \
@@ -152,16 +180,19 @@ complete persistent record and retry lists. See
 
 ## Try a direct local transfer
 
-Build the CLI and create a persistent identity on each node:
+Install the CLI as above and create a persistent identity on each node. For this
+two-terminal local example, use the same working directory in both terminals:
 
 ```bash
-cargo build --release
 deltaweave init --identity receiver.key
 deltaweave init --identity sender.key
 ```
 
 Start the receiver with the sender's printed endpoint ID. Authorization is
-mandatory unless the explicitly unsafe testing flag is supplied.
+mandatory unless the explicitly unsafe testing flag is supplied. Replace angle-bracket
+placeholders with the printed values; do not type the brackets. Keep receiver
+root and private state as separate directories on the same filesystem, because
+replacement/deletion moves old content into state trash with a filesystem rename.
 
 ```bash
 deltaweave serve \
@@ -175,7 +206,9 @@ deltaweave serve \
 
 `--bind` keeps the receiver UDP port stable across restarts. Open that UDP port in
 the host firewall, then copy the receiver's `endpoint_id` and one
-`direct_addresses` value from its JSON output before pushing a file:
+`direct_addresses` value from its JSON output. For a same-host test use
+`127.0.0.1:49152`; for another host use a reachable LAN address. Prepare an existing
+copy of a test file at `./large-file.bin`, then in the second terminal run:
 
 ```bash
 deltaweave push ./large-file.bin \
@@ -194,8 +227,8 @@ adoption also requires a reliable change-time before skipping rehash; otherwise
 it verifies with `hash_stable_file`.
 
 Files of at least 8 GiB automatically use larger FastCDC chunks when all three
-chunk sizes equal the default profile. This keeps 10–70 GiB manifests within
-protocol limits and reduces durable chunk-store overhead. Any non-default
+chunk sizes equal the default profile. This reduces manifest size and durable
+chunk-store overhead; protocol chunk-count and control-frame limits still apply. Any non-default
 `--min-chunk`, `--avg-chunk`, or `--max-chunk` value disables this selection.
 
 Run the command again after editing the source. The receiver requests only
@@ -207,8 +240,15 @@ Internet mode uses iroh discovery and encrypted relay fallback. Omit
 
 ## Synchronize a Windows folder with Synology
 
-Keep the Synology `serve` command running with the Windows endpoint ID on its
-allow-list. On Windows, use the receiver values printed by `serve`:
+Initialize the Windows identity at the path used below, then put its printed
+endpoint ID on the Synology `serve --allow-peer` list:
+
+```powershell
+.\deltaweave.exe init --identity C:\DeltaWeave-Private\windows.key
+```
+
+Keep that receiver running. On Windows, use the receiver values printed by
+`serve`; `sync-once` creates the root if it does not yet exist:
 
 ```powershell
 .\deltaweave.exe sync-once `
@@ -223,11 +263,16 @@ allow-list. On Windows, use the receiver values printed by `serve`:
 `sync-once` returns success only after fresh local and remote snapshots have the
 same deterministic Merkle root. Use `sync` with the same arguments for continuous
 operation: native local events trigger a pass after the default 750 ms quiet
-window, while a five-second poll discovers remote-only changes. Watcher startup
+window, while polling after each successful pass discovers remote-only changes (default
+five-second wait, plus scan/transfer time). Watcher startup
 failure falls back to polling, and transient failures retry with exponential backoff.
 Every pass refuses incomplete scans, retry-queued files, cross-platform name
 collisions, stale causal writes, and concurrent records that have not first
 gone through deterministic reconciliation.
+
+See the [CLI reference](docs/CLI.md) for every command, default, JSON output shape,
+exit behavior, and logging configuration. The wire API is described in
+[PROTOCOL.md](docs/PROTOCOL.md); this project has no HTTP API.
 
 ## Security model
 
@@ -237,8 +282,9 @@ gone through deterministic reconciliation.
 - Wire paths reject traversal, absolute paths, Windows device names, and invalid
   deserialized values.
 - Existing content is preserved in state trash before replacement.
-- Incoming state must causally dominate the installed record; stale, concurrent,
-  and equal-clock/different-state writes are rejected.
+- The v2 synchronization protocol rejects stale, unmerged-concurrent, and
+  equal-clock/different-state writes; exact same-state retries are accepted.
+  Legacy `push` is an authorized one-file overwrite without that causal precondition.
 
 This baseline does not yet defend perfectly against a privileged or racing local
 attacker and does not materialize links or special files. Read

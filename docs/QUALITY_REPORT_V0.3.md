@@ -2,6 +2,11 @@
 
 평가일: 2026-08-26
 
+> 이 문서는 당시 v0.3 평가 기록이다. 아래 73개 테스트, 실행 시간과 90.1점은
+> 현재 v0.4.0의 재검증 결과나 공식 지원 점수가 아니다. 이번 checkout의 실행
+> 결과와 확인하지 못한 범위는 소스 checkout의 `docs/DOCUMENTATION_AUDIT.md`를
+> 따른다(이 파일은 릴리스 아카이브에 포함되지 않는다). workflow 링크는 설정/실행 목록이며 특정 커밋의 통과 증거를 대신하지 않는다.
+
 평가 범위: v0.3에서 제공한다고 명시한 **양방향 P2P 폴더 동기화 엔진**
 
 릴리스 상태: pre-alpha field preview
@@ -60,16 +65,20 @@ native watcher에 의해 **1.019초** 만에 원격 root에 materialize되는 �
 
 ## 재현 명령
 
-Rust 1.91 toolchain에서 다음 한 명령을 실행한다.
+현재 checkout의 Rust 1.91.0 toolchain과 Bash에서 다음 명령을 실행한다.
+스크립트는 이후 변경되었으므로 실행 결과가 과거 테스트 수와 같을 필요는 없다.
 
 ```bash
 ./scripts/verify-release.sh
 ```
 
 이 스크립트는 rustfmt, Clippy `-D warnings`, 전체 테스트, rustdoc
-`-D warnings`, 패키지 self-test, 문서 미디어, patch hygiene를 검사한다. Docker
+`-D warnings`, CLI self-test, 추가 process fault-test, 문서 미디어, patch hygiene를 검사한다. Docker
 Compose가 설치된 환경에서는 Portainer Stack 렌더링도 검사하며, 로컬에 Docker가
-없으면 해당 단계는 명시적으로 skip하고 GitHub Container CI가 필수 게이트를 맡는다.
+없으면 해당 단계는 명시적으로 skip한다. CI는 별도 Compose 검사를 설정하지만
+그 실행 결과는 해당 커밋에서 확인해야 한다. fault-test의 시점 판정과 증거 보존
+한계는 소스 checkout의 `docs/CLI.md`에 기록되어 있다. 릴리스 아카이브에서는
+`TESTING.md`의 장애 주입 항목을 따른다.
 
 ## 범위 밖 항목
 

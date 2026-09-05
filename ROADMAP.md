@@ -50,11 +50,16 @@ zero-transfer retry tests run in CI. Long-running Windows/Synology hardware
 soak, randomized message interruption, and safe tombstone garbage collection
 remain field/hardening gates rather than completed claims.
 
-## v0.4 — Operations and hardening
+## v0.4 — Operations and hardening (partially implemented)
+
+The workspace/release version is 0.4.0, but this broader phase is not complete.
+The CLI now includes fixed-seed process-termination/restart tests and stable
+`serve --bind`; their [current validation limits](docs/CLI.md#fault-injection) do not
+meet the full exit gate below. The remaining items are planned:
 
 - Pairing, device revocation, key rotation, bandwidth/concurrency quotas
 - Handle-relative path operations, disk-space admission control, observability
-- Upgrade/migration tooling, fault injection, compatibility test vectors
+- Upgrade/migration tooling, precise commit-boundary fault injection, compatibility test vectors
 - Signed releases and reproducible packaging for Windows, Linux, and Synology
 
 Exit gate: threat-model review, fuzzing, long-running soak tests, and documented
