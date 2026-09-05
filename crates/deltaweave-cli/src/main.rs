@@ -27,52 +27,96 @@ use serde::Serialize;
 use serde_json::json;
 use tracing_subscriber::EnvFilter;
 
+mod output;
+use output::{Output, OutputFormat};
+
 #[derive(Debug, Parser)]
 #[command(
     name = "deltaweave",
     version,
-    about = "Authenticated, content-defined bidirectional P2P file synchronization",
-    long_about = None
+    about = "Encrypted peer-to-peer file synchronization",
+    long_about = None,
+    max_term_width = 100,
+    after_help = "Start here:\n  deltaweave self-test         Check this device in a temporary workspace\n  deltaweave <COMMAND> --help  Show options and an example\n\nWorkflows:\n  Sync folders     serve + sync-once, or serve + sync\n  Transfer a file  serve + push\n  Index a folder   scan, or watch for continuous updates\n\nResults are JSON by default. Add --output text for readable reports."
 )]
 struct Cli {
+    /// Report format: JSON for scripts, text for readable terminal reports.
+    #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Json, help_heading = "Output")]
+    output: OutputFormat,
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Create or inspect a persistent node identity.
-    Init(InitArgs),
-    /// Build and print a deterministic FastCDC/BLAKE3 manifest.
-    Manifest(ManifestArgs),
-    /// Receive authenticated file pushes.
-    Serve(ServeArgs),
-    /// Send one file and transfer only chunks missing at the receiver.
-    Push(PushArgs),
-    /// Build or refresh the authoritative local directory index once.
-    Scan(ScanArgs),
-    /// Continuously index a directory using native watcher hints and periodic reconciliation.
-    Watch(WatchArgs),
-    /// Reconcile a local folder with a peer once and verify both Merkle roots.
+    /// Sync two folders once and verify both Merkle roots.
+    #[command(
+        after_help = "Example (receiver already running):\n  deltaweave sync-once --root ./shared --peer <ENDPOINT_ID>\n\nFind the peer's endpoint ID in its serve output.\nKeep --state and --identity outside the synchronized folder."
+    )]
     SyncOnce(SyncTargetArgs),
-    /// Continuously reconcile a local folder with retry/backoff until stopped.
+    /// Keep two folders in sync, with automatic retries.
+    #[command(
+        after_help = "Example (receiver already running):\n  deltaweave sync --root ./shared --peer <ENDPOINT_ID>\n\nFind the peer's endpoint ID in its serve output.\nKeep --state and --identity outside the synchronized folder.\nPress Ctrl-C to stop gracefully."
+    )]
     Sync(SyncArgs),
-    /// Run an isolated local end-to-end transfer and delta-reuse check.
+    /// Start a receiver for authorized peers.
+    #[command(
+        after_help = "Example:\n  deltaweave serve --root ./received --allow-peer <SENDER_ENDPOINT_ID>\n\nRun init on the sender to find its endpoint ID.\nKeep --state and --identity outside the destination folder.\nThe ready result contains addresses to use with push or sync.\nPress Ctrl-C to stop gracefully."
+    )]
+    Serve(ServeArgs),
+    /// Send one file, reusing chunks already at the receiver.
+    #[command(
+        after_help = "Example (receiver already running):\n  deltaweave push ./photo.jpg --remote-path photos/photo.jpg --peer <ENDPOINT_ID>\n\nFind the peer's endpoint ID in its serve output.\nFor a direct connection, add --direct <IP:PORT> --direct-only."
+    )]
+    Push(PushArgs),
+    /// Scan a folder and report changes to its local index.
+    #[command(
+        after_help = "Example:\n  deltaweave scan --root ./shared --include-records\n\nUse --state to choose a private index file outside the indexed folder.\nUse watch to keep the index updated as files change."
+    )]
+    Scan(ScanArgs),
+    /// Watch a folder and keep its local index up to date.
+    #[command(
+        after_help = "Example:\n  deltaweave watch --root ./shared\n\nFilesystem events trigger scans; periodic scans reconcile missed events.\nPress Ctrl-C to stop gracefully."
+    )]
+    Watch(WatchArgs),
+    /// Create or inspect this device's persistent identity.
+    #[command(
+        after_help = "Example:\n  deltaweave init --identity ./private/node.key\n\nShare the endpoint ID with your peer. Keep the identity file private.\nUse the same --identity path with subsequent commands."
+    )]
+    Init(InitArgs),
+    /// Inspect a file's FastCDC chunks and BLAKE3 hashes.
+    #[command(
+        after_help = "Example:\n  deltaweave manifest ./archive.zip\n\nChunk sizes are in bytes: minimum < average < maximum."
+    )]
+    Manifest(ManifestArgs),
+    /// Check transfer, sync, and recovery in a temporary workspace.
+    #[command(
+        after_help = "Example:\n  deltaweave self-test\n\nChecks encrypted transfer, delta reuse, bidirectional sync, and recovery.\nCreates temporary test folders automatically; no peer setup is needed."
+    )]
     SelfTest,
-    /// Run the deterministic restart and network fault-injection scenario.
+    /// Test recovery from process and network failures.
+    #[command(
+        after_help = "Example:\n  deltaweave fault-test --seed 424242 --workspace ./fault-evidence\n\nAn explicit workspace keeps reports, logs, and reproduction data.\nThe seed makes identities, file contents, and operation order reproducible."
+    )]
     FaultTest(FaultTestArgs),
 }
 
 #[derive(Debug, Args)]
 struct InitArgs {
     /// Persistent secret-key file.
-    #[arg(long, default_value = ".deltaweave/identity.key")]
+    #[arg(
+        long,
+        default_value = ".deltaweave/identity.key",
+        help_heading = "Identity",
+        value_name = "FILE"
+    )]
     identity: PathBuf,
 }
 
 #[derive(Debug, Args)]
 struct ManifestArgs {
     /// File to chunk and hash.
+    #[arg(value_name = "FILE")]
     file: PathBuf,
     #[command(flatten)]
     chunking: ChunkingArgs,
@@ -81,13 +125,13 @@ struct ManifestArgs {
 #[derive(Clone, Copy, Debug, Args)]
 struct ChunkingArgs {
     /// Minimum FastCDC chunk size in bytes.
-    #[arg(long, default_value_t = ChunkingProfile::DEFAULT.min_size)]
+    #[arg(long, default_value_t = ChunkingProfile::DEFAULT.min_size, help_heading = "Chunking", value_name = "BYTES")]
     min_chunk: u32,
     /// Average FastCDC chunk size in bytes.
-    #[arg(long, default_value_t = ChunkingProfile::DEFAULT.avg_size)]
+    #[arg(long, default_value_t = ChunkingProfile::DEFAULT.avg_size, help_heading = "Chunking", value_name = "BYTES")]
     avg_chunk: u32,
     /// Maximum FastCDC chunk size in bytes.
-    #[arg(long, default_value_t = ChunkingProfile::DEFAULT.max_size)]
+    #[arg(long, default_value_t = ChunkingProfile::DEFAULT.max_size, help_heading = "Chunking", value_name = "BYTES")]
     max_chunk: u32,
 }
 
@@ -107,52 +151,72 @@ impl ChunkingArgs {
 #[derive(Debug, Args)]
 struct ServeArgs {
     /// Directory beneath which received files are materialized.
-    #[arg(long)]
+    #[arg(long, help_heading = "Folder and identity", value_name = "DIR")]
     root: PathBuf,
     /// Private metadata, chunk, journal, and trash directory.
-    #[arg(long, default_value = ".deltaweave/state")]
+    #[arg(
+        long,
+        default_value = ".deltaweave/state",
+        help_heading = "Folder and identity",
+        value_name = "DIR"
+    )]
     state: PathBuf,
     /// Persistent secret-key file.
-    #[arg(long, default_value = ".deltaweave/identity.key")]
+    #[arg(
+        long,
+        default_value = ".deltaweave/identity.key",
+        help_heading = "Folder and identity",
+        value_name = "FILE"
+    )]
     identity: PathBuf,
     /// Endpoint ID authorized to push; repeat for multiple peers.
-    #[arg(long = "allow-peer")]
+    #[arg(long = "allow-peer", help_heading = "Authorization", value_name = "ID")]
     allowed_peers: Vec<String>,
     /// Accept any cryptographically authenticated peer (unsafe on public networks).
-    #[arg(long, conflicts_with = "allowed_peers")]
+    #[arg(long, conflicts_with = "allowed_peers", help_heading = "Authorization")]
     allow_any_authenticated: bool,
     /// Bind the receiver to a stable local UDP socket address.
-    #[arg(long)]
+    #[arg(long, help_heading = "Peer connection", value_name = "IP:PORT")]
     bind: Option<SocketAddr>,
     /// Disable discovery and relay services; advertise direct addresses only.
-    #[arg(long)]
+    #[arg(long, help_heading = "Peer connection")]
     direct_only: bool,
 }
 
 #[derive(Debug, Args)]
 struct PushArgs {
     /// Local file to send.
+    #[arg(value_name = "FILE")]
     source: PathBuf,
     /// Portable relative destination path (uses `/`, never `..`).
-    #[arg(long)]
+    #[arg(long, help_heading = "Destination", value_name = "PATH")]
     remote_path: WirePath,
     /// Receiver endpoint ID.
-    #[arg(long)]
+    #[arg(long, help_heading = "Peer connection", value_name = "ID")]
     peer: String,
     /// Receiver direct UDP address; repeat when multiple addresses are advertised.
-    #[arg(long = "direct")]
+    #[arg(
+        long = "direct",
+        help_heading = "Peer connection",
+        value_name = "IP:PORT"
+    )]
     direct_addresses: Vec<SocketAddr>,
     /// Receiver relay URL; repeat when multiple relays are advertised.
-    #[arg(long = "relay")]
+    #[arg(long = "relay", help_heading = "Peer connection", value_name = "URL")]
     relay_urls: Vec<String>,
     /// Persistent sender secret-key file.
-    #[arg(long, default_value = ".deltaweave/identity.key")]
+    #[arg(
+        long,
+        default_value = ".deltaweave/identity.key",
+        help_heading = "Identity and cache",
+        value_name = "FILE"
+    )]
     identity: PathBuf,
     /// Optional private sender manifest-cache directory.
-    #[arg(long)]
+    #[arg(long, help_heading = "Identity and cache", value_name = "DIR")]
     state: Option<PathBuf>,
     /// Disable discovery and relay services; use supplied direct addresses only.
-    #[arg(long)]
+    #[arg(long, help_heading = "Peer connection")]
     direct_only: bool,
     #[command(flatten)]
     chunking: ChunkingArgs,
@@ -163,7 +227,7 @@ struct ScanArgs {
     #[command(flatten)]
     index: IndexArgs,
     /// Include every persistent path and retry record in the JSON response.
-    #[arg(long)]
+    #[arg(long, help_heading = "Report details")]
     include_records: bool,
 }
 
@@ -172,60 +236,104 @@ struct WatchArgs {
     #[command(flatten)]
     index: IndexArgs,
     /// Quiet period after the latest filesystem event.
-    #[arg(long, default_value_t = 750)]
+    #[arg(
+        long,
+        default_value_t = 750,
+        help_heading = "Scheduling",
+        value_name = "MS"
+    )]
     debounce_ms: u64,
     /// Maximum time an event storm may postpone a scan.
-    #[arg(long, default_value_t = 5_000)]
+    #[arg(
+        long,
+        default_value_t = 5_000,
+        help_heading = "Scheduling",
+        value_name = "MS"
+    )]
     max_debounce_ms: u64,
     /// Safety-net full rescan interval in seconds.
-    #[arg(long, default_value_t = 600)]
+    #[arg(
+        long,
+        default_value_t = 600,
+        help_heading = "Scheduling",
+        value_name = "SECS"
+    )]
     rescan_seconds: u64,
     /// Full-scan interval when native watching is unavailable or reports loss.
-    #[arg(long, default_value_t = 5)]
+    #[arg(
+        long,
+        default_value_t = 5,
+        help_heading = "Scheduling",
+        value_name = "SECS"
+    )]
     poll_fallback_seconds: u64,
 }
 
 #[derive(Debug, Args)]
 struct IndexArgs {
     /// Directory whose local state is indexed.
-    #[arg(long)]
+    #[arg(long, help_heading = "Folder and identity", value_name = "DIR")]
     root: PathBuf,
     /// Private redb index file. If beneath root, its parent is excluded automatically.
-    #[arg(long, default_value = ".deltaweave/index.redb")]
+    #[arg(
+        long,
+        default_value = ".deltaweave/index.redb",
+        help_heading = "Folder and identity",
+        value_name = "FILE"
+    )]
     state: PathBuf,
     /// Persistent node identity used to derive a stable replica ID.
-    #[arg(long, default_value = ".deltaweave/identity.key")]
+    #[arg(
+        long,
+        default_value = ".deltaweave/identity.key",
+        help_heading = "Folder and identity",
+        value_name = "FILE"
+    )]
     identity: PathBuf,
     /// Maximum simultaneous file hashers; defaults to available CPUs capped at eight.
-    #[arg(long)]
+    #[arg(long, help_heading = "Indexing", value_name = "COUNT")]
     hash_workers: Option<usize>,
     /// Path to exclude from indexing; repeat for multiple paths.
-    #[arg(long = "ignore")]
+    #[arg(long = "ignore", help_heading = "Indexing", value_name = "PATH")]
     ignored_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Args)]
 struct SyncTargetArgs {
     /// Local folder participating in bidirectional synchronization.
-    #[arg(long)]
+    #[arg(long, help_heading = "Folder and identity", value_name = "DIR")]
     root: PathBuf,
     /// Private local index, CAS, journal, and recovery directory outside `root`.
-    #[arg(long, default_value = ".deltaweave/sync-state")]
+    #[arg(
+        long,
+        default_value = ".deltaweave/sync-state",
+        help_heading = "Folder and identity",
+        value_name = "DIR"
+    )]
     state: PathBuf,
     /// Persistent local endpoint identity outside `root`.
-    #[arg(long, default_value = ".deltaweave/identity.key")]
+    #[arg(
+        long,
+        default_value = ".deltaweave/identity.key",
+        help_heading = "Folder and identity",
+        value_name = "FILE"
+    )]
     identity: PathBuf,
     /// Remote receiver endpoint ID.
-    #[arg(long)]
+    #[arg(long, help_heading = "Peer connection", value_name = "ID")]
     peer: String,
     /// Remote direct UDP address; repeat when multiple addresses are advertised.
-    #[arg(long = "direct")]
+    #[arg(
+        long = "direct",
+        help_heading = "Peer connection",
+        value_name = "IP:PORT"
+    )]
     direct_addresses: Vec<SocketAddr>,
     /// Remote relay URL; repeat when multiple relays are advertised.
-    #[arg(long = "relay")]
+    #[arg(long = "relay", help_heading = "Peer connection", value_name = "URL")]
     relay_urls: Vec<String>,
     /// Disable discovery and relay services; use supplied direct addresses only.
-    #[arg(long)]
+    #[arg(long, help_heading = "Peer connection")]
     direct_only: bool,
     #[command(flatten)]
     chunking: ChunkingArgs,
@@ -234,16 +342,26 @@ struct SyncTargetArgs {
 #[derive(Debug, Args)]
 struct FaultTestArgs {
     /// Seed controlling identities, file bytes, and operation order.
-    #[arg(long, default_value_t = 424_242)]
+    #[arg(
+        long,
+        default_value_t = 424_242,
+        help_heading = "Test scenario",
+        value_name = "NUMBER"
+    )]
     seed: u64,
     /// Durable evidence directory. Removed after success unless explicitly supplied.
-    #[arg(long)]
+    #[arg(long, help_heading = "Test scenario", value_name = "DIR")]
     workspace: Option<PathBuf>,
     /// Payload size used to keep active-transfer barriers observable.
-    #[arg(long, default_value_t = 16)]
+    #[arg(
+        long,
+        default_value_t = 16,
+        help_heading = "Test scenario",
+        value_name = "MIB"
+    )]
     payload_mib: usize,
     /// Deliberately fail after writing the complete reproduction bundle.
-    #[arg(long)]
+    #[arg(long, help_heading = "Test scenario")]
     force_failure: bool,
 }
 
@@ -252,55 +370,105 @@ struct SyncArgs {
     #[command(flatten)]
     target: SyncTargetArgs,
     /// Maximum delay between successful reconciliation passes (also polls remote changes).
-    #[arg(long, default_value_t = 5)]
+    #[arg(
+        long,
+        default_value_t = 5,
+        help_heading = "Scheduling",
+        value_name = "SECS"
+    )]
     interval_seconds: u64,
     /// Quiet period after the latest local filesystem event.
-    #[arg(long, default_value_t = 750)]
+    #[arg(
+        long,
+        default_value_t = 750,
+        help_heading = "Scheduling",
+        value_name = "MS"
+    )]
     debounce_ms: u64,
     /// Maximum time a local event storm may postpone synchronization.
-    #[arg(long, default_value_t = 5_000)]
+    #[arg(
+        long,
+        default_value_t = 5_000,
+        help_heading = "Scheduling",
+        value_name = "MS"
+    )]
     max_debounce_ms: u64,
     /// Maximum exponential retry delay after failures.
-    #[arg(long, default_value_t = 300)]
+    #[arg(
+        long,
+        default_value_t = 300,
+        help_heading = "Scheduling",
+        value_name = "SECS"
+    )]
     max_backoff_seconds: u64,
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    init_tracing();
-    run(Cli::parse()).await
-}
+async fn main() -> std::process::ExitCode {
+    use std::process::Termination;
 
-async fn run(cli: Cli) -> Result<()> {
-    match cli.command {
-        Command::Init(args) => initialize(args),
-        Command::Manifest(args) => print_manifest(args),
-        Command::Serve(args) => serve(args).await,
-        Command::Push(args) => push(args).await,
-        Command::Scan(args) => scan(args),
-        Command::Watch(args) => watch(args).await,
-        Command::SyncOnce(args) => sync_once(args).await,
-        Command::Sync(args) => sync_forever(args).await,
-        Command::SelfTest => self_test().await,
-        Command::FaultTest(args) => fault_test(args).await,
+    init_tracing();
+    let cli = Cli::parse();
+    let format = cli.output;
+    let output = Output::new(format, cli.command.name());
+    output.progress();
+    match run(cli, &output).await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) if matches!(format, OutputFormat::Text) => {
+            let _ = output.error(&error);
+            std::process::ExitCode::FAILURE
+        }
+        Err(error) => Result::<()>::Err(error).report(),
     }
 }
 
-fn initialize(args: InitArgs) -> Result<()> {
+impl Command {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Init(_) => "init",
+            Self::Manifest(_) => "manifest",
+            Self::Serve(_) => "serve",
+            Self::Push(_) => "push",
+            Self::Scan(_) => "scan",
+            Self::Watch(_) => "watch",
+            Self::SyncOnce(_) => "sync-once",
+            Self::Sync(_) => "sync",
+            Self::SelfTest => "self-test",
+            Self::FaultTest(_) => "fault-test",
+        }
+    }
+}
+
+async fn run(cli: Cli, output: &Output) -> Result<()> {
+    match cli.command {
+        Command::Init(args) => initialize(args, output),
+        Command::Manifest(args) => print_manifest(args, output),
+        Command::Serve(args) => serve(args, output).await,
+        Command::Push(args) => push(args, output).await,
+        Command::Scan(args) => scan(args, output),
+        Command::Watch(args) => watch(args, output).await,
+        Command::SyncOnce(args) => sync_once(args, output).await,
+        Command::Sync(args) => sync_forever(args, output).await,
+        Command::SelfTest => self_test(output).await,
+        Command::FaultTest(args) => fault_test(args, output).await,
+    }
+}
+
+fn initialize(args: InitArgs, output: &Output) -> Result<()> {
     let identity = load_or_create_identity(&args.identity)?;
-    print_json(&json!({
+    output.print(&json!({
         "created": identity.created,
         "endpoint_id": identity.endpoint_id().to_string(),
         "identity_file": display_path(&args.identity),
     }))
 }
 
-fn print_manifest(args: ManifestArgs) -> Result<()> {
+fn print_manifest(args: ManifestArgs, output: &Output) -> Result<()> {
     let manifest = manifest_from_path(&args.file, args.chunking.profile()?)?;
-    print_json(&manifest)
+    output.print(&manifest)
 }
 
-async fn serve(args: ServeArgs) -> Result<()> {
+async fn serve(args: ServeArgs, output: &Output) -> Result<()> {
     if args.allowed_peers.is_empty() && !args.allow_any_authenticated {
         bail!("serve requires at least one --allow-peer, or explicit --allow-any-authenticated");
     }
@@ -335,7 +503,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
     }
 
     let address = server.address_info();
-    print_json(&json!({
+    output.print(&json!({
         "status": "ready",
         "endpoint_id": address.endpoint_id,
         "direct_addresses": address.direct_addresses,
@@ -389,7 +557,7 @@ async fn wait_for_shutdown_signal() -> Result<()> {
         .context("failed to wait for Ctrl-C")
 }
 
-async fn push(args: PushArgs) -> Result<()> {
+async fn push(args: PushArgs, output: &Output) -> Result<()> {
     if args.direct_only && args.direct_addresses.is_empty() {
         bail!("--direct-only requires at least one --direct address");
     }
@@ -405,7 +573,7 @@ async fn push(args: PushArgs) -> Result<()> {
         state_root: args.state,
     })
     .await?;
-    print_json(&receipt)
+    output.print(&receipt)
 }
 
 fn open_sync_engine(args: SyncTargetArgs) -> Result<SyncEngine> {
@@ -431,12 +599,12 @@ fn open_sync_engine(args: SyncTargetArgs) -> Result<SyncEngine> {
     })
 }
 
-async fn sync_once(args: SyncTargetArgs) -> Result<()> {
+async fn sync_once(args: SyncTargetArgs, output: &Output) -> Result<()> {
     let engine = open_sync_engine(args)?;
-    print_json(&engine.sync_once().await?)
+    output.print(&engine.sync_once().await?)
 }
 
-async fn sync_forever(args: SyncArgs) -> Result<()> {
+async fn sync_forever(args: SyncArgs, output: &Output) -> Result<()> {
     ensure!(
         args.interval_seconds > 0,
         "--interval-seconds must be greater than zero"
@@ -464,7 +632,7 @@ async fn sync_forever(args: SyncArgs) -> Result<()> {
         Ok(watcher) => (Some(watcher), None),
         Err(error) => (None, Some(error.to_string())),
     };
-    print_json(&json!({
+    output.print(&json!({
         "event": "sync_started",
         "local_change_detection": if watcher.is_some() { "native_watcher" } else { "polling_fallback" },
         "remote_poll_seconds": interval.as_secs(),
@@ -477,18 +645,18 @@ async fn sync_forever(args: SyncArgs) -> Result<()> {
         let (delay, watch_for_local_changes) = tokio::select! {
             result = &mut shutdown => {
                 result?;
-                print_json(&json!({"event": "shutdown", "status": "stopped"}))?;
+                output.print(&json!({"event": "shutdown", "status": "stopped"}))?;
                 return Ok(());
             }
             result = engine.sync_once() => {
                 match result {
                     Ok(report) => {
-                        print_json(&json!({"event": "sync", "report": report}))?;
+                        output.print(&json!({"event": "sync", "report": report}))?;
                         backoff = Duration::from_secs(1);
                         (interval, true)
                     }
                     Err(error) => {
-                        print_json(&json!({
+                        output.print(&json!({
                             "event": "sync_error",
                             "error": error.to_string(),
                             "retry_in_seconds": backoff.as_secs(),
@@ -510,7 +678,7 @@ async fn sync_forever(args: SyncArgs) -> Result<()> {
             tokio::select! {
                 result = &mut shutdown => {
                     result?;
-                    print_json(&json!({"event": "shutdown", "status": "stopped"}))?;
+                    output.print(&json!({"event": "shutdown", "status": "stopped"}))?;
                     return Ok(());
                 }
                 _ = tokio::time::sleep(remaining.min(Duration::from_millis(100))) => {}
@@ -520,7 +688,7 @@ async fn sync_forever(args: SyncArgs) -> Result<()> {
                     .as_mut()
                     .and_then(|watcher| watcher.poll(Instant::now()))
             {
-                print_json(&json!({
+                output.print(&json!({
                     "event": "local_change",
                     "native_events": trigger.event_count,
                     "rescan_required": trigger.rescan_required,
@@ -532,21 +700,21 @@ async fn sync_forever(args: SyncArgs) -> Result<()> {
     }
 }
 
-fn scan(args: ScanArgs) -> Result<()> {
+fn scan(args: ScanArgs, output: &Output) -> Result<()> {
     let index = open_index(args.index)?;
     let report = index.scan()?;
     if args.include_records {
-        print_json(&json!({
+        output.print(&json!({
             "records": index.records()?,
             "report": report,
             "retries": index.retries()?,
         }))
     } else {
-        print_json(&report)
+        output.print(&report)
     }
 }
 
-async fn watch(args: WatchArgs) -> Result<()> {
+async fn watch(args: WatchArgs, output: &Output) -> Result<()> {
     ensure!(
         args.debounce_ms > 0,
         "--debounce-ms must be greater than zero"
@@ -574,7 +742,7 @@ async fn watch(args: WatchArgs) -> Result<()> {
             Ok(watcher) => (Some(watcher), None),
             Err(error) => (None, Some(error.to_string())),
         };
-    print_json(&json!({
+    output.print(&json!({
         "event": "initial_scan",
         "report": index.scan()?,
         "root": display_path(index.root()),
@@ -592,7 +760,7 @@ async fn watch(args: WatchArgs) -> Result<()> {
         tokio::select! {
             result = &mut shutdown => {
                 result?;
-                print_json(&json!({"event": "shutdown", "status": "stopped"}))?;
+                output.print(&json!({"event": "shutdown", "status": "stopped"}))?;
                 return Ok(());
             }
             _ = tokio::time::sleep(Duration::from_millis(100)) => {
@@ -618,7 +786,7 @@ async fn watch(args: WatchArgs) -> Result<()> {
                             .map_or(&[][..], |value| value.changed_paths.as_slice()),
                     )?
                 };
-                print_json(&json!({
+                output.print(&json!({
                     "event": if periodic {
                         "periodic_scan"
                     } else if fallback {
@@ -915,7 +1083,7 @@ fn write_fault_report(path: &Path, report: &FaultTestReport) -> Result<()> {
     Ok(())
 }
 
-async fn fault_test(args: FaultTestArgs) -> Result<()> {
+async fn fault_test(args: FaultTestArgs, output: &Output) -> Result<()> {
     let temporary = if args.workspace.is_none() {
         Some(tempfile::tempdir()?)
     } else {
@@ -965,7 +1133,7 @@ async fn fault_test(args: FaultTestArgs) -> Result<()> {
         report.status = "failed".into();
         report.error = Some(format!("{error:#}"));
         write_fault_report(&report_path, &report)?;
-        print_json(&report)?;
+        output.print(&report)?;
         return Err(error);
     }
     report.status = if args.force_failure {
@@ -975,7 +1143,7 @@ async fn fault_test(args: FaultTestArgs) -> Result<()> {
     }
     .into();
     write_fault_report(&report_path, &report)?;
-    print_json(&report)?;
+    output.print(&report)?;
     if args.force_failure {
         bail!(
             "forced fault-test failure; reproduction bundle preserved at {}",
@@ -1236,7 +1404,7 @@ fn fault_test_scenario(
     Ok(())
 }
 
-async fn self_test() -> Result<()> {
+async fn self_test(output: &Output) -> Result<()> {
     let workspace = tempfile::tempdir().context("failed to create self-test workspace")?;
     let destination = workspace.path().join("received");
     let state = workspace.path().join("state");
@@ -1271,7 +1439,7 @@ async fn self_test() -> Result<()> {
     };
     let index = exercise_index_self_test(workspace.path())?;
 
-    print_json(&json!({
+    output.print(&json!({
         "architecture": std::env::consts::ARCH,
         "final_size": final_size,
         "first_transfer_bytes": first.transferred_bytes,
@@ -1556,13 +1724,6 @@ fn init_tracing() {
         .with_writer(std::io::stderr)
         .with_ansi(false)
         .init();
-}
-
-fn print_json(value: &impl serde::Serialize) -> Result<()> {
-    let mut stdout = std::io::stdout().lock();
-    serde_json::to_writer_pretty(&mut stdout, value)?;
-    writeln!(stdout)?;
-    Ok(())
 }
 
 fn display_path(path: &Path) -> String {

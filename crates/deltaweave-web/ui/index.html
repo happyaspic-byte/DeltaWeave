@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <meta name="description" content="DeltaWeave 로컬 폴더 검사와 기기 간 동기화 관리">
+    <title>DeltaWeave · 로컬 동기화</title>
+    <link rel="stylesheet" href="/styles.css">
+    <script type="module" src="/app.js"></script>
+  </head>
+  <body>
+    <div id="announcement" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
+
+    <section id="auth-panel" class="auth-panel" role="main" aria-labelledby="auth-heading">
+      <div class="wordmark">DeltaWeave</div>
+      <div class="auth-content">
+        <p class="eyebrow">로컬 동기화 관리</p>
+        <h1 id="auth-heading">이 기기에 연결</h1>
+        <p class="intro">실행 중인 DeltaWeave의 개인 접속 링크를 열거나, 터미널에 표시된 접속 키를 입력하세요.</p>
+        <form id="auth-form" novalidate>
+          <div class="field">
+            <label for="token">접속 키</label>
+            <input id="token" name="token" type="password" autocomplete="off" spellcheck="false" required aria-describedby="token-hint token-error">
+            <p id="token-hint" class="field-hint">접속 키는 이 브라우저 탭에만 보관됩니다.</p>
+            <p id="token-error" class="field-error" role="alert" hidden></p>
+          </div>
+          <button id="auth-submit" class="button button-primary" type="submit">연결하기</button>
+        </form>
+      </div>
+      <p class="auth-footnote">동기화 폴더는 DeltaWeave를 시작할 때 지정한 경로를 사용합니다.</p>
+    </section>
+
+    <div id="app-shell" class="app-shell" hidden>
+      <a class="skip-link" href="#main-content">본문으로 이동</a>
+      <aside class="sidebar" aria-label="DeltaWeave 탐색">
+        <a class="wordmark" href="#overview" aria-label="DeltaWeave 개요">DeltaWeave</a>
+        <p class="sidebar-caption">로컬 동기화</p>
+        <nav aria-label="주 메뉴">
+          <a href="#overview">개요</a>
+          <a href="#connection">기기 연결</a>
+          <a href="#activity">작업 기록</a>
+        </nav>
+        <div class="sidebar-footer">
+          <span>로컬 관리 화면</span>
+          <span id="version-label"></span>
+        </div>
+      </aside>
+
+      <main id="main-content" class="main-content" tabindex="-1">
+        <div id="connection-banner" class="connection-banner" role="status" hidden>
+          <p id="connection-message">서버 연결을 확인하고 있습니다. 표시된 결과는 마지막으로 확인한 내용입니다.</p>
+          <button id="reconnect" class="button button-secondary" type="button">다시 연결</button>
+        </div>
+
+        <section id="overview" class="overview" aria-labelledby="overview-heading">
+          <header class="page-heading">
+            <div>
+              <p class="eyebrow">내 기기</p>
+              <h1 id="overview-heading">동기화 개요</h1>
+              <p>현재 폴더를 확인하고 연결할 기기를 설정하세요.</p>
+            </div>
+            <span id="phase-label" class="status-label" role="status">상태 확인 중</span>
+          </header>
+
+          <div class="folder-panel panel">
+            <div class="folder-heading">
+              <div class="folder-info">
+                <h2>현재 폴더</h2>
+                <p id="root-path" class="root-path selectable">폴더 정보를 불러오고 있습니다.</p>
+              </div>
+              <button id="scan-button" class="button button-primary" type="button">폴더 검사</button>
+            </div>
+            <p id="phase-description" class="phase-description">서버의 작업 상태를 확인하고 있습니다.</p>
+            <div class="device-row">
+              <div class="device-info">
+                <h3>내 기기 ID</h3>
+                <p id="endpoint-id" class="technical selectable">기기 정보를 불러오고 있습니다.</p>
+              </div>
+              <button id="copy-endpoint" class="button button-quiet" type="button">ID 복사</button>
+            </div>
+          </div>
+        </section>
+
+        <div class="workspace-grid">
+          <section class="results-section panel" aria-labelledby="results-heading">
+            <header class="panel-heading">
+              <h2 id="results-heading">폴더 검사 결과</h2>
+              <p>마지막으로 완료한 검사의 파일 정보를 표시합니다.</p>
+            </header>
+            <div id="scan-summary" class="metric-grid" hidden>
+              <dl class="metric"><dt>인덱스 경로</dt><dd id="scan-live-records">미확인</dd></dl>
+              <dl class="metric"><dt>이번에 검사한 파일</dt><dd id="scan-hashed">미확인</dd></dl>
+              <dl class="metric"><dt>재시도 대기</dt><dd id="scan-retries">미확인</dd></dl>
+            </div>
+            <div id="scan-issues" class="scan-issues" hidden></div>
+            <div class="records-heading">
+              <h3 id="records-heading">검사한 항목</h3>
+              <p id="record-count" class="muted">검사 후 표시</p>
+            </div>
+            <p id="scan-empty" class="empty-state">아직 검사하지 않았습니다. 폴더 검사를 실행하면 파일과 변경 상태를 확인할 수 있습니다.</p>
+            <div class="table-container" role="region" aria-labelledby="records-heading" tabindex="0">
+              <table>
+                <caption class="sr-only">마지막 폴더 검사에서 확인한 항목</caption>
+                <thead><tr><th scope="col">경로</th><th scope="col">유형</th><th scope="col">크기</th><th scope="col">상태</th></tr></thead>
+                <tbody id="file-table-body"></tbody>
+              </table>
+            </div>
+            <div class="sync-result">
+              <h3 id="sync-result-label">최근 동기화</h3>
+              <div id="sync-summary">아직 완료한 동기화가 없습니다.</div>
+              <details class="result-disclosure">
+                <summary>검증 결과 상세 보기</summary>
+                <pre id="result-details">동기화를 완료하면 실제 검증 결과가 표시됩니다.</pre>
+              </details>
+            </div>
+          </section>
+
+          <section id="connection" class="connection-section panel" aria-labelledby="connection-heading">
+            <header class="panel-heading">
+              <h2 id="connection-heading">기기 연결</h2>
+              <p>상대 기기에서 수신을 시작한 뒤 연결 정보를 입력하세요.</p>
+            </header>
+            <form id="peer-form" novalidate>
+              <div class="field">
+                <label for="peer_id">상대 기기 ID</label>
+                <input id="peer_id" name="peer_id" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" required aria-describedby="peer_id-hint peer_id-error">
+                <p id="peer_id-hint" class="field-hint">상대 기기의 개요 화면에서 ID를 복사하세요.</p>
+                <p id="peer_id-error" class="field-error" role="alert" hidden></p>
+              </div>
+              <div class="field">
+                <label for="direct_address">상대 기기 주소</label>
+                <input id="direct_address" name="direct_address" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="IP 주소:포트" aria-describedby="direct_address-hint direct_address-error">
+                <p id="direct_address-hint" class="field-hint">상대 기기에 표시된 직접 연결 주소를 입력하세요.</p>
+                <p id="direct_address-error" class="field-error" role="alert" hidden></p>
+              </div>
+              <div class="confirmation">
+                <label for="confirm" class="checkbox-label">
+                  <input id="confirm" name="confirm" type="checkbox" aria-describedby="confirm-hint confirm-error">
+                  <span>양쪽 폴더의 변경 사항을 반영합니다.</span>
+                </label>
+                <p id="confirm-hint" class="field-hint">파일 추가·수정·삭제가 양방향으로 적용됩니다. 상대 기기와 폴더를 확인한 후 실행하세요.</p>
+                <p id="confirm-error" class="field-error" role="alert" hidden></p>
+              </div>
+              <p id="form-error" class="field-error form-error" role="alert" hidden></p>
+              <button id="sync-button" class="button button-primary button-full" type="submit">지금 동기화</button>
+              <div class="receiver-section">
+                <h3>이 기기에서 수신</h3>
+                <p class="field-hint">입력한 상대 기기 ID만 연결할 수 있습니다. 수신 중에는 폴더 검사와 동기화를 실행할 수 없습니다.</p>
+                <div class="receiver-actions">
+                  <button id="receiver-start" class="button button-secondary" type="button">수신 시작</button>
+                  <button id="receiver-stop" class="button button-secondary" type="button" hidden>수신 중지</button>
+                </div>
+                <div id="receiver-info" class="receiver-info" hidden>
+                  <h4>상대 기기에 전달할 주소</h4>
+                  <ul id="receiver-addresses" class="technical selectable"></ul>
+                </div>
+              </div>
+            </form>
+          </section>
+        </div>
+
+        <section id="activity" class="activity-section panel" aria-labelledby="activity-heading">
+          <header class="panel-heading">
+            <h2 id="activity-heading">작업 기록</h2>
+            <p>이 서버에서 실행한 최근 작업을 표시합니다.</p>
+          </header>
+          <p id="activity-empty" class="empty-state">아직 실행한 작업이 없습니다.</p>
+          <ol id="activity-list" class="activity-list"></ol>
+        </section>
+        <footer class="main-footer">브라우저를 닫아도 진행 중인 작업은 서버에서 계속됩니다.</footer>
+      </main>
+    </div>
+    <noscript><p class="noscript-message">DeltaWeave 관리 화면을 사용하려면 JavaScript를 활성화하세요.</p></noscript>
+  </body>
+</html>

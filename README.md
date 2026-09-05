@@ -62,6 +62,24 @@ with a one-node/no-action Merkle fast path.
 
 The scope and acceptance gates for later phases live in [ROADMAP.md](ROADMAP.md).
 
+## Readable terminal output
+
+Use `deltaweave --help` to find a command, then `deltaweave <command> --help`
+for grouped options and examples. Add `--output text` to see status, labeled
+values, and separate detail sections:
+
+```bash
+deltaweave --output text self-test
+deltaweave scan --root ./sync-root --output text
+```
+
+JSON remains the default for every command; `--output json` explicitly selects
+the same output. Existing scripts and JSON report files keep their format.
+Text mode retains complete identifiers and report details, shows empty results,
+and appends watch/sync events without clearing terminal history. It sends a
+short starting message and errors to stderr. Color is used only in a terminal;
+set `NO_COLOR=1` to disable it. Redirected reports contain no styling escapes.
+
 ## Repository layout
 
 | Crate | Responsibility |

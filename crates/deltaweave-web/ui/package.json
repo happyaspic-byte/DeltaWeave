@@ -1,0 +1,6 @@
+{
+  "name": "deltaweave-web-ui",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node --test model.test.js" }
+}
