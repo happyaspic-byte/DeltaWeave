@@ -91,6 +91,12 @@ all operations in a reconciliation pass.
 5. Client sends `Finish`, rebuilds the complete remote tree locally, and rejects
    any root or record-count mismatch.
 
+Before scheduling child queries, the client checks sorted unique immediate child
+names, record-prefix correspondence, positive child cardinalities, and exact
+parent/child cardinality sums. Queried children must match the hash and cardinality
+advertised by their parent. Queued and issued queries together are limited to
+1,000,000; the same upper bound applies to snapshot records.
+
 An unchanged namespace therefore exchanges one node summary rather than the
 complete record set.
 
@@ -118,3 +124,7 @@ Every v2 mutation receipt binds the portable path, logical record hash, unique
 payload bytes, and reused extent count. `sync-once` does not treat receipts alone
 as convergence proof: it independently rescans local state and fetches a new
 remote Merkle root after all actions.
+
+Receiver error responses use bounded, static recovery guidance. Internal absolute
+paths and raw storage errors are not transmitted in those responses or copied into
+receiver failure logs. The message schemas and ALPN identifiers are unchanged.

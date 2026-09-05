@@ -6,7 +6,7 @@ on:
     types: [completed]
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ github.event.workflow_run.head_sha }}
@@ -197,13 +197,15 @@ jobs:
       - name: Install cargo-audit
         run: cargo install cargo-audit --version 0.22.2 --locked
       - name: Audit release lockfile
+        # Same narrowly scoped, documented paste exception as security.yml.
         run: >-
           cargo audit --deny warnings
-          --ignore RUSTSEC-2023-0089
           --ignore RUSTSEC-2024-0436
 
   publish:
     name: Publish GitHub release
+    permissions:
+      contents: write
     needs: [prepare, windows, synology]
     if: >-
       always() &&

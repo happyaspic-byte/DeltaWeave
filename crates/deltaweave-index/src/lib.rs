@@ -4,7 +4,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
-    fs::{self, File, Metadata},
+    fs::{self, File, Metadata, OpenOptions},
     io::Read,
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex, mpsc},
@@ -273,16 +273,32 @@ impl LocalIndex {
         let root = fs::canonicalize(root.as_ref())
             .with_context(|| format!("failed to resolve index root {}", root.as_ref().display()))?;
 
-        let mut database_path = absolute_path(database_path.as_ref())?;
-        if fs::symlink_metadata(&database_path)
+        let database_path = database_path.as_ref();
+        if fs::symlink_metadata(database_path)
             .is_ok_and(|metadata| metadata.file_type().is_symlink())
         {
             bail!("index DB must not be a symbolic link");
         }
+        let mut database_path = absolute_path(database_path)?;
         if let Some(parent) = database_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let database = Database::create(&database_path)
+        let mut file_options = OpenOptions::new();
+        file_options
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            file_options.mode(0o600);
+        }
+        let file = file_options
+            .open(&database_path)
+            .with_context(|| format!("failed to open index DB {}", database_path.display()))?;
+        let database = Database::builder()
+            .create_file(file)
             .with_context(|| format!("failed to open index DB {}", database_path.display()))?;
         database_path = fs::canonicalize(&database_path).with_context(|| {
             format!(
@@ -2608,6 +2624,123 @@ mod tests {
                 .expect("lookup succeeds")
                 .is_none()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_index_database_is_private_in_a_public_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const FIXTURE_ENV: &str = "DELTAWEAVE_INDEX_DB_MODE_FIXTURE";
+        if let Some(fixture) = std::env::var_os(FIXTURE_ENV) {
+            let fixture = PathBuf::from(fixture);
+            let index = LocalIndex::open(
+                fixture.join("root"),
+                fixture.join("index.redb"),
+                replica(),
+                IndexOptions::default(),
+            )
+            .expect("new index DB can open");
+            index.scan().expect("private root can be indexed");
+            return;
+        }
+
+        let fixture = TempDir::new().unwrap();
+        fs::set_permissions(fixture.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let root = fixture.path().join("root");
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(root.join("private.txt"), b"private index fixture").unwrap();
+        let output = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "umask 022; exec \"$@\"",
+                "deltaweave-index-db-mode-test",
+            ])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::new_index_database_is_private_in_a_public_parent",
+            ])
+            .env(FIXTURE_ENV, fixture.path())
+            .output()
+            .expect("controlled-umask process can run");
+        assert!(output.status.success(), "child failed: {output:?}");
+        let database_path = fixture.path().join("index.redb");
+        assert_eq!(
+            fs::metadata(&database_path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "a newly created index DB must exclude other users"
+        );
+        assert_eq!(
+            fs::metadata(fixture.path()).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "existing parent permissions must remain unchanged"
+        );
+
+        fs::set_permissions(&database_path, fs::Permissions::from_mode(0o640)).unwrap();
+        let reopened = LocalIndex::open(&root, &database_path, replica(), IndexOptions::default())
+            .expect("existing DB can reopen");
+        let record = reopened
+            .get(&WirePath::new("private.txt").unwrap())
+            .unwrap()
+            .expect("indexed record survives restart");
+        assert_eq!(
+            record.content_hash,
+            Some(Hash32::digest(b"private index fixture"))
+        );
+        assert!(reopened.scan().unwrap().changes.is_empty());
+        assert!(
+            LocalIndex::open(&root, &database_path, replica(), IndexOptions::default()).is_err(),
+            "DB lock must remain exclusive"
+        );
+        assert_eq!(
+            fs::metadata(&database_path).unwrap().permissions().mode() & 0o777,
+            0o640,
+            "existing DB permissions must remain unchanged"
+        );
+    }
+
+    #[test]
+    fn index_database_rejects_invalid_contents_without_modifying_them() {
+        let root = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        let database_path = state.path().join("index.redb");
+        fs::write(&database_path, b"not an index database").unwrap();
+
+        assert!(
+            LocalIndex::open(
+                root.path(),
+                &database_path,
+                replica(),
+                IndexOptions::default()
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(&database_path).unwrap(), b"not an index database");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symbolic_link_index_database_is_rejected_before_opening_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().expect("root can be created");
+        let outside = TempDir::new().expect("outside can be created");
+        let outside_file = outside.path().join("outside.bin");
+        fs::write(&outside_file, b"").expect("outside file can be written");
+        let database_path = root.path().join("index.redb");
+        symlink(&outside_file, &database_path).expect("symlink can be made");
+
+        let result = LocalIndex::open(
+            root.path(),
+            &database_path,
+            replica(),
+            IndexOptions::default(),
+        );
+
+        assert!(result.is_err(), "a symlink database path must be rejected");
+        assert!(fs::read(&outside_file).unwrap().is_empty());
     }
 
     #[cfg(unix)]

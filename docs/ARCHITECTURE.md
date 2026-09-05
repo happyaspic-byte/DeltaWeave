@@ -37,6 +37,11 @@ and file/parent directories are synchronized where the platform supports it.
 If metadata commit fails after file installation, a later identical transfer
 recognizes the whole-file hash and completes the journal idempotently.
 
+The existing-file fast path also verifies the manifest's size and each chunk
+digest in the same read before committing metadata. A file with other hard links
+is rebuilt into a separate inode before readonly changes. Trash directory names
+are atomically reserved, preserving prior recovery entries across process restarts.
+
 The current symlink-ancestor check blocks ordinary path escapes, but is not an
 `openat2`/handle-relative defense against a hostile local process racing path
 components. That hardening is a pre-production gate.
@@ -106,6 +111,7 @@ One `sync-once` pass follows these gates:
 5. Stage every required content hash in the local CAS before changing either
    namespace. This prevents conflict data from being lost when a canonical path
    is overwritten.
+   Before staging, validate the merged live namespace for case/Unicode collisions.
 6. Authoritatively rescan the local root and require its Merkle root and record
    count to match the initial local snapshot before applying the plan, including
    passes with only remote actions. Incomplete scans or local changes abort the

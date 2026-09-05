@@ -25,10 +25,21 @@
 - Parent symlinks are rejected before materialization.
 - Chunk payloads and complete reconstructed files are hash-verified.
 - Existing files are moved to private state trash rather than deleted.
+- Recovery directories are reserved atomically so process restarts cannot reuse
+  and overwrite prior trash entries; dangling symlinks are preserved on replacement.
+- Existing files are reused only after their size, chunk digests, and complete hash
+  match the manifest. Multiply linked files are replaced with a new inode before
+  applying readonly changes, avoiding permission changes outside the destination.
 - Destination and private state roots may not overlap, and the CLI rejects a
   receiver identity stored beneath the writable destination root.
 - Secret keys are created with owner-only permissions on Unix and insecure
   existing Unix key permissions are rejected.
+- CLI server/sync identity locations are checked before a new secret is created.
+- Newly created Unix state directories and index, metadata, and sender-cache DB
+  files are owner-only. Existing operator-managed file/directory permissions and
+  Windows ACLs are not rewritten automatically.
+- Protocol errors and receiver failure logs use bounded recovery guidance instead
+  of serializing internal filesystem paths and database errors to peers.
 - Local scans never follow symlinks, verify metadata stability around hashing,
   and retain prior records when enumeration or reads are uncertain.
 - Cross-platform Unicode/case name collisions are reported without collapsing
@@ -39,6 +50,10 @@
   accidental reuse from being interpreted as mass deletion.
 - Remote snapshots are accepted only after rebuilding and matching their Merkle
   root and record count; unhealthy local or remote scans abort reconciliation.
+- Merkle child names, cardinalities, prefixes, and parent commitments are checked
+  before scheduling further work; queued and issued queries share a bounded budget.
+- The merged live namespace is checked for case/Unicode collisions before staging,
+  and local state is rescanned before applying a previously computed action plan.
 - Version vectors reject stale, unmerged-concurrent, and equal-clock divergent
   writes before namespace replacement.
 - Required conflict contents enter verified CAS before either peer is mutated,
@@ -62,9 +77,14 @@
   protection across removed devices are not implemented.
 - Name collisions are detected but there is not yet a cross-device operator UX
   or automatic resolution policy.
+- Live-path/tombstone aliases on case-insensitive filesystems need platform tests;
+  live namespace collision rejection does not prove that an aliased deletion is safe.
 - Causal state is implemented for two-peer orchestration; membership changes,
   malicious history amplification, and multi-peer admission policy are not.
 
 Operate the receiver with a dedicated unprivileged account and a dedicated empty
 destination. Keep separate backups. Do not expose `--allow-any-authenticated` on
 an untrusted network.
+
+See [the 2026-09-05 security review](SECURITY_REVIEW_2026-09-05.md) for synthetic
+reproductions, dependency advisory dispositions, verification, and remaining limits.

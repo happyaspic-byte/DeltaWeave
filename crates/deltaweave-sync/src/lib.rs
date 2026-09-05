@@ -13,7 +13,7 @@ use anyhow::{Context, Result, bail, ensure};
 use deltaweave_core::{
     ChunkingProfile, FileManifest, Hash32, ReplicaId, SyncEntryKind, SyncRecord, WirePath,
 };
-use deltaweave_index::{IndexOptions, LocalIndex, ScanReport};
+use deltaweave_index::{IndexOptions, LocalIndex, ScanReport, collision_key};
 use deltaweave_net::{PullReceipt, SyncApplyReceipt, SyncClient, SyncSession};
 use deltaweave_reconcile::{
     ApplyAction, ConflictRecord, MerkleTree, actions_to_reach, merge_snapshots,
@@ -107,12 +107,21 @@ impl SyncEngine {
                 config.root.display()
             )
         })?;
-        fs::create_dir_all(&config.state_root).with_context(|| {
-            format!(
-                "failed to create private state root {}",
-                config.state_root.display()
-            )
-        })?;
+        let mut state_directories = fs::DirBuilder::new();
+        state_directories.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            state_directories.mode(0o700);
+        }
+        state_directories
+            .create(&config.state_root)
+            .with_context(|| {
+                format!(
+                    "failed to create private state root {}",
+                    config.state_root.display()
+                )
+            })?;
         let root = fs::canonicalize(&config.root)?;
         let state_root = fs::canonicalize(&config.state_root)?;
         ensure!(
@@ -419,6 +428,7 @@ fn validate_materializable_namespace(records: &[SyncRecord]) -> Result<()> {
         .iter()
         .map(|record| (record.path.as_str(), record))
         .collect();
+    let mut portable_paths = BTreeMap::new();
     for record in records.iter().filter(|record| !record.tombstone) {
         ensure!(
             matches!(record.kind, SyncEntryKind::File | SyncEntryKind::Directory),
@@ -427,9 +437,18 @@ fn validate_materializable_namespace(records: &[SyncRecord]) -> Result<()> {
             record.path
         );
         let components: Vec<_> = record.path.components().collect();
-        for end in 1..components.len() {
+        for end in 1..=components.len() {
             let ancestor = components[..end].join("/");
-            if let Some(ancestor_record) = by_path.get(ancestor.as_str()) {
+            let key = collision_key(&WirePath::new(ancestor.clone())?);
+            if let Some(previous) = portable_paths.insert(key, ancestor.clone()) {
+                ensure!(
+                    previous == ancestor,
+                    "merged namespace has a cross-platform path collision: {previous} and {ancestor}"
+                );
+            }
+            if end < components.len()
+                && let Some(ancestor_record) = by_path.get(ancestor.as_str())
+            {
                 ensure!(
                     !ancestor_record.tombstone && ancestor_record.kind == SyncEntryKind::Directory,
                     "namespace has non-directory ancestor {ancestor} for {}",
@@ -875,6 +894,161 @@ mod tests {
             BTreeSet::from([b"fresh local edit".to_vec(), b"remote edit".to_vec()])
         );
         server.shutdown().await.expect("server shuts down");
+    }
+
+    fn file_record(path: &str) -> SyncRecord {
+        let mut version = deltaweave_core::VersionVector::default();
+        version.observe(ReplicaId(Hash32::digest(b"fixture")), 1);
+        SyncRecord {
+            schema_version: deltaweave_core::SYNC_RECORD_SCHEMA_V1,
+            path: WirePath::new(path).expect("portable fixture path"),
+            kind: SyncEntryKind::File,
+            size: 7,
+            content_hash: Some(Hash32::digest(b"fixture")),
+            readonly: false,
+            version,
+            tombstone: false,
+        }
+    }
+
+    fn open_test_engine(root: &Path, state: &Path) -> SyncEngine {
+        let key = SecretKey::generate();
+        SyncEngine::open(SyncConfig {
+            root: root.to_path_buf(),
+            state_root: state.to_path_buf(),
+            replica: replica(&key),
+            client: SyncClient {
+                secret_key: key,
+                remote: SecretKey::generate().public().into(),
+                network_mode: NetworkMode::DirectOnly,
+            },
+            profile: ChunkingProfile::DEFAULT,
+            ignored_paths: Vec::new(),
+        })
+        .expect("sync engine")
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn new_sync_state_root_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().expect("workspace");
+        let state = temp.path().join("private/state");
+        let _engine = open_test_engine(&temp.path().join("root"), &state);
+        assert_eq!(
+            fs::metadata(&state)
+                .expect("state directory")
+                .permissions()
+                .mode()
+                & 0o077,
+            0
+        );
+    }
+
+    #[test]
+    fn merged_namespace_rejects_case_and_unicode_collisions() {
+        for (left, right) in [
+            ("README.txt", "readme.txt"),
+            ("caf\u{00e9}.txt", "cafe\u{0301}.txt"),
+            ("Docs/first.txt", "docs/second.txt"),
+        ] {
+            let records = [file_record(left), file_record(right)];
+            assert!(
+                validate_materializable_namespace(&records).is_err(),
+                "colliding namespace {left:?}, {right:?} must fail before materialization"
+            );
+        }
+        assert!(
+            validate_materializable_namespace(&[
+                file_record("docs/first.txt"),
+                file_record("docs/second.txt"),
+            ])
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn local_edit_after_snapshot_blocks_remote_deletion() {
+        let root = TempDir::new().expect("local root");
+        let state = TempDir::new().expect("local state");
+        let path = root.path().join("document.txt");
+        fs::write(&path, b"initial content").expect("initial file");
+        let engine = open_test_engine(root.path(), state.path());
+        engine.index.scan().expect("initial scan");
+        let initial = MerkleTree::from_records(engine.index.sync_records().expect("records"))
+            .expect("snapshot");
+        let mut deleted = initial.records().next().expect("initial file").clone();
+        deleted.tombstone = true;
+        deleted
+            .version
+            .observe(ReplicaId(Hash32::digest(b"remote")), 1);
+        fs::write(&path, b"new local work after the snapshot").expect("local edit");
+
+        let result = engine
+            .apply_local(
+                &initial,
+                &[ApplyAction::Delete { record: deleted }],
+                &BTreeMap::new(),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "changed local state must abort application"
+        );
+        assert_eq!(
+            fs::read(&path).expect("local edit remains at its original path"),
+            b"new local work after the snapshot"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn merged_case_collision_aborts_before_either_namespace_is_modified() {
+        let workspace = TempDir::new().expect("workspace");
+        let local = workspace.path().join("local");
+        let remote = workspace.path().join("remote");
+        fs::create_dir(&local).expect("local root");
+        fs::create_dir(&remote).expect("remote root");
+        fs::write(local.join("README.txt"), b"local original").expect("local fixture");
+        fs::write(remote.join("readme.txt"), b"remote original").expect("remote fixture");
+        let key = SecretKey::generate();
+        let server = start_server(ServerConfig {
+            secret_key: SecretKey::generate(),
+            destination_root: remote.clone(),
+            state_root: workspace.path().join("remote-state"),
+            peer_policy: PeerPolicy::AllowListed(HashSet::from([key.public()])),
+            network_mode: NetworkMode::DirectOnly,
+            bind_address: Some("127.0.0.1:0".parse().expect("loopback")),
+        })
+        .await
+        .expect("server starts");
+        let engine = SyncEngine::open(SyncConfig {
+            root: local.clone(),
+            state_root: workspace.path().join("local-state"),
+            replica: replica(&key),
+            client: SyncClient {
+                secret_key: key,
+                remote: server.endpoint_addr(),
+                network_mode: NetworkMode::DirectOnly,
+            },
+            profile: ChunkingProfile::DEFAULT,
+            ignored_paths: Vec::new(),
+        })
+        .expect("engine opens");
+
+        let outcome = engine.sync_once().await;
+        server.shutdown().await.expect("server shuts down");
+        assert!(outcome.is_err(), "cross-peer collision must abort sync");
+        assert_eq!(
+            fs::read(local.join("README.txt")).expect("local survives"),
+            b"local original"
+        );
+        assert_eq!(
+            fs::read(remote.join("readme.txt")).expect("remote survives"),
+            b"remote original"
+        );
+        assert_eq!(fs::read_dir(&local).expect("local namespace").count(), 1);
+        assert_eq!(fs::read_dir(&remote).expect("remote namespace").count(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

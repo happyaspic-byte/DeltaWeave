@@ -8,7 +8,6 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 concurrency:
   group: container-${{ github.workflow }}-${{ github.ref }}
@@ -66,6 +65,9 @@ jobs:
 
   publish-image:
     name: Publish multi-architecture image
+    permissions:
+      contents: read
+      packages: write
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     needs: test-image
     runs-on: ubuntu-latest
