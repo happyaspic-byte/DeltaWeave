@@ -106,12 +106,17 @@ One `sync-once` pass follows these gates:
 5. Stage every required content hash in the local CAS before changing either
    namespace. This prevents conflict data from being lost when a canonical path
    is overwritten.
-6. Apply tombstones deepest-first, directories parent-first, and files in path
+6. Authoritatively rescan the local root and require its Merkle root and record
+   count to match the initial local snapshot before applying the plan, including
+   passes with only remote actions. Incomplete scans or local changes abort the
+   pass so a retry reconciles the fresh state. This adds a full local rehash; it
+   does not provide an OS snapshot or prevent filesystem races after the check.
+7. Apply tombstones deepest-first, directories parent-first, and files in path
    order. Existing non-directory content moves to private trash; non-empty
    unknown directories block deletion.
-7. Push exact causal records to the remote. The receiver rejects stale,
+8. Push exact causal records to the remote. The receiver rejects stale,
    concurrent, or equal-clock/different-state records that skipped merge.
-8. Rescan local state and reconstruct a fresh remote snapshot. Success is
+9. Rescan local state and reconstruct a fresh remote snapshot. Success is
    reported only when both roots and record counts equal the desired tree.
 
 Directory mtime and read-only flags are deliberately normalized away: child

@@ -180,7 +180,8 @@ impl SyncEngine {
         let (manifests, stage_stats) = self
             .stage_desired_files(session, &required_files, &local_records, &remote.records)
             .await?;
-        self.apply_local(&local_tree, &local_actions, &manifests)?;
+        self.apply_local(&local_tree, &local_actions, &manifests)
+            .await?;
         let remote_stats = self.apply_remote(session, &remote_actions).await?;
 
         let verification_scan = scan_index(Arc::clone(&self.index)).await?;
@@ -287,12 +288,20 @@ impl SyncEngine {
         Ok((manifests, stats))
     }
 
-    fn apply_local(
+    async fn apply_local(
         &self,
         current: &MerkleTree,
         actions: &[ApplyAction],
         manifests: &BTreeMap<Hash32, FileManifest>,
     ) -> Result<()> {
+        let scan = scan_index(Arc::clone(&self.index)).await?;
+        ensure_scan_is_safe(&scan, "local before apply")?;
+        let fresh = MerkleTree::from_records(read_records(Arc::clone(&self.index)).await?)?;
+        ensure!(
+            fresh.root_hash() == current.root_hash() && fresh.len() == current.len(),
+            "local state changed before applying reconciliation; retry with a fresh snapshot"
+        );
+
         let mut deletions = action_records(actions, true, None);
         deletions.sort_by_key(|record| std::cmp::Reverse(path_depth(&record.path)));
         for record in deletions {
@@ -498,14 +507,374 @@ fn apply_readonly(path: &Path, readonly: bool) -> Result<()> {
 mod tests {
     use std::{collections::HashSet, fs};
 
+    use deltaweave_core::{SYNC_RECORD_SCHEMA_V1, VersionVector};
     use deltaweave_net::{NetworkMode, PeerPolicy, ServerConfig, start_server};
-    use iroh::SecretKey;
+    use iroh::{EndpointAddr, SecretKey};
     use tempfile::TempDir;
 
     use super::*;
 
     fn replica(key: &SecretKey) -> ReplicaId {
         ReplicaId(Hash32::digest(key.public().as_bytes()))
+    }
+
+    fn test_engine(root: &TempDir, state: &TempDir) -> SyncEngine {
+        let client_key = SecretKey::generate();
+        SyncEngine::open(SyncConfig {
+            root: root.path().to_path_buf(),
+            state_root: state.path().to_path_buf(),
+            replica: replica(&client_key),
+            client: SyncClient {
+                secret_key: client_key,
+                remote: EndpointAddr::new(SecretKey::generate().public()),
+                network_mode: NetworkMode::DirectOnly,
+            },
+            profile: ChunkingProfile::DEFAULT,
+            ignored_paths: Vec::new(),
+        })
+        .expect("test sync engine can open")
+    }
+
+    fn scanned_tree(engine: &SyncEngine) -> MerkleTree {
+        let report = engine.index.scan().expect("test root can be scanned");
+        ensure_scan_is_safe(&report, "test").expect("test scan is complete");
+        MerkleTree::from_records(
+            engine
+                .index
+                .sync_records()
+                .expect("test records can be read"),
+        )
+        .expect("test records form a Merkle tree")
+    }
+
+    fn stage_file(
+        engine: &SyncEngine,
+        source_root: &TempDir,
+        name: &str,
+        bytes: &[u8],
+    ) -> FileManifest {
+        let source = source_root.path().join(name);
+        fs::write(&source, bytes).expect("staged source can be written");
+        engine
+            .store
+            .ingest_file(&source, ChunkingProfile::DEFAULT)
+            .expect("staged source can enter the local CAS")
+    }
+
+    fn remote_file_record(path: &str, bytes: &[u8], counter: u64) -> SyncRecord {
+        let remote = ReplicaId(Hash32::digest(b"test remote replica"));
+        let mut version = VersionVector::default();
+        version.observe(remote, counter);
+        SyncRecord {
+            schema_version: SYNC_RECORD_SCHEMA_V1,
+            path: WirePath::new(path).expect("fixture path is portable"),
+            kind: SyncEntryKind::File,
+            size: bytes.len() as u64,
+            content_hash: Some(Hash32::digest(bytes)),
+            readonly: false,
+            version,
+            tombstone: false,
+        }
+    }
+
+    fn causally_newer_file_record(
+        current: &MerkleTree,
+        path: &WirePath,
+        bytes: &[u8],
+    ) -> SyncRecord {
+        let mut record = current
+            .get(path)
+            .expect("current tree contains fixture path")
+            .clone();
+        record
+            .version
+            .increment(ReplicaId(Hash32::digest(b"test remote replica")))
+            .expect("fixture clock can advance");
+        record.size = bytes.len() as u64;
+        record.content_hash = Some(Hash32::digest(bytes));
+        record
+    }
+
+    fn causally_newer_tombstone(current: &MerkleTree, path: &WirePath) -> SyncRecord {
+        let mut record = current
+            .get(path)
+            .expect("current tree contains fixture path")
+            .clone();
+        record
+            .version
+            .increment(ReplicaId(Hash32::digest(b"test remote replica")))
+            .expect("fixture clock can advance");
+        record.tombstone = true;
+        record
+    }
+
+    #[tokio::test]
+    async fn apply_local_rejects_edit_made_after_the_planning_snapshot() {
+        let root = TempDir::new().expect("local root can be created");
+        let state = TempDir::new().expect("local state can be created");
+        let sources = TempDir::new().expect("source root can be created");
+        fs::write(root.path().join("report.txt"), b"snapshot bytes")
+            .expect("snapshot file can be written");
+        let engine = test_engine(&root, &state);
+        let current = scanned_tree(&engine);
+        let path = WirePath::new("report.txt").expect("fixture path is portable");
+        let desired_bytes = b"planned remote bytes";
+        let record = causally_newer_file_record(&current, &path, desired_bytes);
+        let manifest = stage_file(&engine, &sources, "planned.bin", desired_bytes);
+        let manifests = BTreeMap::from([(manifest.file_hash, manifest)]);
+
+        fs::write(root.path().join("report.txt"), b"fresh local edit")
+            .expect("fresh local edit can be written");
+        let outcome = engine
+            .apply_local(&current, &[ApplyAction::Materialize { record }], &manifests)
+            .await;
+
+        assert!(outcome.is_err(), "stale local plan must be rejected");
+        assert_eq!(
+            fs::read(root.path().join("report.txt")).expect("fresh local edit remains readable"),
+            b"fresh local edit"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_local_rejects_target_created_after_the_planning_snapshot() {
+        let root = TempDir::new().expect("local root can be created");
+        let state = TempDir::new().expect("local state can be created");
+        let sources = TempDir::new().expect("source root can be created");
+        let engine = test_engine(&root, &state);
+        let current = scanned_tree(&engine);
+        let desired_bytes = b"planned remote creation";
+        let record = remote_file_record("new.txt", desired_bytes, 1);
+        let manifest = stage_file(&engine, &sources, "planned.bin", desired_bytes);
+        let manifests = BTreeMap::from([(manifest.file_hash, manifest)]);
+
+        fs::write(root.path().join("new.txt"), b"fresh local creation")
+            .expect("fresh local creation can be written");
+        let outcome = engine
+            .apply_local(&current, &[ApplyAction::Materialize { record }], &manifests)
+            .await;
+
+        assert!(
+            outcome.is_err(),
+            "new target must invalidate the local plan"
+        );
+        assert_eq!(
+            fs::read(root.path().join("new.txt")).expect("fresh local creation remains readable"),
+            b"fresh local creation"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_local_rejects_fresh_edit_before_any_planned_deletion() {
+        let root = TempDir::new().expect("local root can be created");
+        let state = TempDir::new().expect("local state can be created");
+        fs::write(root.path().join("delete-first.txt"), b"must remain")
+            .expect("first deletion fixture can be written");
+        fs::write(root.path().join("edited-delete.txt"), b"snapshot bytes")
+            .expect("edited deletion fixture can be written");
+        let engine = test_engine(&root, &state);
+        let current = scanned_tree(&engine);
+        let first_path = WirePath::new("delete-first.txt").expect("fixture path is portable");
+        let edited_path = WirePath::new("edited-delete.txt").expect("fixture path is portable");
+        let first = causally_newer_tombstone(&current, &first_path);
+        let edited = causally_newer_tombstone(&current, &edited_path);
+
+        fs::write(root.path().join("edited-delete.txt"), b"fresh local edit")
+            .expect("fresh local edit can be written");
+        let outcome = engine
+            .apply_local(
+                &current,
+                &[
+                    ApplyAction::Delete { record: first },
+                    ApplyAction::Delete { record: edited },
+                ],
+                &BTreeMap::new(),
+            )
+            .await;
+
+        assert!(outcome.is_err(), "fresh edit must invalidate all deletions");
+        assert_eq!(
+            fs::read(root.path().join("edited-delete.txt")).expect("fresh edit remains readable"),
+            b"fresh local edit"
+        );
+        assert_eq!(
+            fs::read(root.path().join("delete-first.txt"))
+                .expect("no earlier deletion was partially applied"),
+            b"must remain"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_local_checks_snapshot_drift_when_no_local_actions_are_planned() {
+        let root = TempDir::new().expect("local root can be created");
+        let state = TempDir::new().expect("local state can be created");
+        fs::write(root.path().join("outgoing.txt"), b"snapshot bytes")
+            .expect("outgoing fixture can be written");
+        let engine = test_engine(&root, &state);
+        let current = scanned_tree(&engine);
+
+        fs::write(root.path().join("outgoing.txt"), b"fresh outgoing edit")
+            .expect("fresh outgoing edit can be written");
+        let outcome = engine.apply_local(&current, &[], &BTreeMap::new()).await;
+
+        assert!(
+            outcome.is_err(),
+            "remote-only plans must reject a stale local source"
+        );
+        assert_eq!(
+            fs::read(root.path().join("outgoing.txt"))
+                .expect("fresh outgoing edit remains readable"),
+            b"fresh outgoing edit"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_local_rejects_incomplete_prescan_before_planned_deletion() {
+        let root = TempDir::new().expect("local root can be created");
+        let state = TempDir::new().expect("local state can be created");
+        fs::write(root.path().join("delete.txt"), b"must remain")
+            .expect("deletion fixture can be written");
+        let engine = test_engine(&root, &state);
+        let current = scanned_tree(&engine);
+        let path = WirePath::new("delete.txt").expect("fixture path is portable");
+        let deletion = causally_newer_tombstone(&current, &path);
+
+        fs::write(root.path().join("bad:name"), b"unportable local file")
+            .expect("Unix permits the non-portable fixture name");
+        let outcome = engine
+            .apply_local(
+                &current,
+                &[ApplyAction::Delete { record: deletion }],
+                &BTreeMap::new(),
+            )
+            .await;
+
+        assert!(
+            outcome.is_err(),
+            "incomplete local scan must abort the plan"
+        );
+        assert_eq!(
+            fs::read(root.path().join("delete.txt"))
+                .expect("planned deletion was not partially applied"),
+            b"must remain"
+        );
+        assert_eq!(
+            fs::read(root.path().join("bad:name")).expect("unportable local file remains readable"),
+            b"unportable local file"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn loopback_stale_snapshot_aborts_then_fresh_sync_preserves_both_edits() {
+        let local_root = TempDir::new().expect("local root can be created");
+        let local_state = TempDir::new().expect("local state can be created");
+        let remote_root = TempDir::new().expect("remote root can be created");
+        let remote_state = TempDir::new().expect("remote state can be created");
+        fs::write(local_root.path().join("shared.txt"), b"common baseline")
+            .expect("local baseline can be written");
+        fs::write(remote_root.path().join("shared.txt"), b"common baseline")
+            .expect("remote baseline can be written");
+
+        let client_key = SecretKey::generate();
+        let server = start_server(ServerConfig {
+            secret_key: SecretKey::generate(),
+            destination_root: remote_root.path().to_path_buf(),
+            state_root: remote_state.path().to_path_buf(),
+            peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
+            network_mode: NetworkMode::DirectOnly,
+            bind_address: None,
+        })
+        .await
+        .expect("server can start");
+        let engine = SyncEngine::open(SyncConfig {
+            root: local_root.path().to_path_buf(),
+            state_root: local_state.path().to_path_buf(),
+            replica: replica(&client_key),
+            client: SyncClient {
+                secret_key: client_key,
+                remote: server.endpoint_addr(),
+                network_mode: NetworkMode::DirectOnly,
+            },
+            profile: ChunkingProfile::DEFAULT,
+            ignored_paths: Vec::new(),
+        })
+        .expect("sync engine can open");
+        engine
+            .sync_once()
+            .await
+            .expect("common baseline can converge");
+
+        fs::write(remote_root.path().join("shared.txt"), b"remote edit")
+            .expect("remote edit can be written");
+        let scan = scan_index(Arc::clone(&engine.index))
+            .await
+            .expect("local planning scan succeeds");
+        ensure_scan_is_safe(&scan, "planned local").expect("local planning scan is complete");
+        let local_records = read_records(Arc::clone(&engine.index))
+            .await
+            .expect("planned local records can be read");
+        let local_tree = MerkleTree::from_records(local_records.clone())
+            .expect("planned local records form a tree");
+        let session = engine
+            .client
+            .open_session()
+            .await
+            .expect("loopback session can open");
+        fs::write(local_root.path().join("shared.txt"), b"fresh local edit")
+            .expect("fresh local edit can be written after planning");
+
+        let stale = engine
+            .sync_with_session(&session, local_records, local_tree)
+            .await;
+        session.close().await;
+
+        assert!(stale.is_err(), "stale loopback pass must abort");
+        assert_eq!(
+            fs::read(local_root.path().join("shared.txt"))
+                .expect("fresh local edit remains readable after abort"),
+            b"fresh local edit"
+        );
+        assert_eq!(
+            fs::read(remote_root.path().join("shared.txt"))
+                .expect("remote edit remains readable after abort"),
+            b"remote edit"
+        );
+
+        let recovered = engine
+            .sync_once()
+            .await
+            .expect("fresh reconciliation can preserve the concurrent edits");
+        assert_eq!(recovered.status, "pass");
+        assert_eq!(
+            recovered.verified_local_root,
+            recovered.verified_remote_root
+        );
+        assert_eq!(recovered.conflicts.len(), 1);
+        let conflict_path = recovered.conflicts[0]
+            .conflict_path
+            .as_ref()
+            .expect("losing edit has a conflict copy");
+        let expected = BTreeSet::from([b"fresh local edit".to_vec(), b"remote edit".to_vec()]);
+        assert_eq!(
+            BTreeSet::from([
+                fs::read(local_root.path().join("shared.txt"))
+                    .expect("local canonical edit can be read"),
+                fs::read(local_path(local_root.path(), conflict_path))
+                    .expect("local conflict edit can be read"),
+            ]),
+            expected
+        );
+        assert_eq!(
+            BTreeSet::from([
+                fs::read(remote_root.path().join("shared.txt"))
+                    .expect("remote canonical edit can be read"),
+                fs::read(local_path(remote_root.path(), conflict_path))
+                    .expect("remote conflict edit can be read"),
+            ]),
+            BTreeSet::from([b"fresh local edit".to_vec(), b"remote edit".to_vec()])
+        );
+        server.shutdown().await.expect("server shuts down");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
