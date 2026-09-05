@@ -234,7 +234,7 @@ node_hash = BLAKE3_DERIVE_KEY(
 - client node query 최대 1,000,000회
 - query prefix의 `WirePath` validation
 - 응답 prefix와 요청 prefix 일치 확인
-- 중복 path 삽입 거부
+- 같은 path의 불일치 record 삽입 거부 (`insert_snapshot_record`는 동일 record의 중복은 허용)
 - control frame 크기 제한과 `postcard` decoding validation
 - remote scan의 collision, read issue, queued retry가 있으면 snapshot session 거부
 

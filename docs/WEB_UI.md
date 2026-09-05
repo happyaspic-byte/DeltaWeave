@@ -71,3 +71,21 @@ cargo run --locked -p deltaweave-web -- \
 - 모든 `/api/*` 요청은 프로세스별 Bearer 토큰을 요구합니다. 실제 HTTP 주소와 일치하지 않는 Host·Origin을 거부하며 CORS는 열지 않습니다. JSON 요청 본문은 8 KiB로 제한하고 CSP, 캐시 금지, 프레임 삽입 차단 등의 응답 헤더를 적용합니다.
 
 웹 작업은 기존 DeltaWeave 인덱스·네트워크·동기화 라이브러리를 사용합니다. 충돌 사본, 변경 이력, 검증 및 비공개 복구 데이터는 기존 엔진 규칙을 따릅니다. 실행 중인 같은 상태 폴더를 다른 DeltaWeave 프로세스에서 함께 열지 마세요.
+
+## 로컬 HTTP 관리 API
+
+동일 프로세스의 UI 전용 API이며 공개 원격 관리 API가 아닙니다. 모든 API 요청은
+`Authorization: Bearer <접속 토큰>`과 실제 리스너의 Host를 사용합니다. Origin을
+보내는 경우 같은 origin이어야 합니다. POST는 `Content-Type: application/json`과
+8 KiB 이하 JSON 객체가 필요합니다. 빈 요청 본문 대신 `{}`를 보냅니다.
+
+| 메서드·경로 | 요청·동작 |
+| --- | --- |
+| `GET /api/state` | 현재 폴더·피어·작업·검사·동기화 상태 |
+| `POST /api/scan` | `{}`로 실제 폴더 검사 시작 |
+| `POST /api/receiver/start` | `peer_id`로 수신 허용 피어 지정 |
+| `POST /api/receiver/stop` | `{}`로 수신 중지 |
+| `POST /api/sync` | `peer_id`, `direct_address`, `confirm`으로 1회 동기화 요청 |
+
+작업 접수는 완료와 다릅니다. 이후 `/api/state`의 작업 결과를 확인해야 합니다.
+동시에 실행할 수 없는 작업은 거부되며, 인증·입력·작업 오류는 JSON으로 반환됩니다.
