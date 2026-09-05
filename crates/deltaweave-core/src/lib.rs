@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
+    borrow::Borrow,
     collections::{BTreeMap, BTreeSet},
     fmt,
     str::FromStr,
@@ -398,6 +399,12 @@ impl WirePath {
     /// Iterates over validated path components.
     pub fn components(&self) -> impl Iterator<Item = &str> {
         self.0.split('/')
+    }
+}
+
+impl Borrow<str> for WirePath {
+    fn borrow(&self) -> &str {
+        self.as_str()
     }
 }
 

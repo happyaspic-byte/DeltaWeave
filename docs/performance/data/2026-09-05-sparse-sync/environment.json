@@ -1,0 +1,51 @@
+{
+  "baseline_commit": "75ffab74ee3de4dd1d071c13ab04ae26fb4e6e5b",
+  "date_utc": "2026-09-05T20:45:33Z",
+  "platform": "Linux-7.0.0-31-generic-x86_64-with-glibc2.43",
+  "toolchain": "rustc 1.91.0 (f8297e351 2025-10-28)",
+  "cargo": "cargo 1.91.0 (ea2d97820 2025-10-10)",
+  "cpu_count": 20,
+  "affinity_available": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19
+  ],
+  "loadavg": [
+    26.7890625,
+    17.99462890625,
+    7.99951171875
+  ],
+  "cpuinfo": "model name\t: Intel Xeon E312xx (Sandy Bridge)",
+  "meminfo": [
+    "MemTotal:       51114364 kB",
+    "MemFree:        34958280 kB",
+    "MemAvailable:   46343464 kB"
+  ],
+  "perf_event_paranoid": "4",
+  "release_profile": {
+    "codegen-units": 1,
+    "lto": "thin",
+    "strip": "symbols"
+  },
+  "constraints": "KVM shared host; another independent worktree compiling observed. Do not stop unrelated processes. Controlled runs use taskset CPU 12-15 and no own parallel builds/tests.",
+  "clock_ticks_per_second": 100,
+  "pilot_fixture_storage": "default /tmp is tmpfs",
+  "final_fixture_storage": "TMPDIR=<worktree>/target/performance/fixtures on ext4 /dev/mapper/ubuntu--vg-ubuntu--lv"
+}

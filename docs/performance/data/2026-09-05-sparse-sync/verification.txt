@@ -1,0 +1,46 @@
+All six commands below completed successfully in a sequential set -e shell (exit 0).
+cargo build --release --locked --workspace --all-features --bins --examples
+cargo test --locked --workspace --all-targets --all-features
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+RUSTDOCFLAGS='-D warnings' cargo doc --locked --workspace --no-deps --all-features
+cargo fmt --all -- --check
+target/release/deltaweave self-test
+
+Workspace: 107 passed, 0 failed, 0 ignored.
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 160.65s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.33s
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.69s
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.61s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.22s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+Release CLI self-test:
+{
+  "architecture": "x86_64",
+  "final_size": 4194335,
+  "first_transfer_bytes": 4194304,
+  "index_initial_records": 1,
+  "index_rename_detected": true,
+  "index_restart_verified": true,
+  "index_tombstones": 2,
+  "operating_system": "linux",
+  "reused_extents": 16,
+  "second_transfer_bytes": 257800,
+  "status": "pass",
+  "sync_bidirectional_verified": true,
+  "sync_conflicts_preserved": 1,
+  "sync_delete_verified": true,
+  "sync_restart_actions": 0,
+  "sync_verified_root": "1c00a9e57aefa494a6dab9f7aa06c08cdc576a8f87d7b8d5bd95cfc3f57b10fd",
+  "temporary_data": "cleaned on exit"
+}
+
+Full command logs remain in target/performance/{optimized-build,workspace-tests,clippy,rustdoc,format}.log and self-test.stderr.
+Before optimization: cargo test --release --locked -p deltaweave-core -p deltaweave-reconcile --lib passed 11+15 tests including the four new behavior-preservation tests.
+The CSV summary tool accepted an identical self-comparison and rejected the intentionally interrupted pilot as incomplete.

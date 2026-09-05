@@ -720,6 +720,8 @@ dependencies = [
  "deltaweave-reconcile",
  "deltaweave-store",
  "iroh",
+ "postcard",
+ "redb",
  "serde",
  "tempfile",
  "tokio",

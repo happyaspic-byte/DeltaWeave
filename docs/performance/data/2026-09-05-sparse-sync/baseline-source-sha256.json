@@ -1,0 +1,10 @@
+{
+  "Cargo.toml": "aa500caa730e191656842b1f4007e9c6bb74dc2f34a2d5d154b321a012d15350",
+  "Cargo.lock": "1613af9f76a93403c65d49db974c7cbadeabb6cab6c46c51cf68cc66856dac07",
+  "crates/deltaweave-core/src/lib.rs": "3284efcc3a6b013b6ab06fd077d12cef07f876438c2673d8a49dc49d0f635443",
+  "crates/deltaweave-reconcile/src/lib.rs": "60adbcc03923bd4ec6416d3167849c710d8751ab373f213ae950d1a659b3231a",
+  "crates/deltaweave-sync/examples/sparse_sync.rs": "744a649fa2fcb4e256b95e7d6c927615db4b3d8125ff9ce70a85a30bc0fe9624",
+  "crates/deltaweave-reconcile/examples/subtree_lookup.rs": "80e5613d1e1b1e75f7ce14b8894b18edae7fdc4d7cee001e660b06f432c2fcaf",
+  "target/performance/sparse-sync-before": "b47640ed026802c9a1a8d6800d4f35d2aca4fa6b1c5d3f8dff7f0c7d8fb3a399",
+  "target/performance/subtree-lookup-before": "411b43d5cb705f9d5416c0fc415de449da1e46e07f076c37ca225d9e030313fd"
+}

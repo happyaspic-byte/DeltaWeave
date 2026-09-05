@@ -299,9 +299,12 @@ Hash 비교는 cryptographic commitment이지만 remote filesystem의 진실성�
 | `MerkleTree::from_records` | map 구성 `O(N log N)` + trie 구성/finalize `O(C)` | record map과 trie를 함께 보유 |
 | `merge_snapshots` | path 합집합 구성과 map 작업으로 대략 `O(N log N)` | complete canonical snapshot 생성 |
 | `different_paths` | 동일 subtree는 `O(1)` prune, 최악 `O(C)` | 출력은 changed/one-sided paths에 비례 |
-| remote snapshot | 일치 root는 1 query, 최악 node 수에 비례 | 방문 node의 immediate-child summaries + 복원 records |
+| `records_under(prefix)` | 비어 있지 않은 prefix는 `O(log N + K)` map 연산 (`K`: 반환 record 수) | exact record 조회 + `prefix/`부터 descendant 범위만 복제; root는 전체 복제 |
+| remote snapshot | 일치 root는 1 query, 최악 node 수에 비례 | 방문 node의 immediate-child summaries + 복원 records; 일치 subtree는 범위 조회로 재사용 |
 | `actions_to_reach` | diff traversal + changed path lookup | action 수는 desired와 다른 경로 수에 비례 |
 | remote apply | incoming action마다 receiver index 전체 scan | action 수가 많으면 반복 scan이 지배적 비용이 될 수 있음 |
+
+일치 subtree의 record 재사용은 정렬 map의 범위 조회를 이용한다. 따라서 flat namespace에서 파일 하나만 달라진 경우, unchanged leaf마다 전체 map을 순회하던 `O(N²)` 조회를 피한다. 실측 조건과 한계는 [sparse sync 성능 기록](performance/2026-09-05-sparse-sync.md)에 정리한다.
 
 현재 구현은 snapshot과 merge를 memory에 완전히 materialize한다. Merkle protocol은 네트워크에서 불필요한 remote record 전송을 줄이지만, 양쪽 모두 local complete index와 tree를 구성하는 비용까지 없애지는 않는다.
 
