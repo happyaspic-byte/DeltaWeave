@@ -69,7 +69,9 @@ impl ChunkStore {
         let temporary = state_root.join("tmp");
         let trash = state_root.join("trash");
         for directory in [&chunks, &temporary, &trash] {
-            fs::create_dir_all(directory)
+            private_directory_builder()
+                .recursive(true)
+                .create(directory)
                 .with_context(|| format!("failed to create {}", directory.display()))?;
         }
         Ok(Self {
@@ -260,15 +262,24 @@ impl ChunkStore {
         ))
     }
 
-    fn trash_path(&self, path: &WirePath, manifest_hash: Hash32) -> PathBuf {
-        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let mut destination = self
-            .trash
-            .join(format!("replace-{manifest_hash}-{sequence}"));
+    fn trash_path(&self, path: &WirePath, manifest_hash: Hash32) -> Result<PathBuf> {
+        // Reserve the recovery directory atomically: the sequence restarts with the process,
+        // and a previous operation's recovery data must never be overwritten.
+        let mut destination = loop {
+            let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let directory = self
+                .trash
+                .join(format!("replace-{manifest_hash}-{sequence}"));
+            match private_directory_builder().create(&directory) {
+                Ok(()) => break directory,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        };
         for component in path.components() {
             destination.push(component);
         }
-        destination
+        Ok(destination)
     }
 }
 
@@ -288,9 +299,20 @@ impl MetadataStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            private_directory_builder().recursive(true).create(parent)?;
         }
-        let database = Database::create(path)
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options
+            .open(path)
+            .with_context(|| format!("failed to open metadata DB {}", path.display()))?;
+        let database = Database::builder()
+            .create_file(file)
             .with_context(|| format!("failed to open metadata DB {}", path.display()))?;
         Ok(Self { database })
     }
@@ -379,7 +401,9 @@ impl Store {
     /// Opens a complete DeltaWeave state directory.
     pub fn open(state_root: impl AsRef<Path>) -> Result<Self> {
         let state_root = state_root.as_ref();
-        fs::create_dir_all(state_root)?;
+        private_directory_builder()
+            .recursive(true)
+            .create(state_root)?;
         Ok(Self {
             chunks: ChunkStore::open(state_root)?,
             metadata: MetadataStore::open(state_root.join("metadata.redb"))?,
@@ -447,7 +471,11 @@ impl Store {
         let destination_root = destination_root.as_ref();
         fs::create_dir_all(destination_root)?;
         let destination = checked_destination(destination_root, path)?;
-        let existing = fs::symlink_metadata(&destination).ok();
+        let existing = match fs::symlink_metadata(&destination) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
         if existing
             .as_ref()
             .is_some_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
@@ -457,10 +485,11 @@ impl Store {
                 destination.display()
             );
         }
-        if existing
-            .as_ref()
-            .is_some_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
-            && hash_file(&destination)? == manifest.file_hash
+        if existing.as_ref().is_some_and(|metadata| {
+            metadata.is_file()
+                && !metadata.file_type().is_symlink()
+                && has_unique_file_link(&destination, metadata)
+        }) && file_matches_manifest(&destination, manifest)?
         {
             let operation = committed_operation(path, manifest);
             self.metadata.put_manifest(path, manifest)?;
@@ -528,9 +557,16 @@ impl Store {
             return Err(error);
         }
 
-        let replaced_existing = destination.exists();
-        let backup =
-            replaced_existing.then(|| self.chunks.trash_path(path, manifest.manifest_hash()));
+        let replaced_existing = match fs::symlink_metadata(&destination) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
+        let backup = if replaced_existing {
+            Some(self.chunks.trash_path(path, manifest.manifest_hash())?)
+        } else {
+            None
+        };
         if let Some(backup) = &backup {
             if let Some(parent) = backup.parent() {
                 fs::create_dir_all(parent)?;
@@ -634,7 +670,7 @@ impl Store {
             })?;
             None
         } else {
-            let backup = self.chunks.trash_path(path, tombstone_hash);
+            let backup = self.chunks.trash_path(path, tombstone_hash)?;
             if let Some(parent) = backup.parent() {
                 fs::create_dir_all(parent)?;
             }
@@ -714,6 +750,9 @@ impl MaterializationObservation {
         let before = materialization_observation(path, self.file_hash)?;
         if before != *self {
             bail!("materialized file changed before readonly update");
+        }
+        if !has_unique_file_link(path, &fs::symlink_metadata(path)?) {
+            bail!("refusing to update permissions on a file with other hard links");
         }
         apply_readonly(path, readonly)?;
         let after = materialization_observation(path, self.file_hash)?;
@@ -815,6 +854,36 @@ fn ensure_regular_file(metadata: &std::fs::Metadata, path: &Path) -> Result<()> 
     Ok(())
 }
 
+#[cfg(unix)]
+fn has_unique_file_link(_path: &Path, metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    metadata.nlink() == 1
+}
+
+#[cfg(windows)]
+fn has_unique_file_link(path: &Path, _metadata: &std::fs::Metadata) -> bool {
+    winapi_util::Handle::from_path_any(path)
+        .and_then(|handle| winapi_util::file::information(&handle))
+        .is_ok_and(|information| information.number_of_links() == 1)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn has_unique_file_link(_path: &Path, _metadata: &std::fs::Metadata) -> bool {
+    false
+}
+
+fn private_directory_builder() -> fs::DirBuilder {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder
+    }
+    #[cfg(not(unix))]
+    fs::DirBuilder::new()
+}
+
 fn modified_ns(metadata: &std::fs::Metadata) -> Option<u128> {
     metadata
         .modified()
@@ -879,18 +948,36 @@ fn file_identity(_path: &Path, _metadata: &std::fs::Metadata) -> Option<(u64, u6
     None
 }
 
-fn hash_file(path: &Path) -> Result<Hash32> {
+fn file_matches_manifest(path: &Path, manifest: &FileManifest) -> Result<bool> {
     let mut file = File::open(path)?;
+    if file.metadata()?.len() != manifest.size {
+        return Ok(false);
+    }
     let mut hasher = blake3::Hasher::new();
     let mut buffer = vec![0_u8; 1024 * 1024];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
+    // A peer can supply a valid whole-file hash alongside unrelated chunk hashes.
+    // Verify both representations in one pass before committing an idempotent result.
+    for chunk in &manifest.chunks {
+        let mut remaining = chunk.length as usize;
+        let mut chunk_hasher = blake3::Hasher::new();
+        while remaining != 0 {
+            let limit = remaining.min(buffer.len());
+            let read = file.read(&mut buffer[..limit])?;
+            if read == 0 {
+                return Ok(false);
+            }
+            chunk_hasher.update(&buffer[..read]);
+            hasher.update(&buffer[..read]);
+            remaining -= read;
         }
-        hasher.update(&buffer[..read]);
+        if Hash32::from_bytes(*chunk_hasher.finalize().as_bytes()) != chunk.hash {
+            return Ok(false);
+        }
     }
-    Ok(Hash32::from_bytes(*hasher.finalize().as_bytes()))
+    if file.read(&mut buffer[..1])? != 0 {
+        return Ok(false);
+    }
+    Ok(Hash32::from_bytes(*hasher.finalize().as_bytes()) == manifest.file_hash)
 }
 
 fn operation_id(path: &WirePath, manifest: &FileManifest) -> Hash32 {
@@ -936,6 +1023,52 @@ mod tests {
         (0..length)
             .map(|index| ((index * 31) ^ (index >> 3)) as u8)
             .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn newly_created_state_is_private_with_a_permissive_umask() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const FIXTURE_ENV: &str = "DELTAWEAVE_PRIVATE_STATE_FIXTURE";
+        if let Some(fixture) = std::env::var_os(FIXTURE_ENV) {
+            let store = Store::open(PathBuf::from(fixture).join("state"))
+                .expect("new state can be created");
+            store
+                .chunks()
+                .put_verified(Hash32::digest(b"private data"), b"private data")
+                .expect("private content can be stored");
+            return;
+        }
+
+        let fixture = TempDir::new().expect("fixture can be created");
+        fs::set_permissions(fixture.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let output = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "umask 022; exec \"$@\"",
+                "deltaweave-private-state-test",
+            ])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::newly_created_state_is_private_with_a_permissive_umask",
+            ])
+            .env(FIXTURE_ENV, fixture.path())
+            .output()
+            .expect("controlled-umask process can run");
+        assert!(output.status.success(), "child failed: {output:?}");
+        for directory in ["state", "state/chunks", "state/tmp", "state/trash"] {
+            assert_eq!(
+                fs::metadata(fixture.path().join(directory))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700,
+                "new private directory {directory} must exclude other users"
+            );
+        }
     }
 
     fn populate(store: &Store, bytes: &[u8], manifest: &FileManifest) {
@@ -1171,6 +1304,81 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn new_metadata_database_is_private_in_a_public_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const FIXTURE_ENV: &str = "DELTAWEAVE_METADATA_DB_MODE_FIXTURE";
+        let path = WirePath::new("private/document.txt").unwrap();
+        let manifest = manifest_from_reader(
+            Cursor::new(b"private metadata fixture"),
+            ChunkingProfile::DEFAULT,
+        )
+        .unwrap();
+        if let Some(fixture) = std::env::var_os(FIXTURE_ENV) {
+            let store = MetadataStore::open(PathBuf::from(fixture).join("metadata.redb"))
+                .expect("new metadata DB can open");
+            store.put_manifest(&path, &manifest).unwrap();
+            return;
+        }
+
+        let fixture = TempDir::new().unwrap();
+        fs::set_permissions(fixture.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let output = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "umask 022; exec \"$@\"",
+                "deltaweave-metadata-db-mode-test",
+            ])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::new_metadata_database_is_private_in_a_public_parent",
+            ])
+            .env(FIXTURE_ENV, fixture.path())
+            .output()
+            .expect("controlled-umask process can run");
+        assert!(output.status.success(), "child failed: {output:?}");
+        let database_path = fixture.path().join("metadata.redb");
+        assert_eq!(
+            fs::metadata(&database_path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "a newly created metadata DB must exclude other users"
+        );
+        assert_eq!(
+            fs::metadata(fixture.path()).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "existing parent permissions must remain unchanged"
+        );
+
+        fs::set_permissions(&database_path, fs::Permissions::from_mode(0o640)).unwrap();
+        let reopened = MetadataStore::open(&database_path).expect("existing DB can reopen");
+        assert_eq!(reopened.get_manifest(&path).unwrap(), Some(manifest));
+        assert!(
+            MetadataStore::open(&database_path).is_err(),
+            "DB lock must remain exclusive"
+        );
+        assert_eq!(
+            fs::metadata(&database_path).unwrap().permissions().mode() & 0o777,
+            0o640,
+            "existing DB permissions must remain unchanged"
+        );
+    }
+
+    #[test]
+    fn metadata_database_rejects_invalid_contents_without_modifying_them() {
+        let fixture = TempDir::new().unwrap();
+        let database_path = fixture.path().join("metadata.redb");
+        fs::write(&database_path, b"not a metadata database").unwrap();
+
+        assert!(MetadataStore::open(&database_path).is_err());
+        assert_eq!(
+            fs::read(&database_path).unwrap(),
+            b"not a metadata database"
+        );
+    }
+
+    #[test]
     fn metadata_survives_reopen() {
         let temp = TempDir::new().expect("temporary directory can be created");
         let bytes = fixture(300_000);
@@ -1235,6 +1443,87 @@ mod tests {
     }
 
     #[test]
+    fn idempotent_materialization_rejects_inconsistent_manifests() {
+        for supplied in [b"other content".as_slice(), b"a longer unrelated payload"] {
+            let state = TempDir::new().expect("state can be created");
+            let destination = TempDir::new().expect("destination can be created");
+            let path = WirePath::new("current.txt").expect("path is portable");
+            let store = Store::open(state.path()).expect("store can open");
+            let current =
+                manifest_from_reader(Cursor::new(b"local content"), ChunkingProfile::DEFAULT)
+                    .expect("current content can be chunked");
+            populate(&store, b"local content", &current);
+            store
+                .materialize(&current, &path, destination.path())
+                .expect("current content can be installed");
+
+            let mut inconsistent =
+                manifest_from_reader(Cursor::new(supplied), ChunkingProfile::DEFAULT)
+                    .expect("supplied content can be chunked");
+            populate(&store, supplied, &inconsistent);
+            inconsistent.file_hash = current.file_hash;
+            inconsistent.validate().expect("structure remains valid");
+
+            let result = store.materialize(&inconsistent, &path, destination.path());
+
+            assert!(
+                result.is_err(),
+                "matching the existing whole-file hash must not accept unrelated chunks"
+            );
+            assert_eq!(
+                fs::read(destination.path().join(path.as_str())).unwrap(),
+                b"local content"
+            );
+            assert_eq!(store.metadata().get_manifest(&path).unwrap(), Some(current));
+            assert!(
+                store
+                    .metadata()
+                    .get_operation(operation_id(&path, &inconsistent))
+                    .unwrap()
+                    .is_none_or(|operation| operation.state != OperationState::Committed),
+                "an inconsistent manifest must never be committed"
+            );
+        }
+    }
+
+    #[test]
+    fn idempotent_materialization_accepts_verified_alternate_chunk_boundaries() {
+        let state = TempDir::new().expect("state can be created");
+        let destination = TempDir::new().expect("destination can be created");
+        let path = WirePath::new("current.txt").expect("path is portable");
+        let store = Store::open(state.path()).expect("store can open");
+        let mut manifest =
+            manifest_from_reader(Cursor::new(b"local content"), ChunkingProfile::DEFAULT)
+                .expect("content can be chunked");
+        fs::write(destination.path().join(path.as_str()), b"local content")
+            .expect("current content can be written");
+        manifest.chunks = vec![
+            ChunkDescriptor {
+                offset: 0,
+                length: 6,
+                hash: Hash32::digest(b"local "),
+            },
+            ChunkDescriptor {
+                offset: 6,
+                length: 7,
+                hash: Hash32::digest(b"content"),
+            },
+        ];
+
+        let outcome = store
+            .materialize(&manifest, &path, destination.path())
+            .expect("verified existing bytes can be reused without cached chunks");
+
+        assert!(outcome.already_current);
+        assert_eq!(outcome.bytes_written, 0);
+        assert_eq!(fs::read(&outcome.destination).unwrap(), b"local content");
+        assert_eq!(
+            store.metadata().get_manifest(&path).unwrap(),
+            Some(manifest)
+        );
+    }
+
+    #[test]
     fn replacement_preserves_old_content() {
         let temp = TempDir::new().expect("temporary directory can be created");
         let destination = TempDir::new().expect("destination can be created");
@@ -1259,6 +1548,80 @@ mod tests {
             .expect("trash can be read")
             .count();
         assert_eq!(trash_entries, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readonly_update_does_not_change_a_hardlinked_file_outside_destination() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let state = TempDir::new().expect("state can be created");
+        let destination = TempDir::new().expect("destination can be created");
+        let outside = TempDir::new().expect("outside can be created");
+        let outside_file = outside.path().join("outside.txt");
+        fs::write(&outside_file, b"same content").expect("outside file can be written");
+        fs::set_permissions(&outside_file, fs::Permissions::from_mode(0o600))
+            .expect("outside permissions can be set");
+        let path = WirePath::new("linked.txt").expect("path is portable");
+        fs::hard_link(&outside_file, destination.path().join(path.as_str()))
+            .expect("hardlink can be created");
+        let store = Store::open(state.path()).expect("store can open");
+        let manifest = manifest_from_reader(Cursor::new(b"same content"), ChunkingProfile::DEFAULT)
+            .expect("content can be chunked");
+        populate(&store, b"same content", &manifest);
+
+        let outcome = store
+            .materialize(&manifest, &path, destination.path())
+            .expect("hardlinked file can be materialized");
+        outcome
+            .observation
+            .after_readonly_update(&outcome.destination, true)
+            .expect("materialized file can become readonly");
+
+        assert_eq!(
+            fs::metadata(&outside_file).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "a remote readonly update must not chmod the outside inode"
+        );
+        assert!(
+            fs::metadata(&outcome.destination)
+                .unwrap()
+                .permissions()
+                .readonly()
+        );
+        assert_eq!(fs::read(&outside_file).unwrap(), b"same content");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_preserves_a_dangling_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let state = TempDir::new().expect("state can be created");
+        let destination = TempDir::new().expect("destination can be created");
+        let path = WirePath::new("dangling.txt").expect("path is portable");
+        symlink("missing-target", destination.path().join(path.as_str()))
+            .expect("dangling symlink can be created");
+        let store = Store::open(state.path()).expect("store can open");
+        let manifest = manifest_from_reader(Cursor::new(b"new content"), ChunkingProfile::DEFAULT)
+            .expect("content can be chunked");
+        populate(&store, b"new content", &manifest);
+
+        let outcome = store
+            .materialize(&manifest, &path, destination.path())
+            .expect("symlink can be replaced");
+
+        assert!(outcome.replaced_existing);
+        let backups: Vec<_> = fs::read_dir(state.path().join("trash"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path().join(path.as_str()))
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(
+            fs::read_link(&backups[0]).unwrap(),
+            Path::new("missing-target")
+        );
+        assert_eq!(fs::read(&outcome.destination).unwrap(), b"new content");
     }
 
     #[test]
@@ -1340,6 +1703,48 @@ mod tests {
                 .is_err()
         );
         assert!(destination.path().join("folder/unindexed.txt").exists());
+    }
+
+    #[test]
+    fn deletion_history_survives_process_restart() {
+        const FIXTURE_ENV: &str = "DELTAWEAVE_TRASH_RESTART_FIXTURE";
+        if let Some(fixture) = std::env::var_os(FIXTURE_ENV) {
+            let fixture = PathBuf::from(fixture);
+            let store = Store::open(fixture.join("state")).expect("store can open");
+            store
+                .remove_path(
+                    &WirePath::new("file.txt").unwrap(),
+                    fixture.join("destination"),
+                    Hash32::digest(b"same deletion"),
+                )
+                .expect("deletion can preserve content");
+            return;
+        }
+
+        let fixture = TempDir::new().expect("fixture can be created");
+        fs::create_dir(fixture.path().join("destination")).unwrap();
+        for content in [b"first content", b"later content"] {
+            fs::write(fixture.path().join("destination/file.txt"), content).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::deletion_history_survives_process_restart",
+                ])
+                .env(FIXTURE_ENV, fixture.path())
+                .output()
+                .expect("fresh store process can run");
+            assert!(output.status.success(), "child failed: {output:?}");
+        }
+
+        let mut preserved: Vec<_> = fs::read_dir(fixture.path().join("state/trash"))
+            .unwrap()
+            .map(|entry| fs::read(entry.unwrap().path().join("file.txt")).unwrap())
+            .collect();
+        preserved.sort();
+        assert_eq!(
+            preserved,
+            vec![b"first content".to_vec(), b"later content".to_vec()]
+        );
     }
 
     #[cfg(unix)]

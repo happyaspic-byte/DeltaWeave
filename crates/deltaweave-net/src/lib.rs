@@ -324,7 +324,15 @@ fn prepare_server_roots(destination_root: &Path, state_root: &Path) -> Result<(P
             destination_root.display()
         )
     })?;
-    fs::create_dir_all(state_root)
+    let mut state_directory = fs::DirBuilder::new();
+    state_directory.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        state_directory.mode(0o700);
+    }
+    state_directory
+        .create(state_root)
         .with_context(|| format!("failed to create state root {}", state_root.display()))?;
     let destination_root = fs::canonicalize(destination_root)?;
     let state_root = fs::canonicalize(state_root)?;
@@ -518,12 +526,12 @@ impl SyncClient {
             .open_bi()
             .await
             .context("open reconciliation stream")?;
-        let mut queue = VecDeque::from([String::new()]);
+        let mut queue = VecDeque::from([(String::new(), None)]);
         let mut remote_records = BTreeMap::new();
         let mut root = None;
         let mut queried_nodes = 0_usize;
 
-        while let Some(prefix) = queue.pop_front() {
+        while let Some((prefix, expected)) = queue.pop_front() {
             queried_nodes = queried_nodes
                 .checked_add(1)
                 .context("Merkle query counter overflow")?;
@@ -547,10 +555,13 @@ impl SyncClient {
             }
             .with_context(|| format!("remote Merkle prefix {prefix:?} disappeared"))?;
             ensure!(summary.prefix == prefix, "remote Merkle prefix mismatch");
-            ensure!(
-                summary.record_count <= 1_000_000,
-                "remote snapshot exceeds record safety limit"
-            );
+            validate_snapshot_summary(&summary)?;
+            if let Some((hash, record_count)) = expected {
+                ensure!(
+                    summary.hash == hash && summary.record_count == record_count,
+                    "remote Merkle child differs from its parent summary"
+                );
+            }
             if prefix.is_empty() {
                 root = Some((summary.hash, summary.record_count));
             }
@@ -582,7 +593,11 @@ impl SyncClient {
                         local.records_under(&child_prefix)?,
                     )?;
                 } else {
-                    queue.push_back(child_prefix);
+                    ensure!(
+                        queue.len() < 1_000_000 - queried_nodes,
+                        "remote Merkle tree exceeds query safety limit"
+                    );
+                    queue.push_back((child_prefix, Some((child.hash, child.record_count))));
                 }
             }
         }
@@ -933,6 +948,47 @@ impl SyncSession {
     }
 }
 
+fn validate_snapshot_summary(summary: &MerkleNodeSummary) -> Result<()> {
+    ensure!(
+        summary.record_count <= 1_000_000,
+        "remote snapshot exceeds record safety limit"
+    );
+    if !summary.prefix.is_empty() {
+        WirePath::new(summary.prefix.clone())?;
+        ensure!(summary.record_count > 0, "remote Merkle child is empty");
+    }
+    if let Some(record) = &summary.record {
+        record.validate()?;
+        ensure!(
+            record.path.as_str() == summary.prefix,
+            "remote Merkle record does not match its prefix"
+        );
+    }
+    let mut record_count = usize::from(summary.record.is_some());
+    let mut previous_name: Option<&str> = None;
+    for child in &summary.children {
+        let name = WirePath::new(child.name.clone())?;
+        ensure!(
+            name.components().count() == 1,
+            "remote Merkle child is not an immediate path component"
+        );
+        ensure!(
+            previous_name.is_none_or(|previous| previous < child.name.as_str()),
+            "remote Merkle children are duplicated or out of order"
+        );
+        previous_name = Some(&child.name);
+        ensure!(child.record_count > 0, "remote Merkle child is empty");
+        record_count = record_count
+            .checked_add(child.record_count)
+            .context("remote Merkle record count overflow")?;
+    }
+    ensure!(
+        record_count == summary.record_count,
+        "remote Merkle child record counts do not match their parent"
+    );
+    Ok(())
+}
+
 fn insert_snapshot_records(
     records: &mut BTreeMap<WirePath, SyncRecord>,
     incoming: impl IntoIterator<Item = SyncRecord>,
@@ -1063,8 +1119,27 @@ struct SenderManifestCache {
 impl SenderManifestCache {
     fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
-        fs::create_dir_all(root)?;
-        let database = Database::create(root.join("sender-manifests.redb"))?;
+        let mut directory = fs::DirBuilder::new();
+        directory.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            directory.mode(0o700);
+        }
+        directory.create(root)?;
+        let mut database_file = OpenOptions::new();
+        database_file
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            database_file.mode(0o600);
+        }
+        let database = Database::builder()
+            .create_file(database_file.open(root.join("sender-manifests.redb"))?)?;
         let write = database.begin_write()?;
         {
             let _ = write.open_table(SENDER_MANIFESTS)?;
@@ -1352,14 +1427,18 @@ impl ProtocolHandler for PushHandler {
         let (mut send, mut receive) = connection.accept_bi().await?;
         info!(%peer, "accepted DeltaWeave peer");
         if let Err(error) = self.handle_push(&mut send, &mut receive).await {
-            warn!(%peer, error = %error, "DeltaWeave transfer failed");
-            let message = truncate_error(&error.to_string());
-            let _ = write_frame(&mut send, &WireResponse::Error { message }).await;
+            let message = public_error_message(&error);
+            warn!(%peer, error = message, "DeltaWeave transfer failed");
+            let _ = write_frame(
+                &mut send,
+                &WireResponse::Error {
+                    message: message.to_owned(),
+                },
+            )
+            .await;
             let _ = send.finish();
             connection.closed().await;
-            return Err(AcceptError::from_err(std::io::Error::other(
-                error.to_string(),
-            )));
+            return Err(AcceptError::from_err(std::io::Error::other(message)));
         }
         send.finish()?;
         connection.closed().await;
@@ -1538,14 +1617,18 @@ impl ProtocolHandler for SyncHandler {
         }
         .await;
         if let Err(error) = outcome {
-            warn!(%peer, error = %error, "DeltaWeave reconciliation operation failed");
-            let message = truncate_error(&error.to_string());
-            let _ = write_frame(&mut send, &SyncWireResponse::Error { message }).await;
+            let message = public_error_message(&error);
+            warn!(%peer, error = message, "DeltaWeave reconciliation operation failed");
+            let _ = write_frame(
+                &mut send,
+                &SyncWireResponse::Error {
+                    message: message.to_owned(),
+                },
+            )
+            .await;
             let _ = send.finish();
             connection.closed().await;
-            return Err(AcceptError::from_err(std::io::Error::other(
-                error.to_string(),
-            )));
+            return Err(AcceptError::from_err(std::io::Error::other(message)));
         }
         send.finish()?;
         connection.closed().await;
@@ -2144,16 +2227,53 @@ async fn read_frame<T: DeserializeOwned>(receive: &mut RecvStream) -> Result<T> 
     postcard::from_bytes(&bytes).context("malformed control frame")
 }
 
-fn truncate_error(message: &str) -> String {
-    const LIMIT: usize = 1024;
-    if message.len() <= LIMIT {
-        return message.to_owned();
+fn public_error_message(error: &anyhow::Error) -> &'static str {
+    // Filesystem and database errors may embed private absolute paths. Use the
+    // same bounded, static descriptions for the peer, application log, and router.
+    for cause in error.chain() {
+        if cause.is::<deltaweave_core::WirePathError>() {
+            return "Invalid destination path; choose a portable relative path and retry.";
+        }
+        if cause.is::<deltaweave_core::ManifestError>() {
+            return "Invalid file manifest; regenerate it from the source and retry.";
+        }
+        if cause.is::<deltaweave_core::SyncRecordError>() {
+            return "Invalid causal record; refresh the snapshot and reconcile before retrying.";
+        }
+        if cause.is::<postcard::Error>() {
+            return "Malformed protocol message; check peer compatibility before retrying.";
+        }
+        if let Some(io_error) = cause.downcast_ref::<std::io::Error>() {
+            return match io_error.kind() {
+                std::io::ErrorKind::DirectoryNotEmpty => {
+                    "Destination directory is not empty; synchronize or move its contents before retrying."
+                }
+                std::io::ErrorKind::PermissionDenied => {
+                    "Receiver permission denied; check destination and state permissions before retrying."
+                }
+                _ => {
+                    "Receiver storage or transport failed; check storage, permissions, and connectivity before retrying."
+                }
+            };
+        }
     }
-    let mut end = LIMIT;
-    while !message.is_char_boundary(end) {
-        end -= 1;
+    match error.to_string().as_str() {
+        "incoming record is causally stale" => {
+            "Incoming record is causally stale; refresh the snapshot and reconcile before retrying."
+        }
+        "incoming record is concurrent; reconcile it before applying" => {
+            "Incoming record is concurrent; refresh the snapshot and reconcile before retrying."
+        }
+        "incoming record reuses an existing causal version for different state" => {
+            "Incoming record reuses a causal version for different state; reconcile before retrying."
+        }
+        "requested path is absent" | "requested path changed after snapshot" => {
+            "Requested path changed or is absent; refresh the snapshot before retrying."
+        }
+        _ => {
+            "Operation rejected; check the destination and receiver storage, then refresh the snapshot and retry."
+        }
     }
-    format!("{}…", &message[..end])
 }
 
 #[cfg(test)]
@@ -2204,6 +2324,161 @@ mod tests {
             version: version(label, counter),
             tombstone: false,
         }
+    }
+
+    async fn scripted_snapshot(
+        summaries: Vec<MerkleNodeSummary>,
+    ) -> (Result<RemoteSnapshot>, Vec<SyncWireRequest>) {
+        let endpoint = bind_endpoint(
+            SecretKey::generate(),
+            NetworkMode::DirectOnly,
+            Some(vec![ALPN_V2.to_vec()]),
+            Some("127.0.0.1:0".parse().expect("loopback address is valid")),
+        )
+        .await
+        .expect("scripted peer can bind");
+        let client = SyncClient {
+            secret_key: SecretKey::generate(),
+            remote: endpoint_addr_with_local_fallback(&endpoint),
+            network_mode: NetworkMode::DirectOnly,
+        };
+        let peer = tokio::spawn(async move {
+            let connection = endpoint
+                .accept()
+                .await
+                .expect("client connects")
+                .await
+                .expect("client authenticates");
+            let (mut send, mut receive) =
+                connection.accept_bi().await.expect("client opens stream");
+            let mut summaries = VecDeque::from(summaries);
+            let mut requests = Vec::new();
+            while let Ok(request) = read_frame::<SyncWireRequest>(&mut receive).await {
+                let response = match &request {
+                    SyncWireRequest::QueryNode { .. } => match summaries.pop_front() {
+                        Some(summary) => SyncWireResponse::Node {
+                            summary: Some(summary),
+                        },
+                        None => SyncWireResponse::Error {
+                            message: "script exhausted".into(),
+                        },
+                    },
+                    SyncWireRequest::Finish => SyncWireResponse::Finished,
+                    _ => panic!("unexpected snapshot request"),
+                };
+                let done = matches!(
+                    response,
+                    SyncWireResponse::Error { .. } | SyncWireResponse::Finished
+                );
+                requests.push(request);
+                write_frame(&mut send, &response)
+                    .await
+                    .expect("scripted response can be sent");
+                if done {
+                    send.finish().expect("scripted response can finish");
+                    connection.closed().await;
+                    break;
+                }
+            }
+            endpoint.close().await;
+            requests
+        });
+        let local =
+            MerkleTree::from_records(Vec::<SyncRecord>::new()).expect("empty tree is valid");
+        let result = tokio::time::timeout(Duration::from_secs(15), client.fetch_snapshot(&local))
+            .await
+            .expect("snapshot validation finishes promptly");
+        (result, peer.await.expect("scripted peer completes"))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_rejects_malformed_children_before_scheduling_queries() {
+        use deltaweave_reconcile::MerkleChildSummary;
+
+        let child = MerkleChildSummary {
+            name: "file".into(),
+            hash: Hash32::digest(b"child"),
+            record_count: 1,
+        };
+        let root = MerkleNodeSummary {
+            prefix: String::new(),
+            hash: Hash32::digest(b"root"),
+            record_count: 1,
+            record: None,
+            children: vec![child.clone()],
+        };
+        let cases = [
+            MerkleNodeSummary {
+                children: vec![child.clone(), child.clone()],
+                record_count: 2,
+                ..root.clone()
+            },
+            MerkleNodeSummary {
+                children: vec![MerkleChildSummary {
+                    name: "nested/file".into(),
+                    ..child.clone()
+                }],
+                ..root.clone()
+            },
+            MerkleNodeSummary {
+                children: vec![MerkleChildSummary {
+                    record_count: 0,
+                    ..child.clone()
+                }],
+                record_count: 0,
+                ..root.clone()
+            },
+            MerkleNodeSummary {
+                record_count: 2,
+                ..root.clone()
+            },
+            MerkleNodeSummary {
+                record: Some(file_record("unrelated", b"", b"peer", 1)),
+                record_count: 2,
+                ..root
+            },
+        ];
+        for summary in cases {
+            let (result, requests) = scripted_snapshot(vec![summary]).await;
+            assert!(result.is_err(), "malformed Merkle summaries must fail");
+            assert_eq!(
+                requests.len(),
+                1,
+                "invalid summaries must fail before follow-up requests"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_rejects_child_that_changes_its_advertised_commitment() {
+        use deltaweave_reconcile::MerkleChildSummary;
+
+        let record = file_record("file", b"", b"peer", 1);
+        let root = MerkleNodeSummary {
+            prefix: String::new(),
+            hash: Hash32::digest(b"root"),
+            record_count: 1,
+            record: None,
+            children: vec![MerkleChildSummary {
+                name: "file".into(),
+                hash: Hash32::digest(b"advertised child"),
+                record_count: 1,
+            }],
+        };
+        let changed_child = MerkleNodeSummary {
+            prefix: "file".into(),
+            hash: Hash32::digest(b"different child"),
+            record_count: 1,
+            record: Some(record),
+            children: Vec::new(),
+        };
+        let (result, requests) = scripted_snapshot(vec![root, changed_child]).await;
+        assert!(result.is_err());
+        assert_eq!(
+            requests.len(),
+            2,
+            "changed child must fail before snapshot completion"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2584,6 +2859,100 @@ mod tests {
         assert_eq!(manifest.size, 64 * 1024);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn sender_manifest_cache_creates_private_database_in_existing_public_root() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TempDir::new().expect("sender cache root can be created");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o755))
+            .expect("existing cache parent is searchable");
+        drop(SenderManifestCache::open(root.path()).expect("sender cache can be opened"));
+        let database = root.path().join("sender-manifests.redb");
+        assert_eq!(
+            fs::metadata(&database).unwrap().permissions().mode() & 0o077,
+            0,
+            "a new database must keep source metadata private in an existing public parent"
+        );
+        assert_eq!(
+            fs::metadata(root.path()).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "existing parent permissions are preserved"
+        );
+
+        fs::set_permissions(&database, fs::Permissions::from_mode(0o640))
+            .expect("administrator can configure existing database permissions");
+        drop(SenderManifestCache::open(root.path()).expect("existing database can be reused"));
+        assert_eq!(
+            fs::metadata(&database).unwrap().permissions().mode() & 0o777,
+            0o640,
+            "existing database permissions are preserved"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sender_manifest_cache_creates_private_root_without_changing_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TempDir::new().expect("temporary root can be created");
+        let state = root.path().join("sender-state");
+        drop(SenderManifestCache::open(&state).expect("sender manifest cache can be opened"));
+        assert_eq!(
+            fs::metadata(&state)
+                .expect("sender cache metadata is readable")
+                .permissions()
+                .mode()
+                & 0o077,
+            0,
+            "source paths and fingerprints require a private sender cache"
+        );
+
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o750))
+            .expect("administrator can configure existing permissions");
+        drop(SenderManifestCache::open(&state).expect("existing sender cache can be reused"));
+        assert_eq!(
+            fs::metadata(&state)
+                .expect("sender cache metadata is readable")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o750
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn server_creates_private_state_root_without_changing_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TempDir::new().expect("temporary root can be created");
+        let state = root.path().join("state");
+        prepare_server_roots(&root.path().join("destination"), &state)
+            .expect("separate server roots can be created");
+        assert_eq!(
+            fs::metadata(&state)
+                .expect("state metadata is readable")
+                .permissions()
+                .mode()
+                & 0o077,
+            0
+        );
+
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o750))
+            .expect("administrator can configure existing permissions");
+        prepare_server_roots(&root.path().join("destination"), &state)
+            .expect("existing server roots can be reused");
+        assert_eq!(
+            fs::metadata(&state)
+                .expect("state metadata is readable")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o750
+        );
+    }
+
     #[tokio::test]
     async fn server_rejects_overlapping_destination_and_state_roots() {
         let root = TempDir::new().expect("root can be created");
@@ -2728,6 +3097,110 @@ mod tests {
         .await;
         assert!(reconciliation.is_err());
         server.shutdown().await.expect("server shuts down");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn filesystem_errors_hide_receiver_paths_and_allow_recovery() {
+        let root = tempfile::Builder::new()
+            .prefix("receiver-private-sentinel-")
+            .tempdir()
+            .expect("synthetic private receiver root can be created");
+        let destination = root.path().join("destination");
+        fs::create_dir_all(destination.join("occupied"))
+            .expect("occupied directory can be created");
+        fs::write(destination.join("occupied/keep.txt"), b"keep me")
+            .expect("existing contents can be created");
+        let source = root.path().join("source.txt");
+        fs::write(&source, b"new data").expect("synthetic source can be created");
+        let client_key = SecretKey::generate();
+        let server = start_server(ServerConfig {
+            secret_key: SecretKey::generate(),
+            destination_root: destination.clone(),
+            state_root: root.path().join("state"),
+            peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
+            network_mode: NetworkMode::DirectOnly,
+            bind_address: Some("127.0.0.1:0".parse().expect("loopback address is valid")),
+        })
+        .await
+        .expect("server can start");
+        let options = PushOptions {
+            secret_key: client_key.clone(),
+            source,
+            remote_path: WirePath::new("occupied").expect("path is portable"),
+            remote: server.endpoint_addr(),
+            profile: ChunkingProfile::DEFAULT,
+            network_mode: NetworkMode::DirectOnly,
+            state_root: None,
+        };
+        let push_error = push_file(options.clone())
+            .await
+            .expect_err("replacing a nonempty directory must fail")
+            .to_string();
+        let client = SyncClient {
+            secret_key: client_key,
+            remote: server.endpoint_addr(),
+            network_mode: NetworkMode::DirectOnly,
+        };
+        let empty =
+            MerkleTree::from_records(Vec::<SyncRecord>::new()).expect("empty tree is valid");
+        let mut directory = client
+            .fetch_snapshot(&empty)
+            .await
+            .expect("snapshot remains available after rejected push")
+            .records
+            .into_iter()
+            .find(|record| record.path.as_str() == "occupied")
+            .expect("snapshot includes occupied directory");
+        directory
+            .version
+            .increment(ReplicaId(Hash32::digest(b"synthetic-client")))
+            .expect("new version fits");
+        directory.tombstone = true;
+        let metadata_error = client
+            .apply_metadata(directory)
+            .await
+            .expect_err("removing a nonempty directory must fail")
+            .to_string();
+
+        push_file(PushOptions {
+            remote_path: WirePath::new("recovered.txt").expect("path is portable"),
+            ..options
+        })
+        .await
+        .expect("a corrected push succeeds after the error");
+        client
+            .apply_metadata(SyncRecord {
+                schema_version: SYNC_RECORD_SCHEMA_V1,
+                path: WirePath::new("recovered-directory").expect("path is portable"),
+                kind: SyncEntryKind::Directory,
+                size: 0,
+                content_hash: None,
+                readonly: false,
+                version: version(b"synthetic-client", 1),
+                tombstone: false,
+            })
+            .await
+            .expect("a corrected metadata operation succeeds after the error");
+        server.shutdown().await.expect("server shuts down");
+        assert_eq!(
+            fs::read(destination.join("occupied/keep.txt")).unwrap(),
+            b"keep me"
+        );
+        assert_eq!(
+            fs::read(destination.join("recovered.txt")).unwrap(),
+            b"new data"
+        );
+        assert!(destination.join("recovered-directory").is_dir());
+        assert!(
+            [&push_error, &metadata_error]
+                .iter()
+                .all(|message| !message.contains("receiver-private-sentinel-")),
+            "wire errors disclose receiver paths: V1={push_error:?}, V2={metadata_error:?}"
+        );
+        for message in [&push_error, &metadata_error] {
+            assert!(message.contains("directory is not empty"));
+            assert!(message.contains("retry"));
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

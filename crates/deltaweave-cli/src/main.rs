@@ -304,8 +304,8 @@ async fn serve(args: ServeArgs) -> Result<()> {
     if args.allowed_peers.is_empty() && !args.allow_any_authenticated {
         bail!("serve requires at least one --allow-peer, or explicit --allow-any-authenticated");
     }
-    let identity = load_or_create_identity(&args.identity)?;
     ensure_identity_outside_destination(&args.identity, &args.root)?;
+    let identity = load_or_create_identity(&args.identity)?;
     let peer_policy = if args.allow_any_authenticated {
         PeerPolicy::AnyAuthenticated
     } else {
@@ -352,8 +352,21 @@ fn ensure_identity_outside_destination(identity: &Path, destination_root: &Path)
             destination_root.display()
         )
     })?;
-    let identity = fs::canonicalize(identity)
-        .with_context(|| format!("failed to resolve identity file {}", identity.display()))?;
+    let identity = if identity.try_exists()? {
+        fs::canonicalize(identity)
+            .with_context(|| format!("failed to resolve identity file {}", identity.display()))?
+    } else {
+        let parent = identity
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
+        fs::canonicalize(parent)?.join(
+            identity
+                .file_name()
+                .context("identity path must name a file")?,
+        )
+    };
     let destination_root = fs::canonicalize(destination_root).with_context(|| {
         format!(
             "failed to resolve destination root {}",
@@ -412,8 +425,8 @@ fn open_sync_engine(args: SyncTargetArgs) -> Result<SyncEngine> {
     if args.direct_only && args.direct_addresses.is_empty() {
         bail!("--direct-only requires at least one --direct address");
     }
-    let identity = load_or_create_identity(&args.identity)?;
     ensure_identity_outside_destination(&args.identity, &args.root)?;
+    let identity = load_or_create_identity(&args.identity)?;
     let profile = args.chunking.profile()?;
     let remote = endpoint_addr(&args.peer, &args.direct_addresses, &args.relay_urls)?;
     let replica = ReplicaId(Hash32::digest(identity.endpoint_id().as_bytes()));
@@ -1775,5 +1788,74 @@ mod tests {
         load_or_create_identity(&identity).expect("identity can be created");
 
         assert!(ensure_identity_outside_destination(&identity, &root).is_err());
+    }
+
+    #[test]
+    fn rejected_sync_configuration_does_not_create_identity_in_destination() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let root = temp.path().join("received");
+        let identity = root.join("private/receiver.key");
+        let cli = Cli::try_parse_from([
+            std::ffi::OsStr::new("deltaweave"),
+            std::ffi::OsStr::new("sync-once"),
+            std::ffi::OsStr::new("--root"),
+            root.as_os_str(),
+            std::ffi::OsStr::new("--identity"),
+            identity.as_os_str(),
+            std::ffi::OsStr::new("--peer"),
+            std::ffi::OsStr::new("unused-peer"),
+        ])
+        .expect("CLI arguments");
+        let Command::SyncOnce(args) = cli.command else {
+            panic!("sync-once command expected");
+        };
+
+        assert!(open_sync_engine(args).is_err());
+        assert!(
+            !identity.exists(),
+            "rejected configuration must not leave a secret key"
+        );
+    }
+
+    #[test]
+    fn missing_identity_outside_destination_can_be_validated_before_creation() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let root = temp.path().join("received");
+        let identity = temp.path().join("private/receiver.key");
+
+        ensure_identity_outside_destination(&identity, &root)
+            .expect("safe fresh identity location");
+        assert!(
+            !identity.exists(),
+            "location validation must not create a secret"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_server_configuration_does_not_create_identity_in_destination() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let root = temp.path().join("received");
+        let identity = root.join("private/receiver.key");
+        let peer = SecretKey::generate().public().to_string();
+        let cli = Cli::try_parse_from([
+            std::ffi::OsStr::new("deltaweave"),
+            std::ffi::OsStr::new("serve"),
+            std::ffi::OsStr::new("--root"),
+            root.as_os_str(),
+            std::ffi::OsStr::new("--identity"),
+            identity.as_os_str(),
+            std::ffi::OsStr::new("--allow-peer"),
+            std::ffi::OsStr::new(&peer),
+        ])
+        .expect("CLI arguments");
+        let Command::Serve(args) = cli.command else {
+            panic!("serve command expected");
+        };
+
+        assert!(serve(args).await.is_err());
+        assert!(
+            !identity.exists(),
+            "rejected configuration must not leave a secret key"
+        );
     }
 }
