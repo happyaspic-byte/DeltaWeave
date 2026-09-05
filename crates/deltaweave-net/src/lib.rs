@@ -2730,6 +2730,233 @@ mod tests {
         server.shutdown().await.expect("server shuts down");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn causal_push_rechecks_local_edits_after_chunk_negotiation() {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let state = TempDir::new().expect("state directory can be created");
+            let destination = TempDir::new().expect("destination can be created");
+            let sources = TempDir::new().expect("source directory can be created");
+            let source = sources.path().join("source.bin");
+            let initial_bytes = b"initial";
+            fs::write(&source, initial_bytes).expect("initial source can be written");
+            let client_key = SecretKey::from_bytes(&[31; 32]);
+            let server_key = SecretKey::from_bytes(&[32; 32]);
+            let server_replica = ReplicaId(Hash32::digest(server_key.public().as_bytes()));
+            let server = start_server(ServerConfig {
+                secret_key: server_key,
+                destination_root: destination.path().to_path_buf(),
+                state_root: state.path().to_path_buf(),
+                peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
+                network_mode: NetworkMode::DirectOnly,
+                bind_address: Some("127.0.0.1:0".parse().expect("loopback address is valid")),
+            })
+            .await
+            .expect("server can start");
+            let client = SyncClient {
+                secret_key: client_key,
+                remote: server.endpoint_addr(),
+                network_mode: NetworkMode::DirectOnly,
+            };
+            let initial = file_record("shared.bin", initial_bytes, b"client-a", 1);
+            client
+                .push_record(&source, initial.clone(), ChunkingProfile::DEFAULT)
+                .await
+                .expect("initial causal file can be seeded");
+
+            let incoming_bytes = b"incoming upload";
+            fs::write(&source, incoming_bytes).expect("incoming source can be written");
+            let incoming = file_record("shared.bin", incoming_bytes, b"client-a", 2);
+            let manifest = manifest_from_path(&source, ChunkingProfile::DEFAULT)
+                .expect("incoming manifest can be built");
+            let session = client.open_session().await.expect("session can open");
+            let connection = session
+                .endpoint
+                .connect(server.endpoint_addr(), ALPN_V2)
+                .await
+                .expect("upload connection can open");
+            let (mut send, mut receive) = connection.open_bi().await.expect("stream can open");
+            write_frame(
+                &mut send,
+                &SyncWireRequest::PushRecord {
+                    record: incoming.clone(),
+                    manifest: manifest.clone(),
+                },
+            )
+            .await
+            .expect("causal push request can be sent");
+            let SyncWireResponse::NeedChunks { hashes } = read_frame(&mut receive)
+                .await
+                .expect("receiver negotiates missing chunks")
+            else {
+                panic!("receiver must request the new content before applying it");
+            };
+            assert_eq!(hashes, vec![Hash32::digest(incoming_bytes)]);
+
+            // NeedChunks leaves the receiver waiting for payload, making this edit deterministic.
+            // Its different length also guarantees the authoritative scan observes the change.
+            let local_bytes = b"receiver independently edited this file during the upload";
+            fs::write(destination.path().join("shared.bin"), local_bytes)
+                .expect("receiver can edit the file before payload arrives");
+            send_requested_chunks(&mut send, &source, &manifest, hashes)
+                .await
+                .expect("requested payload can be uploaded");
+            send.finish().expect("upload can finish");
+            let response: SyncWireResponse = read_frame(&mut receive)
+                .await
+                .expect("receiver returns a causal decision");
+            connection.close(0_u8.into(), b"test upload finished");
+            session.close().await;
+            assert!(
+                matches!(response, SyncWireResponse::Error { .. }),
+                "an upload based on the old record must be rejected: {response:?}"
+            );
+            assert_eq!(
+                fs::read(destination.path().join("shared.bin")).expect("local edit remains"),
+                local_bytes
+            );
+            assert_eq!(
+                fs::read_dir(state.path().join("trash"))
+                    .expect("replacement history can be read")
+                    .count(),
+                0,
+                "a rejected upload must not replace the local edit"
+            );
+            let empty =
+                MerkleTree::from_records(Vec::<SyncRecord>::new()).expect("empty tree is valid");
+            let snapshot = client
+                .fetch_snapshot(&empty)
+                .await
+                .expect("fresh receiver snapshot can be verified");
+            let mut expected = file_record("shared.bin", local_bytes, b"client-a", 1);
+            expected.version.observe(server_replica, 1);
+            assert_eq!(snapshot.records, vec![expected]);
+            server.shutdown().await.expect("server shuts down");
+        })
+        .await
+        .expect("causal upload race completes within its timeout");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn causal_tombstones_preserve_conflicts_and_allow_idempotent_delete() {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let state = TempDir::new().expect("state directory can be created");
+            let destination = TempDir::new().expect("destination can be created");
+            let sources = TempDir::new().expect("source directory can be created");
+            let source = sources.path().join("source.bin");
+            let bytes = b"content that must survive a conflicting delete";
+            fs::write(&source, bytes).expect("source can be written");
+            let client_key = SecretKey::from_bytes(&[33; 32]);
+            let server = start_server(ServerConfig {
+                secret_key: SecretKey::from_bytes(&[34; 32]),
+                destination_root: destination.path().to_path_buf(),
+                state_root: state.path().to_path_buf(),
+                peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
+                network_mode: NetworkMode::DirectOnly,
+                bind_address: Some("127.0.0.1:0".parse().expect("loopback address is valid")),
+            })
+            .await
+            .expect("server can start");
+            let client = SyncClient {
+                secret_key: client_key,
+                remote: server.endpoint_addr(),
+                network_mode: NetworkMode::DirectOnly,
+            };
+            let current = file_record("shared.bin", bytes, b"client-a", 2);
+            client
+                .push_record(&source, current.clone(), ChunkingProfile::DEFAULT)
+                .await
+                .expect("current causal file can be seeded");
+            let empty =
+                MerkleTree::from_records(Vec::<SyncRecord>::new()).expect("empty tree is valid");
+
+            for (case, clock) in [
+                ("stale", version(b"client-a", 1)),
+                ("equal clock with deleted state", version(b"client-a", 2)),
+                ("concurrent", version(b"client-b", 1)),
+            ] {
+                let tombstone = SyncRecord {
+                    version: clock,
+                    tombstone: true,
+                    ..current.clone()
+                };
+                let result = client.apply_metadata(tombstone).await;
+                assert!(
+                    result.is_err(),
+                    "{case} deletion must be rejected: {result:?}"
+                );
+                assert_eq!(
+                    fs::read(destination.path().join("shared.bin"))
+                        .expect("conflicting delete must preserve the file"),
+                    bytes,
+                    "{case} deletion changed file contents"
+                );
+                let snapshot = client
+                    .fetch_snapshot(&empty)
+                    .await
+                    .expect("receiver snapshot remains valid after rejected delete");
+                assert_eq!(
+                    snapshot.records,
+                    vec![current.clone()],
+                    "{case} deletion changed causal state"
+                );
+                assert_eq!(
+                    fs::read_dir(state.path().join("trash"))
+                        .expect("replacement history can be read")
+                        .count(),
+                    0,
+                    "{case} deletion must not move the file into trash"
+                );
+            }
+
+            let mut resolved_version = version(b"client-a", 3);
+            resolved_version.merge(&version(b"client-b", 1));
+            let resolved = SyncRecord {
+                version: resolved_version,
+                tombstone: true,
+                ..current
+            };
+            let expected_receipt = SyncApplyReceipt {
+                path: resolved.path.clone(),
+                record_hash: resolved.logical_hash(),
+                transferred_bytes: 0,
+                reused_extents: 0,
+            };
+            for attempt in ["resolved delete", "identical retry"] {
+                let receipt = client
+                    .apply_metadata(resolved.clone())
+                    .await
+                    .expect("dominating deletion and its retry must succeed");
+                assert_eq!(
+                    receipt, expected_receipt,
+                    "{attempt} receipt must bind the exact record"
+                );
+                assert!(!destination.path().join("shared.bin").exists());
+                let snapshot = client
+                    .fetch_snapshot(&empty)
+                    .await
+                    .expect("deleted record can be independently verified");
+                assert_eq!(
+                    snapshot.records,
+                    vec![resolved.clone()],
+                    "{attempt} must retain the exact tombstone"
+                );
+                let backups: Vec<_> = fs::read_dir(state.path().join("trash"))
+                    .expect("replacement history can be read")
+                    .map(|entry| entry.expect("trash entry can be read").path())
+                    .collect();
+                assert_eq!(backups.len(), 1, "{attempt} must preserve exactly one copy");
+                assert_eq!(
+                    fs::read(backups[0].join("shared.bin")).expect("preserved content can be read"),
+                    bytes,
+                    "{attempt} must preserve the deleted content"
+                );
+            }
+            server.shutdown().await.expect("server shuts down");
+        })
+        .await
+        .expect("causal tombstone checks complete within their timeout");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn reconciliation_v2_covers_snapshot_delta_pull_causal_push_and_metadata() {
         let server_state = TempDir::new().expect("server state can be created");

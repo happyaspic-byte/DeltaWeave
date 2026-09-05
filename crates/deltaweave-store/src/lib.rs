@@ -1235,6 +1235,150 @@ mod tests {
     }
 
     #[test]
+    fn whole_file_hash_mismatch_preserves_destination_and_metadata() {
+        let state = TempDir::new().expect("state directory can be created");
+        let destination = TempDir::new().expect("destination can be created");
+        let path = WirePath::new("output.bin").expect("path is portable");
+        let old_bytes = b"existing content to preserve";
+        let old_manifest = manifest_from_reader(Cursor::new(old_bytes), ChunkingProfile::DEFAULT)
+            .expect("old content can be chunked");
+        let new_bytes = b"verified replacement chunks";
+        let mut manifest = manifest_from_reader(Cursor::new(new_bytes), ChunkingProfile::DEFAULT)
+            .expect("replacement can be chunked");
+        let store = Store::open(state.path()).expect("store can open");
+        fs::write(destination.path().join(path.as_str()), old_bytes)
+            .expect("existing file can be written");
+        store
+            .metadata()
+            .put_manifest(&path, &old_manifest)
+            .expect("existing metadata can be written");
+        populate(&store, new_bytes, &manifest);
+        manifest.file_hash = Hash32::digest(b"a different complete file");
+        manifest
+            .validate()
+            .expect("a wrong whole-file hash is structurally valid");
+
+        store
+            .materialize(&manifest, &path, destination.path())
+            .expect_err("verified chunks must not bypass the complete-file hash check");
+        drop(store);
+
+        let reopened = Store::open(state.path()).expect("store can reopen after rejection");
+        assert_eq!(
+            fs::read(destination.path().join(path.as_str())).expect("old file remains readable"),
+            old_bytes
+        );
+        assert_eq!(
+            reopened
+                .metadata()
+                .get_manifest(&path)
+                .expect("existing metadata remains readable"),
+            Some(old_manifest)
+        );
+        assert_eq!(
+            reopened
+                .metadata()
+                .get_operation(operation_id(&path, &manifest))
+                .expect("rejected operation remains readable"),
+            Some(OperationRecord {
+                id: operation_id(&path, &manifest),
+                path,
+                file_hash: manifest.file_hash,
+                state: OperationState::Prepared,
+            })
+        );
+        assert_eq!(
+            fs::read_dir(destination.path())
+                .expect("destination can be inspected")
+                .count(),
+            1,
+            "failed reconstruction must remove its temporary file"
+        );
+        assert_eq!(
+            fs::read_dir(state.path().join("trash"))
+                .expect("trash can be inspected")
+                .count(),
+            0,
+            "existing content must stay in place when verification fails"
+        );
+    }
+
+    #[test]
+    fn retry_after_install_recovers_prepared_operation_without_cached_chunks() {
+        let state = TempDir::new().expect("state directory can be created");
+        let destination = TempDir::new().expect("destination can be created");
+        let path = WirePath::new("recovered.bin").expect("path is portable");
+        let bytes = b"already installed and verified file";
+        let manifest = manifest_from_reader(Cursor::new(bytes), ChunkingProfile::DEFAULT)
+            .expect("installed content can be chunked");
+        let old_manifest =
+            manifest_from_reader(Cursor::new(b"previous content"), ChunkingProfile::DEFAULT)
+                .expect("old content can be chunked");
+        let prepared = OperationRecord {
+            id: operation_id(&path, &manifest),
+            path: path.clone(),
+            file_hash: manifest.file_hash,
+            state: OperationState::Prepared,
+        };
+
+        // Recreate an interruption after file installation but before the metadata commit.
+        {
+            let store = Store::open(state.path()).expect("store can open");
+            store
+                .metadata()
+                .put_manifest(&path, &old_manifest)
+                .expect("old metadata can be written");
+            store
+                .metadata()
+                .put_operation(&prepared)
+                .expect("prepared operation can be written");
+            fs::write(destination.path().join(path.as_str()), bytes)
+                .expect("installed file can be written");
+        }
+
+        {
+            let reopened = Store::open(state.path()).expect("store can reopen after interruption");
+            assert!(!reopened.missing_chunks(&manifest).is_empty());
+            let outcome = reopened
+                .materialize(&manifest, &path, destination.path())
+                .expect("installed file must finish the journal without downloading chunks");
+            assert!(outcome.already_current);
+            assert_eq!(outcome.bytes_written, 0);
+            assert!(!outcome.replaced_existing);
+            assert_eq!(
+                fs::read(outcome.destination).expect("installed file remains readable"),
+                bytes
+            );
+        }
+
+        let recovered = Store::open(state.path()).expect("recovered store can reopen");
+        assert_eq!(
+            recovered
+                .metadata()
+                .get_manifest(&path)
+                .expect("recovered metadata can be read"),
+            Some(manifest)
+        );
+        assert_eq!(
+            recovered
+                .metadata()
+                .get_operation(prepared.id)
+                .expect("recovered journal can be read"),
+            Some(OperationRecord {
+                state: OperationState::Committed,
+                ..prepared
+            })
+        );
+        assert_eq!(
+            fs::read_dir(state.path().join("trash"))
+                .expect("trash can be inspected")
+                .count(),
+            0,
+            "retry must not preserve another copy of the already-current file"
+        );
+    }
+
+    #[test]
     fn replacement_preserves_old_content() {
         let temp = TempDir::new().expect("temporary directory can be created");
         let destination = TempDir::new().expect("destination can be created");
@@ -1257,8 +1401,14 @@ mod tests {
         );
         let trash_entries = fs::read_dir(temp.path().join("trash"))
             .expect("trash can be read")
-            .count();
-        assert_eq!(trash_entries, 1);
+            .collect::<std::io::Result<Vec<_>>>()
+            .expect("trash entries can be read");
+        assert_eq!(trash_entries.len(), 1);
+        assert_eq!(
+            fs::read(trash_entries[0].path().join(path.as_str()))
+                .expect("preserved replacement exposes the old content"),
+            b"old content"
+        );
     }
 
     #[test]
