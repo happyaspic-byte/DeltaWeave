@@ -454,11 +454,39 @@ impl Store {
         source: impl AsRef<Path>,
         profile: ChunkingProfile,
     ) -> Result<FileManifest> {
+        self.ingest_file_with_admission(source, profile, |_| Ok(()))
+    }
+
+    /// Chunks a local file after admitting all missing bytes and rechecking each CAS write.
+    pub fn ingest_file_with_admission(
+        &self,
+        source: impl AsRef<Path>,
+        profile: ChunkingProfile,
+        mut admit: impl FnMut(u64) -> Result<()>,
+    ) -> Result<FileManifest> {
         let source = source.as_ref();
         let manifest = manifest_from_path(source, profile)?;
+        let mut missing: std::collections::HashSet<_> =
+            self.missing_chunks(&manifest).into_iter().collect();
+        let mut counted = std::collections::HashSet::new();
+        let missing_bytes = manifest
+            .chunks
+            .iter()
+            .filter(|descriptor| {
+                missing.contains(&descriptor.hash) && counted.insert(descriptor.hash)
+            })
+            .try_fold(0_u64, |total, descriptor| {
+                total
+                    .checked_add(u64::from(descriptor.length))
+                    .context("local CAS admission byte count overflow")
+            })?;
+        admit(missing_bytes)?;
         let mut file = File::open(source)?;
         for descriptor in &manifest.chunks {
             let bytes = read_chunk(&mut file, descriptor)?;
+            if missing.remove(&descriptor.hash) {
+                admit(u64::from(descriptor.length))?;
+            }
             self.chunks.put_verified(descriptor.hash, &bytes)?;
         }
         Ok(manifest)

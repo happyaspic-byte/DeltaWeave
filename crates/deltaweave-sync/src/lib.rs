@@ -15,8 +15,8 @@ use deltaweave_core::{
 };
 use deltaweave_index::{IndexOptions, LocalIndex, ScanReport, collision_key};
 use deltaweave_net::{
-    Inventory, PullReceipt, SyncApplyReceipt, SyncClient, SyncSession, TransferEvent,
-    TransferObserver,
+    DiskAdmission, Inventory, PullReceipt, SyncApplyReceipt, SyncClient, SyncSession,
+    TransferEvent, TransferObserver,
 };
 use deltaweave_reconcile::{
     ApplyAction, ConflictRecord, MerkleTree, actions_to_reach, merge_snapshots,
@@ -49,6 +49,7 @@ pub struct SyncEngine {
     store: Arc<Store>,
     client: SyncClient,
     profile: ChunkingProfile,
+    min_free_space_bytes: u64,
 }
 
 /// Auditable outcome after both peers have been re-read and proven converged.
@@ -103,6 +104,11 @@ struct RemoteStats {
 impl SyncEngine {
     /// Opens durable state after rejecting overlapping public and private roots.
     pub fn open(config: SyncConfig) -> Result<Self> {
+        Self::open_with_min_free_space(config, 0)
+    }
+
+    /// Opens durable state while reserving free space across local CAS and file writes.
+    pub fn open_with_min_free_space(config: SyncConfig, min_free_space_bytes: u64) -> Result<Self> {
         config.profile.validate()?;
         fs::create_dir_all(&config.root).with_context(|| {
             format!(
@@ -148,25 +154,13 @@ impl SyncEngine {
             store,
             client: config.client,
             profile: config.profile,
+            min_free_space_bytes,
         })
     }
 
     /// Reads the retained index snapshot without scanning or opening another owner.
     pub fn inventory(&self) -> Result<Inventory> {
-        let mut inventory = Inventory {
-            retries: self.index.retries()?.len(),
-            ..Inventory::default()
-        };
-        for record in self.index.sync_records()? {
-            if !record.tombstone && record.kind == SyncEntryKind::File {
-                inventory.files += 1;
-                inventory.bytes = inventory
-                    .bytes
-                    .checked_add(record.size)
-                    .context("inventory byte overflow")?;
-            }
-        }
-        Ok(inventory)
+        Inventory::from_index(&self.index)
     }
 
     /// Merges, applies, and independently verifies one complete bidirectional round.
@@ -241,6 +235,21 @@ impl SyncEngine {
         let desired_tree = merged.tree()?;
         let local_actions = actions_to_reach(&local_tree, &merged)?;
         let remote_actions = actions_to_reach(&remote_tree, &merged)?;
+        let pending_local_bytes = local_actions
+            .iter()
+            .filter_map(|action| match action {
+                ApplyAction::Materialize { record }
+                    if !record.tombstone && record.kind == SyncEntryKind::File =>
+                {
+                    Some(record.size)
+                }
+                ApplyAction::Delete { .. } | ApplyAction::Materialize { .. } => None,
+            })
+            .try_fold(0_u64, |total, bytes| {
+                total
+                    .checked_add(bytes)
+                    .context("pending local materialization byte count overflow")
+            })?;
 
         let required_files: Vec<_> = local_actions
             .iter()
@@ -258,6 +267,7 @@ impl SyncEngine {
                 &required_files,
                 &local_records,
                 &remote.records,
+                pending_local_bytes,
                 observer,
             )
             .await?;
@@ -319,6 +329,7 @@ impl SyncEngine {
         desired: &[SyncRecord],
         local: &[SyncRecord],
         remote: &[SyncRecord],
+        pending_local_bytes: u64,
         observer: &Option<TransferObserver>,
     ) -> Result<(BTreeMap<Hash32, FileManifest>, StageStats)> {
         let local_sources = live_file_sources(local);
@@ -340,7 +351,17 @@ impl SyncEngine {
         for hash in required {
             if let Some(source) = local_sources.get(&hash) {
                 let source_path = local_path(&self.root, &source.path);
-                let manifest = self.store.ingest_file(&source_path, self.profile)?;
+                let admission = DiskAdmission::new(
+                    self.store.state_root().to_path_buf(),
+                    self.root.clone(),
+                    self.min_free_space_bytes,
+                    pending_local_bytes,
+                );
+                let manifest =
+                    self.store
+                        .ingest_file_with_admission(&source_path, self.profile, |bytes| {
+                            admission.check_state(bytes)
+                        })?;
                 ensure!(
                     manifest.file_hash == hash,
                     "local source changed after its snapshot"
@@ -359,10 +380,12 @@ impl SyncEngine {
                 reused_extents,
                 ..
             } = session
-                .pull_record_to(
+                .pull_record_to_with_budget(
                     (*source).clone(),
                     Arc::clone(&self.store),
                     self.root.clone(),
+                    self.min_free_space_bytes,
+                    pending_local_bytes,
                 )
                 .await?;
             ensure!(
@@ -438,6 +461,13 @@ impl SyncEngine {
             let manifest = manifests
                 .get(&hash)
                 .with_context(|| format!("required content {hash} was not staged"))?;
+            DiskAdmission::new(
+                self.store.state_root().to_path_buf(),
+                self.root.clone(),
+                self.min_free_space_bytes,
+                0,
+            )
+            .check_materialization(manifest.size)?;
             let outcome = self.store.materialize(manifest, &record.path, &self.root)?;
             let observation = outcome
                 .observation

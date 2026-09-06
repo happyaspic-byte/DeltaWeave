@@ -138,26 +138,34 @@ impl Worker {
         } else {
             let input = view.input.clone();
             let engine = tokio::task::spawn_blocking(move || -> Result<SyncEngine> {
-                SyncEngine::open(SyncConfig {
-                    root: input.root.into(),
-                    state_root: input.state_path.context("state path missing")?.into(),
-                    replica: ReplicaId(Hash32::digest(identity.endpoint_id().as_bytes())),
-                    client: SyncClient {
-                        secret_key: identity.secret_key,
-                        remote: endpoint_addr(
-                            input.peer_endpoint_id.as_deref().context("peer missing")?,
-                            &input
-                                .direct_addresses
-                                .iter()
-                                .map(|a| a.parse())
-                                .collect::<std::result::Result<Vec<_>, _>>()?,
-                            &[],
-                        )?,
-                        network_mode: NetworkMode::DirectOnly,
+                let min_free_space_bytes = input
+                    .min_free_space_mib
+                    .context("minimum free space missing")?
+                    .checked_mul(1024 * 1024)
+                    .context("minimum free space byte count overflow")?;
+                SyncEngine::open_with_min_free_space(
+                    SyncConfig {
+                        root: input.root.into(),
+                        state_root: input.state_path.context("state path missing")?.into(),
+                        replica: ReplicaId(Hash32::digest(identity.endpoint_id().as_bytes())),
+                        client: SyncClient {
+                            secret_key: identity.secret_key,
+                            remote: endpoint_addr(
+                                input.peer_endpoint_id.as_deref().context("peer missing")?,
+                                &input
+                                    .direct_addresses
+                                    .iter()
+                                    .map(|a| a.parse())
+                                    .collect::<std::result::Result<Vec<_>, _>>()?,
+                                &[],
+                            )?,
+                            network_mode: NetworkMode::DirectOnly,
+                        },
+                        profile: ChunkingProfile::default(),
+                        ignored_paths: Vec::new(),
                     },
-                    profile: ChunkingProfile::default(),
-                    ignored_paths: Vec::new(),
-                })
+                    min_free_space_bytes,
+                )
             })
             .await??;
             Engine::Sync(Arc::new(engine))

@@ -11,6 +11,22 @@ fn receive(base: &Path, name: &str) -> FolderInput {
         ..Default::default()
     }
 }
+
+fn regular_files_below(path: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .map(|entry| {
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                regular_files_below(&entry.path())
+            } else {
+                usize::from(entry.file_type().is_ok_and(|kind| kind.is_file()))
+            }
+        })
+        .sum()
+}
 #[tokio::test]
 async fn persistence_identity_ownership_and_preserved_files() {
     let temp = tempfile::tempdir().unwrap();
@@ -286,6 +302,59 @@ async fn real_pair_sync_idle_pause_and_reopen() {
     })
     .await
     .expect("restarted sender must reach receiver at saved port");
+    manager.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn managed_sync_impossible_reserve_rejects_before_file_or_cas_write() {
+    const MIB: u64 = 1024 * 1024;
+    let temp = tempfile::tempdir().unwrap();
+    let remote_root = temp.path().join("remote");
+    std::fs::create_dir(&remote_root).unwrap();
+    std::fs::write(remote_root.join("only-remote.txt"), b"must not be pulled").unwrap();
+
+    let manager = Manager::open(temp.path().join("admin")).await.unwrap();
+    let sync_identity = temp.path().join("sync.key");
+    let identity = deltaweave_net::load_or_create_identity(&sync_identity).unwrap();
+    let mut receiver = receive(temp.path(), "remote");
+    receiver.enabled = Some(true);
+    receiver.allowed_peers = vec![identity.endpoint_id().to_string()];
+    let remote = manager.add_folder(receiver).await.unwrap();
+    let impossible_reserve = fs2::available_space(temp.path()).unwrap() / MIB + 2;
+    let local = manager
+        .add_folder(FolderInput {
+            name: "limited local".into(),
+            root: temp.path().join("local").display().to_string(),
+            role: "sync".into(),
+            identity_path: Some(sync_identity.display().to_string()),
+            peer_endpoint_id: Some(remote.endpoint_id),
+            direct_addresses: remote.addresses,
+            interval_seconds: Some(3600),
+            min_free_space_mib: Some(impossible_reserve),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        manager.command(&local.id, FolderCommand::Sync),
+    )
+    .await
+    .unwrap();
+    assert!(
+        result.is_err(),
+        "an impossible reserve must reject the pull"
+    );
+    assert!(
+        !Path::new(&local.input.root)
+            .join("only-remote.txt")
+            .exists()
+    );
+    let chunks = Path::new(local.input.state_path.as_deref().unwrap())
+        .join("store")
+        .join("chunks");
+    assert_eq!(regular_files_below(&chunks), 0, "CAS must remain empty");
     manager.shutdown().await.unwrap();
 }
 

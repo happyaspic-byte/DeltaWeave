@@ -76,6 +76,26 @@ pub struct Inventory {
     pub retries: usize,
 }
 
+impl Inventory {
+    /// Counts live files, their logical bytes, and queued retries from one retained index.
+    pub fn from_index(index: &LocalIndex) -> Result<Self> {
+        let mut inventory = Self {
+            retries: index.retries()?.len(),
+            ..Self::default()
+        };
+        for record in index.sync_records()? {
+            if !record.tombstone && record.kind == SyncEntryKind::File {
+                inventory.files += 1;
+                inventory.bytes = inventory
+                    .bytes
+                    .checked_add(record.size)
+                    .context("inventory byte overflow")?;
+            }
+        }
+        Ok(inventory)
+    }
+}
+
 fn observed_event(
     observer: &Option<TransferObserver>,
     phase: &str,
@@ -265,20 +285,7 @@ pub struct Server {
 impl Server {
     /// Reads the retained index snapshot without scanning or opening another owner.
     pub fn inventory(&self) -> Result<Inventory> {
-        let mut inventory = Inventory {
-            retries: self.index.retries()?.len(),
-            ..Inventory::default()
-        };
-        for record in self.index.sync_records()? {
-            if !record.tombstone && record.kind == SyncEntryKind::File {
-                inventory.files += 1;
-                inventory.bytes = inventory
-                    .bytes
-                    .checked_add(record.size)
-                    .context("inventory byte overflow")?;
-            }
-        }
-        Ok(inventory)
+        Inventory::from_index(&self.index)
     }
 
     /// Rejects new operations, then drains all admitted operations.
@@ -863,7 +870,8 @@ impl SyncClient {
     /// Pulls one exact remote live-file record into `store` without publishing a path yet.
     pub async fn pull_record(&self, record: SyncRecord, store: Arc<Store>) -> Result<PullReceipt> {
         let destination_root = store.state_root().to_path_buf();
-        self.pull_record_to(record, store, destination_root).await
+        self.pull_record_to_with_budget(record, store, destination_root, 0, 0)
+            .await
     }
 
     /// Pulls one exact remote record with admission checks for its eventual destination.
@@ -873,6 +881,26 @@ impl SyncClient {
         store: Arc<Store>,
         destination_root: PathBuf,
     ) -> Result<PullReceipt> {
+        let pending_destination_bytes = record.size;
+        self.pull_record_to_with_budget(
+            record,
+            store,
+            destination_root,
+            0,
+            pending_destination_bytes,
+        )
+        .await
+    }
+
+    /// Pulls one record while preserving a reserve across CAS and pending destination writes.
+    pub async fn pull_record_to_with_budget(
+        &self,
+        record: SyncRecord,
+        store: Arc<Store>,
+        destination_root: PathBuf,
+        min_free_space_bytes: u64,
+        pending_destination_bytes: u64,
+    ) -> Result<PullReceipt> {
         record.validate()?;
         ensure!(
             !record.tombstone && record.kind == SyncEntryKind::File,
@@ -880,7 +908,13 @@ impl SyncClient {
         );
         let session = self.open_session().await?;
         let outcome = session
-            .pull_record_to(record, store, destination_root)
+            .pull_record_to_with_budget(
+                record,
+                store,
+                destination_root,
+                min_free_space_bytes,
+                pending_destination_bytes,
+            )
             .await;
         session.close().await;
         outcome
@@ -892,6 +926,8 @@ impl SyncClient {
         expected: SyncRecord,
         store: Arc<Store>,
         destination_root: PathBuf,
+        min_free_space_bytes: u64,
+        pending_destination_bytes: u64,
     ) -> Result<PullReceipt> {
         let connection = endpoint
             .connect(self.remote.clone(), ALPN_V2)
@@ -932,9 +968,13 @@ impl SyncClient {
             .iter()
             .filter(|chunk| !missing_set.contains(&chunk.hash))
             .count();
-        let admission = DiskAdmission::new(store.state_root().to_path_buf(), destination_root, 0);
+        let admission = DiskAdmission::new(
+            store.state_root().to_path_buf(),
+            destination_root,
+            min_free_space_bytes,
+            pending_destination_bytes,
+        );
         admission.check_state(unique_missing_chunk_bytes(&manifest, &missing)?)?;
-        admission.check_materialization(manifest.size)?;
         write_frame(
             &mut send,
             &SyncWireRequest::NeedChunks {
@@ -1094,7 +1134,8 @@ impl SyncSession {
     /// Pulls one exact live-file record through this reusable endpoint.
     pub async fn pull_record(&self, record: SyncRecord, store: Arc<Store>) -> Result<PullReceipt> {
         let destination_root = store.state_root().to_path_buf();
-        self.pull_record_to(record, store, destination_root).await
+        self.pull_record_to_with_budget(record, store, destination_root, 0, 0)
+            .await
     }
 
     /// Pulls a record with admission checks for its eventual destination filesystem.
@@ -1104,13 +1145,40 @@ impl SyncSession {
         store: Arc<Store>,
         destination_root: PathBuf,
     ) -> Result<PullReceipt> {
+        let pending_destination_bytes = record.size;
+        self.pull_record_to_with_budget(
+            record,
+            store,
+            destination_root,
+            0,
+            pending_destination_bytes,
+        )
+        .await
+    }
+
+    /// Pulls a record while preserving a reserve across CAS and pending destination writes.
+    pub async fn pull_record_to_with_budget(
+        &self,
+        record: SyncRecord,
+        store: Arc<Store>,
+        destination_root: PathBuf,
+        min_free_space_bytes: u64,
+        pending_destination_bytes: u64,
+    ) -> Result<PullReceipt> {
         record.validate()?;
         ensure!(
             !record.tombstone && record.kind == SyncEntryKind::File,
             "pull_record requires a live file record"
         );
         self.client
-            .pull_record_connected(&self.endpoint, record, store, destination_root)
+            .pull_record_connected(
+                &self.endpoint,
+                record,
+                store,
+                destination_root,
+                min_free_space_bytes,
+                pending_destination_bytes,
+            )
             .await
     }
 
@@ -1682,9 +1750,9 @@ impl PushHandler {
             self.state_root.clone(),
             self.destination_root.clone(),
             self.min_free_space_bytes,
+            manifest.size,
         );
         admission.check_state(unique_missing_chunk_bytes(&manifest, &missing)?)?;
-        admission.check_materialization(manifest.size)?;
         write_frame(
             send,
             &WireResponse::NeedChunks {
@@ -1698,6 +1766,7 @@ impl PushHandler {
             .iter()
             .map(|chunk| (chunk.hash, chunk.clone()))
             .collect();
+        let materialize_admission = admission.clone();
         let mut writer = ChunkWritePipeline::with_admission(
             Arc::clone(&self.store),
             CHUNK_WRITE_CONCURRENCY,
@@ -1751,6 +1820,7 @@ impl PushHandler {
                 SyncEntryKind::File,
                 materialize_manifest.manifest_hash(),
             )?;
+            materialize_admission.check_materialization(materialize_manifest.size)?;
             store.materialize(&materialize_manifest, &materialize_path, root)
         })
         .await
@@ -2030,9 +2100,9 @@ impl SyncHandler {
             self.state_root.clone(),
             self.destination_root.clone(),
             self.min_free_space_bytes,
+            manifest.size,
         );
         admission.check_state(unique_missing_chunk_bytes(&manifest, &missing)?)?;
-        admission.check_materialization(manifest.size)?;
         write_frame(
             send,
             &SyncWireResponse::NeedChunks {
@@ -2041,6 +2111,7 @@ impl SyncHandler {
         )
         .await?;
 
+        let materialize_admission = admission.clone();
         let transferred_bytes =
             receive_chunks(&self.store, receive, &manifest, missing, admission).await?;
         let _apply_guard = self.apply_lock.lock().await;
@@ -2056,6 +2127,7 @@ impl SyncHandler {
         let materialize_manifest = manifest;
         let outcome = tokio::task::spawn_blocking(move || {
             prepare_destination_kind(&store, &path, &root, SyncEntryKind::File, operation_hash)?;
+            materialize_admission.check_materialization(materialize_manifest.size)?;
             store.materialize(&materialize_manifest, &path, root)
         })
         .await
@@ -2209,38 +2281,101 @@ struct InflightWrite {
     task: tokio::task::JoinHandle<Result<usize>>,
 }
 
-#[derive(Clone)]
-struct DiskAdmission {
+/// Free-space admission shared by CAS persistence and destination materialization.
+#[derive(Clone, Debug)]
+pub struct DiskAdmission {
     state_path: PathBuf,
     destination_path: PathBuf,
     reserve_bytes: u64,
+    pending_destination_bytes: u64,
 }
 
 impl DiskAdmission {
-    fn new(state_path: PathBuf, destination_path: PathBuf, reserve_bytes: u64) -> Self {
+    /// Tracks the reserve and all destination bytes that must remain affordable while staging.
+    #[must_use]
+    pub fn new(
+        state_path: PathBuf,
+        destination_path: PathBuf,
+        reserve_bytes: u64,
+        pending_destination_bytes: u64,
+    ) -> Self {
         Self {
             state_path,
             destination_path,
             reserve_bytes,
+            pending_destination_bytes,
         }
     }
 
-    fn check_state(&self, write_bytes: u64) -> Result<()> {
-        check_filesystem_space(&self.state_path, write_bytes, self.reserve_bytes, "state")
+    /// Rechecks a CAS write while retaining space for all pending destination writes.
+    pub fn check_state(&self, write_bytes: u64) -> Result<()> {
+        self.check_budget(write_bytes, self.pending_destination_bytes)
     }
 
-    fn check_materialization(&self, write_bytes: u64) -> Result<()> {
-        check_filesystem_space(
-            &self.destination_path,
-            write_bytes,
+    /// Rechecks one destination write immediately before materialization.
+    pub fn check_materialization(&self, write_bytes: u64) -> Result<()> {
+        self.check_budget(0, write_bytes)
+    }
+
+    fn check_budget(&self, state_write_bytes: u64, destination_write_bytes: u64) -> Result<()> {
+        let budget = FilesystemBudget {
+            state_available: available_space(&self.state_path, "state")?,
+            destination_available: available_space(&self.destination_path, "destination")?,
+            shared: same_filesystem(&self.state_path, &self.destination_path)?,
+        };
+        check_filesystem_budget(
+            budget,
+            state_write_bytes,
+            destination_write_bytes,
             self.reserve_bytes,
-            "destination",
         )
     }
 }
 
-fn check_filesystem_space(
-    path: &Path,
+#[derive(Clone, Copy, Debug)]
+struct FilesystemBudget {
+    state_available: u64,
+    destination_available: u64,
+    shared: bool,
+}
+
+fn check_filesystem_budget(
+    budget: FilesystemBudget,
+    state_write_bytes: u64,
+    destination_write_bytes: u64,
+    reserve_bytes: u64,
+) -> Result<()> {
+    if budget.shared {
+        let write_bytes = state_write_bytes
+            .checked_add(destination_write_bytes)
+            .context("combined disk admission byte count overflow")?;
+        let required = reserve_bytes
+            .checked_add(write_bytes)
+            .context("combined disk admission byte count overflow")?;
+        let available = budget.state_available.min(budget.destination_available);
+        ensure!(
+            available >= required,
+            "insufficient shared disk space: writes need {write_bytes} bytes plus {reserve_bytes} reserved bytes, have {available} bytes"
+        );
+    } else {
+        check_available(
+            budget.state_available,
+            state_write_bytes,
+            reserve_bytes,
+            "state",
+        )?;
+        check_available(
+            budget.destination_available,
+            destination_write_bytes,
+            reserve_bytes,
+            "destination",
+        )?;
+    }
+    Ok(())
+}
+
+fn check_available(
+    available: u64,
     write_bytes: u64,
     reserve_bytes: u64,
     label: &str,
@@ -2248,13 +2383,36 @@ fn check_filesystem_space(
     let required = reserve_bytes
         .checked_add(write_bytes)
         .context("disk admission byte count overflow")?;
-    let available = fs2::available_space(path)
-        .with_context(|| format!("failed to query free space for {}", path.display()))?;
     ensure!(
         available >= required,
         "insufficient {label} disk space: write needs {write_bytes} bytes plus {reserve_bytes} reserved bytes, have {available} bytes"
     );
     Ok(())
+}
+
+fn available_space(path: &Path, label: &str) -> Result<u64> {
+    fs2::available_space(path)
+        .with_context(|| format!("failed to query free space for {label} filesystem"))
+}
+
+#[cfg(unix)]
+fn same_filesystem(left: &Path, right: &Path) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(fs::metadata(left)?.dev() == fs::metadata(right)?.dev())
+}
+
+#[cfg(windows)]
+fn same_filesystem(left: &Path, right: &Path) -> Result<bool> {
+    let left = fs::canonicalize(left)?;
+    let right = fs::canonicalize(right)?;
+    Ok(left.components().next().map(|part| part.as_os_str())
+        == right.components().next().map(|part| part.as_os_str()))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_filesystem(_left: &Path, _right: &Path) -> Result<bool> {
+    // Conservatively combine budgets on platforms without a stable filesystem identity API.
+    Ok(true)
 }
 
 struct ChunkWritePipeline {
@@ -2652,6 +2810,22 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    fn regular_files_below(path: &Path) -> usize {
+        let Ok(entries) = fs::read_dir(path) else {
+            return 0;
+        };
+        entries
+            .filter_map(Result::ok)
+            .map(|entry| {
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    regular_files_below(&entry.path())
+                } else {
+                    usize::from(entry.file_type().is_ok_and(|kind| kind.is_file()))
+                }
+            })
+            .sum()
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn observed_transfer_reports_literal_payload_and_inventory() {
@@ -3126,6 +3300,7 @@ mod tests {
             state.path().to_path_buf(),
             destination.path().to_path_buf(),
             0,
+            1,
         );
         admission.check_state(1).expect("state admits small write");
         admission
@@ -3133,6 +3308,138 @@ mod tests {
             .expect("destination admits small materialization");
         assert!(admission.check_state(u64::MAX).is_err());
         assert!(admission.check_materialization(u64::MAX).is_err());
+    }
+
+    #[test]
+    fn shared_budget_combines_cas_and_destination_while_distinct_budgets_do_not() {
+        let shared = FilesystemBudget {
+            state_available: 300,
+            destination_available: 300,
+            shared: true,
+        };
+        assert!(check_filesystem_budget(shared, 100, 100, 128).is_err());
+
+        let distinct = FilesystemBudget {
+            state_available: 228,
+            destination_available: 228,
+            shared: false,
+        };
+        check_filesystem_budget(distinct, 100, 100, 128)
+            .expect("distinct filesystems each have their own complete budget");
+
+        let exact_shared = FilesystemBudget {
+            state_available: 328,
+            destination_available: 328,
+            shared: true,
+        };
+        check_filesystem_budget(exact_shared, 100, 100, 128)
+            .expect("combined shared budget admits an exact fit");
+        assert_eq!(exact_shared.state_available - 100 - 100, 128);
+
+        let after_cas = FilesystemBudget {
+            state_available: 228,
+            destination_available: 228,
+            shared: true,
+        };
+        check_filesystem_budget(after_cas, 0, 100, 128)
+            .expect("materialization recheck preserves the exact reserve");
+        assert!(
+            check_filesystem_budget(
+                FilesystemBudget {
+                    state_available: 227,
+                    destination_available: 227,
+                    shared: true,
+                },
+                0,
+                100,
+                128,
+            )
+            .is_err(),
+            "a changed post-CAS budget must block materialization"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn receiver_impossible_reserve_rejects_before_destination_or_cas_write() {
+        let state = TempDir::new().expect("state");
+        let destination = TempDir::new().expect("destination");
+        let source_dir = TempDir::new().expect("source");
+        let source = source_dir.path().join("payload.bin");
+        fs::write(&source, fixture(256 * 1024)).expect("source can be written");
+        let client_key = SecretKey::generate();
+        let server = start_server(ServerConfig {
+            secret_key: SecretKey::generate(),
+            destination_root: destination.path().to_path_buf(),
+            state_root: state.path().to_path_buf(),
+            peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
+            network_mode: NetworkMode::DirectOnly,
+            bind_address: Some("127.0.0.1:0".parse().unwrap()),
+            max_connections: 8,
+            min_free_space_bytes: u64::MAX,
+        })
+        .await
+        .expect("server can start with a conservative reserve");
+
+        let result = push_file(PushOptions {
+            secret_key: client_key,
+            source,
+            remote_path: WirePath::new("rejected.bin").unwrap(),
+            remote: server.endpoint_addr(),
+            profile: ChunkingProfile::DEFAULT,
+            network_mode: NetworkMode::DirectOnly,
+            state_root: None,
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(!destination.path().join("rejected.bin").exists());
+        assert_eq!(regular_files_below(&state.path().join("chunks")), 0);
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn receiver_successful_shared_transfer_preserves_configured_reserve() {
+        const HEADROOM: u64 = 64 * 1024 * 1024;
+        let root = TempDir::new().expect("shared filesystem root");
+        let state = root.path().join("state");
+        let destination = root.path().join("destination");
+        let source = root.path().join("source.bin");
+        fs::create_dir(&state).unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::write(&source, fixture(256 * 1024)).unwrap();
+        let available = fs2::available_space(root.path()).unwrap();
+        assert!(
+            available > HEADROOM,
+            "test filesystem needs bounded headroom"
+        );
+        let reserve = available - HEADROOM;
+        let client_key = SecretKey::generate();
+        let server = start_server(ServerConfig {
+            secret_key: SecretKey::generate(),
+            destination_root: destination.clone(),
+            state_root: state.clone(),
+            peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
+            network_mode: NetworkMode::DirectOnly,
+            bind_address: Some("127.0.0.1:0".parse().unwrap()),
+            max_connections: 8,
+            min_free_space_bytes: reserve,
+        })
+        .await
+        .unwrap();
+
+        push_file(PushOptions {
+            secret_key: client_key,
+            source,
+            remote_path: WirePath::new("accepted.bin").unwrap(),
+            remote: server.endpoint_addr(),
+            profile: ChunkingProfile::DEFAULT,
+            network_mode: NetworkMode::DirectOnly,
+            state_root: None,
+        })
+        .await
+        .expect("bounded transfer succeeds");
+        assert!(destination.join("accepted.bin").is_file());
+        assert!(fs2::available_space(root.path()).unwrap() >= reserve);
+        server.shutdown().await.unwrap();
     }
 
     #[test]
@@ -3168,6 +3475,7 @@ mod tests {
                 state.path().to_path_buf(),
                 state.path().to_path_buf(),
                 reserve,
+                0,
             ),
         );
         writer
