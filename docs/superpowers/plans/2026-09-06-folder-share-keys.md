@@ -52,7 +52,7 @@ cargo test --locked -p deltaweave-net -p deltaweave-sync --all-targets --all-fea
 
 ### Task 2: Implement versioned invitation keys and the v3 authorization boundary
 
-**Files:** create focused modules under `crates/deltaweave-net/src/share/` and a public module export; modify transport helpers in `crates/deltaweave-net/src/lib.rs` only as needed to reuse verified transfers. Add common root admission and focused hooks at legacy `SyncEngine::open`, the control worker lifetime lock, and CLI direct publishing paths where the underlying entry points do not already enforce admission. Add `crates/deltaweave-net/tests/shares.rs` and unit adversarial tests. Add dependencies only when existing maintained iroh/serde/postcard/redb facilities do not suffice.
+**Files:** create focused modules under `crates/deltaweave-net/src/share/` and a public module export; modify transport helpers in `crates/deltaweave-net/src/lib.rs` only as needed to reuse verified transfers. Add a bounded dedicated share-metadata slot and atomic record-adoption variants in `deltaweave-index` so accepted records, causal ceilings and provenance commit together without changing existing bindings/adoption contracts. Add common root admission and focused hooks at legacy `SyncEngine::open`, the control worker lifetime lock, and CLI direct publishing paths where the underlying entry points do not already enforce admission. Add `crates/deltaweave-net/tests/shares.rs` and unit adversarial tests. Add dependencies only when existing maintained iroh/serde/postcard/redb facilities do not suffice.
 
 **Interfaces:** produces `share::Permission::{ReadOnly,ReadWrite}`, a secret-redacting `ShareTicket` encode/parse/verified-preview type, durable owner registry and shared endpoint service, owner share creation/load, key issue/rotate/revoke, membership list/revoke, online validation/enrollment and a member session using the same `fetch_snapshot/pull_record/push_record/apply_metadata` semantics as `SyncSession`. Final Rust signatures are recorded in the task report before Task 3 starts; transport configuration carries owner ID + share ID, never a caller-trusted role. A single endpoint is cloned for member sessions rather than binding its private key again.
 
@@ -69,6 +69,10 @@ cargo test --locked -p deltaweave-net -p deltaweave-sync --all-targets --all-fea
 cargo test --locked -p deltaweave-net --all-targets --all-features
 cargo clippy --locked -p deltaweave-net --all-targets --all-features -- -D warnings
 ```
+
+Include focused index transaction/compatibility tests and index static checks for
+the atomic share-metadata extension. Existing root/replica metadata is never
+exposed through a general arbitrary-key mutation API.
 
 - [ ] Commit, report the public API and attack evidence, and obtain independent spec/quality review.
 
