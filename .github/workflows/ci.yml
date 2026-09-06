@@ -15,6 +15,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  DELTAWEAVE_REQUIRE_WEB_ASSETS: '1'
 
 jobs:
   quality-linux:
@@ -23,6 +24,14 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Test and build dashboard assets
+        run: |
+          npm --prefix web ci
+          npm --prefix web test
+          npm --prefix web run build
       - uses: dtolnay/rust-toolchain@1.91.0
         with:
           components: clippy,rustfmt
@@ -65,6 +74,14 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Test and build dashboard assets
+        run: |
+          npm --prefix web ci
+          npm --prefix web test
+          npm --prefix web run build
       - uses: dtolnay/rust-toolchain@1.91.0
       - uses: Swatinem/rust-cache@v2
         with:

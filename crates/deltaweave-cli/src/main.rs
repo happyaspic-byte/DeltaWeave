@@ -49,6 +49,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Run the authenticated browser dashboard and managed folder workers.
+    Web(WebArgs),
     /// Sync two folders once and verify both Merkle roots.
     #[command(
         after_help = "Example (receiver already running):\n  deltaweave sync-once --root ./shared --peer <ENDPOINT_ID>\n\nFind the peer's endpoint ID in its serve output.\nKeep --state and --identity outside the synchronized folder."
@@ -99,6 +101,19 @@ enum Command {
         after_help = "Example:\n  deltaweave fault-test --seed 424242 --workspace ./fault-evidence\n\nAn explicit workspace keeps reports, logs, and reproduction data.\nThe seed makes identities, file contents, and operation order reproducible."
     )]
     FaultTest(FaultTestArgs),
+}
+
+#[derive(Debug, Args)]
+struct WebArgs {
+    /// HTTP listener. Wildcard binding requires at least one --allow-host.
+    #[arg(long, default_value = "127.0.0.1:8390")]
+    bind: SocketAddr,
+    /// Private dashboard configuration, credentials, and folder state.
+    #[arg(long, default_value = ".deltaweave/web")]
+    data_dir: PathBuf,
+    /// Hostname or IP permitted in browser requests; repeat for LAN addresses.
+    #[arg(long = "allow-host")]
+    allowed_hosts: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -425,6 +440,7 @@ async fn main() -> std::process::ExitCode {
 impl Command {
     fn name(&self) -> &'static str {
         match self {
+            Self::Web(_) => "web",
             Self::Init(_) => "init",
             Self::Manifest(_) => "manifest",
             Self::Serve(_) => "serve",
@@ -441,6 +457,14 @@ impl Command {
 
 async fn run(cli: Cli, output: &Output) -> Result<()> {
     match cli.command {
+        Command::Web(args) => {
+            deltaweave_web::run(deltaweave_web::WebConfig {
+                bind: args.bind,
+                data_dir: args.data_dir,
+                allowed_hosts: args.allowed_hosts,
+            })
+            .await
+        }
         Command::Init(args) => initialize(args, output),
         Command::Manifest(args) => print_manifest(args, output),
         Command::Serve(args) => serve(args, output).await,
@@ -495,6 +519,8 @@ async fn serve(args: ServeArgs, output: &Output) -> Result<()> {
         peer_policy,
         network_mode: network_mode(args.direct_only),
         bind_address: args.bind,
+        max_connections: 64,
+        min_free_space_bytes: 0,
     })
     .await?;
     if !server.wait_online(Duration::from_secs(20)).await {
@@ -1432,6 +1458,8 @@ async fn self_test(output: &Output) -> Result<()> {
         peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
         network_mode: NetworkMode::DirectOnly,
         bind_address: None,
+        max_connections: 64,
+        min_free_space_bytes: 0,
     })
     .await
     .context("self-test receiver failed to start")?;
@@ -1861,6 +1889,26 @@ mod tests {
         let cli =
             Cli::try_parse_from(["deltaweave", "self-test"]).expect("self-test command parses");
         assert!(matches!(cli.command, Command::SelfTest));
+    }
+
+    #[test]
+    fn parses_web_with_explicit_network_access() {
+        assert!(
+            Cli::try_parse_from([
+                "deltaweave",
+                "web",
+                "--bind",
+                "0.0.0.0:8390",
+                "--data-dir",
+                "private-web",
+                "--allow-host",
+                "172.30.1.85",
+                "--allow-host",
+                "100.127.33.28",
+            ])
+            .is_ok()
+        );
+        assert!(Cli::try_parse_from(["deltaweave", "web", "--bind", "invalid"]).is_err());
     }
 
     #[test]

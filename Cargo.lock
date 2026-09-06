@@ -650,6 +650,7 @@ dependencies = [
  "deltaweave-index",
  "deltaweave-net",
  "deltaweave-sync",
+ "deltaweave-web",
  "hex",
  "iroh",
  "serde",
@@ -668,6 +669,23 @@ dependencies = [
  "fastcdc",
  "tempfile",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "deltaweave-control"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "deltaweave-core",
+ "deltaweave-index",
+ "deltaweave-net",
+ "deltaweave-sync",
+ "fs2",
+ "iroh",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -710,6 +728,7 @@ dependencies = [
  "deltaweave-index",
  "deltaweave-reconcile",
  "deltaweave-store",
+ "fs2",
  "hex",
  "iroh",
  "postcard",
@@ -771,13 +790,17 @@ version = "0.4.0"
 dependencies = [
  "anyhow",
  "axum",
+ "blake3",
  "clap",
+ "deltaweave-control",
  "deltaweave-core",
  "deltaweave-index",
  "deltaweave-net",
  "deltaweave-store",
  "deltaweave-sync",
+ "futures-util",
  "hex",
+ "http-body-util",
  "iroh",
  "redb",
  "serde",
@@ -993,6 +1016,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
+]
+
+[[package]]
+name = "fs2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
+dependencies = [
+ "libc",
+ "winapi",
 ]
 
 [[package]]

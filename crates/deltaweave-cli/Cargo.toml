@@ -20,6 +20,7 @@ deltaweave-core = { path = "../deltaweave-core" }
 deltaweave-index = { path = "../deltaweave-index" }
 deltaweave-net = { path = "../deltaweave-net" }
 deltaweave-sync = { path = "../deltaweave-sync" }
+deltaweave-web = { path = "../deltaweave-web" }
 hex.workspace = true
 iroh.workspace = true
 serde.workspace = true

@@ -16,6 +16,7 @@ deltaweave-index = { path = "../deltaweave-index" }
 deltaweave-reconcile = { path = "../deltaweave-reconcile" }
 deltaweave-store = { path = "../deltaweave-store" }
 hex.workspace = true
+fs2.workspace = true
 iroh.workspace = true
 postcard.workspace = true
 redb.workspace = true

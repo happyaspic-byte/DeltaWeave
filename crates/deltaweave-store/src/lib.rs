@@ -392,6 +392,7 @@ pub struct OperationRecord {
 /// Combined content and metadata store used by the transfer engine.
 #[derive(Debug)]
 pub struct Store {
+    state_root: PathBuf,
     chunks: ChunkStore,
     metadata: MetadataStore,
     materialize_lock: Mutex<()>,
@@ -405,10 +406,17 @@ impl Store {
             .recursive(true)
             .create(state_root)?;
         Ok(Self {
+            state_root: state_root.to_path_buf(),
             chunks: ChunkStore::open(state_root)?,
             metadata: MetadataStore::open(state_root.join("metadata.redb"))?,
             materialize_lock: Mutex::new(()),
         })
+    }
+
+    /// Returns the state filesystem root used for resource-admission checks.
+    #[must_use]
+    pub fn state_root(&self) -> &Path {
+        &self.state_root
     }
 
     /// Returns the content-addressed chunk store.

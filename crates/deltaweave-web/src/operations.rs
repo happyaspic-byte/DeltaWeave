@@ -206,6 +206,8 @@ pub(crate) async fn worker(
                     peer_policy: PeerPolicy::AllowListed(HashSet::from([peer])),
                     network_mode: NetworkMode::DirectOnly,
                     bind_address: Some(config.peer_bind),
+                    max_connections: 64,
+                    min_free_space_bytes: 0,
                 })
                 .await
                 {

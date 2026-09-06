@@ -44,6 +44,86 @@ const CHUNK_WRITE_BATCH: usize = 8;
 const CHUNK_WRITE_CONCURRENCY: usize = 8;
 const CHUNK_WRITE_MAX_QUEUED_BYTES: usize = 32 * 1024 * 1024;
 
+/// A completed payload or current operation observed by management clients.
+#[derive(Clone, Debug, Serialize)]
+pub struct TransferEvent {
+    pub phase: String,
+    pub path: Option<String>,
+    pub direction: Option<String>,
+    pub bytes: u64,
+    pub peer: Option<String>,
+}
+
+/// Optional non-blocking instrumentation callback. Panics cannot affect transfers.
+#[derive(Clone)]
+pub struct TransferObserver(Arc<dyn Fn(TransferEvent) + Send + Sync>);
+
+impl TransferObserver {
+    pub fn new(callback: impl Fn(TransferEvent) + Send + Sync + 'static) -> Self {
+        Self(Arc::new(callback))
+    }
+
+    pub fn emit(&self, event: TransferEvent) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (self.0)(event)));
+    }
+}
+
+/// Live file totals and queued retries in the retained index snapshot.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct Inventory {
+    pub files: u64,
+    pub bytes: u64,
+    pub retries: usize,
+}
+
+fn observed_event(
+    observer: &Option<TransferObserver>,
+    phase: &str,
+    path: Option<&WirePath>,
+    direction: Option<&str>,
+    bytes: u64,
+    peer: EndpointId,
+) {
+    if let Some(observer) = observer {
+        observer.emit(TransferEvent {
+            phase: phase.into(),
+            path: path.map(|path| path.as_str().into()),
+            direction: direction.map(str::to_owned),
+            bytes,
+            peer: Some(peer.to_string()),
+        });
+    }
+}
+
+#[derive(Debug, Default)]
+struct OperationAdmission {
+    paused: std::sync::atomic::AtomicBool,
+    active: Arc<tokio::sync::RwLock<()>>,
+    lifecycle: tokio::sync::Mutex<()>,
+}
+
+impl OperationAdmission {
+    fn admit(&self) -> Option<tokio::sync::OwnedRwLockReadGuard<()>> {
+        let guard = Arc::clone(&self.active).try_read_owned().ok()?;
+        if self.paused.load(std::sync::atomic::Ordering::SeqCst) {
+            return None;
+        }
+        Some(guard)
+    }
+
+    async fn pause(&self) {
+        let _lifecycle = self.lifecycle.lock().await;
+        self.paused.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _drained = self.active.write().await;
+    }
+
+    async fn resume(&self) {
+        let _lifecycle = self.lifecycle.lock().await;
+        self.paused
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Whether an endpoint uses internet discovery/relays or direct addresses only.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NetworkMode {
@@ -167,6 +247,10 @@ pub struct ServerConfig {
     pub network_mode: NetworkMode,
     /// Optional local UDP socket address for stable direct connectivity.
     pub bind_address: Option<SocketAddr>,
+    /// Maximum concurrently handled protocol connections.
+    pub max_connections: usize,
+    /// Free bytes reserved before receiving new content.
+    pub min_free_space_bytes: u64,
 }
 
 /// A running DeltaWeave protocol router.
@@ -174,9 +258,40 @@ pub struct ServerConfig {
 pub struct Server {
     router: Router,
     network_mode: NetworkMode,
+    index: Arc<LocalIndex>,
+    admission: Arc<OperationAdmission>,
 }
 
 impl Server {
+    /// Reads the retained index snapshot without scanning or opening another owner.
+    pub fn inventory(&self) -> Result<Inventory> {
+        let mut inventory = Inventory {
+            retries: self.index.retries()?.len(),
+            ..Inventory::default()
+        };
+        for record in self.index.sync_records()? {
+            if !record.tombstone && record.kind == SyncEntryKind::File {
+                inventory.files += 1;
+                inventory.bytes = inventory
+                    .bytes
+                    .checked_add(record.size)
+                    .context("inventory byte overflow")?;
+            }
+        }
+        Ok(inventory)
+    }
+
+    /// Rejects new operations, then drains all admitted operations.
+    pub async fn pause(&self) -> Result<()> {
+        self.admission.pause().await;
+        Ok(())
+    }
+
+    /// Reopens operation admission without replacing the endpoint identity.
+    pub async fn resume(&self) -> Result<()> {
+        self.admission.resume().await;
+        Ok(())
+    }
     /// Returns the endpoint's current authenticated address information.
     #[must_use]
     pub fn endpoint_addr(&self) -> EndpointAddr {
@@ -225,6 +340,14 @@ pub struct AddressInfo {
 
 /// Starts a receiving DeltaWeave endpoint.
 pub async fn start_server(config: ServerConfig) -> Result<Server> {
+    start_server_observed(config, None).await
+}
+
+/// Starts a receiving endpoint with optional best-effort observations.
+pub async fn start_server_observed(
+    config: ServerConfig,
+    observer: Option<TransferObserver>,
+) -> Result<Server> {
     let ServerConfig {
         secret_key,
         destination_root,
@@ -232,7 +355,13 @@ pub async fn start_server(config: ServerConfig) -> Result<Server> {
         peer_policy,
         network_mode,
         bind_address,
+        max_connections,
+        min_free_space_bytes,
     } = config;
+    ensure!(
+        max_connections > 0,
+        "max_connections must be greater than zero"
+    );
     let replica = ReplicaId(Hash32::digest(secret_key.public().as_bytes()));
     let (destination_root, state_root) = prepare_server_roots(&destination_root, &state_root)?;
     let store = Arc::new(Store::open(&state_root)?);
@@ -243,6 +372,8 @@ pub async fn start_server(config: ServerConfig) -> Result<Server> {
         IndexOptions::default(),
     )?);
     let apply_lock = Arc::new(tokio::sync::Mutex::new(()));
+    let connection_limit = Arc::new(tokio::sync::Semaphore::new(max_connections));
+    let receive_admission_lock = Arc::new(tokio::sync::Mutex::new(()));
     let endpoint = bind_endpoint(
         secret_key,
         network_mode,
@@ -250,19 +381,32 @@ pub async fn start_server(config: ServerConfig) -> Result<Server> {
         bind_address,
     )
     .await?;
+    let admission = Arc::new(OperationAdmission::default());
     let push_handler = PushHandler {
+        admission: Arc::clone(&admission),
+        observer: observer.clone(),
         store: Arc::clone(&store),
         index: Arc::clone(&index),
         destination_root: destination_root.clone(),
         peer_policy: peer_policy.clone(),
         apply_lock: Arc::clone(&apply_lock),
+        connection_limit: Arc::clone(&connection_limit),
+        min_free_space_bytes,
+        state_root: state_root.clone(),
+        receive_admission_lock: Arc::clone(&receive_admission_lock),
     };
     let sync_handler = SyncHandler {
+        admission: Arc::clone(&admission),
+        observer,
         store,
-        index,
+        index: Arc::clone(&index),
         destination_root,
         peer_policy,
         apply_lock,
+        connection_limit,
+        min_free_space_bytes,
+        state_root,
+        receive_admission_lock,
     };
     let router = Router::builder(endpoint)
         .accept(ALPN_V1, push_handler)
@@ -271,6 +415,8 @@ pub async fn start_server(config: ServerConfig) -> Result<Server> {
     Ok(Server {
         router,
         network_mode,
+        index,
+        admission,
     })
 }
 
@@ -716,13 +862,26 @@ impl SyncClient {
 
     /// Pulls one exact remote live-file record into `store` without publishing a path yet.
     pub async fn pull_record(&self, record: SyncRecord, store: Arc<Store>) -> Result<PullReceipt> {
+        let destination_root = store.state_root().to_path_buf();
+        self.pull_record_to(record, store, destination_root).await
+    }
+
+    /// Pulls one exact remote record with admission checks for its eventual destination.
+    pub async fn pull_record_to(
+        &self,
+        record: SyncRecord,
+        store: Arc<Store>,
+        destination_root: PathBuf,
+    ) -> Result<PullReceipt> {
         record.validate()?;
         ensure!(
             !record.tombstone && record.kind == SyncEntryKind::File,
             "pull_record requires a live file record"
         );
         let session = self.open_session().await?;
-        let outcome = session.pull_record(record, store).await;
+        let outcome = session
+            .pull_record_to(record, store, destination_root)
+            .await;
         session.close().await;
         outcome
     }
@@ -732,6 +891,7 @@ impl SyncClient {
         endpoint: &Endpoint,
         expected: SyncRecord,
         store: Arc<Store>,
+        destination_root: PathBuf,
     ) -> Result<PullReceipt> {
         let connection = endpoint
             .connect(self.remote.clone(), ALPN_V2)
@@ -772,6 +932,9 @@ impl SyncClient {
             .iter()
             .filter(|chunk| !missing_set.contains(&chunk.hash))
             .count();
+        let admission = DiskAdmission::new(store.state_root().to_path_buf(), destination_root, 0);
+        admission.check_state(unique_missing_chunk_bytes(&manifest, &missing)?)?;
+        admission.check_materialization(manifest.size)?;
         write_frame(
             &mut send,
             &SyncWireRequest::NeedChunks {
@@ -785,7 +948,12 @@ impl SyncClient {
             .iter()
             .map(|chunk| (chunk.hash, chunk.clone()))
             .collect();
-        let mut writer = ChunkWritePipeline::new(Arc::clone(&store), CHUNK_WRITE_CONCURRENCY);
+        let mut writer = ChunkWritePipeline::with_admission(
+            Arc::clone(&store),
+            CHUNK_WRITE_CONCURRENCY,
+            CHUNK_WRITE_MAX_QUEUED_BYTES,
+            admission,
+        );
         let receive_result = async {
             let mut transferred_bytes = 0_u64;
             for expected_hash in missing {
@@ -925,13 +1093,24 @@ impl SyncSession {
 
     /// Pulls one exact live-file record through this reusable endpoint.
     pub async fn pull_record(&self, record: SyncRecord, store: Arc<Store>) -> Result<PullReceipt> {
+        let destination_root = store.state_root().to_path_buf();
+        self.pull_record_to(record, store, destination_root).await
+    }
+
+    /// Pulls a record with admission checks for its eventual destination filesystem.
+    pub async fn pull_record_to(
+        &self,
+        record: SyncRecord,
+        store: Arc<Store>,
+        destination_root: PathBuf,
+    ) -> Result<PullReceipt> {
         record.validate()?;
         ensure!(
             !record.tombstone && record.kind == SyncEntryKind::File,
             "pull_record requires a live file record"
         );
         self.client
-            .pull_record_connected(&self.endpoint, record, store)
+            .pull_record_connected(&self.endpoint, record, store, destination_root)
             .await
     }
 
@@ -1398,11 +1577,17 @@ async fn send_requested_chunks(
 
 #[derive(Clone)]
 struct PushHandler {
+    admission: Arc<OperationAdmission>,
+    observer: Option<TransferObserver>,
     store: Arc<Store>,
     index: Arc<LocalIndex>,
     destination_root: PathBuf,
     peer_policy: PeerPolicy,
     apply_lock: Arc<tokio::sync::Mutex<()>>,
+    connection_limit: Arc<tokio::sync::Semaphore>,
+    min_free_space_bytes: u64,
+    state_root: PathBuf,
+    receive_admission_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl fmt::Debug for PushHandler {
@@ -1417,6 +1602,10 @@ impl fmt::Debug for PushHandler {
 
 impl ProtocolHandler for PushHandler {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        let Ok(_permit) = Arc::clone(&self.connection_limit).try_acquire_owned() else {
+            connection.close(0_u8.into(), b"server connection limit reached; retry later");
+            return Ok(());
+        };
         let peer = connection.remote_id();
         if !self.peer_policy.allows(peer) {
             warn!(%peer, "rejected unauthorized DeltaWeave peer");
@@ -1424,9 +1613,16 @@ impl ProtocolHandler for PushHandler {
             return Ok(());
         }
 
+        let Some(operation) = self.admission.admit() else {
+            connection.close(0_u8.into(), b"receiver paused; retry later");
+            return Ok(());
+        };
+        observed_event(&self.observer, "peer_seen", None, None, 0, peer);
         let (mut send, mut receive) = connection.accept_bi().await?;
         info!(%peer, "accepted DeltaWeave peer");
-        if let Err(error) = self.handle_push(&mut send, &mut receive).await {
+        if let Err(error) = self.handle_push(&mut send, &mut receive, peer).await {
+            drop(operation);
+            observed_event(&self.observer, "error", None, None, 0, peer);
             let message = public_error_message(&error);
             warn!(%peer, error = message, "DeltaWeave transfer failed");
             let _ = write_frame(
@@ -1440,6 +1636,7 @@ impl ProtocolHandler for PushHandler {
             connection.closed().await;
             return Err(AcceptError::from_err(std::io::Error::other(message)));
         }
+        drop(operation);
         send.finish()?;
         connection.closed().await;
         Ok(())
@@ -1447,12 +1644,18 @@ impl ProtocolHandler for PushHandler {
 }
 
 impl PushHandler {
-    async fn handle_push(&self, send: &mut SendStream, receive: &mut RecvStream) -> Result<()> {
+    async fn handle_push(
+        &self,
+        send: &mut SendStream,
+        receive: &mut RecvStream,
+        peer: EndpointId,
+    ) -> Result<()> {
         let request: WireRequest = read_frame(receive).await?;
         let (path, manifest) = match request {
             WireRequest::Push { path, manifest } => (path, manifest),
         };
         manifest.validate()?;
+        let _receive_guard = self.receive_admission_lock.lock().await;
         ensure!(
             manifest.size <= MAX_FILE_SIZE,
             "file exceeds protocol size limit"
@@ -1475,6 +1678,13 @@ impl PushHandler {
             .iter()
             .filter(|chunk| !missing_set.contains(&chunk.hash))
             .count();
+        let admission = DiskAdmission::new(
+            self.state_root.clone(),
+            self.destination_root.clone(),
+            self.min_free_space_bytes,
+        );
+        admission.check_state(unique_missing_chunk_bytes(&manifest, &missing)?)?;
+        admission.check_materialization(manifest.size)?;
         write_frame(
             send,
             &WireResponse::NeedChunks {
@@ -1488,7 +1698,12 @@ impl PushHandler {
             .iter()
             .map(|chunk| (chunk.hash, chunk.clone()))
             .collect();
-        let mut writer = ChunkWritePipeline::new(Arc::clone(&self.store), CHUNK_WRITE_CONCURRENCY);
+        let mut writer = ChunkWritePipeline::with_admission(
+            Arc::clone(&self.store),
+            CHUNK_WRITE_CONCURRENCY,
+            CHUNK_WRITE_MAX_QUEUED_BYTES,
+            admission,
+        );
         let receive_result = async {
             let mut transferred_bytes = 0_u64;
             for expected_hash in missing {
@@ -1556,21 +1771,35 @@ impl PushHandler {
                 manifest_hash: manifest.manifest_hash(),
                 transferred_bytes,
                 reused_extents,
-                path,
+                path: path.clone(),
             }),
         )
         .await?;
+        observed_event(
+            &self.observer,
+            "file_received",
+            Some(&path),
+            Some("receive"),
+            transferred_bytes,
+            peer,
+        );
         Ok(())
     }
 }
 
 #[derive(Clone)]
 struct SyncHandler {
+    admission: Arc<OperationAdmission>,
+    observer: Option<TransferObserver>,
     store: Arc<Store>,
     index: Arc<LocalIndex>,
     destination_root: PathBuf,
     peer_policy: PeerPolicy,
     apply_lock: Arc<tokio::sync::Mutex<()>>,
+    connection_limit: Arc<tokio::sync::Semaphore>,
+    min_free_space_bytes: u64,
+    state_root: PathBuf,
+    receive_admission_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl fmt::Debug for SyncHandler {
@@ -1585,6 +1814,10 @@ impl fmt::Debug for SyncHandler {
 
 impl ProtocolHandler for SyncHandler {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        let Ok(_permit) = Arc::clone(&self.connection_limit).try_acquire_owned() else {
+            connection.close(0_u8.into(), b"server connection limit reached; retry later");
+            return Ok(());
+        };
         let peer = connection.remote_id();
         if !self.peer_policy.allows(peer) {
             warn!(%peer, "rejected unauthorized DeltaWeave reconciliation peer");
@@ -1592,6 +1825,11 @@ impl ProtocolHandler for SyncHandler {
             return Ok(());
         }
 
+        let Some(operation) = self.admission.admit() else {
+            connection.close(0_u8.into(), b"receiver paused; retry later");
+            return Ok(());
+        };
+        observed_event(&self.observer, "peer_seen", None, None, 0, peer);
         let (mut send, mut receive) = connection.accept_bi().await?;
         info!(%peer, "accepted DeltaWeave reconciliation peer");
         let outcome = async {
@@ -1601,10 +1839,11 @@ impl ProtocolHandler for SyncHandler {
                         .await
                 }
                 SyncWireRequest::PullRecord { record } => {
-                    self.handle_pull(record, &mut send, &mut receive).await
+                    self.handle_pull(record, &mut send, &mut receive, peer)
+                        .await
                 }
                 SyncWireRequest::PushRecord { record, manifest } => {
-                    self.handle_push_record(record, manifest, &mut send, &mut receive)
+                    self.handle_push_record(record, manifest, &mut send, &mut receive, peer)
                         .await
                 }
                 SyncWireRequest::ApplyMetadata { record } => {
@@ -1617,6 +1856,8 @@ impl ProtocolHandler for SyncHandler {
         }
         .await;
         if let Err(error) = outcome {
+            drop(operation);
+            observed_event(&self.observer, "error", None, None, 0, peer);
             let message = public_error_message(&error);
             warn!(%peer, error = message, "DeltaWeave reconciliation operation failed");
             let _ = write_frame(
@@ -1630,6 +1871,7 @@ impl ProtocolHandler for SyncHandler {
             connection.closed().await;
             return Err(AcceptError::from_err(std::io::Error::other(message)));
         }
+        drop(operation);
         send.finish()?;
         connection.closed().await;
         Ok(())
@@ -1678,6 +1920,7 @@ impl SyncHandler {
         expected: SyncRecord,
         send: &mut SendStream,
         receive: &mut RecvStream,
+        peer: EndpointId,
     ) -> Result<()> {
         expected.validate()?;
         ensure!(
@@ -1731,6 +1974,14 @@ impl SyncHandler {
             }),
         )
         .await?;
+        observed_event(
+            &self.observer,
+            "file_sent",
+            Some(&expected.path),
+            Some("send"),
+            transferred_bytes,
+            peer,
+        );
         Ok(())
     }
 
@@ -1740,9 +1991,11 @@ impl SyncHandler {
         manifest: FileManifest,
         send: &mut SendStream,
         receive: &mut RecvStream,
+        peer: EndpointId,
     ) -> Result<()> {
         record.validate()?;
         manifest.validate()?;
+        let _receive_guard = self.receive_admission_lock.lock().await;
         ensure!(
             !record.tombstone && record.kind == SyncEntryKind::File,
             "causal push requires a live file record"
@@ -1773,6 +2026,13 @@ impl SyncHandler {
             .iter()
             .filter(|chunk| !missing_set.contains(&chunk.hash))
             .count();
+        let admission = DiskAdmission::new(
+            self.state_root.clone(),
+            self.destination_root.clone(),
+            self.min_free_space_bytes,
+        );
+        admission.check_state(unique_missing_chunk_bytes(&manifest, &missing)?)?;
+        admission.check_materialization(manifest.size)?;
         write_frame(
             send,
             &SyncWireResponse::NeedChunks {
@@ -1781,7 +2041,8 @@ impl SyncHandler {
         )
         .await?;
 
-        let transferred_bytes = receive_chunks(&self.store, receive, &manifest, missing).await?;
+        let transferred_bytes =
+            receive_chunks(&self.store, receive, &manifest, missing, admission).await?;
         let _apply_guard = self.apply_lock.lock().await;
         let index = Arc::clone(&self.index);
         let candidate = record.clone();
@@ -1819,6 +2080,14 @@ impl SyncHandler {
             }),
         )
         .await?;
+        observed_event(
+            &self.observer,
+            "file_received",
+            Some(&record.path),
+            Some("receive"),
+            transferred_bytes,
+            peer,
+        );
         Ok(())
     }
 
@@ -1940,8 +2209,57 @@ struct InflightWrite {
     task: tokio::task::JoinHandle<Result<usize>>,
 }
 
+#[derive(Clone)]
+struct DiskAdmission {
+    state_path: PathBuf,
+    destination_path: PathBuf,
+    reserve_bytes: u64,
+}
+
+impl DiskAdmission {
+    fn new(state_path: PathBuf, destination_path: PathBuf, reserve_bytes: u64) -> Self {
+        Self {
+            state_path,
+            destination_path,
+            reserve_bytes,
+        }
+    }
+
+    fn check_state(&self, write_bytes: u64) -> Result<()> {
+        check_filesystem_space(&self.state_path, write_bytes, self.reserve_bytes, "state")
+    }
+
+    fn check_materialization(&self, write_bytes: u64) -> Result<()> {
+        check_filesystem_space(
+            &self.destination_path,
+            write_bytes,
+            self.reserve_bytes,
+            "destination",
+        )
+    }
+}
+
+fn check_filesystem_space(
+    path: &Path,
+    write_bytes: u64,
+    reserve_bytes: u64,
+    label: &str,
+) -> Result<()> {
+    let required = reserve_bytes
+        .checked_add(write_bytes)
+        .context("disk admission byte count overflow")?;
+    let available = fs2::available_space(path)
+        .with_context(|| format!("failed to query free space for {}", path.display()))?;
+    ensure!(
+        available >= required,
+        "insufficient {label} disk space: write needs {write_bytes} bytes plus {reserve_bytes} reserved bytes, have {available} bytes"
+    );
+    Ok(())
+}
+
 struct ChunkWritePipeline {
     store: Arc<Store>,
+    admission: Option<DiskAdmission>,
     max_inflight: usize,
     max_queued_bytes: usize,
     inflight: Vec<InflightWrite>,
@@ -1949,13 +2267,34 @@ struct ChunkWritePipeline {
 }
 
 impl ChunkWritePipeline {
+    #[cfg(test)]
     fn new(store: Arc<Store>, max_inflight: usize) -> Self {
         Self::with_limits(store, max_inflight, CHUNK_WRITE_MAX_QUEUED_BYTES)
     }
 
+    #[cfg(test)]
     fn with_limits(store: Arc<Store>, max_inflight: usize, max_queued_bytes: usize) -> Self {
+        Self::with_optional_admission(store, max_inflight, max_queued_bytes, None)
+    }
+
+    fn with_admission(
+        store: Arc<Store>,
+        max_inflight: usize,
+        max_queued_bytes: usize,
+        admission: DiskAdmission,
+    ) -> Self {
+        Self::with_optional_admission(store, max_inflight, max_queued_bytes, Some(admission))
+    }
+
+    fn with_optional_admission(
+        store: Arc<Store>,
+        max_inflight: usize,
+        max_queued_bytes: usize,
+        admission: Option<DiskAdmission>,
+    ) -> Self {
         Self {
             store,
+            admission,
             max_inflight: max_inflight.max(1),
             max_queued_bytes: max_queued_bytes.max(1),
             inflight: Vec::new(),
@@ -2031,6 +2370,9 @@ impl ChunkWritePipeline {
         }
         let batch = std::mem::take(&mut self.pending);
         let bytes = batch.iter().map(|chunk| chunk.bytes().len()).sum();
+        if let Some(admission) = &self.admission {
+            admission.check_state(u64::try_from(bytes).context("write batch size overflow")?)?;
+        }
         let store = Arc::clone(&self.store);
         self.inflight.push(InflightWrite {
             bytes,
@@ -2072,18 +2414,44 @@ async fn drain_chunk_tasks(tasks: Vec<tokio::task::JoinHandle<Result<usize>>>) -
     }
 }
 
+fn unique_missing_chunk_bytes(manifest: &FileManifest, missing: &[Hash32]) -> Result<u64> {
+    let descriptors: HashMap<_, _> = manifest
+        .chunks
+        .iter()
+        .map(|chunk| (chunk.hash, chunk.length))
+        .collect();
+    let mut seen = HashSet::new();
+    missing
+        .iter()
+        .filter(|hash| seen.insert(**hash))
+        .try_fold(0_u64, |total, hash| {
+            let length = descriptors
+                .get(hash)
+                .with_context(|| format!("missing chunk {hash} is absent from manifest"))?;
+            total
+                .checked_add(u64::from(*length))
+                .context("missing chunk byte count overflow")
+        })
+}
+
 async fn receive_chunks(
     store: &Arc<Store>,
     receive: &mut RecvStream,
     manifest: &FileManifest,
     missing: Vec<Hash32>,
+    admission: DiskAdmission,
 ) -> Result<u64> {
     let descriptor_by_hash: HashMap<_, _> = manifest
         .chunks
         .iter()
         .map(|chunk| (chunk.hash, chunk.clone()))
         .collect();
-    let mut writer = ChunkWritePipeline::new(Arc::clone(store), CHUNK_WRITE_CONCURRENCY);
+    let mut writer = ChunkWritePipeline::with_admission(
+        Arc::clone(store),
+        CHUNK_WRITE_CONCURRENCY,
+        CHUNK_WRITE_MAX_QUEUED_BYTES,
+        admission,
+    );
     let receive_result = async {
         let mut transferred_bytes = 0_u64;
         for expected_hash in missing {
@@ -2285,6 +2653,182 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn observed_transfer_reports_literal_payload_and_inventory() {
+        let state = TempDir::new().unwrap();
+        let destination = TempDir::new().unwrap();
+        let source_dir = TempDir::new().unwrap();
+        let source = source_dir.path().join("source.txt");
+        fs::write(&source, b"observed bytes").unwrap();
+        let client_key = SecretKey::generate();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let server = start_server_observed(
+            ServerConfig {
+                secret_key: SecretKey::generate(),
+                destination_root: destination.path().into(),
+                state_root: state.path().into(),
+                peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
+                network_mode: NetworkMode::DirectOnly,
+                bind_address: Some("127.0.0.1:0".parse().unwrap()),
+                max_connections: 8,
+                min_free_space_bytes: 0,
+            },
+            Some(TransferObserver::new(move |event| {
+                captured.lock().unwrap().push(event)
+            })),
+        )
+        .await
+        .unwrap();
+        push_file(PushOptions {
+            secret_key: client_key.clone(),
+            source,
+            remote_path: WirePath::new("folder/report.txt").unwrap(),
+            remote: server.endpoint_addr(),
+            profile: ChunkingProfile::DEFAULT,
+            network_mode: NetworkMode::DirectOnly,
+            state_root: None,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            fs::read(destination.path().join("folder/report.txt")).unwrap(),
+            b"observed bytes"
+        );
+        let inventory = server.inventory().unwrap();
+        assert_eq!(
+            (inventory.files, inventory.bytes, inventory.retries),
+            (1, 14, 0)
+        );
+        let events = events.lock().unwrap().clone();
+        let received = events
+            .iter()
+            .find(|event| event.phase == "file_received")
+            .unwrap();
+        assert_eq!(received.path.as_deref(), Some("folder/report.txt"));
+        assert_eq!(received.direction.as_deref(), Some("receive"));
+        assert_eq!(received.bytes, 14);
+        assert_eq!(
+            received.peer.as_deref(),
+            Some(client_key.public().to_string().as_str())
+        );
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pause_drains_admitted_transfer_rejects_new_work_and_resumes_identity() {
+        let state = TempDir::new().unwrap();
+        let destination = TempDir::new().unwrap();
+        let client_key = SecretKey::generate();
+        let server = start_server(ServerConfig {
+            secret_key: SecretKey::generate(),
+            destination_root: destination.path().into(),
+            state_root: state.path().into(),
+            peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
+            network_mode: NetworkMode::DirectOnly,
+            bind_address: Some("127.0.0.1:0".parse().unwrap()),
+            max_connections: 8,
+            min_free_space_bytes: 0,
+        })
+        .await
+        .unwrap();
+        let original_id = server.endpoint_addr().id;
+        let endpoint = bind_endpoint(client_key.clone(), NetworkMode::DirectOnly, None, None)
+            .await
+            .unwrap();
+        let connection = endpoint
+            .connect(server.endpoint_addr(), ALPN_V1)
+            .await
+            .unwrap();
+        let (mut send, mut receive) = connection.open_bi().await.unwrap();
+        let manifest = manifest_from_reader(&b"drain me"[..], ChunkingProfile::DEFAULT).unwrap();
+        write_frame(
+            &mut send,
+            &WireRequest::Push {
+                path: WirePath::new("drained.txt").unwrap(),
+                manifest: manifest.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_frame::<WireResponse>(&mut receive).await.unwrap(),
+            WireResponse::NeedChunks { .. }
+        ));
+        {
+            let pause = server.pause();
+            tokio::pin!(pause);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(75), &mut pause)
+                    .await
+                    .is_err()
+            );
+            assert!(!destination.path().join("drained.txt").exists());
+            let chunk = &manifest.chunks[0];
+            write_frame(
+                &mut send,
+                &ChunkHeader {
+                    hash: chunk.hash,
+                    length: chunk.length,
+                },
+            )
+            .await
+            .unwrap();
+            send.write_all(b"drain me").await.unwrap();
+            assert!(matches!(
+                read_frame::<WireResponse>(&mut receive).await.unwrap(),
+                WireResponse::Complete(_)
+            ));
+            // Draining means the operation is done; it must not depend on a cooperative peer closing QUIC.
+            tokio::time::timeout(Duration::from_secs(5), &mut pause)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(
+            fs::read(destination.path().join("drained.txt")).unwrap(),
+            b"drain me"
+        );
+        let client = SyncClient {
+            secret_key: client_key,
+            remote: server.endpoint_addr(),
+            network_mode: NetworkMode::DirectOnly,
+        };
+        let blocked = client
+            .fetch_snapshot(&MerkleTree::from_records(Vec::new()).unwrap())
+            .await;
+        assert!(blocked.is_err(), "paused receiver must reject new V2 work");
+        let directory = SyncRecord {
+            schema_version: SYNC_RECORD_SCHEMA_V1,
+            path: WirePath::new("after-resume").unwrap(),
+            kind: SyncEntryKind::Directory,
+            size: 0,
+            content_hash: None,
+            readonly: false,
+            version: version(b"pause-client", 1),
+            tombstone: false,
+        };
+        assert!(client.apply_metadata(directory.clone()).await.is_err());
+        assert!(!destination.path().join("after-resume").exists());
+        server.resume().await.unwrap();
+        client.apply_metadata(directory).await.unwrap();
+        assert!(destination.path().join("after-resume").is_dir());
+        assert_eq!(server.endpoint_addr().id, original_id);
+        let snapshot = client
+            .fetch_snapshot(&MerkleTree::from_records(Vec::new()).unwrap())
+            .await
+            .unwrap();
+        assert!(
+            snapshot
+                .records
+                .iter()
+                .any(|record| record.path.as_str() == "drained.txt")
+        );
+        connection.close(0_u8.into(), b"test done");
+        endpoint.close().await;
+        server.shutdown().await.unwrap();
+    }
+
     fn fixture(length: usize) -> Vec<u8> {
         let mut value = 0x243f_6a88_85a3_08d3_u64;
         (0..length)
@@ -2482,6 +3026,158 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shared_connection_limit_covers_v1_and_v2_until_transfer_finishes() {
+        let state = TempDir::new().unwrap();
+        let destination = TempDir::new().unwrap();
+        let first_key = SecretKey::generate();
+        let second_key = SecretKey::generate();
+        let server = start_server(ServerConfig {
+            secret_key: SecretKey::generate(),
+            destination_root: destination.path().into(),
+            state_root: state.path().into(),
+            peer_policy: PeerPolicy::AllowListed(HashSet::from([
+                first_key.public(),
+                second_key.public(),
+            ])),
+            network_mode: NetworkMode::DirectOnly,
+            bind_address: Some("127.0.0.1:0".parse().unwrap()),
+            max_connections: 1,
+            min_free_space_bytes: 0,
+        })
+        .await
+        .unwrap();
+        let endpoint = bind_endpoint(first_key, NetworkMode::DirectOnly, None, None)
+            .await
+            .unwrap();
+        let connection = endpoint
+            .connect(server.endpoint_addr(), ALPN_V1)
+            .await
+            .unwrap();
+        let (mut send, mut receive) = connection.open_bi().await.unwrap();
+        let manifest =
+            manifest_from_reader(&b"held payload"[..], ChunkingProfile::DEFAULT).unwrap();
+        write_frame(
+            &mut send,
+            &WireRequest::Push {
+                path: WirePath::new("held.txt").unwrap(),
+                manifest: manifest.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_frame::<WireResponse>(&mut receive).await.unwrap(),
+            WireResponse::NeedChunks { .. }
+        ));
+
+        let client = SyncClient {
+            secret_key: second_key,
+            remote: server.endpoint_addr(),
+            network_mode: NetworkMode::DirectOnly,
+        };
+        assert!(
+            client
+                .fetch_snapshot(&MerkleTree::from_records(Vec::new()).unwrap())
+                .await
+                .is_err(),
+            "V1 must consume the shared V1/V2 connection permit"
+        );
+
+        let chunk = &manifest.chunks[0];
+        write_frame(
+            &mut send,
+            &ChunkHeader {
+                hash: chunk.hash,
+                length: chunk.length,
+            },
+        )
+        .await
+        .unwrap();
+        send.write_all(b"held payload").await.unwrap();
+        assert!(matches!(
+            read_frame::<WireResponse>(&mut receive).await.unwrap(),
+            WireResponse::Complete(_)
+        ));
+        connection.close(0_u8.into(), b"complete");
+        endpoint.close().await;
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if client
+                    .fetch_snapshot(&MerkleTree::from_records(Vec::new()).unwrap())
+                    .await
+                    .is_ok()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("permit is released after V1 transfer finishes");
+        server.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn disk_admission_checks_state_and_destination_filesystems() {
+        let state = TempDir::new().expect("state");
+        let destination = TempDir::new().expect("destination");
+        let admission = DiskAdmission::new(
+            state.path().to_path_buf(),
+            destination.path().to_path_buf(),
+            0,
+        );
+        admission.check_state(1).expect("state admits small write");
+        admission
+            .check_materialization(1)
+            .expect("destination admits small materialization");
+        assert!(admission.check_state(u64::MAX).is_err());
+        assert!(admission.check_materialization(u64::MAX).is_err());
+    }
+
+    #[test]
+    fn missing_chunk_bytes_counts_each_hash_once() {
+        let bytes = fixture(128 * 1024);
+        let manifest = manifest_from_reader(
+            std::io::Cursor::new([bytes.clone(), bytes].concat()),
+            ChunkingProfile {
+                version: 1,
+                min_size: 64 * 1024,
+                avg_size: 128 * 1024,
+                max_size: 256 * 1024,
+            },
+        )
+        .expect("manifest");
+        let missing = vec![manifest.chunks[0].hash];
+        assert_eq!(
+            unique_missing_chunk_bytes(&manifest, &missing).expect("byte count"),
+            u64::from(manifest.chunks[0].length)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn chunk_writer_rechecks_disk_reserve_before_persistence() {
+        let state = TempDir::new().expect("state");
+        let store = Arc::new(Store::open(state.path()).expect("store"));
+        let reserve = fs2::available_space(state.path()).expect("free space");
+        let mut writer = ChunkWritePipeline::with_admission(
+            Arc::clone(&store),
+            1,
+            CHUNK_WRITE_MAX_QUEUED_BYTES,
+            DiskAdmission::new(
+                state.path().to_path_buf(),
+                state.path().to_path_buf(),
+                reserve,
+            ),
+        );
+        writer
+            .push(verified_chunk(fixture(4096)))
+            .await
+            .expect("chunk queues");
+        assert!(writer.finish().await.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn chunk_writer_drain_waits_for_all_tasks_after_first_error() {
         let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let delayed_completed = Arc::clone(&completed);
@@ -2652,6 +3348,8 @@ mod tests {
             peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
             network_mode: NetworkMode::DirectOnly,
             bind_address: Some("127.0.0.1:0".parse().expect("ephemeral bind is valid")),
+            max_connections: 64,
+            min_free_space_bytes: 0,
         })
         .await
         .expect("server can start");
@@ -2963,6 +3661,8 @@ mod tests {
             peer_policy: PeerPolicy::AllowListed(HashSet::new()),
             network_mode: NetworkMode::DirectOnly,
             bind_address: None,
+            max_connections: 64,
+            min_free_space_bytes: 0,
         })
         .await;
 
@@ -2991,6 +3691,8 @@ mod tests {
             peer_policy: PeerPolicy::AllowListed(HashSet::new()),
             network_mode: NetworkMode::DirectOnly,
             bind_address: Some("127.0.0.1:0".parse().expect("ephemeral bind is valid")),
+            max_connections: 64,
+            min_free_space_bytes: 0,
         })
         .await
         .expect("server can bind an ephemeral local address");
@@ -3006,6 +3708,8 @@ mod tests {
             peer_policy: PeerPolicy::AllowListed(HashSet::new()),
             network_mode: NetworkMode::DirectOnly,
             bind_address: Some(bind_address),
+            max_connections: 64,
+            min_free_space_bytes: 0,
         })
         .await
         .expect("server can rebind the previously assigned address");
@@ -3031,6 +3735,8 @@ mod tests {
             peer_policy: PeerPolicy::AllowListed(HashSet::new()),
             network_mode: NetworkMode::DirectOnly,
             bind_address: Some(bind_address),
+            max_connections: 64,
+            min_free_space_bytes: 0,
         })
         .await;
         assert!(result.is_err());
@@ -3048,6 +3754,8 @@ mod tests {
             peer_policy: PeerPolicy::AllowListed(HashSet::new()),
             network_mode: NetworkMode::DirectOnly,
             bind_address: None,
+            max_connections: 64,
+            min_free_space_bytes: 0,
         })
         .await
         .expect("server can start");
@@ -3070,6 +3778,8 @@ mod tests {
             peer_policy: PeerPolicy::AllowListed(HashSet::from([SecretKey::generate().public()])),
             network_mode: NetworkMode::DirectOnly,
             bind_address: None,
+            max_connections: 64,
+            min_free_space_bytes: 0,
         })
         .await
         .expect("server can start");
@@ -3118,6 +3828,8 @@ mod tests {
                 peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
                 network_mode: NetworkMode::DirectOnly,
                 bind_address: Some("127.0.0.1:0".parse().expect("loopback address is valid")),
+                max_connections: 64,
+                min_free_space_bytes: 0,
             })
             .await
             .expect("server can start");
@@ -3222,6 +3934,8 @@ mod tests {
                 peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
                 network_mode: NetworkMode::DirectOnly,
                 bind_address: Some("127.0.0.1:0".parse().expect("loopback address is valid")),
+                max_connections: 64,
+                min_free_space_bytes: 0,
             })
             .await
             .expect("server can start");
@@ -3347,6 +4061,8 @@ mod tests {
             peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
             network_mode: NetworkMode::DirectOnly,
             bind_address: Some("127.0.0.1:0".parse().expect("loopback address is valid")),
+            max_connections: 64,
+            min_free_space_bytes: 0,
         })
         .await
         .expect("server can start");
@@ -3450,6 +4166,8 @@ mod tests {
             peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
             network_mode: NetworkMode::DirectOnly,
             bind_address: None,
+            max_connections: 64,
+            min_free_space_bytes: 0,
         })
         .await
         .expect("server can start");

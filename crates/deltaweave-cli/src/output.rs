@@ -435,7 +435,6 @@ fn escape(text: &str) -> String {
     let mut safe = String::with_capacity(text.len());
     for character in text.chars() {
         match character {
-            '\\' => safe.push_str("\\\\"),
             '\n' => safe.push_str("\\n"),
             '\r' => safe.push_str("\\r"),
             '\t' => safe.push_str("\\t"),
@@ -490,6 +489,21 @@ mod tests {
             )
             .unwrap();
         assert_eq!(bytes, b"{\n  \"zebra\": 7,\n  \"alpha\": \"x\\ny\"\n}\n");
+    }
+
+    #[test]
+    fn text_preserves_literal_windows_path_backslashes() {
+        let output = text(
+            "init",
+            &json!({
+                "endpoint_id": "endpoint",
+                "identity_path": r"C:\Users\Alice\DeltaWeave\identity.key",
+                "created": true,
+            }),
+        );
+
+        assert!(output.contains(r"C:\Users\Alice\DeltaWeave\identity.key"));
+        assert!(!output.contains(r"C:\\Users\\Alice\\DeltaWeave\\identity.key"));
     }
 
     #[test]
@@ -661,7 +675,7 @@ mod tests {
         }
         assert!(output.contains("資料/ok\\nforged\\r\\t\\u{001b}[31m\\u{0085}\\u{202e}txt"));
         assert!(output.contains("extra\\u{001b}]0;title\\u{0007}"));
-        assert!(output.contains("literal\\\\n"));
+        assert!(output.contains("literal\\n"));
     }
 
     #[test]

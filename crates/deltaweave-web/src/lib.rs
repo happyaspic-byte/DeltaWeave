@@ -1,8 +1,12 @@
 //! Local-only authenticated browser management of real DeltaWeave engines.
 #![forbid(unsafe_code)]
 
+mod assets;
+mod auth;
 mod operations;
-use anyhow::{Context, Result};
+mod routes;
+
+use anyhow::{Context, Result, ensure};
 use axum::{
     Router,
     body::to_bytes,
@@ -12,6 +16,7 @@ use axum::{
     response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
+use deltaweave_control::Manager;
 use iroh::EndpointId;
 use operations::{Command, Prepared};
 use serde::Serialize;
@@ -34,6 +39,73 @@ pub struct Config {
     pub identity: Option<PathBuf>,
     pub bind: SocketAddr,
     pub peer_bind: SocketAddr,
+}
+
+/// HTTP listener and private management configuration for the multi-folder console.
+#[derive(Clone, Debug)]
+pub struct WebConfig {
+    /// Socket to bind. Unspecified addresses require explicit allowed hosts.
+    pub bind: SocketAddr,
+    /// Private persistent management state and administrator access key directory.
+    pub data_dir: PathBuf,
+    /// Additional exact HTTP host names or authorities; wildcard values are rejected.
+    pub allowed_hosts: Vec<String>,
+}
+
+/// Runs the embedded multi-folder management server until shutdown.
+pub async fn run(config: WebConfig) -> Result<()> {
+    ensure!(
+        assets::available(),
+        "browser assets are missing; run npm --prefix web run build and rebuild DeltaWeave"
+    );
+    let hosts = routes::HostPolicy::new(config.bind, &config.allowed_hosts)?;
+    let listener = tokio::net::TcpListener::bind(config.bind)
+        .await
+        .context("bind management HTTP listener")?;
+    let manager = Manager::open(config.data_dir.clone()).await?;
+    let (auth, _bootstrap) = match auth::Auth::open(&config.data_dir) {
+        Ok(auth) => auth,
+        Err(error) => {
+            manager.shutdown().await?;
+            return Err(error);
+        }
+    };
+    let state = Arc::new(routes::AppState {
+        manager: Arc::clone(&manager),
+        auth: Arc::new(auth),
+        hosts,
+    });
+    let app = routes::router(Arc::clone(&state));
+    println!(
+        "DeltaWeave web listening on http://{}",
+        listener.local_addr()?
+    );
+    println!(
+        "Administrator access key file: {}",
+        config.data_dir.join("admin-token").display()
+    );
+    let served = axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            state.auth.revoke_all();
+        })
+        .await;
+    let shutdown = manager.shutdown().await;
+    served.context("management HTTP server failed")?;
+    shutdown
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        if let Ok(mut terminate) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = terminate.recv() => {} }
+            return;
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
 }
 #[derive(Clone, Serialize)]
 pub struct Activity {

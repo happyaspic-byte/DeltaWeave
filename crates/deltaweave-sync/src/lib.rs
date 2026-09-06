@@ -14,7 +14,10 @@ use deltaweave_core::{
     ChunkingProfile, FileManifest, Hash32, ReplicaId, SyncEntryKind, SyncRecord, WirePath,
 };
 use deltaweave_index::{IndexOptions, LocalIndex, ScanReport, collision_key};
-use deltaweave_net::{PullReceipt, SyncApplyReceipt, SyncClient, SyncSession};
+use deltaweave_net::{
+    Inventory, PullReceipt, SyncApplyReceipt, SyncClient, SyncSession, TransferEvent,
+    TransferObserver,
+};
 use deltaweave_reconcile::{
     ApplyAction, ConflictRecord, MerkleTree, actions_to_reach, merge_snapshots,
 };
@@ -148,18 +151,78 @@ impl SyncEngine {
         })
     }
 
+    /// Reads the retained index snapshot without scanning or opening another owner.
+    pub fn inventory(&self) -> Result<Inventory> {
+        let mut inventory = Inventory {
+            retries: self.index.retries()?.len(),
+            ..Inventory::default()
+        };
+        for record in self.index.sync_records()? {
+            if !record.tombstone && record.kind == SyncEntryKind::File {
+                inventory.files += 1;
+                inventory.bytes = inventory
+                    .bytes
+                    .checked_add(record.size)
+                    .context("inventory byte overflow")?;
+            }
+        }
+        Ok(inventory)
+    }
+
     /// Merges, applies, and independently verifies one complete bidirectional round.
     pub async fn sync_once(&self) -> Result<SyncReport> {
-        let scan = scan_index(Arc::clone(&self.index)).await?;
-        ensure_scan_is_safe(&scan, "local")?;
-        let local_records = read_records(Arc::clone(&self.index)).await?;
-        let local_tree = MerkleTree::from_records(local_records.clone())?;
-        let session = self.client.open_session().await?;
-        let outcome = self
-            .sync_with_session(&session, local_records, local_tree)
-            .await;
-        session.close().await;
+        self.sync_once_observed(None).await
+    }
+
+    /// Runs a complete round while emitting phases and successful payload observations.
+    pub async fn sync_once_observed(
+        &self,
+        observer: Option<TransferObserver>,
+    ) -> Result<SyncReport> {
+        self.observe(&observer, "scanning", None, None, 0);
+        let outcome = async {
+            let scan = scan_index(Arc::clone(&self.index)).await?;
+            ensure_scan_is_safe(&scan, "local")?;
+            let local_records = read_records(Arc::clone(&self.index)).await?;
+            let local_tree = MerkleTree::from_records(local_records.clone())?;
+            let session = self.client.open_session().await?;
+            let outcome = self
+                .sync_with_session(&session, local_records, local_tree, &observer)
+                .await;
+            session.close().await;
+            outcome
+        }
+        .await;
+        match &outcome {
+            Ok(report) => self.observe(
+                &observer,
+                "complete",
+                None,
+                None,
+                report.pulled_bytes.saturating_add(report.pushed_bytes),
+            ),
+            Err(_) => self.observe(&observer, "error", None, None, 0),
+        }
         outcome
+    }
+
+    fn observe(
+        &self,
+        observer: &Option<TransferObserver>,
+        phase: &str,
+        path: Option<&WirePath>,
+        direction: Option<&str>,
+        bytes: u64,
+    ) {
+        if let Some(observer) = observer {
+            observer.emit(TransferEvent {
+                phase: phase.into(),
+                path: path.map(|path| path.as_str().into()),
+                direction: direction.map(str::to_owned),
+                bytes,
+                peer: Some(self.client.remote.id.to_string()),
+            });
+        }
     }
 
     async fn sync_with_session(
@@ -167,8 +230,11 @@ impl SyncEngine {
         session: &SyncSession,
         local_records: Vec<SyncRecord>,
         local_tree: MerkleTree,
+        observer: &Option<TransferObserver>,
     ) -> Result<SyncReport> {
+        self.observe(observer, "comparing", None, None, 0);
         let remote = session.fetch_snapshot(&local_tree).await?;
+        self.observe(observer, "peer_seen", None, None, 0);
         let remote_tree = MerkleTree::from_records(remote.records.clone())?;
         let merged = merge_snapshots(&local_tree, &remote_tree)?;
         validate_materializable_namespace(&merged.records)?;
@@ -187,11 +253,22 @@ impl SyncEngine {
             })
             .collect();
         let (manifests, stage_stats) = self
-            .stage_desired_files(session, &required_files, &local_records, &remote.records)
+            .stage_desired_files(
+                session,
+                &required_files,
+                &local_records,
+                &remote.records,
+                observer,
+            )
             .await?;
+        self.observe(observer, "applying", None, None, 0);
         self.apply_local(&local_tree, &local_actions, &manifests)
             .await?;
-        let remote_stats = self.apply_remote(session, &remote_actions).await?;
+        self.observe(observer, "pushing", None, Some("push"), 0);
+        let remote_stats = self
+            .apply_remote(session, &remote_actions, observer)
+            .await?;
+        self.observe(observer, "verifying", None, None, 0);
 
         let verification_scan = scan_index(Arc::clone(&self.index)).await?;
         ensure_scan_is_safe(&verification_scan, "verified local")?;
@@ -242,6 +319,7 @@ impl SyncEngine {
         desired: &[SyncRecord],
         local: &[SyncRecord],
         remote: &[SyncRecord],
+        observer: &Option<TransferObserver>,
     ) -> Result<(BTreeMap<Hash32, FileManifest>, StageStats)> {
         let local_sources = live_file_sources(local);
         let remote_sources = live_file_sources(remote);
@@ -274,17 +352,29 @@ impl SyncEngine {
             let source = remote_sources
                 .get(&hash)
                 .with_context(|| format!("no peer retains required content {hash}"))?;
+            self.observe(observer, "pulling", Some(&source.path), Some("pull"), 0);
             let PullReceipt {
                 manifest,
                 transferred_bytes,
                 reused_extents,
                 ..
             } = session
-                .pull_record((*source).clone(), Arc::clone(&self.store))
+                .pull_record_to(
+                    (*source).clone(),
+                    Arc::clone(&self.store),
+                    self.root.clone(),
+                )
                 .await?;
             ensure!(
                 manifest.file_hash == hash,
                 "remote source returned different content"
+            );
+            self.observe(
+                observer,
+                "file_received",
+                Some(&source.path),
+                Some("pull"),
+                transferred_bytes,
             );
             manifests.insert(hash, manifest);
             stats.remote_files += 1;
@@ -361,6 +451,7 @@ impl SyncEngine {
         &self,
         session: &SyncSession,
         actions: &[ApplyAction],
+        observer: &Option<TransferObserver>,
     ) -> Result<RemoteStats> {
         let mut stats = RemoteStats::default();
         let mut deletions = action_records(actions, true, None);
@@ -386,6 +477,13 @@ impl SyncEngine {
             } = session
                 .push_record(source, record.clone(), self.profile)
                 .await?;
+            self.observe(
+                observer,
+                "file_sent",
+                Some(&record.path),
+                Some("push"),
+                transferred_bytes,
+            );
             stats.pushed_bytes = stats
                 .pushed_bytes
                 .checked_add(transferred_bytes)
@@ -527,7 +625,9 @@ mod tests {
     use std::{collections::HashSet, fs};
 
     use deltaweave_core::{SYNC_RECORD_SCHEMA_V1, VersionVector};
-    use deltaweave_net::{NetworkMode, PeerPolicy, ServerConfig, start_server};
+    use deltaweave_net::{
+        NetworkMode, PeerPolicy, ServerConfig, start_server, start_server_observed,
+    };
     use iroh::{EndpointAddr, SecretKey};
     use tempfile::TempDir;
 
@@ -535,6 +635,109 @@ mod tests {
 
     fn replica(key: &SecretKey) -> ReplicaId {
         ReplicaId(Hash32::digest(key.public().as_bytes()))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn observed_cycle_reports_real_bidirectional_payloads_and_failure() {
+        let local = TempDir::new().unwrap();
+        let local_state = TempDir::new().unwrap();
+        let remote = TempDir::new().unwrap();
+        let remote_state = TempDir::new().unwrap();
+        fs::write(local.path().join("out.txt"), b"outgoing").unwrap();
+        fs::write(remote.path().join("in.txt"), b"incoming").unwrap();
+        let key = SecretKey::generate();
+        let server_events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_server = Arc::clone(&server_events);
+        let server = start_server_observed(
+            ServerConfig {
+                secret_key: SecretKey::generate(),
+                destination_root: remote.path().into(),
+                state_root: remote_state.path().into(),
+                peer_policy: PeerPolicy::AllowListed(HashSet::from([key.public()])),
+                network_mode: NetworkMode::DirectOnly,
+                bind_address: Some("127.0.0.1:0".parse().unwrap()),
+                max_connections: 8,
+                min_free_space_bytes: 0,
+            },
+            Some(TransferObserver::new(move |event| {
+                captured_server.lock().unwrap().push(event)
+            })),
+        )
+        .await
+        .unwrap();
+        let engine = SyncEngine::open(SyncConfig {
+            root: local.path().into(),
+            state_root: local_state.path().into(),
+            replica: replica(&key),
+            client: SyncClient {
+                secret_key: key,
+                remote: server.endpoint_addr(),
+                network_mode: NetworkMode::DirectOnly,
+            },
+            profile: ChunkingProfile::DEFAULT,
+            ignored_paths: Vec::new(),
+        })
+        .unwrap();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let observer = TransferObserver::new(move |event| captured.lock().unwrap().push(event));
+        let report = engine
+            .sync_once_observed(Some(observer.clone()))
+            .await
+            .unwrap();
+        assert_eq!((report.pulled_bytes, report.pushed_bytes), (8, 8));
+        assert_eq!(fs::read(local.path().join("in.txt")).unwrap(), b"incoming");
+        assert_eq!(
+            fs::read(remote.path().join("out.txt")).unwrap(),
+            b"outgoing"
+        );
+        let inventory = engine.inventory().unwrap();
+        assert_eq!(
+            (inventory.files, inventory.bytes, inventory.retries),
+            (2, 16, 0)
+        );
+        {
+            let captured = events.lock().unwrap();
+            let phases: Vec<_> = captured.iter().map(|event| event.phase.as_str()).collect();
+            for phase in [
+                "scanning",
+                "comparing",
+                "pulling",
+                "applying",
+                "pushing",
+                "verifying",
+                "complete",
+            ] {
+                assert!(phases.contains(&phase), "missing phase {phase}");
+            }
+            assert!(captured.iter().any(|event| event.phase == "file_received"
+                && event.path.as_deref() == Some("in.txt")
+                && event.bytes == 8));
+            assert!(captured.iter().any(|event| event.phase == "file_sent"
+                && event.path.as_deref() == Some("out.txt")
+                && event.bytes == 8));
+        }
+        {
+            let captured = server_events.lock().unwrap();
+            assert!(captured.iter().any(|event| event.phase == "file_received"
+                && event.path.as_deref() == Some("out.txt")
+                && event.direction.as_deref() == Some("receive")
+                && event.bytes == 8));
+            assert!(captured.iter().any(|event| event.phase == "file_sent"
+                && event.path.as_deref() == Some("in.txt")
+                && event.direction.as_deref() == Some("send")
+                && event.bytes == 8));
+        }
+        // An instrumentation failure must not turn a valid sync into a transfer failure.
+        engine
+            .sync_once_observed(Some(TransferObserver::new(|_| panic!("observer failed"))))
+            .await
+            .unwrap();
+        events.lock().unwrap().clear();
+        server.pause().await.unwrap();
+        assert!(engine.sync_once_observed(Some(observer)).await.is_err());
+        assert_eq!(events.lock().unwrap().last().unwrap().phase, "error");
+        server.shutdown().await.unwrap();
     }
 
     fn test_engine(root: &TempDir, state: &TempDir) -> SyncEngine {
@@ -803,6 +1006,8 @@ mod tests {
             peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
             network_mode: NetworkMode::DirectOnly,
             bind_address: None,
+            max_connections: 64,
+            min_free_space_bytes: 0,
         })
         .await
         .expect("server can start");
@@ -844,7 +1049,7 @@ mod tests {
             .expect("fresh local edit can be written after planning");
 
         let stale = engine
-            .sync_with_session(&session, local_records, local_tree)
+            .sync_with_session(&session, local_records, local_tree, &None)
             .await;
         session.close().await;
 
@@ -1019,6 +1224,8 @@ mod tests {
             peer_policy: PeerPolicy::AllowListed(HashSet::from([key.public()])),
             network_mode: NetworkMode::DirectOnly,
             bind_address: Some("127.0.0.1:0".parse().expect("loopback")),
+            max_connections: 64,
+            min_free_space_bytes: 0,
         })
         .await
         .expect("server starts");
@@ -1076,6 +1283,8 @@ mod tests {
             peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
             network_mode: NetworkMode::DirectOnly,
             bind_address: None,
+            max_connections: 64,
+            min_free_space_bytes: 0,
         })
         .await
         .expect("server can start");

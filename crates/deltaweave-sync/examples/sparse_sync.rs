@@ -547,6 +547,8 @@ async fn main() -> Result<()> {
         peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
         network_mode: NetworkMode::DirectOnly,
         bind_address: Some("127.0.0.1:0".parse()?),
+        max_connections: 64,
+        min_free_space_bytes: 0,
     })
     .await?;
     let engine = SyncEngine::open(SyncConfig {

@@ -10,3 +10,6 @@ target
 *.log
 *.md
 LICENSE
+web/node_modules
+web/dist
+web/*.tsbuildinfo
