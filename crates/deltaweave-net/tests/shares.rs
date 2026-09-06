@@ -1235,6 +1235,35 @@ fn incomplete_creation_resumes_from_durable_intent() {
     });
 }
 
+fn closed_catalog_bytes(path: &std::path::Path) -> Vec<u8> {
+    use redb::{ReadableDatabase, ReadableTable, TableDefinition, TableHandle};
+
+    // Call only after ShareService::shutdown. Compare the entire durable table,
+    // including its keys, rather than redb allocation/header bytes changed by open.
+    let db = redb::ReadOnlyDatabase::open(path).unwrap();
+    let read = db.begin_read().unwrap();
+    assert_eq!(
+        read.list_tables()
+            .unwrap()
+            .map(|table| table.name().to_owned())
+            .collect::<Vec<_>>(),
+        vec!["owner_share_catalog_v3"]
+    );
+    assert!(read.list_multimap_tables().unwrap().next().is_none());
+    let table = read
+        .open_table(TableDefinition::<u8, &[u8]>::new("owner_share_catalog_v3"))
+        .unwrap();
+    let entries: Vec<_> = table
+        .iter()
+        .unwrap()
+        .map(|entry| {
+            let (key, value) = entry.unwrap();
+            (key.value(), value.value().to_vec())
+        })
+        .collect();
+    postcard::to_stdvec(&entries).unwrap()
+}
+
 fn tree_bytes(root: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
     fn visit(
         base: &std::path::Path,
@@ -1253,7 +1282,11 @@ fn tree_bytes(root: &std::path::Path) -> std::collections::BTreeMap<std::path::P
             } else {
                 out.insert(
                     path.strip_prefix(base).unwrap().into(),
-                    std::fs::read(&path).unwrap(),
+                    if path.file_name().unwrap() == "shares.redb" {
+                        closed_catalog_bytes(&path)
+                    } else {
+                        std::fs::read(&path).unwrap()
+                    },
                 );
             }
         }
@@ -1276,6 +1309,7 @@ fn private_state_and_denied_descendants_never_enter_served_namespaces() {
                         .await
                         .unwrap();
                 let initial = owner.owned_configs().unwrap();
+                owner.shutdown().await.unwrap();
                 let private_before = tree_bytes(&base.join("private"));
                 for (i, root) in [
                     base.join("private/device"),
@@ -1285,6 +1319,13 @@ fn private_state_and_denied_descendants_never_enter_served_namespaces() {
                 .into_iter()
                 .enumerate()
                 {
+                    let owner = ShareService::open(
+                        base.join("private/device"),
+                        NetworkMode::DirectOnly,
+                        None,
+                    )
+                    .await
+                    .unwrap();
                     let state = base.join(format!("denied-state-{i}"));
                     assert!(
                         owner
@@ -1295,11 +1336,16 @@ fn private_state_and_denied_descendants_never_enter_served_namespaces() {
                     );
                     assert!(!state.exists());
                     assert_eq!(owner.owned_configs().unwrap(), initial);
+                    owner.shutdown().await.unwrap();
                     assert!(
                         tree_bytes(&base.join("private")) == private_before,
                         "protected device tree changed"
                     );
                 }
+                let owner =
+                    ShareService::open(base.join("private/device"), NetworkMode::DirectOnly, None)
+                        .await
+                        .unwrap();
                 let share = owner
                     .create_owned_share(
                         "A".into(),
@@ -1313,7 +1359,16 @@ fn private_state_and_denied_descendants_never_enter_served_namespaces() {
                 std::fs::write(base.join("public/visible"), b"public bytes").unwrap();
                 let before = tree_bytes(&base.join("public"));
                 let configs = owner.owned_configs().unwrap();
-                let owner_catalog = std::fs::read(base.join("private/device/shares.redb")).unwrap();
+                let share_id = share.config().share_id;
+                drop(share);
+                owner.shutdown().await.unwrap();
+                let catalog_path = base.join("private/device/shares.redb");
+                let owner_catalog = closed_catalog_bytes(&catalog_path);
+                let mut owner =
+                    ShareService::open(base.join("private/device"), NetworkMode::DirectOnly, None)
+                        .await
+                        .unwrap();
+                let mut share = owner.load_owned_share(share_id).await.unwrap();
                 for (root, state) in [
                     (base.join("other-root"), base.join("public/b-state")),
                     (base.join("public/new/deep"), base.join("denied-state")),
@@ -1333,12 +1388,21 @@ fn private_state_and_denied_descendants_never_enter_served_namespaces() {
                     assert!(!root.exists());
                     assert!(!state.exists());
                     assert_eq!(owner.owned_configs().unwrap(), configs);
+                    drop(share);
+                    owner.shutdown().await.unwrap();
                     assert!(
-                        std::fs::read(base.join("private/device/shares.redb")).unwrap()
-                            == owner_catalog,
+                        closed_catalog_bytes(&catalog_path) == owner_catalog,
                         "denied share changed device catalog"
                     );
                     assert!(tree_bytes(&base.join("public")) == before);
+                    owner = ShareService::open(
+                        base.join("private/device"),
+                        NetworkMode::DirectOnly,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                    share = owner.load_owned_share(share_id).await.unwrap();
                 }
                 assert!(
                     ShareService::open(
@@ -1369,7 +1433,17 @@ fn private_state_and_denied_descendants_never_enter_served_namespaces() {
                     b"other share private bytes",
                 )
                 .unwrap();
+                let b_id = b.config().share_id;
+                drop(b);
+                other.shutdown().await.unwrap();
                 let b_before = tree_bytes(&base.join("b-private"));
+                // Durable private reservations must protect a share even before
+                // its runtime is reloaded; leave its index/store closed for the
+                // exact byte comparison while the other device runs again.
+                let other =
+                    ShareService::open(base.join("other-device"), NetworkMode::DirectOnly, None)
+                        .await
+                        .unwrap();
                 assert!(
                     owner
                         .create_owned_share(
@@ -1384,6 +1458,7 @@ fn private_state_and_denied_descendants_never_enter_served_namespaces() {
                 );
                 assert!(!base.join("denied-reverse-state").exists());
                 assert!(tree_bytes(&base.join("b-private")) == b_before);
+                let b = other.load_owned_share(b_id).await.unwrap();
                 #[cfg(unix)]
                 {
                     std::os::unix::fs::symlink(base.join("private"), base.join("alias-private"))

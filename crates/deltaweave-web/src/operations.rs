@@ -95,6 +95,10 @@ fn resolve_path(path: &Path) -> Result<PathBuf> {
     let mut resolved = PathBuf::new();
     for component in absolute.components() {
         match component {
+            Component::Prefix(_) => {
+                resolved.push(component.as_os_str());
+                continue;
+            }
             Component::ParentDir => {
                 resolved.pop();
             }
@@ -381,5 +385,20 @@ fn diagnostic_field(value: &str) -> String {
         prefix
     } else {
         format!("{prefix}... [{omitted} characters omitted]")
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    #[test]
+    fn canonical_paths_resolve_existing_directories_and_missing_suffixes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        assert_eq!(resolve_path(&root).unwrap(), root);
+        let missing = root.join("missing/nested");
+        assert_eq!(resolve_path(&missing).unwrap(), missing);
+        assert!(!missing.exists(), "validation must not create directories");
     }
 }

@@ -236,6 +236,85 @@ fn same_volume_replacement_type_transition_and_noreplace_restore() {
     assert_eq!(fs::read(change.artifact).unwrap(), b"remote");
 }
 
+#[cfg(windows)]
+#[test]
+fn readonly_replacement_preserves_original_bytes_and_attributes() {
+    use deltaweave_core::{ChunkingProfile, WirePath};
+    use deltaweave_store::Store;
+    use std::fs;
+    let base = tempfile::tempdir().unwrap();
+    let root = base.path().join("root");
+    fs::create_dir(&root).unwrap();
+    let store = Store::open(base.path().join("state")).unwrap();
+    let source = base.path().join("source");
+    fs::write(&source, b"incoming revision").unwrap();
+    let manifest = store.ingest_file(source, ChunkingProfile::DEFAULT).unwrap();
+    let destination = root.join("document");
+    fs::write(&destination, b"original readonly content").unwrap();
+    let outside_link = base.path().join("outside-link");
+    fs::hard_link(&destination, &outside_link).unwrap();
+    let mut permissions = fs::metadata(&destination).unwrap().permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(&destination, permissions).unwrap();
+    let outcome = store
+        .materialize(&manifest, &WirePath::new("document").unwrap(), &root)
+        .unwrap();
+    let preserved = outcome.preserved_path.unwrap();
+    assert_eq!(fs::read(&destination).unwrap(), b"incoming revision");
+    assert_eq!(fs::read(&preserved).unwrap(), b"original readonly content");
+    assert!(fs::metadata(&preserved).unwrap().permissions().readonly());
+    assert_eq!(
+        fs::read(&outside_link).unwrap(),
+        b"original readonly content"
+    );
+    assert!(
+        fs::metadata(&outside_link)
+            .unwrap()
+            .permissions()
+            .readonly()
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn recovery_retries_preservation_flush_before_installing_incoming_content() {
+    use deltaweave_core::{ChunkingProfile, WirePath};
+    use deltaweave_store::{PathObservation, PathTarget, Store};
+    use std::{fs, os::windows::fs::OpenOptionsExt};
+    let base = tempfile::tempdir().unwrap();
+    let root = base.path().join("root");
+    fs::create_dir(&root).unwrap();
+    let store = Store::open(base.path().join("state")).unwrap();
+    let source = base.path().join("source");
+    fs::write(&source, b"incoming").unwrap();
+    let manifest = store.ingest_file(source, ChunkingProfile::DEFAULT).unwrap();
+    let path = WirePath::new("document").unwrap();
+    fs::write(root.join("document"), b"original").unwrap();
+    let mut change = store
+        .prepare_path_change(
+            &root,
+            &path,
+            PathTarget::File(manifest),
+            PathObservation::read(&root, &path).unwrap(),
+            false,
+        )
+        .unwrap();
+    // Permit observation and rename, but prevent a write handle for FlushFileBuffers.
+    let held = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0x00000001 | 0x00000004)
+        .open(root.join("document"))
+        .unwrap();
+    assert!(store.capture_path_change(&mut change).is_err());
+    assert!(store.resume_path_change(&mut change).is_err());
+    assert!(!root.join("document").exists());
+    assert_eq!(fs::read(&change.artifact).unwrap(), b"original");
+    drop(held);
+    store.resume_path_change(&mut change).unwrap();
+    assert_eq!(fs::read(root.join("document")).unwrap(), b"incoming");
+    assert_eq!(fs::read(&change.artifact).unwrap(), b"original");
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn symlinked_recovery_vault_is_rejected_before_capture() {

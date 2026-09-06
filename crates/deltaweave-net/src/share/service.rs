@@ -647,6 +647,27 @@ mod capacity_tests {
     use super::super::{Permission, registry::MAX_REPLICAS};
     use super::*;
 
+    fn catalog_snapshot(registry: &Registry) -> Vec<u8> {
+        // Read every persisted share field through redb transactions. A second
+        // file handle cannot read a live redb file under Windows byte-range locks.
+        let shares: Vec<_> = registry
+            .configs()
+            .unwrap()
+            .into_iter()
+            .map(|config| {
+                let id = config.share_id;
+                (
+                    registry.is_ready(id).unwrap(),
+                    config,
+                    registry.invitations(id).unwrap(),
+                    registry.members(id).unwrap(),
+                    registry.known(id).unwrap(),
+                )
+            })
+            .collect();
+        postcard::to_stdvec(&(shares, registry.relationships().unwrap())).unwrap()
+    }
+
     #[test]
     fn proof_at_replica_capacity_is_atomic_and_existing_writer_survives_restart() {
         let name = "share::service::capacity_tests::proof_at_replica_capacity_is_atomic_and_existing_writer_survives_restart";
@@ -712,13 +733,13 @@ mod capacity_tests {
             let proof =
                 LegacyProof::create(&ticket, &unknown_key, member.endpoint_id(), unknown_id)
                     .unwrap();
-            let catalog_before = std::fs::read(device.join("shares.redb")).unwrap();
+            let catalog_before = catalog_snapshot(&owner.registry);
             assert!(
                 member.enroll(&ticket, Some(proof)).await.is_err(),
                 "unknown retained replica exceeded capacity"
             );
             assert!(
-                std::fs::read(device.join("shares.redb")).unwrap() == catalog_before,
+                catalog_snapshot(&owner.registry) == catalog_before,
                 "denied enrollment wrote catalog"
             );
             assert_eq!(
@@ -733,6 +754,10 @@ mod capacity_tests {
                 .await
                 .unwrap();
             let share = owner.load_owned_share(config.share_id).await.unwrap();
+            assert!(
+                catalog_snapshot(&owner.registry) == catalog_before,
+                "denied enrollment changed the persisted catalog after restart"
+            );
             assert_eq!(owner.registry.known(config.share_id).unwrap(), known);
             assert_eq!(share.members().unwrap(), vec![writer_grant.clone()]);
             let ticket = share

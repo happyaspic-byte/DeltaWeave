@@ -875,6 +875,13 @@ fn change_time_ns(_metadata: &std::fs::Metadata) -> Option<u128> {
 
 fn apply_readonly(path: &Path, readonly: bool) -> Result<()> {
     let file = preservation::open_nofollow(path, false, false)?;
+    if file.metadata()?.permissions().readonly() == readonly {
+        return Ok(());
+    }
+    // A no-op must not demand attribute-write rights. Revalidate the handle used
+    // for an actual Windows attribute change before checking hardlinks or writing.
+    #[cfg(windows)]
+    let file = preservation::open_for_permissions(path)?;
     let metadata = file.metadata()?;
     if metadata.permissions().readonly() == readonly {
         return Ok(());

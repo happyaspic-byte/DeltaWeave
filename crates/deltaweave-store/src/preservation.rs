@@ -366,7 +366,7 @@ impl Store {
             sync_directory(destination.parent())?;
             sync_directory(change.artifact.parent())?;
             if change.expected.as_ref().is_some_and(|o| o.kind == 0) {
-                open_nofollow(&change.artifact, false, false)?.sync_all()?;
+                sync_preserved_file(&change.artifact)?;
             }
             if PathObservation::at(&change.artifact)? != change.expected {
                 self.abort_path_change(change)?;
@@ -663,6 +663,9 @@ impl Store {
                     PathObservation::at(&change.artifact)? == change.expected,
                     "captured recovery object changed"
                 );
+                if change.expected.as_ref().is_some_and(|o| o.kind == 0) {
+                    sync_preserved_file(&change.artifact)?;
+                }
                 change.state = PathChangeState::Preserved;
                 self.put_change(change)?;
             } else if matches!(&change.target, PathTarget::File(_)) && !change.staging.exists() {
@@ -825,12 +828,36 @@ fn validate_real_directory(path: &Path) -> Result<()> {
     let mut cursor = PathBuf::new();
     for component in path.components() {
         cursor.push(component);
+        // A Windows prefix is not a complete filesystem location. In particular,
+        // canonical paths begin with a verbatim disk prefix that needs RootDir.
+        if matches!(component, std::path::Component::Prefix(_)) {
+            continue;
+        }
         let metadata = fs::symlink_metadata(&cursor)?;
         ensure!(
             metadata.is_dir() && !metadata.file_type().is_symlink(),
             "recovery path contains a symlink or non-directory"
         );
     }
+    Ok(())
+}
+
+fn sync_preserved_file(path: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        let observed = open_nofollow(path, false, false)?;
+        // FlushFileBuffers requires GENERIC_WRITE. Do not clear readonly attributes:
+        // that would also modify any hardlink outside the managed namespace.
+        // Windows readonly originals retain process-recovery protection, without an
+        // explicit content flush or a power-loss durability guarantee.
+        if observed.metadata()?.permissions().readonly() {
+            return Ok(());
+        }
+        drop(observed);
+        open_nofollow(path, true, false)?.sync_all()?;
+    }
+    #[cfg(not(windows))]
+    open_nofollow(path, false, false)?.sync_all()?;
     Ok(())
 }
 
@@ -889,6 +916,22 @@ pub(super) fn open_nofollow(path: &Path, write: bool, create: bool) -> Result<Fi
         options.custom_flags(0x00200000 | 0x02000000); // OPEN_REPARSE_POINT | BACKUP_SEMANTICS
     }
     let file = options.open(path)?;
+    ensure!(
+        !file.metadata()?.file_type().is_symlink(),
+        "refusing symlink file handle"
+    );
+    Ok(file)
+}
+
+#[cfg(windows)]
+pub(super) fn open_for_permissions(path: &Path) -> Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    validate_real_directory(path.parent().context("path lacks parent")?)?;
+    let file = OpenOptions::new()
+        // Attribute writes are allowed even when the file has the readonly flag.
+        .access_mode(0x80000000 | 0x00000100) // GENERIC_READ | FILE_WRITE_ATTRIBUTES
+        .custom_flags(0x00200000 | 0x02000000) // OPEN_REPARSE_POINT | BACKUP_SEMANTICS
+        .open(path)?;
     ensure!(
         !file.metadata()?.file_type().is_symlink(),
         "refusing symlink file handle"

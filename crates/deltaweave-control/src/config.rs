@@ -60,6 +60,10 @@ pub(crate) fn candidate(path: &Path) -> Result<PathBuf> {
     for part in absolute.components() {
         use std::path::Component;
         match part {
+            Component::Prefix(_) => {
+                resolved.push(part);
+                continue;
+            }
             Component::ParentDir => {
                 resolved.pop();
             }
@@ -223,6 +227,16 @@ pub(crate) fn normalize(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn canonical_paths_resolve_existing_directories_and_missing_suffixes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        assert_eq!(candidate(&root).unwrap(), root);
+        let missing = root.join("missing/nested");
+        assert_eq!(candidate(&missing).unwrap(), missing);
+        assert!(!missing.exists(), "validation must not create directories");
+    }
+
     #[test]
     fn rejects_root_state_and_symlink_overlap() {
         let dir = tempfile::tempdir().unwrap();

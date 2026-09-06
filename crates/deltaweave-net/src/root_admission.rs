@@ -202,6 +202,9 @@ fn prospective_root(path: &Path) -> Result<PathBuf> {
     let mut root = PathBuf::new();
     for component in absolute.components() {
         match component {
+            // A Windows drive/UNC prefix is not a complete absolute path until
+            // RootDir is appended; querying a verbatim prefix alone fails.
+            Component::Prefix(_) => root.push(component.as_os_str()),
             Component::ParentDir => {
                 root.pop();
             }
@@ -491,6 +494,16 @@ fn admit_at<T>(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn canonical_roots_resolve_existing_paths_and_missing_suffixes() {
+        let temp = TempDir::new().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        assert_eq!(prospective_root(&root).unwrap(), root);
+        let missing = root.join("missing/nested");
+        assert_eq!(prospective_root(&missing).unwrap(), missing);
+        assert!(!missing.exists(), "admission must not create directories");
+    }
 
     fn managed() -> RootUse {
         RootUse::Managed {
