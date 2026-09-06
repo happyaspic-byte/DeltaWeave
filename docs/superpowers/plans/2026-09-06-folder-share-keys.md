@@ -35,10 +35,10 @@
 
 **Interfaces:** produces `deltaweave_web::run(WebConfig)`, `deltaweave_control::Manager`, preserved React console API, and required `TransferObserver`, `Inventory`, `Server::{pause,resume,inventory}`, `SyncEngine::{inventory,sync_once_observed}` without weakening existing operations. Existing `Config`, `WebApp`, `start_server` and CLI contracts remain supported.
 
-- [ ] Capture baseline evidence and read the preserved UI audit. Verify current repo source before choosing each imported hunk.
-- [ ] Run the existing and imported behavior tests against the baseline/integration and observe any missing API/behavior failures. For Windows path output, add a literal Windows path containing backslashes to the real formatter test and prove the current escaping is wrong.
-- [ ] Import the preserved console/control and adapt to main. Keep main's private directory creation, namespace validation, async pre-apply rescan, causal preconditions, writer draining and safe errors. Import only needed hooks; do not copy the prior net/sync/index/store implementation.
-- [ ] Build web assets and verify behavior using the preserved tests plus all legacy web/API/CLI tests. Use real receiver pause/resume tests, inventory and transferred-byte observation tests.
+- [x] Capture baseline evidence and read the preserved UI audit. Verify current repo source before choosing each imported hunk.
+- [x] Run the existing and imported behavior tests against the baseline/integration and observe any missing API/behavior failures. For Windows path output, add a literal Windows path containing backslashes to the real formatter test and prove the current escaping is wrong.
+- [x] Import the preserved console/control and adapt to main. Keep main's private directory creation, namespace validation, async pre-apply rescan, causal preconditions, writer draining and safe errors. Import only needed hooks; do not copy the prior net/sync/index/store implementation.
+- [x] Build web assets and verify behavior using the preserved tests plus all legacy web/API/CLI tests. Use real receiver pause/resume tests, inventory and transferred-byte observation tests.
 
 ```bash
 npm --prefix web ci
@@ -48,7 +48,7 @@ cargo test --locked -p deltaweave-control -p deltaweave-web -p deltaweave --all-
 cargo test --locked -p deltaweave-net -p deltaweave-sync --all-targets --all-features
 ```
 
-- [ ] Commit the focused prerequisite, write the report with commands/results, and obtain independent spec/quality review before the next implementation task.
+- [x] Commit the focused prerequisite, write the report with commands/results, and obtain independent spec/quality review before the next implementation task.
 
 ### Task 2: Implement versioned invitation keys and the v3 authorization boundary
 
