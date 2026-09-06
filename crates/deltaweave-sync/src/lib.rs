@@ -44,6 +44,7 @@ pub struct SyncConfig {
 /// Reusable local half of a bidirectional reconciliation relationship.
 #[derive(Debug)]
 pub struct SyncEngine {
+    _root_lease: deltaweave_net::root_admission::RootLease,
     root: PathBuf,
     index: Arc<LocalIndex>,
     store: Arc<Store>,
@@ -109,6 +110,10 @@ impl SyncEngine {
 
     /// Opens durable state while reserving free space across local CAS and file writes.
     pub fn open_with_min_free_space(config: SyncConfig, min_free_space_bytes: u64) -> Result<Self> {
+        let root_lease = deltaweave_net::root_admission::acquire(
+            &config.root,
+            deltaweave_net::root_admission::RootUse::Legacy,
+        )?;
         config.profile.validate()?;
         fs::create_dir_all(&config.root).with_context(|| {
             format!(
@@ -149,6 +154,7 @@ impl SyncEngine {
         )?);
         let store = Arc::new(Store::open(state_root.join("store"))?);
         Ok(Self {
+            _root_lease: root_lease,
             root,
             index,
             store,

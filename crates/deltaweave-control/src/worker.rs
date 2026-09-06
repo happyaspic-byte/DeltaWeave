@@ -7,8 +7,6 @@ use deltaweave_net::{
 };
 use deltaweave_sync::{SyncConfig, SyncEngine, SyncReport};
 use std::{
-    fs::{File, OpenOptions},
-    path::Path,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -25,33 +23,14 @@ struct Message {
 impl Worker {
     pub async fn start(mut view: FolderView, shared: Arc<Mutex<Runtime>>) -> Result<Self> {
         let id = view.id.clone();
-        let root = view.input.root.clone();
         let identity_path = view
             .input
             .identity_path
             .clone()
             .context("identity path missing")?;
-        let (identity, ownership) = tokio::task::spawn_blocking(move || -> Result<_> {
-            std::fs::create_dir_all(&root)?;
-            let lock_path = Path::new(&root)
-                .parent()
-                .context("root needs parent")?
-                .join(format!(
-                    ".deltaweave-{}.lock",
-                    Hash32::digest(root.as_bytes())
-                ));
-            let lock = OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .read(true)
-                .write(true)
-                .open(lock_path)?;
-            fs2::FileExt::try_lock_exclusive(&lock).context(
-                "folder is already managed by another process; stop its worker before importing",
-            )?;
-            Ok((load_or_create_identity(identity_path)?, lock))
-        })
-        .await??;
+        // Server and SyncEngine hold the common hierarchy-aware root lease.
+        let identity =
+            tokio::task::spawn_blocking(move || load_or_create_identity(identity_path)).await??;
         let event_id = id.clone();
         let event_shared = shared.clone();
         let observer = TransferObserver::new(move |event| {
@@ -183,7 +162,7 @@ impl Worker {
             },
         );
         let (sender, receiver) = mpsc::channel(8);
-        let task = tokio::spawn(run(engine, view, observer, shared, receiver, ownership));
+        let task = tokio::spawn(run(engine, view, observer, shared, receiver));
         Ok(Self { sender, task })
     }
     pub async fn command(&self, command: FolderCommand) -> Result<()> {
@@ -325,7 +304,6 @@ async fn run(
     observer: TransferObserver,
     shared: Arc<Mutex<Runtime>>,
     mut receiver: mpsc::Receiver<Message>,
-    _ownership: File,
 ) {
     let id = view.id;
     let mut paused = view.input.enabled == Some(false);

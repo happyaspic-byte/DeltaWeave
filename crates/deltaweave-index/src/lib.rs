@@ -25,6 +25,10 @@ use unicode_normalization::UnicodeNormalization;
 const INDEX_SCHEMA_V1: u16 = 1;
 const RECORDS: TableDefinition<&str, &[u8]> = TableDefinition::new("path_records");
 const RETRIES: TableDefinition<&str, &[u8]> = TableDefinition::new("index_retries");
+const SHARE_METADATA: TableDefinition<u8, &[u8]> =
+    TableDefinition::new("share_authorization_metadata_v1");
+const MAX_SHARE_METADATA: usize = 2 * 1024 * 1024;
+
 const METADATA: TableDefinition<&str, u64> = TableDefinition::new("index_metadata");
 const CONFIG: TableDefinition<&str, &[u8]> = TableDefinition::new("index_config");
 const GENERATION_KEY: &str = "generation";
@@ -258,6 +262,46 @@ impl std::fmt::Debug for LocalIndex {
 }
 
 impl LocalIndex {
+    /// Reads an existing logical replica after verifying its canonical root/schema binding.
+    /// This does not create, rebind, or reset an index. Opening the index afterward
+    /// still performs all normal binding checks under the caller's root lease.
+    pub fn read_bound_replica(
+        root: impl AsRef<Path>,
+        database_path: impl AsRef<Path>,
+    ) -> Result<Option<ReplicaId>> {
+        if !database_path.as_ref().exists() {
+            return Ok(None);
+        }
+        let root = fs::canonicalize(root)?;
+        let database = Database::open(database_path)?;
+        let read = database.begin_read()?;
+        let table = read.open_table(CONFIG)?;
+        ensure!(
+            table
+                .get(CONFIG_SCHEMA_KEY)?
+                .context("index schema binding missing")?
+                .value()
+                == INDEX_SCHEMA_V1.to_le_bytes(),
+            "index schema binding mismatch"
+        );
+        ensure!(
+            table
+                .get(CONFIG_ROOT_KEY)?
+                .context("index root binding missing")?
+                .value()
+                == root_binding(&root).as_bytes(),
+            "index DB is bound to a different root"
+        );
+        let value = table
+            .get(CONFIG_REPLICA_KEY)?
+            .context("index replica binding missing")?;
+        let bytes: [u8; 32] = value
+            .value()
+            .try_into()
+            .context("invalid index replica binding")?;
+        Ok(Some(ReplicaId(Hash32::from_bytes(bytes))))
+    }
+
     /// Opens an index database and validates that `root` is a real directory.
     pub fn open(
         root: impl AsRef<Path>,
@@ -523,7 +567,7 @@ impl LocalIndex {
             version,
             tombstone: false,
         };
-        self.commit_adopted_record(&record, Some(observation))
+        self.commit_adopted_record(&record, Some(observation), None)
     }
 
     /// Adopts a live file using a locally produced materialization observation.
@@ -545,7 +589,7 @@ impl LocalIndex {
                 && Some(observation.file_hash()) == record.content_hash,
             "materialization observation does not match causal record"
         );
-        self.commit_adopted_record(record, Some(observation))
+        self.commit_adopted_record(record, Some(observation), None)
     }
 
     /// Adopts a verified filesystem state with the exact causal version received from peers.
@@ -555,13 +599,74 @@ impl LocalIndex {
     /// being attached to bytes that were not actually installed.
     pub fn adopt_verified_record(&self, record: &SyncRecord) -> Result<()> {
         record.validate()?;
-        self.commit_adopted_record(record, None)
+        self.commit_adopted_record(record, None, None)
+    }
+
+    /// A dedicated bounded opaque slot for owner-share causal ceilings/provenance.
+    /// It cannot address or replace root/replica configuration metadata.
+    pub fn share_metadata(&self) -> Result<Option<Vec<u8>>> {
+        let read = self.database.begin_read()?;
+        Ok(read
+            .open_table(SHARE_METADATA)?
+            .get(0)?
+            .map(|value| value.value().to_vec()))
+    }
+
+    /// Persists trusted local share metadata; remote adoption must use the atomic variants.
+    pub fn set_share_metadata(&self, metadata: &[u8]) -> Result<()> {
+        ensure!(
+            metadata.len() <= MAX_SHARE_METADATA,
+            "share metadata exceeds size limit"
+        );
+        let write = self.database.begin_write()?;
+        write.open_table(SHARE_METADATA)?.insert(0, metadata)?;
+        write.commit()?;
+        Ok(())
+    }
+
+    /// Atomically adopts a verified record and its bounded owner authorization metadata.
+    pub fn adopt_verified_record_with_share_metadata(
+        &self,
+        record: &SyncRecord,
+        metadata: &[u8],
+    ) -> Result<()> {
+        record.validate()?;
+        ensure!(
+            metadata.len() <= MAX_SHARE_METADATA,
+            "share metadata exceeds size limit"
+        );
+        self.commit_adopted_record(record, None, Some(metadata))
+    }
+
+    /// Atomically adopts a materialized file and its bounded owner authorization metadata.
+    pub fn adopt_materialized_record_with_share_metadata(
+        &self,
+        record: &SyncRecord,
+        observation: &MaterializationObservation,
+        metadata: &[u8],
+    ) -> Result<()> {
+        record.validate()?;
+        ensure!(
+            !record.tombstone && record.kind == SyncEntryKind::File,
+            "materialized adoption requires a live file record"
+        );
+        ensure!(
+            observation.size() == record.size
+                && Some(observation.file_hash()) == record.content_hash,
+            "materialization observation does not match causal record"
+        );
+        ensure!(
+            metadata.len() <= MAX_SHARE_METADATA,
+            "share metadata exceeds size limit"
+        );
+        self.commit_adopted_record(record, Some(observation), Some(metadata))
     }
 
     fn commit_adopted_record(
         &self,
         record: &SyncRecord,
         observation: Option<&MaterializationObservation>,
+        share_metadata: Option<&[u8]>,
     ) -> Result<()> {
         let generation = self
             .metadata_value(GENERATION_KEY)?
@@ -679,7 +784,13 @@ impl LocalIndex {
         let replica_counter = self
             .metadata_value(REPLICA_COUNTER_KEY)?
             .max(record.version.get(self.replica));
-        self.commit_state(&records, &retries, generation, replica_counter)
+        self.commit_state_with_share_metadata(
+            &records,
+            &retries,
+            generation,
+            replica_counter,
+            share_metadata,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -920,7 +1031,21 @@ impl LocalIndex {
         generation: u64,
         replica_counter: u64,
     ) -> Result<()> {
+        self.commit_state_with_share_metadata(records, retries, generation, replica_counter, None)
+    }
+
+    fn commit_state_with_share_metadata(
+        &self,
+        records: &BTreeMap<WirePath, PathRecord>,
+        retries: &BTreeMap<WirePath, RetryRecord>,
+        generation: u64,
+        replica_counter: u64,
+        share_metadata: Option<&[u8]>,
+    ) -> Result<()> {
         let write = self.database.begin_write()?;
+        if let Some(metadata) = share_metadata {
+            write.open_table(SHARE_METADATA)?.insert(0, metadata)?;
+        }
         {
             let mut table = write.open_table(RECORDS)?;
             for (path, record) in records {
@@ -960,7 +1085,15 @@ impl LocalIndex {
             table.insert(GENERATION_KEY, generation)?;
             table.insert(REPLICA_COUNTER_KEY, replica_counter)?;
         }
+        #[cfg(test)]
+        if share_metadata.is_some() {
+            share_metadata_crash_barrier("before_commit");
+        }
         write.commit()?;
+        #[cfg(test)]
+        if share_metadata.is_some() {
+            share_metadata_crash_barrier("after_commit");
+        }
         Ok(())
     }
 }
@@ -1051,6 +1184,7 @@ fn initialize_tables(database: &Database) -> Result<()> {
         let _ = write.open_table(RETRIES)?;
         let _ = write.open_table(METADATA)?;
         let _ = write.open_table(CONFIG)?;
+        let _ = write.open_table(SHARE_METADATA)?;
     }
     write.commit()?;
     Ok(())
@@ -1804,6 +1938,18 @@ impl WatchService {
 }
 
 #[cfg(test)]
+fn share_metadata_crash_barrier(stage: &str) {
+    if std::env::var("DW_INDEX_SHARE_CRASH_STAGE").ok().as_deref() != Some(stage) {
+        return;
+    }
+    let base = PathBuf::from(std::env::var_os("DW_INDEX_SHARE_CRASH_BASE").expect("crash fixture"));
+    fs::write(base.join("ready"), stage).expect("crash barrier");
+    loop {
+        std::thread::park();
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::fs;
 
@@ -1827,6 +1973,139 @@ mod tests {
             },
         )
         .expect("index can open")
+    }
+
+    #[test]
+    fn share_metadata_crash_worker() {
+        let Some(base) = std::env::var_os("DW_INDEX_SHARE_CRASH_BASE") else {
+            return;
+        };
+        let base = PathBuf::from(base);
+        let index = open_index(&base.join("root"), &base.join("state"), 1000);
+        let candidate: SyncRecord =
+            postcard::from_bytes(&fs::read(base.join("candidate")).unwrap()).unwrap();
+        index
+            .adopt_verified_record_with_share_metadata(&candidate, b"new-ceiling")
+            .unwrap();
+    }
+
+    #[test]
+    fn actual_crash_never_separates_record_and_share_metadata_commits() {
+        for (stage, committed) in [("before_commit", false), ("after_commit", true)] {
+            let temp = TempDir::new().unwrap();
+            let root = temp.path().join("root");
+            let state = temp.path().join("state");
+            fs::create_dir(&root).unwrap();
+            fs::write(root.join("file"), b"content").unwrap();
+            let index = open_index(&root, &state, 1000);
+            index.scan().unwrap();
+            index.set_share_metadata(b"old-ceiling").unwrap();
+            let before = index.sync_records().unwrap()[0].clone();
+            let mut candidate = before.clone();
+            candidate
+                .version
+                .observe(ReplicaId(Hash32::digest(b"writer")), 7);
+            fs::write(
+                temp.path().join("candidate"),
+                postcard::to_stdvec(&candidate).unwrap(),
+            )
+            .unwrap();
+            drop(index);
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::share_metadata_crash_worker",
+                    "--nocapture",
+                ])
+                .env("DW_INDEX_SHARE_CRASH_BASE", temp.path())
+                .env("DW_INDEX_SHARE_CRASH_STAGE", stage)
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !temp.path().join("ready").exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let ready = temp.path().join("ready").exists();
+            child.kill().unwrap();
+            child.wait().unwrap();
+            assert!(ready, "index never reached crash barrier");
+            let index = open_index(&root, &state, 1000);
+            assert_eq!(
+                index.sync_records().unwrap(),
+                vec![if committed { candidate } else { before }]
+            );
+            assert_eq!(
+                index.share_metadata().unwrap().unwrap(),
+                if committed {
+                    b"new-ceiling"
+                } else {
+                    b"old-ceiling"
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn retained_replica_inspection_verifies_root_without_rebinding() {
+        let root = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        let other = TempDir::new().unwrap();
+        assert_eq!(
+            LocalIndex::read_bound_replica(root.path(), state.path().join("index.redb")).unwrap(),
+            None
+        );
+        let index = open_index(root.path(), state.path(), 1000);
+        drop(index);
+        assert_eq!(
+            LocalIndex::read_bound_replica(root.path(), state.path().join("index.redb")).unwrap(),
+            Some(replica())
+        );
+        assert!(
+            LocalIndex::read_bound_replica(other.path(), state.path().join("index.redb")).is_err()
+        );
+        let index = open_index(root.path(), state.path(), 1000);
+        assert!(index.sync_records().unwrap().is_empty());
+    }
+
+    #[test]
+    fn share_metadata_commits_with_adoption_and_survives_reopen() {
+        let root = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        fs::write(root.path().join("file"), b"old").unwrap();
+        let index = open_index(root.path(), state.path(), 1000);
+        index.scan().unwrap();
+        let before = index.sync_records().unwrap()[0].clone();
+        index.set_share_metadata(b"old-ceiling").unwrap();
+        let mut candidate = before.clone();
+        candidate
+            .version
+            .observe(ReplicaId(Hash32::digest(b"peer")), 100);
+        candidate.content_hash = Some(Hash32::digest(b"new"));
+        assert!(
+            index
+                .adopt_verified_record_with_share_metadata(&candidate, b"new-ceiling")
+                .is_err()
+        );
+        assert_eq!(index.sync_records().unwrap(), vec![before]);
+        assert_eq!(index.share_metadata().unwrap().unwrap(), b"old-ceiling");
+        fs::write(root.path().join("file"), b"new").unwrap();
+        assert!(
+            index
+                .adopt_verified_record_with_share_metadata(
+                    &candidate,
+                    &vec![0; 2 * 1024 * 1024 + 1]
+                )
+                .is_err()
+        );
+        assert_eq!(index.share_metadata().unwrap().unwrap(), b"old-ceiling");
+        index
+            .adopt_verified_record_with_share_metadata(&candidate, b"new-ceiling")
+            .unwrap();
+        drop(index);
+        let index = open_index(root.path(), state.path(), 1000);
+        assert_eq!(index.sync_records().unwrap(), vec![candidate]);
+        assert_eq!(index.share_metadata().unwrap().unwrap(), b"new-ceiling");
     }
 
     #[test]

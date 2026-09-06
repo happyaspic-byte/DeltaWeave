@@ -2,6 +2,9 @@
 
 #![forbid(unsafe_code)]
 
+pub mod root_admission;
+pub mod share;
+
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fmt,
@@ -276,6 +279,7 @@ pub struct ServerConfig {
 /// A running DeltaWeave protocol router.
 #[derive(Debug)]
 pub struct Server {
+    active_handlers: Arc<tokio::sync::RwLock<()>>,
     router: Router,
     network_mode: NetworkMode,
     index: Arc<LocalIndex>,
@@ -330,7 +334,12 @@ impl Server {
 
     /// Gracefully shuts down the router and all connections.
     pub async fn shutdown(self) -> Result<()> {
-        self.router.shutdown().await.context("iroh router shutdown")
+        self.router
+            .shutdown()
+            .await
+            .context("iroh router shutdown")?;
+        let _drained = self.active_handlers.write().await;
+        Ok(())
     }
 }
 
@@ -369,6 +378,10 @@ pub async fn start_server_observed(
         max_connections > 0,
         "max_connections must be greater than zero"
     );
+    let root_lease = Arc::new(root_admission::acquire(
+        &destination_root,
+        root_admission::RootUse::Legacy,
+    )?);
     let replica = ReplicaId(Hash32::digest(secret_key.public().as_bytes()));
     let (destination_root, state_root) = prepare_server_roots(&destination_root, &state_root)?;
     let store = Arc::new(Store::open(&state_root)?);
@@ -389,7 +402,10 @@ pub async fn start_server_observed(
     )
     .await?;
     let admission = Arc::new(OperationAdmission::default());
+    let active_handlers = Arc::new(tokio::sync::RwLock::new(()));
     let push_handler = PushHandler {
+        active_handlers: Arc::clone(&active_handlers),
+        _root_lease: Arc::clone(&root_lease),
         admission: Arc::clone(&admission),
         observer: observer.clone(),
         store: Arc::clone(&store),
@@ -403,6 +419,9 @@ pub async fn start_server_observed(
         receive_admission_lock: Arc::clone(&receive_admission_lock),
     };
     let sync_handler = SyncHandler {
+        active_handlers: Arc::clone(&active_handlers),
+        share_authorization: None,
+        _root_lease: root_lease,
         admission: Arc::clone(&admission),
         observer,
         store,
@@ -420,6 +439,7 @@ pub async fn start_server_observed(
         .accept(ALPN_V2, sync_handler)
         .spawn();
     Ok(Server {
+        active_handlers,
         router,
         network_mode,
         index,
@@ -586,6 +606,7 @@ pub struct SyncClient {
 pub struct SyncSession {
     client: SyncClient,
     endpoint: Endpoint,
+    share: Option<share::ShareId>,
 }
 
 impl fmt::Debug for SyncSession {
@@ -655,6 +676,7 @@ impl SyncClient {
         Ok(SyncSession {
             client: self.clone(),
             endpoint,
+            share: None,
         })
     }
 
@@ -668,13 +690,9 @@ impl SyncClient {
 
     async fn fetch_snapshot_connected(
         &self,
-        endpoint: &Endpoint,
+        connection: OperationConnection,
         local: &MerkleTree,
     ) -> Result<RemoteSnapshot> {
-        let connection = endpoint
-            .connect(self.remote.clone(), ALPN_V2)
-            .await
-            .context("failed to connect to reconciliation endpoint")?;
         let (mut send, mut receive) = connection
             .open_bi()
             .await
@@ -699,7 +717,7 @@ impl SyncClient {
                 },
             )
             .await?;
-            let summary = match read_frame::<SyncWireResponse>(&mut receive).await? {
+            let summary = match read_sync_response(&mut receive).await? {
                 SyncWireResponse::Node { summary } => summary,
                 SyncWireResponse::Error { message } => {
                     bail!("remote Merkle query failed: {message}")
@@ -756,7 +774,7 @@ impl SyncClient {
         }
 
         write_frame(&mut send, &SyncWireRequest::Finish).await?;
-        match read_frame::<SyncWireResponse>(&mut receive).await? {
+        match read_sync_response(&mut receive).await? {
             SyncWireResponse::Finished => {}
             SyncWireResponse::Error { message } => bail!("remote snapshot failed: {message}"),
             _ => bail!("remote sent an unexpected snapshot completion"),
@@ -809,7 +827,7 @@ impl SyncClient {
         let session = self.open_session().await?;
         let outcome = session
             .client
-            .push_record_connected(&session.endpoint, &source, record, manifest)
+            .push_record_connected(session.connect().await?, &source, record, manifest)
             .await;
         session.close().await;
         outcome
@@ -817,15 +835,11 @@ impl SyncClient {
 
     async fn push_record_connected(
         &self,
-        endpoint: &Endpoint,
+        connection: OperationConnection,
         source_path: &Path,
         record: SyncRecord,
         manifest: FileManifest,
     ) -> Result<SyncApplyReceipt> {
-        let connection = endpoint
-            .connect(self.remote.clone(), ALPN_V2)
-            .await
-            .context("failed to connect for causal file push")?;
         let (mut send, mut receive) = connection
             .open_bi()
             .await
@@ -838,15 +852,15 @@ impl SyncClient {
             },
         )
         .await?;
-        let missing = match read_frame::<SyncWireResponse>(&mut receive).await? {
+        let missing = match read_sync_response(&mut receive).await? {
             SyncWireResponse::NeedChunks { hashes } => hashes,
             SyncWireResponse::Error { message } => bail!("remote rejected causal push: {message}"),
             _ => bail!("remote sent an unexpected causal push response"),
         };
         let (sent_bytes, reused_extents) =
-            send_requested_chunks(&mut send, source_path, &manifest, missing).await?;
+            send_requested_chunks(&mut send, source_path, &manifest, missing, None).await?;
         send.finish().context("finish causal file upload")?;
-        let receipt = match read_frame::<SyncWireResponse>(&mut receive).await? {
+        let receipt = match read_sync_response(&mut receive).await? {
             SyncWireResponse::Applied(receipt) => receipt,
             SyncWireResponse::Error { message } => bail!("remote causal push failed: {message}"),
             _ => bail!("remote sent an unexpected causal push completion"),
@@ -922,17 +936,13 @@ impl SyncClient {
 
     async fn pull_record_connected(
         &self,
-        endpoint: &Endpoint,
+        connection: OperationConnection,
         expected: SyncRecord,
         store: Arc<Store>,
         destination_root: PathBuf,
         min_free_space_bytes: u64,
         pending_destination_bytes: u64,
     ) -> Result<PullReceipt> {
-        let connection = endpoint
-            .connect(self.remote.clone(), ALPN_V2)
-            .await
-            .context("failed to connect for causal file pull")?;
         let (mut send, mut receive) = connection
             .open_bi()
             .await
@@ -944,7 +954,7 @@ impl SyncClient {
             },
         )
         .await?;
-        let (record, manifest) = match read_frame::<SyncWireResponse>(&mut receive).await? {
+        let (record, manifest) = match read_sync_response(&mut receive).await? {
             SyncWireResponse::PullManifest { record, manifest } => (record, manifest),
             SyncWireResponse::Error { message } => bail!("remote rejected causal pull: {message}"),
             _ => bail!("remote sent an unexpected causal pull response"),
@@ -1022,7 +1032,7 @@ impl SyncClient {
         }
         .await;
         let transferred_bytes = finish_chunk_writes(writer, receive_result).await?;
-        let receipt = match read_frame::<SyncWireResponse>(&mut receive).await? {
+        let receipt = match read_sync_response(&mut receive).await? {
             SyncWireResponse::Applied(receipt) => receipt,
             SyncWireResponse::Error { message } => bail!("remote causal pull failed: {message}"),
             _ => bail!("remote sent an unexpected causal pull completion"),
@@ -1052,7 +1062,7 @@ impl SyncClient {
 
     async fn apply_metadata_connected(
         &self,
-        endpoint: &Endpoint,
+        connection: OperationConnection,
         record: SyncRecord,
     ) -> Result<SyncApplyReceipt> {
         record.validate()?;
@@ -1060,10 +1070,7 @@ impl SyncClient {
             record.tombstone || record.kind == SyncEntryKind::Directory,
             "metadata apply supports only directories and tombstones"
         );
-        let connection = endpoint
-            .connect(self.remote.clone(), ALPN_V2)
-            .await
-            .context("failed to connect for metadata apply")?;
+
         let outcome = async {
             let (mut send, mut receive) =
                 connection.open_bi().await.context("open metadata stream")?;
@@ -1075,7 +1082,7 @@ impl SyncClient {
             )
             .await?;
             send.finish().context("finish metadata request")?;
-            match read_frame::<SyncWireResponse>(&mut receive).await? {
+            match read_sync_response(&mut receive).await? {
                 SyncWireResponse::Applied(receipt) => {
                     ensure!(
                         receipt.path == record.path && receipt.record_hash == record.logical_hash(),
@@ -1095,11 +1102,41 @@ impl SyncClient {
     }
 }
 
+struct OperationConnection(Connection);
+impl std::ops::Deref for OperationConnection {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        &self.0
+    }
+}
+impl Drop for OperationConnection {
+    fn drop(&mut self) {
+        self.0.close(0u8.into(), b"operation complete");
+    }
+}
+
 impl SyncSession {
+    async fn connect(&self) -> Result<OperationConnection> {
+        let alpn = if self.share.is_some() {
+            share::ALPN_V3
+        } else {
+            ALPN_V2
+        };
+        let connection = OperationConnection(
+            self.endpoint
+                .connect(self.client.remote.clone(), alpn)
+                .await
+                .map_err(|_| share::ShareError::Offline)?,
+        );
+        if let Some(share_id) = self.share {
+            share::wire::open_session(&connection, share_id).await?;
+        }
+        Ok(connection)
+    }
     /// Reconstructs the remote snapshot through this reusable endpoint.
     pub async fn fetch_snapshot(&self, local: &MerkleTree) -> Result<RemoteSnapshot> {
         self.client
-            .fetch_snapshot_connected(&self.endpoint, local)
+            .fetch_snapshot_connected(self.connect().await?, local)
             .await
     }
 
@@ -1127,7 +1164,7 @@ impl SyncSession {
             "source content does not match causal record"
         );
         self.client
-            .push_record_connected(&self.endpoint, &source, record, manifest)
+            .push_record_connected(self.connect().await?, &source, record, manifest)
             .await
     }
 
@@ -1172,7 +1209,7 @@ impl SyncSession {
         );
         self.client
             .pull_record_connected(
-                &self.endpoint,
+                self.connect().await?,
                 record,
                 store,
                 destination_root,
@@ -1185,13 +1222,15 @@ impl SyncSession {
     /// Applies a directory or tombstone record through this reusable endpoint.
     pub async fn apply_metadata(&self, record: SyncRecord) -> Result<SyncApplyReceipt> {
         self.client
-            .apply_metadata_connected(&self.endpoint, record)
+            .apply_metadata_connected(self.connect().await?, record)
             .await
     }
 
     /// Gracefully closes the reusable local endpoint.
     pub async fn close(self) {
-        self.endpoint.close().await;
+        if self.share.is_none() {
+            self.endpoint.close().await;
+        }
     }
 }
 
@@ -1464,6 +1503,7 @@ fn source_identity(_file: &File, _metadata: &Metadata) -> Option<(u64, u64)> {
 
 /// Sends one file, transmitting only chunks the receiver reports missing.
 pub async fn push_file(options: PushOptions) -> Result<TransferReceipt> {
+    let _root_lease = root_admission::acquire(&options.source, root_admission::RootUse::Legacy)?;
     let source_for_manifest = options.source.clone();
     let profile = options.profile;
     let state_root = options.state_root.clone();
@@ -1599,6 +1639,7 @@ async fn send_requested_chunks(
     source_path: &Path,
     manifest: &FileManifest,
     missing: Vec<Hash32>,
+    authorization: Option<&share::Authorization>,
 ) -> Result<(u64, usize)> {
     let descriptors: HashMap<_, _> = manifest
         .chunks
@@ -1618,6 +1659,10 @@ async fn send_requested_chunks(
     let mut source = tokio::fs::File::open(source_path).await?;
     let mut sent_bytes = 0_u64;
     for hash in missing {
+        if let Some(auth) = authorization {
+            auth.check(false)?;
+            auth.phase("sending", None);
+        }
         let descriptor = descriptors
             .get(&hash)
             .with_context(|| format!("receiver requested unknown chunk {hash}"))?;
@@ -1635,6 +1680,9 @@ async fn send_requested_chunks(
             },
         )
         .await?;
+        if let Some(auth) = authorization {
+            auth.check(false)?;
+        }
         send.write_all(&bytes).await?;
         sent_bytes = sent_bytes
             .checked_add(u64::from(descriptor.length))
@@ -1645,6 +1693,8 @@ async fn send_requested_chunks(
 
 #[derive(Clone)]
 struct PushHandler {
+    active_handlers: Arc<tokio::sync::RwLock<()>>,
+    _root_lease: Arc<root_admission::RootLease>,
     admission: Arc<OperationAdmission>,
     observer: Option<TransferObserver>,
     store: Arc<Store>,
@@ -1670,6 +1720,19 @@ impl fmt::Debug for PushHandler {
 
 impl ProtocolHandler for PushHandler {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        let handler = self.clone();
+        let active = self.active_handlers.clone().read_owned().await;
+        tokio::spawn(async move {
+            let _active = active;
+            handler.accept_retained(connection).await
+        })
+        .await
+        .map_err(AcceptError::from_err)?
+    }
+}
+
+impl PushHandler {
+    async fn accept_retained(&self, connection: Connection) -> Result<(), AcceptError> {
         let Ok(_permit) = Arc::clone(&self.connection_limit).try_acquire_owned() else {
             connection.close(0_u8.into(), b"server connection limit reached; retry later");
             return Ok(());
@@ -1859,6 +1922,9 @@ impl PushHandler {
 
 #[derive(Clone)]
 struct SyncHandler {
+    active_handlers: Arc<tokio::sync::RwLock<()>>,
+    share_authorization: Option<share::Authorization>,
+    _root_lease: Arc<root_admission::RootLease>,
     admission: Arc<OperationAdmission>,
     observer: Option<TransferObserver>,
     store: Arc<Store>,
@@ -1884,6 +1950,19 @@ impl fmt::Debug for SyncHandler {
 
 impl ProtocolHandler for SyncHandler {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        let handler = self.clone();
+        let active = self.active_handlers.clone().read_owned().await;
+        tokio::spawn(async move {
+            let _active = active;
+            handler.accept_retained(connection).await
+        })
+        .await
+        .map_err(AcceptError::from_err)?
+    }
+}
+
+impl SyncHandler {
+    async fn accept_retained(&self, connection: Connection) -> Result<(), AcceptError> {
         let Ok(_permit) = Arc::clone(&self.connection_limit).try_acquire_owned() else {
             connection.close(0_u8.into(), b"server connection limit reached; retry later");
             return Ok(());
@@ -1949,12 +2028,22 @@ impl ProtocolHandler for SyncHandler {
 }
 
 impl SyncHandler {
+    fn authorize(&self, write: bool) -> Result<()> {
+        if let Some(auth) = &self.share_authorization {
+            auth.check(write)?;
+        }
+        Ok(())
+    }
+
     async fn handle_query_session(
         &self,
         first: SyncWireRequest,
         send: &mut SendStream,
         receive: &mut RecvStream,
     ) -> Result<()> {
+        self.authorize(false)?;
+        let _gate = self.apply_lock.lock().await;
+        self.authorize(false)?;
         let index = Arc::clone(&self.index);
         let records = tokio::task::spawn_blocking(move || {
             let report = index.scan()?;
@@ -1970,6 +2059,7 @@ impl SyncHandler {
         let tree = MerkleTree::from_records(records)?;
         let mut request = first;
         loop {
+            self.authorize(false)?;
             match request {
                 SyncWireRequest::QueryNode { prefix } => {
                     let summary = tree.node_summary(&prefix)?;
@@ -1992,6 +2082,9 @@ impl SyncHandler {
         receive: &mut RecvStream,
         peer: EndpointId,
     ) -> Result<()> {
+        self.authorize(false)?;
+        let _gate = self.apply_lock.lock().await;
+        self.authorize(false)?;
         expected.validate()?;
         ensure!(
             !expected.tombstone && expected.kind == SyncEntryKind::File,
@@ -2020,6 +2113,7 @@ impl SyncHandler {
             manifest.size == expected.size && Some(manifest.file_hash) == expected.content_hash,
             "indexed file changed while preparing pull"
         );
+        self.authorize(false)?;
         write_frame(
             send,
             &SyncWireResponse::PullManifest {
@@ -2032,8 +2126,16 @@ impl SyncHandler {
             SyncWireRequest::NeedChunks { hashes } => hashes,
             _ => bail!("pull client did not send a chunk request"),
         };
-        let (transferred_bytes, reused_extents) =
-            send_requested_chunks(send, &source, &manifest, missing).await?;
+        self.authorize(false)?;
+        let (transferred_bytes, reused_extents) = send_requested_chunks(
+            send,
+            &source,
+            &manifest,
+            missing,
+            self.share_authorization.as_ref(),
+        )
+        .await?;
+        self.authorize(false)?;
         write_frame(
             send,
             &SyncWireResponse::Applied(SyncApplyReceipt {
@@ -2063,6 +2165,7 @@ impl SyncHandler {
         receive: &mut RecvStream,
         peer: EndpointId,
     ) -> Result<()> {
+        self.authorize(true)?;
         record.validate()?;
         manifest.validate()?;
         let _receive_guard = self.receive_admission_lock.lock().await;
@@ -2103,6 +2206,7 @@ impl SyncHandler {
             manifest.size,
         );
         admission.check_state(unique_missing_chunk_bytes(&manifest, &missing)?)?;
+        self.authorize(true)?;
         write_frame(
             send,
             &SyncWireResponse::NeedChunks {
@@ -2112,36 +2216,73 @@ impl SyncHandler {
         .await?;
 
         let materialize_admission = admission.clone();
-        let transferred_bytes =
-            receive_chunks(&self.store, receive, &manifest, missing, admission).await?;
+        let transferred_bytes = receive_chunks(
+            &self.store,
+            receive,
+            &manifest,
+            missing,
+            admission,
+            self.share_authorization.clone(),
+        )
+        .await?;
         let _apply_guard = self.apply_lock.lock().await;
+        self.authorize(true)?;
         let index = Arc::clone(&self.index);
         let candidate = record.clone();
-        tokio::task::spawn_blocking(move || ensure_causally_applicable(&index, &candidate))
-            .await
-            .context("causal precondition task failed")??;
+        let authorization = self.share_authorization.clone();
+        let share_metadata = tokio::task::spawn_blocking(move || {
+            ensure_causally_applicable(&index, &candidate)?;
+            authorization
+                .as_ref()
+                .map(|auth| auth.candidate_metadata(&candidate))
+                .transpose()
+        })
+        .await
+        .context("causal precondition task failed")??;
         let store = Arc::clone(&self.store);
         let root = self.destination_root.clone();
         let path = record.path.clone();
         let operation_hash = record.logical_hash();
         let materialize_manifest = manifest;
+        let authorization = self.share_authorization.clone();
+        let observer = self.observer.clone();
         let outcome = tokio::task::spawn_blocking(move || {
+            if let Some(auth) = &authorization {
+                auth.check(true)?;
+                auth.phase("applying", Some(&path));
+            } else {
+                observed_event(&observer, "applying", Some(&path), Some("receive"), 0, peer);
+            }
             prepare_destination_kind(&store, &path, &root, SyncEntryKind::File, operation_hash)?;
             materialize_admission.check_materialization(materialize_manifest.size)?;
             store.materialize(&materialize_manifest, &path, root)
         })
         .await
         .context("causal materialization task failed")??;
+        self.authorize(true)?;
         let observation = outcome
             .observation
             .after_readonly_update(&outcome.destination, record.readonly)?;
         let index = Arc::clone(&self.index);
         let adopted = record.clone();
+        let authorization = self.share_authorization.clone();
         tokio::task::spawn_blocking(move || {
-            index.adopt_materialized_record(&adopted, &observation)
+            if let Some(auth) = &authorization {
+                auth.check(true)?;
+            }
+            if let Some(metadata) = share_metadata {
+                index.adopt_materialized_record_with_share_metadata(
+                    &adopted,
+                    &observation,
+                    &metadata,
+                )
+            } else {
+                index.adopt_materialized_record(&adopted, &observation)
+            }
         })
         .await
         .context("causal index adoption task failed")??;
+        self.authorize(false)?;
         write_frame(
             send,
             &SyncWireResponse::Applied(SyncApplyReceipt {
@@ -2164,21 +2305,35 @@ impl SyncHandler {
     }
 
     async fn handle_metadata(&self, record: SyncRecord, send: &mut SendStream) -> Result<()> {
+        self.authorize(true)?;
         record.validate()?;
         ensure!(
             record.tombstone || record.kind == SyncEntryKind::Directory,
             "metadata apply supports only directories and tombstones"
         );
         let _apply_guard = self.apply_lock.lock().await;
+        self.authorize(true)?;
         let index = Arc::clone(&self.index);
         let candidate = record.clone();
-        tokio::task::spawn_blocking(move || ensure_causally_applicable(&index, &candidate))
-            .await
-            .context("metadata causal precondition task failed")??;
+        let authorization = self.share_authorization.clone();
+        let share_metadata = tokio::task::spawn_blocking(move || {
+            ensure_causally_applicable(&index, &candidate)?;
+            authorization
+                .as_ref()
+                .map(|auth| auth.candidate_metadata(&candidate))
+                .transpose()
+        })
+        .await
+        .context("metadata causal precondition task failed")??;
         let store = Arc::clone(&self.store);
         let root = self.destination_root.clone();
         let apply_record = record.clone();
+        let authorization = self.share_authorization.clone();
         tokio::task::spawn_blocking(move || {
+            if let Some(auth) = &authorization {
+                auth.check(true)?;
+                auth.phase("applying", Some(&apply_record.path));
+            }
             if apply_record.tombstone {
                 store.remove_path(&apply_record.path, root, apply_record.logical_hash())?;
             } else {
@@ -2198,9 +2353,20 @@ impl SyncHandler {
         .context("metadata filesystem task failed")??;
         let index = Arc::clone(&self.index);
         let adopted = record.clone();
-        tokio::task::spawn_blocking(move || index.adopt_verified_record(&adopted))
-            .await
-            .context("metadata index adoption task failed")??;
+        let authorization = self.share_authorization.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Some(auth) = &authorization {
+                auth.check(true)?;
+            }
+            if let Some(metadata) = share_metadata {
+                index.adopt_verified_record_with_share_metadata(&adopted, &metadata)
+            } else {
+                index.adopt_verified_record(&adopted)
+            }
+        })
+        .await
+        .context("metadata index adoption task failed")??;
+        self.authorize(false)?;
         write_frame(
             send,
             &SyncWireResponse::Applied(SyncApplyReceipt {
@@ -2416,6 +2582,7 @@ fn same_filesystem(_left: &Path, _right: &Path) -> Result<bool> {
 }
 
 struct ChunkWritePipeline {
+    authorization: Option<share::Authorization>,
     store: Arc<Store>,
     admission: Option<DiskAdmission>,
     max_inflight: usize,
@@ -2451,6 +2618,7 @@ impl ChunkWritePipeline {
         admission: Option<DiskAdmission>,
     ) -> Self {
         Self {
+            authorization: None,
             store,
             admission,
             max_inflight: max_inflight.max(1),
@@ -2534,7 +2702,16 @@ impl ChunkWritePipeline {
         let store = Arc::clone(&self.store);
         self.inflight.push(InflightWrite {
             bytes,
-            task: tokio::task::spawn_blocking(move || store.chunks().put_validated_batch(batch)),
+            task: {
+                let authorization = self.authorization.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Some(auth) = &authorization {
+                        auth.check(true)?;
+                        auth.phase("receiving", None);
+                    }
+                    store.chunks().put_validated_batch(batch)
+                })
+            },
         });
         Ok(())
     }
@@ -2598,6 +2775,7 @@ async fn receive_chunks(
     manifest: &FileManifest,
     missing: Vec<Hash32>,
     admission: DiskAdmission,
+    authorization: Option<share::Authorization>,
 ) -> Result<u64> {
     let descriptor_by_hash: HashMap<_, _> = manifest
         .chunks
@@ -2610,6 +2788,7 @@ async fn receive_chunks(
         CHUNK_WRITE_MAX_QUEUED_BYTES,
         admission,
     );
+    writer.authorization = authorization;
     let receive_result = async {
         let mut transferred_bytes = 0_u64;
         for expected_hash in missing {
@@ -2706,6 +2885,7 @@ enum SyncWireResponse {
     Error {
         message: String,
     },
+    ShareError(share::ShareError),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2728,6 +2908,13 @@ enum WireResponse {
 struct ChunkHeader {
     hash: Hash32,
     length: u32,
+}
+
+async fn read_sync_response(receive: &mut RecvStream) -> Result<SyncWireResponse> {
+    match read_frame(receive).await? {
+        SyncWireResponse::ShareError(error) => Err(error.into()),
+        response => Ok(response),
+    }
 }
 
 async fn write_frame<T: Serialize>(send: &mut SendStream, value: &T) -> Result<()> {
@@ -4186,7 +4373,7 @@ mod tests {
             let local_bytes = b"receiver independently edited this file during the upload";
             fs::write(destination.path().join("shared.bin"), local_bytes)
                 .expect("receiver can edit the file before payload arrives");
-            send_requested_chunks(&mut send, &source, &manifest, hashes)
+            send_requested_chunks(&mut send, &source, &manifest, hashes, None)
                 .await
                 .expect("requested payload can be uploaded");
             send.finish().expect("upload can finish");
@@ -4629,5 +4816,130 @@ mod tests {
                 && record.content_hash == Some(Hash32::digest(&second_bytes))
         }));
         server.shutdown().await.expect("server shuts down");
+    }
+    #[test]
+    fn legacy_shutdown_drains_blocking_apply_before_releasing_root() {
+        if std::env::var_os("DW_LEGACY_DRAIN_CHILD").is_none() {
+            let home = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::legacy_shutdown_drains_blocking_apply_before_releasing_root",
+                    "--nocapture",
+                ])
+                .env("DW_LEGACY_DRAIN_CHILD", "1")
+                .env("HOME", home.path())
+                .env("USERPROFILE", home.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                use std::{future::Future, task::Poll};
+                let temp = tempfile::tempdir().unwrap();
+                let root = temp.path().join("root");
+                let state = temp.path().join("state");
+                let peer = SecretKey::generate();
+                let source_root = temp.path().join("source");
+                fs::create_dir(&source_root).unwrap();
+                fs::write(source_root.join("file"), b"valid payload").unwrap();
+                let index = LocalIndex::open(
+                    &source_root,
+                    temp.path().join("source-state/index.redb"),
+                    ReplicaId(Hash32::digest(peer.public().as_bytes())),
+                    IndexOptions::default(),
+                )
+                .unwrap();
+                index.scan().unwrap();
+                let record = index.sync_records().unwrap()[0].clone();
+                let entered = Arc::new(tokio::sync::Notify::new());
+                let release = Arc::new(std::sync::Barrier::new(2));
+                let e = entered.clone();
+                let r = release.clone();
+                let observer = TransferObserver::new(move |event| {
+                    if event.phase == "applying" {
+                        e.notify_one();
+                        r.wait();
+                    }
+                });
+                let server = start_server_observed(
+                    ServerConfig {
+                        secret_key: SecretKey::generate(),
+                        destination_root: root.clone(),
+                        state_root: state,
+                        peer_policy: PeerPolicy::AnyAuthenticated,
+                        network_mode: NetworkMode::DirectOnly,
+                        bind_address: None,
+                        max_connections: 8,
+                        min_free_space_bytes: 0,
+                    },
+                    Some(observer),
+                )
+                .await
+                .unwrap();
+                let client = SyncClient {
+                    secret_key: peer,
+                    remote: server.endpoint_addr(),
+                    network_mode: NetworkMode::DirectOnly,
+                };
+                let pushing = tokio::spawn(async move {
+                    client
+                        .push_record(source_root.join("file"), record, ChunkingProfile::DEFAULT)
+                        .await
+                });
+                tokio::time::timeout(Duration::from_secs(10), entered.notified())
+                    .await
+                    .unwrap();
+                // Finish iroh cancellation before polling our public shutdown. Its
+                // remaining obligation is the retained blocking application task.
+                server.router.shutdown().await.unwrap();
+                let shutdown = server.shutdown();
+                tokio::pin!(shutdown);
+                let returned_early = std::future::poll_fn(|cx| {
+                    Poll::Ready(match shutdown.as_mut().poll(cx) {
+                        Poll::Ready(result) => Some(result),
+                        Poll::Pending => None,
+                    })
+                })
+                .await;
+                assert!(
+                    root_admission::acquire(
+                        &root,
+                        root_admission::RootUse::Managed {
+                            share: [1; 32],
+                            owner: [2; 32]
+                        }
+                    )
+                    .is_err()
+                );
+                tokio::task::spawn_blocking(move || release.wait())
+                    .await
+                    .unwrap();
+                if returned_early.is_none() {
+                    shutdown.await.unwrap();
+                }
+                let _ = pushing.await.unwrap();
+                assert!(
+                    returned_early.is_none(),
+                    "shutdown returned with an outstanding disk task"
+                );
+                assert_eq!(fs::read(root.join("file")).unwrap(), b"valid payload");
+                assert!(
+                    root_admission::acquire(
+                        &root,
+                        root_admission::RootUse::Managed {
+                            share: [1; 32],
+                            owner: [2; 32]
+                        }
+                    )
+                    .is_ok()
+                );
+            });
     }
 }
