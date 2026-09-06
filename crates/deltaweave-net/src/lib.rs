@@ -385,13 +385,16 @@ pub async fn start_server_observed(
     )?);
     let replica = ReplicaId(Hash32::digest(secret_key.public().as_bytes()));
     let (destination_root, state_root) = prepare_server_roots(&destination_root, &state_root)?;
-    let store = Arc::new(Store::open(&state_root)?);
+    let store = Arc::new(Store::open_with_recovery_reserver(&state_root, |path| {
+        crate::root_admission::reserve_private(path)
+    })?);
     let index = Arc::new(LocalIndex::open(
         &destination_root,
         state_root.join("index.redb"),
         replica,
         IndexOptions::default(),
     )?);
+    recover_causal_index(&store, &index, &destination_root)?;
     let apply_lock = Arc::new(tokio::sync::Mutex::new(()));
     let connection_limit = Arc::new(tokio::sync::Semaphore::new(max_connections));
     let receive_admission_lock = Arc::new(tokio::sync::Mutex::new(()));
@@ -1872,18 +1875,12 @@ impl PushHandler {
         let transferred_bytes = finish_chunk_writes(writer, receive_result).await?;
 
         let _apply_guard = self.apply_lock.lock().await;
+        recover_causal_index(&self.store, &self.index, &self.destination_root)?;
         let store = Arc::clone(&self.store);
         let root = self.destination_root.clone();
         let materialize_manifest = manifest.clone();
         let materialize_path = path.clone();
         let outcome = tokio::task::spawn_blocking(move || {
-            prepare_destination_kind(
-                &store,
-                &materialize_path,
-                &root,
-                SyncEntryKind::File,
-                materialize_manifest.manifest_hash(),
-            )?;
             materialize_admission.check_materialization(materialize_manifest.size)?;
             store.materialize(&materialize_manifest, &materialize_path, root)
         })
@@ -1897,6 +1894,13 @@ impl PushHandler {
         })
         .await
         .context("receiver index adoption task failed")??;
+        let adopted = self
+            .index
+            .get(&path)?
+            .context("adopted record disappeared")?
+            .to_sync_record();
+        self.store
+            .mark_record_indexed(&self.destination_root, &adopted)?;
 
         write_frame(
             send,
@@ -2036,6 +2040,22 @@ impl SyncHandler {
         Ok(())
     }
 
+    async fn recover_pending(&self) -> Result<()> {
+        let store = self.store.clone();
+        let index = self.index.clone();
+        let root = self.destination_root.clone();
+        let authorization = self.share_authorization.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Some(authorization) = authorization {
+                authorization.recover_pending()
+            } else {
+                recover_causal_index(&store, &index, &root)
+            }
+        })
+        .await
+        .context("causal recovery task failed")?
+    }
+
     async fn handle_query_session(
         &self,
         first: SyncWireRequest,
@@ -2045,6 +2065,7 @@ impl SyncHandler {
         self.authorize(false)?;
         let _gate = self.apply_lock.lock().await;
         self.authorize(false)?;
+        self.recover_pending().await?;
         let index = Arc::clone(&self.index);
         let records = tokio::task::spawn_blocking(move || {
             let report = index.scan()?;
@@ -2086,6 +2107,7 @@ impl SyncHandler {
         self.authorize(false)?;
         let _gate = self.apply_lock.lock().await;
         self.authorize(false)?;
+        self.recover_pending().await?;
         expected.validate()?;
         ensure!(
             !expected.tombstone && expected.kind == SyncEntryKind::File,
@@ -2228,6 +2250,7 @@ impl SyncHandler {
         .await?;
         let _apply_guard = self.apply_lock.lock().await;
         self.authorize(true)?;
+        self.recover_pending().await?;
         let index = Arc::clone(&self.index);
         let candidate = record.clone();
         let authorization = self.share_authorization.clone();
@@ -2243,8 +2266,8 @@ impl SyncHandler {
         let store = Arc::clone(&self.store);
         let root = self.destination_root.clone();
         let path = record.path.clone();
-        let operation_hash = record.logical_hash();
         let materialize_manifest = manifest;
+        let binding = causal_binding(&self.index, &record, self.share_authorization.as_ref())?;
         let authorization = self.share_authorization.clone();
         let observer = self.observer.clone();
         let outcome = tokio::task::spawn_blocking(move || {
@@ -2254,16 +2277,21 @@ impl SyncHandler {
             } else {
                 observed_event(&observer, "applying", Some(&path), Some("receive"), 0, peer);
             }
-            prepare_destination_kind(&store, &path, &root, SyncEntryKind::File, operation_hash)?;
             materialize_admission.check_materialization(materialize_manifest.size)?;
-            store.materialize(&materialize_manifest, &path, root)
+            let change = store.apply_causal_record(&root, binding, Some(&materialize_manifest))?;
+            let observation = store.observe_path_change(&change)?;
+            Ok::<_, anyhow::Error>((change, observation))
         })
         .await
         .context("causal materialization task failed")??;
+        if let Some(auth) = &self.share_authorization {
+            auth.phase("materialized", Some(&record.path));
+        }
         self.authorize(true)?;
-        let observation = outcome
-            .observation
-            .after_readonly_update(&outcome.destination, record.readonly)?;
+        let observation = outcome.1.after_readonly_update(
+            sync_local_path(&self.destination_root, &record.path),
+            record.readonly,
+        )?;
         let index = Arc::clone(&self.index);
         let adopted = record.clone();
         let authorization = self.share_authorization.clone();
@@ -2283,6 +2311,8 @@ impl SyncHandler {
         })
         .await
         .context("causal index adoption task failed")??;
+        self.store
+            .mark_record_indexed(&self.destination_root, &record)?;
         self.authorize(false)?;
         write_frame(
             send,
@@ -2314,6 +2344,7 @@ impl SyncHandler {
         );
         let _apply_guard = self.apply_lock.lock().await;
         self.authorize(true)?;
+        self.recover_pending().await?;
         let index = Arc::clone(&self.index);
         let candidate = record.clone();
         let authorization = self.share_authorization.clone();
@@ -2329,24 +2360,16 @@ impl SyncHandler {
         let store = Arc::clone(&self.store);
         let root = self.destination_root.clone();
         let apply_record = record.clone();
+        let binding = causal_binding(&self.index, &record, self.share_authorization.as_ref())?;
         let authorization = self.share_authorization.clone();
         tokio::task::spawn_blocking(move || {
             if let Some(auth) = &authorization {
                 auth.check(true)?;
                 auth.phase("applying", Some(&apply_record.path));
             }
-            if apply_record.tombstone {
-                store.remove_path(&apply_record.path, root, apply_record.logical_hash())?;
-            } else {
-                prepare_destination_kind(
-                    &store,
-                    &apply_record.path,
-                    &root,
-                    SyncEntryKind::Directory,
-                    apply_record.logical_hash(),
-                )?;
-                let directory = store.materialize_directory(&apply_record.path, root)?;
-                apply_readonly(&directory, apply_record.readonly)?;
+            store.apply_causal_record(&root, binding, None)?;
+            if !apply_record.tombstone {
+                store.set_readonly(&root, &apply_record.path, apply_record.readonly)?;
             }
             Ok::<_, anyhow::Error>(())
         })
@@ -2367,6 +2390,8 @@ impl SyncHandler {
         })
         .await
         .context("metadata index adoption task failed")??;
+        self.store
+            .mark_record_indexed(&self.destination_root, &record)?;
         self.authorize(false)?;
         write_frame(
             send,
@@ -2382,9 +2407,120 @@ impl SyncHandler {
     }
 }
 
+/// Recovers legacy/member causal installations without inventing a local authoring event.
+/// Owner runtimes use their private authorization-aware variant under the share gate.
+pub fn recover_causal_index(store: &Store, index: &LocalIndex, root: &Path) -> Result<()> {
+    recover_causal_index_with(store, index, root, |binding| {
+        ensure!(
+            binding.authorization.is_none(),
+            share::ShareError::StateUnavailable
+        );
+        Ok(RecoveryDecision::Adopt(None))
+    })
+}
+
+pub(crate) enum RecoveryDecision {
+    Adopt(Option<Vec<u8>>),
+    Rollback,
+}
+
+pub(crate) fn recover_causal_index_with(
+    store: &Store,
+    index: &LocalIndex,
+    root: &Path,
+    authorize: impl Fn(&deltaweave_store::CausalBinding) -> Result<RecoveryDecision>,
+) -> Result<()> {
+    use deltaweave_store::PathChangeState;
+    for mut change in store.recover_path_changes(root)? {
+        if change.root != root {
+            continue;
+        }
+        let Some(binding) = change.causal.clone() else {
+            continue;
+        };
+        if matches!(
+            change.state,
+            PathChangeState::Committed | PathChangeState::Aborted | PathChangeState::RolledBack
+        ) {
+            continue;
+        }
+        let current = index.get(&binding.record.path)?.map(|r| r.to_sync_record());
+        if current.as_ref() == Some(&binding.record) {
+            store.mark_path_change_indexed(&change.id)?;
+            continue;
+        }
+        ensure!(
+            current == binding.precondition,
+            share::ShareError::StateUnavailable
+        );
+        if change.state == PathChangeState::RollingBack {
+            store.rollback_causal_change(&mut change)?;
+            continue;
+        }
+        ensure_index_causally_applicable(index, &binding.record)?;
+        let decision = authorize(&binding)?;
+        let RecoveryDecision::Adopt(metadata) = decision else {
+            store.rollback_causal_change(&mut change)?;
+            continue;
+        };
+        store.resume_path_change(&mut change)?;
+        if change.state == PathChangeState::Aborted {
+            continue;
+        }
+        ensure!(
+            change.state == PathChangeState::Materialized,
+            share::ShareError::StateUnavailable
+        );
+        if !binding.record.tombstone && binding.record.kind == SyncEntryKind::File {
+            let observation = store.observe_path_change(&change)?.after_readonly_update(
+                sync_local_path(root, &binding.record.path),
+                binding.record.readonly,
+            )?;
+            if let Some(metadata) = metadata {
+                index.adopt_materialized_record_with_share_metadata(
+                    &binding.record,
+                    &observation,
+                    &metadata,
+                )?;
+            } else {
+                index.adopt_materialized_record(&binding.record, &observation)?;
+            }
+        } else {
+            if !binding.record.tombstone {
+                store.set_readonly(root, &binding.record.path, binding.record.readonly)?;
+            }
+            if let Some(metadata) = metadata {
+                index.adopt_verified_record_with_share_metadata(&binding.record, &metadata)?;
+            } else {
+                index.adopt_verified_record(&binding.record)?;
+            }
+        }
+        store.mark_path_change_indexed(&change.id)?;
+    }
+    Ok(())
+}
+
+fn causal_binding(
+    index: &LocalIndex,
+    record: &SyncRecord,
+    authorization: Option<&share::Authorization>,
+) -> Result<deltaweave_store::CausalBinding> {
+    Ok(deltaweave_store::CausalBinding {
+        record: record.clone(),
+        precondition: index.get(&record.path)?.map(|r| r.to_sync_record()),
+        authorization: authorization
+            .map(|a| a.recovery_context(record))
+            .transpose()?,
+    })
+}
+
 fn ensure_causally_applicable(index: &LocalIndex, incoming: &SyncRecord) -> Result<()> {
     let report = index.scan()?;
     ensure_index_report_safe(&report)?;
+    ensure_index_causally_applicable(index, incoming)
+}
+
+fn ensure_index_causally_applicable(index: &LocalIndex, incoming: &SyncRecord) -> Result<()> {
     let Some(current) = index
         .get(&incoming.path)?
         .map(|record| record.to_sync_record())
@@ -2416,30 +2552,6 @@ fn ensure_index_report_safe(report: &deltaweave_index::ScanReport) -> Result<()>
         report.issues.len(),
         report.retries_queued
     );
-    Ok(())
-}
-
-fn prepare_destination_kind(
-    store: &Store,
-    path: &WirePath,
-    root: &Path,
-    desired: SyncEntryKind,
-    operation_hash: Hash32,
-) -> Result<()> {
-    let destination = sync_local_path(root, path);
-    let metadata = match fs::symlink_metadata(&destination) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
-    let already_compatible = match desired {
-        SyncEntryKind::File => metadata.is_file() && !metadata.file_type().is_symlink(),
-        SyncEntryKind::Directory => metadata.is_dir() && !metadata.file_type().is_symlink(),
-        SyncEntryKind::Symlink | SyncEntryKind::Other => false,
-    };
-    if !already_compatible {
-        store.remove_path(path, root, operation_hash)?;
-    }
     Ok(())
 }
 
@@ -2830,24 +2942,6 @@ fn sync_local_path(root: &Path, path: &WirePath) -> PathBuf {
     local
 }
 
-fn apply_readonly(path: &Path, readonly: bool) -> Result<()> {
-    let mut permissions = fs::symlink_metadata(path)?.permissions();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = permissions.mode();
-        permissions.set_mode(if readonly {
-            mode & !0o222
-        } else {
-            mode | 0o200
-        });
-    }
-    #[cfg(not(unix))]
-    permissions.set_readonly(readonly);
-    fs::set_permissions(path, permissions)?;
-    Ok(())
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize)]
 enum SyncWireRequest {
     QueryNode {
@@ -3013,6 +3107,24 @@ mod tests {
                 }
             })
             .sum()
+    }
+
+    fn regular_file_paths_below(path: &Path) -> Vec<PathBuf> {
+        let Ok(entries) = fs::read_dir(path) else {
+            return Vec::new();
+        };
+        entries
+            .filter_map(Result::ok)
+            .flat_map(|entry| {
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    regular_file_paths_below(&entry.path())
+                } else if entry.file_type().is_ok_and(|kind| kind.is_file()) {
+                    vec![entry.path()]
+                } else {
+                    Vec::new()
+                }
+            })
+            .collect()
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4392,9 +4504,7 @@ mod tests {
                 local_bytes
             );
             assert_eq!(
-                fs::read_dir(state.path().join("trash"))
-                    .expect("replacement history can be read")
-                    .count(),
+                regular_files_below(&state.path().join("trash")),
                 0,
                 "a rejected upload must not replace the local edit"
             );
@@ -4479,9 +4589,7 @@ mod tests {
                     "{case} deletion changed causal state"
                 );
                 assert_eq!(
-                    fs::read_dir(state.path().join("trash"))
-                        .expect("replacement history can be read")
-                        .count(),
+                    regular_files_below(&state.path().join("trash")),
                     0,
                     "{case} deletion must not move the file into trash"
                 );
@@ -4519,13 +4627,10 @@ mod tests {
                     vec![resolved.clone()],
                     "{attempt} must retain the exact tombstone"
                 );
-                let backups: Vec<_> = fs::read_dir(state.path().join("trash"))
-                    .expect("replacement history can be read")
-                    .map(|entry| entry.expect("trash entry can be read").path())
-                    .collect();
+                let backups = regular_file_paths_below(&state.path().join("trash"));
                 assert_eq!(backups.len(), 1, "{attempt} must preserve exactly one copy");
                 assert_eq!(
-                    fs::read(backups[0].join("shared.bin")).expect("preserved content can be read"),
+                    fs::read(&backups[0]).expect("preserved content can be read"),
                     bytes,
                     "{attempt} must preserve the deleted content"
                 );

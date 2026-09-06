@@ -674,6 +674,29 @@ impl LocalIndex {
             .context("index generation overflow")?;
         let mut records = self.records_map()?;
         let mut retries = self.retries_map()?;
+        let adopted = self.verify_adopted_record(record, observation, &records, generation)?;
+
+        records.insert(record.path.clone(), adopted);
+        retries.remove(&record.path);
+        let replica_counter = self
+            .metadata_value(REPLICA_COUNTER_KEY)?
+            .max(record.version.get(self.replica));
+        self.commit_state_with_share_metadata(
+            &records,
+            &retries,
+            generation,
+            replica_counter,
+            share_metadata,
+        )
+    }
+
+    fn verify_adopted_record(
+        &self,
+        record: &SyncRecord,
+        observation: Option<&MaterializationObservation>,
+        records: &BTreeMap<WirePath, PathRecord>,
+        generation: u64,
+    ) -> Result<PathRecord> {
         let local_path = local_path(&self.root, &record.path);
 
         let adopted = if record.tombstone {
@@ -682,8 +705,7 @@ impl LocalIndex {
                 "tombstones cannot be adopted from a materialization observation"
             );
             ensure!(
-                fs::symlink_metadata(&local_path)
-                    .is_err_and(|error| { error.kind() == std::io::ErrorKind::NotFound }),
+                path_is_absent(&self.root, &record.path)?,
                 "cannot adopt tombstone while local object still exists at {}",
                 local_path.display()
             );
@@ -779,18 +801,131 @@ impl LocalIndex {
             }
         };
 
-        records.insert(record.path.clone(), adopted);
-        retries.remove(&record.path);
-        let replica_counter = self
-            .metadata_value(REPLICA_COUNTER_KEY)?
-            .max(record.version.get(self.replica));
-        self.commit_state_with_share_metadata(
-            &records,
-            &retries,
-            generation,
-            replica_counter,
-            share_metadata,
-        )
+        Ok(adopted)
+    }
+
+    /// Verifies the complete authoritative namespace and atomically replaces all rows and
+    /// trusted checkpoint metadata. The root/replica binding and local counter never reset.
+    /// Callers hold their share mutation gate through materialization and this transaction.
+    pub fn adopt_authoritative_snapshot(
+        &self,
+        snapshot: &[SyncRecord],
+        metadata: &[u8],
+    ) -> Result<()> {
+        ensure!(
+            metadata.len() <= MAX_SHARE_METADATA,
+            "share metadata exceeds size limit"
+        );
+        let mut by_path = BTreeMap::new();
+        let mut names = BTreeMap::new();
+        for record in snapshot {
+            record.validate()?;
+            ensure!(
+                by_path.insert(record.path.clone(), record).is_none(),
+                "duplicate authoritative path"
+            );
+            if !record.tombstone {
+                ensure!(
+                    matches!(record.kind, SyncEntryKind::File | SyncEntryKind::Directory),
+                    "unsupported authoritative kind"
+                );
+                let parts: Vec<_> = record.path.components().collect();
+                for end in 1..=parts.len() {
+                    let path = WirePath::new(parts[..end].join("/"))?;
+                    if let Some(previous) = names.insert(collision_key(&path), path.clone()) {
+                        ensure!(previous == path, "authoritative namespace collision");
+                    }
+                }
+            }
+        }
+        for record in snapshot.iter().filter(|r| !r.tombstone) {
+            let parts: Vec<_> = record.path.components().collect();
+            for end in 1..parts.len() {
+                let parent = WirePath::new(parts[..end].join("/"))?;
+                ensure!(
+                    by_path
+                        .get(&parent)
+                        .is_some_and(|r| !r.tombstone && r.kind == SyncEntryKind::Directory),
+                    "authoritative namespace lacks live directory ancestor"
+                );
+            }
+        }
+        let generation = self
+            .metadata_value(GENERATION_KEY)?
+            .checked_add(1)
+            .context("index generation overflow")?;
+        let previous = self.records_map()?;
+        let mut adopted = BTreeMap::new();
+        let mut counter = self.metadata_value(REPLICA_COUNTER_KEY)?;
+        for record in snapshot {
+            counter = counter.max(record.version.get(self.replica));
+            adopted.insert(
+                record.path.clone(),
+                self.verify_adopted_record(record, None, &previous, generation)?,
+            );
+        }
+        // Verify that no live local-only rows would be silently hidden by replacement.
+        let mut traversal = Traversal::default();
+        collect_directory(
+            &self.root,
+            &self.root,
+            &self.ignored_paths,
+            true,
+            &mut traversal,
+        )?;
+        ensure!(
+            traversal.issues.is_empty()
+                && traversal.uncertain_paths.is_empty()
+                && !traversal.preserve_all_missing,
+            "authoritative traversal incomplete"
+        );
+        let actual: BTreeSet<_> = traversal
+            .candidates
+            .iter()
+            .map(|c| c.path.clone())
+            .collect();
+        let desired: BTreeSet<_> = snapshot
+            .iter()
+            .filter(|r| !r.tombstone)
+            .map(|r| r.path.clone())
+            .collect();
+        ensure!(
+            actual == desired,
+            "local namespace differs from authoritative snapshot"
+        );
+        let write = self.database.begin_write()?;
+        {
+            let mut table = write.open_table(RECORDS)?;
+            let keys = table
+                .iter()?
+                .map(|item| item.map(|(key, _)| key.value().to_owned()))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            for key in keys {
+                table.remove(key.as_str())?;
+            }
+            for (path, record) in adopted {
+                table.insert(path.as_str(), postcard::to_stdvec(&record)?.as_slice())?;
+            }
+        }
+        {
+            let mut retries = write.open_table(RETRIES)?;
+            let keys = retries
+                .iter()?
+                .map(|item| item.map(|(key, _)| key.value().to_owned()))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            for key in keys {
+                retries.remove(key.as_str())?;
+            }
+        }
+        write.open_table(SHARE_METADATA)?.insert(0, metadata)?;
+        write
+            .open_table(METADATA)?
+            .insert(GENERATION_KEY, generation)?;
+        write
+            .open_table(METADATA)?
+            .insert(REPLICA_COUNTER_KEY, counter)?;
+        write.commit()?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3148,5 +3283,99 @@ mod tests {
         assert!(trigger.event_count > 0);
         let created = fs::canonicalize(created).expect("path resolves");
         assert!(trigger.changed_paths.iter().any(|path| path == &created));
+    }
+}
+
+// A tombstoned descendant beneath a real file is absent after a directory-to-file
+// transition. Inspect each component rather than following a symbolic-link ancestor.
+fn path_is_absent(root: &Path, path: &WirePath) -> Result<bool> {
+    let mut current = root.to_path_buf();
+    let parts: Vec<_> = path.components().collect();
+    for (index, part) in parts.iter().enumerate() {
+        current.push(part);
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+            Err(error) => return Err(error.into()),
+        };
+        if index + 1 != parts.len() {
+            ensure!(
+                !metadata.file_type().is_symlink(),
+                "refusing tombstone beneath symbolic link"
+            );
+            if !metadata.is_dir() {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(test)]
+mod authoritative_tests {
+    use super::*;
+
+    #[test]
+    fn authoritative_adoption_removes_local_history_atomically_and_keeps_replica() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let replica = ReplicaId(Hash32::digest(b"member"));
+        let index = LocalIndex::open(
+            &root,
+            temp.path().join("index.redb"),
+            replica,
+            IndexOptions::default(),
+        )
+        .unwrap();
+        fs::write(root.join("local"), b"local work").unwrap();
+        index.scan().unwrap();
+        let before = index.sync_records().unwrap();
+        let mut version = VersionVector::default();
+        version.observe(ReplicaId(Hash32::digest(b"owner")), 7);
+        let record = SyncRecord {
+            schema_version: SYNC_RECORD_SCHEMA_V1,
+            path: WirePath::new("owner").unwrap(),
+            kind: SyncEntryKind::File,
+            size: 5,
+            content_hash: Some(Hash32::digest(b"owner")),
+            readonly: false,
+            version,
+            tombstone: false,
+        };
+        assert!(
+            index
+                .adopt_authoritative_snapshot(std::slice::from_ref(&record), b"checkpoint")
+                .is_err()
+        );
+        assert_eq!(index.sync_records().unwrap(), before);
+        assert_eq!(index.share_metadata().unwrap(), None);
+        fs::rename(root.join("local"), temp.path().join("preserved")).unwrap();
+        fs::write(root.join("owner"), b"owner").unwrap();
+        index
+            .adopt_authoritative_snapshot(std::slice::from_ref(&record), b"checkpoint")
+            .unwrap();
+        assert_eq!(index.sync_records().unwrap(), vec![record.clone()]);
+        drop(index);
+        assert_eq!(
+            LocalIndex::read_bound_replica(&root, temp.path().join("index.redb")).unwrap(),
+            Some(replica)
+        );
+        let index = LocalIndex::open(
+            &root,
+            temp.path().join("index.redb"),
+            replica,
+            IndexOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(index.sync_records().unwrap(), vec![record]);
+        assert_eq!(
+            index.share_metadata().unwrap(),
+            Some(b"checkpoint".to_vec())
+        );
+        assert_eq!(
+            fs::read(temp.path().join("preserved")).unwrap(),
+            b"local work"
+        );
     }
 }

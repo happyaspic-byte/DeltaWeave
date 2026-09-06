@@ -195,12 +195,15 @@ impl ShareService {
                     ShareError::StateUnavailable
                 );
             }
-            let report = index.scan()?;
+            let store = Arc::new(Store::open_with_recovery_reserver(&state_root, |path| {
+                crate::root_admission::reserve_private(path)
+            })?);
+            store.recover_path_changes(&root)?;
+            let runtime = OwnedRuntime::new(config, registry, index, store, lease)?;
+            let report = runtime.index.scan()?;
             crate::ensure_index_report_safe(&report)?;
-            let store = Arc::new(Store::open(&state_root)?);
-            Ok(Arc::new(OwnedRuntime::new(
-                config, registry, index, store, lease,
-            )?))
+            runtime.refresh_causal_state()?;
+            Ok(Arc::new(runtime))
         })
         .await??;
         self.registry.mark_ready(runtime.config.share_id)?;

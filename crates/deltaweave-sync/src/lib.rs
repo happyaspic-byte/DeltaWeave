@@ -24,6 +24,13 @@ use deltaweave_reconcile::{
 use deltaweave_store::Store;
 use serde::Serialize;
 
+mod read_only;
+mod shared;
+mod transport;
+pub use read_only::{PreservedLocalChange, ReadOnlyReport};
+pub use shared::{ManagedSyncConfig, ManagedSyncEngine, ManagedSyncFailure, ManagedSyncReport};
+use transport::ReconcileTransport;
+
 /// Durable local inputs for one reconciliation engine.
 #[derive(Clone, Debug)]
 pub struct SyncConfig {
@@ -44,13 +51,27 @@ pub struct SyncConfig {
 /// Reusable local half of a bidirectional reconciliation relationship.
 #[derive(Debug)]
 pub struct SyncEngine {
+    local: Arc<ReplicaState>,
+    client: SyncClient,
+}
+
+#[derive(Debug)]
+#[doc(hidden)]
+pub struct ReplicaState {
     _root_lease: deltaweave_net::root_admission::RootLease,
     root: PathBuf,
     index: Arc<LocalIndex>,
     store: Arc<Store>,
-    client: SyncClient,
     profile: ChunkingProfile,
     min_free_space_bytes: u64,
+    peer: String,
+}
+
+impl std::ops::Deref for SyncEngine {
+    type Target = ReplicaState;
+    fn deref(&self) -> &Self::Target {
+        &self.local
+    }
 }
 
 /// Auditable outcome after both peers have been re-read and proven converged.
@@ -153,15 +174,22 @@ impl SyncEngine {
                 ..IndexOptions::default()
             },
         )?);
-        let store = Arc::new(Store::open(state_root.join("store"))?);
+        let store = Arc::new(Store::open_with_recovery_reserver(
+            state_root.join("store"),
+            |path| deltaweave_net::root_admission::reserve_private(path),
+        )?);
+        deltaweave_net::recover_causal_index(&store, &index, &root)?;
         Ok(Self {
-            _root_lease: root_lease,
-            root,
-            index,
-            store,
+            local: Arc::new(ReplicaState {
+                _root_lease: root_lease,
+                root,
+                index,
+                store,
+                profile: config.profile,
+                min_free_space_bytes,
+                peer: config.client.remote.id.to_string(),
+            }),
             client: config.client,
-            profile: config.profile,
-            min_free_space_bytes,
         })
     }
 
@@ -180,33 +208,53 @@ impl SyncEngine {
         &self,
         observer: Option<TransferObserver>,
     ) -> Result<SyncReport> {
-        self.observe(&observer, "scanning", None, None, 0);
-        let outcome = async {
-            let scan = scan_index(Arc::clone(&self.index)).await?;
-            ensure_scan_is_safe(&scan, "local")?;
-            let local_records = read_records(Arc::clone(&self.index)).await?;
-            let local_tree = MerkleTree::from_records(local_records.clone())?;
-            let session = self.client.open_session().await?;
-            let outcome = self
-                .sync_with_session(&session, local_records, local_tree, &observer)
-                .await;
-            session.close().await;
+        let local = self.local.clone();
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            local.observe(&observer, "scanning", None, None, 0);
+            let outcome = async {
+                local.recover_pending()?;
+                let scan = scan_index(Arc::clone(&local.index)).await?;
+                ensure_scan_is_safe(&scan, "local")?;
+                let local_records = read_records(Arc::clone(&local.index)).await?;
+                let local_tree = MerkleTree::from_records(local_records.clone())?;
+                let session = client.open_session().await?;
+                let outcome = local
+                    .sync_with_session(&session, local_records, local_tree, &observer)
+                    .await;
+                session.close().await;
+                outcome
+            }
+            .await;
+            match &outcome {
+                Ok(report) => local.observe(
+                    &observer,
+                    "complete",
+                    None,
+                    None,
+                    report.pulled_bytes.saturating_add(report.pushed_bytes),
+                ),
+                Err(_) => local.observe(&observer, "error", None, None, 0),
+            }
             outcome
-        }
-        .await;
-        match &outcome {
-            Ok(report) => self.observe(
-                &observer,
-                "complete",
-                None,
-                None,
-                report.pulled_bytes.saturating_add(report.pushed_bytes),
-            ),
-            Err(_) => self.observe(&observer, "error", None, None, 0),
-        }
-        outcome
+        })
+        .await
+        .context("legacy sync task failed")?
+    }
+}
+
+impl ReplicaState {
+    fn recover_pending(&self) -> Result<()> {
+        deltaweave_net::recover_causal_index(&self.store, &self.index, &self.root)
     }
 
+    fn causal_binding(&self, record: &SyncRecord) -> Result<deltaweave_store::CausalBinding> {
+        Ok(deltaweave_store::CausalBinding {
+            record: record.clone(),
+            precondition: self.index.get(&record.path)?.map(|r| r.to_sync_record()),
+            authorization: None,
+        })
+    }
     fn observe(
         &self,
         observer: &Option<TransferObserver>,
@@ -221,14 +269,14 @@ impl SyncEngine {
                 path: path.map(|path| path.as_str().into()),
                 direction: direction.map(str::to_owned),
                 bytes,
-                peer: Some(self.client.remote.id.to_string()),
+                peer: Some(self.peer.clone()),
             });
         }
     }
 
     async fn sync_with_session(
         &self,
-        session: &SyncSession,
+        session: &impl ReconcileTransport,
         local_records: Vec<SyncRecord>,
         local_tree: MerkleTree,
         observer: &Option<TransferObserver>,
@@ -332,7 +380,7 @@ impl SyncEngine {
 
     async fn stage_desired_files(
         &self,
-        session: &SyncSession,
+        session: &impl ReconcileTransport,
         desired: &[SyncRecord],
         local: &[SyncRecord],
         remote: &[SyncRecord],
@@ -435,28 +483,20 @@ impl SyncEngine {
         deletions.sort_by_key(|record| std::cmp::Reverse(path_depth(&record.path)));
         for record in deletions {
             self.store
-                .remove_path(&record.path, &self.root, record.logical_hash())?;
+                .apply_causal_record(&self.root, self.causal_binding(record)?, None)?;
             self.index.adopt_verified_record(record)?;
-        }
-
-        let mut live = action_records(actions, false, None);
-        live.sort_by_key(|record| std::cmp::Reverse(path_depth(&record.path)));
-        for record in &live {
-            if current
-                .get(&record.path)
-                .is_some_and(|existing| !existing.tombstone && existing.kind != record.kind)
-            {
-                self.store
-                    .remove_path(&record.path, &self.root, record.logical_hash())?;
-            }
+            self.store.mark_record_indexed(&self.root, record)?;
         }
 
         let mut directories = action_records(actions, false, Some(SyncEntryKind::Directory));
         directories.sort_by_key(|record| path_depth(&record.path));
         for record in directories {
-            let path = self.store.materialize_directory(&record.path, &self.root)?;
-            apply_readonly(&path, record.readonly)?;
+            self.store
+                .apply_causal_record(&self.root, self.causal_binding(record)?, None)?;
+            self.store
+                .set_readonly(&self.root, &record.path, record.readonly)?;
             self.index.adopt_verified_record(record)?;
+            self.store.mark_record_indexed(&self.root, record)?;
         }
 
         let mut files = action_records(actions, false, Some(SyncEntryKind::File));
@@ -475,18 +515,24 @@ impl SyncEngine {
                 0,
             )
             .check_materialization(manifest.size)?;
-            let outcome = self.store.materialize(manifest, &record.path, &self.root)?;
-            let observation = outcome
-                .observation
-                .after_readonly_update(&outcome.destination, record.readonly)?;
+            let change = self.store.apply_causal_record(
+                &self.root,
+                self.causal_binding(record)?,
+                Some(manifest),
+            )?;
+            let observation = self
+                .store
+                .observe_path_change(&change)?
+                .after_readonly_update(local_path(&self.root, &record.path), record.readonly)?;
             self.index.adopt_materialized_record(record, &observation)?;
+            self.store.mark_record_indexed(&self.root, record)?;
         }
         Ok(())
     }
 
     async fn apply_remote(
         &self,
-        session: &SyncSession,
+        session: &impl ReconcileTransport,
         actions: &[ApplyAction],
         observer: &Option<TransferObserver>,
     ) -> Result<RemoteStats> {
@@ -637,24 +683,6 @@ fn local_path(root: &Path, path: &WirePath) -> PathBuf {
 
 fn path_depth(path: &WirePath) -> usize {
     path.components().count()
-}
-
-fn apply_readonly(path: &Path, readonly: bool) -> Result<()> {
-    let mut permissions = fs::symlink_metadata(path)?.permissions();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = permissions.mode();
-        permissions.set_mode(if readonly {
-            mode & !0o222
-        } else {
-            mode | 0o200
-        });
-    }
-    #[cfg(not(unix))]
-    permissions.set_readonly(readonly);
-    fs::set_permissions(path, permissions)?;
-    Ok(())
 }
 
 #[cfg(test)]

@@ -81,6 +81,7 @@ impl OwnedRuntime {
             next_connection: AtomicU64::new(1),
             changed: Notify::new(),
         };
+        runtime.recover_pending()?;
         runtime.refresh_causal_state()?;
         Ok(runtime)
     }
@@ -314,10 +315,49 @@ impl Authorization {
     }
     /// Runs under the share gate after the existing authoritative pre-apply rescan.
     pub fn candidate_metadata(&self, record: &SyncRecord) -> Result<Vec<u8>> {
-        let member = self.check(true)?;
-        self.runtime.refresh_causal_state()?;
-        let mut state = self.runtime.causal_state()?;
-        let known = self.runtime.registry.known(record_share(self))?;
+        self.check(true)?;
+        self.runtime
+            .candidate_metadata_for(self.peer, self.epoch, record)
+    }
+
+    pub fn recovery_context(&self, record: &SyncRecord) -> Result<Vec<u8>> {
+        self.check(true)?;
+        Ok(postcard::to_stdvec(&RecoveryContext {
+            version: 1,
+            share: self.runtime.config.share_id,
+            owner: self.runtime.config.owner,
+            peer: self.peer,
+            epoch: self.epoch,
+            record_hash: record.logical_hash(),
+        })?)
+    }
+
+    pub fn recover_pending(&self) -> Result<()> {
+        self.runtime.recover_pending()
+    }
+}
+#[derive(Serialize, Deserialize)]
+struct RecoveryContext {
+    version: u8,
+    share: ShareId,
+    owner: EndpointId,
+    peer: EndpointId,
+    epoch: u64,
+    record_hash: Hash32,
+}
+
+impl OwnedRuntime {
+    fn candidate_metadata_for(
+        &self,
+        peer: EndpointId,
+        epoch: u64,
+        record: &SyncRecord,
+    ) -> Result<Vec<u8>> {
+        let member = self.registry.authorize(self.config.share_id, peer, true)?;
+        ensure!(member.epoch == epoch, ShareError::MemberRevoked);
+        self.refresh_causal_state()?;
+        let mut state = self.causal_state()?;
+        let known = self.registry.known(self.config.share_id)?;
         ensure!(
             record.version.iter().count() <= MAX_REPLICAS
                 && postcard::to_stdvec(&record.version)?.len() <= 256 * 1024,
@@ -340,7 +380,7 @@ impl Authorization {
             *ceiling = (*ceiling).max(counter);
         }
         state.audit.push(MutationProvenance {
-            peer: self.peer,
+            peer,
             membership_epoch: member.epoch,
             path: record.path.clone(),
             operation: if record.tombstone { "delete" } else { "adopt" }.into(),
@@ -354,7 +394,44 @@ impl Authorization {
         ensure!(metadata.len() <= 2 * 1024 * 1024, ShareError::InvalidRecord);
         Ok(metadata)
     }
-}
-fn record_share(auth: &Authorization) -> ShareId {
-    auth.runtime.config.share_id
+
+    /// Called only under the runtime gate, or before this runtime is published.
+    pub fn recover_pending(&self) -> Result<()> {
+        crate::recover_causal_index_with(&self.store, &self.index, &self.config.root, |binding| {
+            let context: RecoveryContext = postcard::from_bytes(
+                binding
+                    .authorization
+                    .as_deref()
+                    .ok_or(ShareError::StateUnavailable)?,
+            )
+            .map_err(|_| ShareError::StateUnavailable)?;
+            ensure!(
+                context.version == 1
+                    && context.share == self.config.share_id
+                    && context.owner == self.config.owner
+                    && context.record_hash == binding.record.logical_hash(),
+                ShareError::StateUnavailable
+            );
+            match self
+                .registry
+                .authorize(self.config.share_id, context.peer, true)
+            {
+                Ok(member) if member.epoch == context.epoch => {
+                    Ok(crate::RecoveryDecision::Adopt(Some(
+                        self.candidate_metadata_for(context.peer, context.epoch, &binding.record)?,
+                    )))
+                }
+                Ok(_) => Ok(crate::RecoveryDecision::Rollback),
+                Err(error)
+                    if matches!(
+                        ShareError::classify(&error),
+                        ShareError::MemberRevoked | ShareError::PermissionDenied
+                    ) =>
+                {
+                    Ok(crate::RecoveryDecision::Rollback)
+                }
+                Err(_) => Err(ShareError::StateUnavailable.into()),
+            }
+        })
+    }
 }

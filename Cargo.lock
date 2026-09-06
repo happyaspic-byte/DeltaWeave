@@ -762,6 +762,7 @@ dependencies = [
  "deltaweave-core",
  "postcard",
  "redb",
+ "rustix",
  "serde",
  "tempfile",
  "winapi-util",

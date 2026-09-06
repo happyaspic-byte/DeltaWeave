@@ -10,6 +10,8 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+iroh.workspace = true
+postcard.workspace = true
 deltaweave-core = { path = "../deltaweave-core" }
 deltaweave-index = { path = "../deltaweave-index" }
 deltaweave-net = { path = "../deltaweave-net" }
@@ -19,8 +21,6 @@ serde.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
-iroh.workspace = true
-postcard.workspace = true
 redb.workspace = true
 tempfile.workspace = true
 

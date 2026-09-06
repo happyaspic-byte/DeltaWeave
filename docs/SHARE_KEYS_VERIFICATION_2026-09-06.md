@@ -127,6 +127,25 @@ identity를 유지했다. 실제 공유 키 전환은 아직 이 준비 단계�
 다시 검증한다. 증거는 `/tmp/deltaweave-crossfs-probe-zstw7got/result.json`과
 `/dev/shm/deltaweave-crossfs-state-gnobqc4z/`에 있다. 해당 시험 프로세스는 종료했다.
 
+## 동기화·복구 단계의 중간 검증
+
+아래는 구현 중인 동기화 단계에서 실제 실행한 중간 결과다. 아직 이 단계의 최종
+커밋과 독립 리뷰가 끝나지 않았으며, 이후 수정한 전체 코드를 검증한 결과로 보지 않는다.
+
+| 시험 | 확인한 동작 | 증거 |
+| --- | --- | --- |
+| 서로 다른 owner/RW/RO endpoint | RW 전송, RO 수신·로컬 수정 보존·로컬 추가 비전파·로컬 삭제 복원·원격 삭제 보존 및 서비스/엔진 재시작 | `/tmp/dw-task3-shared-green.log` |
+| 실제 두 파일시스템의 RO 중단 | prepared/path-prepared/preserved/materialized/adopted 각 단계에서 프로세스 종료 후 원래 사본을 같은 경로에 하나만 유지하며 복구 | `/tmp/dw-task3-restarts-green.log` |
+| 실제 v1/v2 전송 | root 장치 36과 state 장치 26에서 최초 전송·교체·삭제 및 보존 journal 4건의 commit 통과 | `/tmp/dw-task3-physical-legacy.log` |
+| 악성 RO 출처 대체 | 유효한 형식의 변조된 v2/v3 스냅샷을 제공해도 managed RW가 거부하고 owner/다른 RW 파일은 그대로 유지 | `/tmp/dw-task3-laundering.log` |
+
+추가로 실제 owner 프로세스를 파일 생성 후 인덱스 채택 전에 종료하여, 재시작 시
+상대의 변경을 소유자의 새 변경으로 잘못 기록하는 결함을 재현했다. 실패 증거는
+`/tmp/dw-task3-causal-recovery-red.log`다. 정확한 인과 기록과 인증된 출처를 보존하는
+복구, 권한 해제된 적용의 안전한 되돌리기 및 경합 시 데이터 보존을 수정·검증 중이다.
+이 실패가 해결되고 영향 범위 검사와 리뷰를 통과하기 전에는 해당 단계를 완료로
+판정하지 않는다.
+
 ## 증거 위치와 남은 필수 검증
 
 작업 환경의 임시 증거 위치:

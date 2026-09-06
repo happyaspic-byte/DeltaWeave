@@ -14,8 +14,14 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+
+mod preservation;
 use deltaweave_cdc::{manifest_from_path, read_chunk, verify_chunk};
 use deltaweave_core::{ChunkDescriptor, ChunkingProfile, FileManifest, Hash32, WirePath};
+pub use preservation::{
+    CausalBinding, PathChange, PathChangeState, PathObservation, PathTarget, PreservationError,
+    RecoveryReserver,
+};
 use redb::{Database, ReadableDatabase, TableDefinition};
 use serde::{Deserialize, Serialize};
 
@@ -261,26 +267,6 @@ impl ChunkStore {
             hash
         ))
     }
-
-    fn trash_path(&self, path: &WirePath, manifest_hash: Hash32) -> Result<PathBuf> {
-        // Reserve the recovery directory atomically: the sequence restarts with the process,
-        // and a previous operation's recovery data must never be overwritten.
-        let mut destination = loop {
-            let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let directory = self
-                .trash
-                .join(format!("replace-{manifest_hash}-{sequence}"));
-            match private_directory_builder().create(&directory) {
-                Ok(()) => break directory,
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error.into()),
-            }
-        };
-        for component in path.components() {
-            destination.push(component);
-        }
-        Ok(destination)
-    }
 }
 
 /// ACID metadata index backed by redb.
@@ -396,12 +382,24 @@ pub struct Store {
     chunks: ChunkStore,
     metadata: MetadataStore,
     materialize_lock: Mutex<()>,
+    recovery_reserver: Option<RecoveryReserver>,
 }
 
 impl Store {
     /// Opens a complete DeltaWeave state directory.
     pub fn open(state_root: impl AsRef<Path>) -> Result<Self> {
-        let state_root = state_root.as_ref();
+        Self::open_inner(state_root.as_ref(), None)
+    }
+
+    /// Opens storage with the host admission service used to reserve private recovery vaults.
+    pub fn open_with_recovery_reserver(
+        state_root: impl AsRef<Path>,
+        reserver: RecoveryReserver,
+    ) -> Result<Self> {
+        Self::open_inner(state_root.as_ref(), Some(reserver))
+    }
+
+    fn open_inner(state_root: &Path, recovery_reserver: Option<RecoveryReserver>) -> Result<Self> {
         private_directory_builder()
             .recursive(true)
             .create(state_root)?;
@@ -410,6 +408,7 @@ impl Store {
             chunks: ChunkStore::open(state_root)?,
             metadata: MetadataStore::open(state_root.join("metadata.redb"))?,
             materialize_lock: Mutex::new(()),
+            recovery_reserver,
         })
     }
 
@@ -512,15 +511,6 @@ impl Store {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(error.into()),
         };
-        if existing
-            .as_ref()
-            .is_some_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
-        {
-            bail!(
-                "refusing to replace destination directory {} with a file",
-                destination.display()
-            );
-        }
         if existing.as_ref().is_some_and(|metadata| {
             metadata.is_file()
                 && !metadata.file_type().is_symlink()
@@ -535,20 +525,12 @@ impl Store {
                 destination,
                 bytes_written: 0,
                 replaced_existing: false,
+                preserved_path: None,
+                operation_id: None,
                 already_current: true,
                 observation,
             });
         }
-
-        let parent = destination
-            .parent()
-            .context("validated destination unexpectedly has no parent")?;
-        fs::create_dir_all(parent)?;
-        let temporary = parent.join(format!(
-            ".deltaweave-{}-{}.part",
-            manifest.manifest_hash(),
-            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ));
 
         let operation = OperationRecord {
             id: operation_id(path, manifest),
@@ -557,82 +539,41 @@ impl Store {
             state: OperationState::Prepared,
         };
         self.metadata.put_operation(&operation)?;
-
-        let write_result = (|| -> Result<()> {
-            let mut output = OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&temporary)?;
-            let mut file_hasher = blake3::Hasher::new();
-            for chunk in &manifest.chunks {
-                let bytes = self.chunks.read_verified(chunk.hash)?;
-                if bytes.len() != chunk.length as usize {
-                    bail!(
-                        "chunk {} has length {}, expected {}",
-                        chunk.hash,
-                        bytes.len(),
-                        chunk.length
-                    );
-                }
-                output.write_all(&bytes)?;
-                file_hasher.update(&bytes);
-            }
-            output.sync_all()?;
-            let actual = Hash32::from_bytes(*file_hasher.finalize().as_bytes());
-            if actual != manifest.file_hash {
-                bail!(
-                    "materialized file hash mismatch: expected {}, got {}",
-                    manifest.file_hash,
-                    actual
-                );
-            }
-            Ok(())
-        })();
-        if let Err(error) = write_result {
-            let _ = fs::remove_file(&temporary);
-            return Err(error);
+        // Validate the combined representation before allocating recovery paths.
+        let mut hasher = blake3::Hasher::new();
+        for chunk in &manifest.chunks {
+            let bytes = self.chunks.read_verified(chunk.hash)?;
+            anyhow::ensure!(
+                bytes.len() == chunk.length as usize,
+                "cached extent has incorrect length"
+            );
+            hasher.update(&bytes);
         }
-
-        let replaced_existing = match fs::symlink_metadata(&destination) {
-            Ok(_) => true,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-            Err(error) => return Err(error.into()),
-        };
-        let backup = if replaced_existing {
-            Some(self.chunks.trash_path(path, manifest.manifest_hash())?)
-        } else {
-            None
-        };
-        if let Some(backup) = &backup {
-            if let Some(parent) = backup.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::rename(&destination, backup).with_context(|| {
-                format!("failed to preserve existing {}", destination.display())
-            })?;
-        }
-
-        if let Err(error) = fs::rename(&temporary, &destination) {
-            if let Some(backup) = &backup {
-                let _ = fs::rename(backup, &destination);
-            }
-            let _ = fs::remove_file(&temporary);
-            return Err(error)
-                .with_context(|| format!("failed to install {}", destination.display()));
-        }
-        sync_directory(Some(parent))?;
-
-        self.metadata.put_manifest(path, manifest)?;
+        anyhow::ensure!(
+            Hash32::from_bytes(*hasher.finalize().as_bytes()) == manifest.file_hash,
+            "materialized file hash mismatch"
+        );
+        let expected = PathObservation::read(destination_root, path)?;
+        let mut change = self.prepare_path_change(
+            destination_root,
+            path,
+            PathTarget::File(manifest.clone()),
+            expected,
+            false,
+        )?;
+        self.capture_path_change(&mut change)?;
+        self.materialize_path_change(&mut change)?;
         self.metadata.put_operation(&OperationRecord {
             state: OperationState::Committed,
             ..operation
         })?;
-
         let observation = materialization_observation(&destination, manifest.file_hash)?;
         Ok(MaterializeOutcome {
             destination,
             bytes_written: manifest.size,
-            replaced_existing,
+            replaced_existing: change.expected.is_some(),
+            preserved_path: change.expected.as_ref().map(|_| change.artifact.clone()),
+            operation_id: Some(change.id),
             already_current: false,
             observation,
         })
@@ -651,19 +592,21 @@ impl Store {
         let destination_root = destination_root.as_ref();
         fs::create_dir_all(destination_root)?;
         let destination = checked_destination(destination_root, path)?;
-        match fs::symlink_metadata(&destination) {
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-                bail!(
-                    "refusing to replace non-directory {} with a directory",
-                    destination.display()
-                );
-            }
-            Ok(_) => return Ok(destination),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
+        if fs::symlink_metadata(&destination)
+            .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+        {
+            return Ok(destination);
         }
-        fs::create_dir_all(&destination)?;
-        sync_directory(destination.parent())?;
+        let expected = PathObservation::read(destination_root, path)?;
+        let mut change = self.prepare_path_change(
+            destination_root,
+            path,
+            PathTarget::Directory,
+            expected,
+            false,
+        )?;
+        self.capture_path_change(&mut change)?;
+        self.materialize_path_change(&mut change)?;
         Ok(destination)
     }
 
@@ -675,7 +618,7 @@ impl Store {
         &self,
         path: &WirePath,
         destination_root: impl AsRef<Path>,
-        tombstone_hash: Hash32,
+        _tombstone_hash: Hash32,
     ) -> Result<RemoveOutcome> {
         let _guard = self
             .materialize_lock
@@ -684,8 +627,8 @@ impl Store {
         let destination_root = destination_root.as_ref();
         fs::create_dir_all(destination_root)?;
         let destination = checked_destination(destination_root, path)?;
-        let metadata = match fs::symlink_metadata(&destination) {
-            Ok(metadata) => metadata,
+        match fs::symlink_metadata(&destination) {
+            Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(RemoveOutcome {
                     destination,
@@ -697,32 +640,16 @@ impl Store {
             Err(error) => return Err(error.into()),
         };
 
-        let preserved_path = if metadata.is_dir() && !metadata.file_type().is_symlink() {
-            fs::remove_dir(&destination).with_context(|| {
-                format!(
-                    "refusing to remove non-empty or unavailable directory {}",
-                    destination.display()
-                )
-            })?;
-            None
-        } else {
-            let backup = self.chunks.trash_path(path, tombstone_hash)?;
-            if let Some(parent) = backup.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::rename(&destination, &backup).with_context(|| {
-                format!(
-                    "failed to preserve deleted {} in trash",
-                    destination.display()
-                )
-            })?;
-            Some(backup)
-        };
-        sync_directory(destination.parent())?;
+        let expected = PathObservation::read(destination_root, path)?;
+        let mut change =
+            self.prepare_path_change(destination_root, path, PathTarget::Absent, expected, false)?;
+        self.capture_path_change(&mut change)?;
+        self.materialize_path_change(&mut change)?;
+        let preserved_path = Some(change.artifact);
         Ok(RemoveOutcome {
             destination,
             removed: true,
-            preserved_in_trash: preserved_path.is_some(),
+            preserved_in_trash: true,
             preserved_path,
         })
     }
@@ -814,6 +741,10 @@ pub struct MaterializeOutcome {
     pub bytes_written: u64,
     /// Whether a different existing file was preserved in trash.
     pub replaced_existing: bool,
+    /// Actual retained same-volume recovery object, outside the shared namespace.
+    pub preserved_path: Option<PathBuf>,
+    /// Unique journal attempt for caller index completion.
+    pub operation_id: Option<String>,
     /// Whether the destination already contained the requested content.
     pub already_current: bool,
     /// Metadata fingerprint captured after the verified file was installed.
@@ -943,7 +874,15 @@ fn change_time_ns(_metadata: &std::fs::Metadata) -> Option<u128> {
 }
 
 fn apply_readonly(path: &Path, readonly: bool) -> Result<()> {
-    let mut permissions = fs::symlink_metadata(path)?.permissions();
+    let file = preservation::open_nofollow(path, false, false)?;
+    let metadata = file.metadata()?;
+    if metadata.permissions().readonly() == readonly {
+        return Ok(());
+    }
+    if metadata.is_file() && !has_unique_file_link(path, &metadata) {
+        bail!("refusing to change permissions on a hardlinked file");
+    }
+    let mut permissions = metadata.permissions();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -956,7 +895,7 @@ fn apply_readonly(path: &Path, readonly: bool) -> Result<()> {
     }
     #[cfg(not(unix))]
     permissions.set_readonly(readonly);
-    fs::set_permissions(path, permissions)?;
+    file.set_permissions(permissions)?;
     Ok(())
 }
 
@@ -985,7 +924,7 @@ fn file_identity(_path: &Path, _metadata: &std::fs::Metadata) -> Option<(u64, u6
 }
 
 fn file_matches_manifest(path: &Path, manifest: &FileManifest) -> Result<bool> {
-    let mut file = File::open(path)?;
+    let mut file = preservation::open_nofollow(path, false, false)?;
     if file.metadata()?.len() != manifest.size {
         return Ok(false);
     }
