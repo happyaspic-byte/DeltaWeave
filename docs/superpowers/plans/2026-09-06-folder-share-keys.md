@@ -79,7 +79,7 @@ exposed through a general arbitrary-key mutation API.
 
 ### Task 3: Reuse causal RW sync and implement preserving RO application
 
-**Files:** `crates/deltaweave-sync/src/lib.rs`, new `read_only.rs`/shared sync module, focused `deltaweave-index` authoritative snapshot adoption method if necessary, preserving move/recovery helpers in `deltaweave-store`, `crates/deltaweave-sync/tests/shares.rs` and focused store regressions.
+**Files:** `crates/deltaweave-sync/src/lib.rs`, new `read_only.rs`/shared sync module, focused `deltaweave-index` authoritative snapshot adoption method if necessary, preserving move/recovery helpers in `deltaweave-store`, focused net/service and necessary direct-CLI constructor/adoption hooks, `crates/deltaweave-sync/tests/shares.rs` and focused store regressions.
 
 **Interfaces:** consumes the authenticated shared-session surface from Task 2. Produces managed RW synchronization with existing `SyncReport` semantics, separate RO synchronization, and a serializable RO report including preserved conflict locations. `LocalIndex` authoritative adoption validates all records and namespace and durably removes local-only versions without changing existing data schemas.
 
@@ -99,6 +99,10 @@ cargo clippy --locked -p deltaweave-index -p deltaweave-sync --all-targets --all
 
 Include store tests/static checks and an actual two-filesystem transfer/recovery
 run for the preservation fix; record the filesystem identities in evidence.
+Check the affected net/caller surfaces as well. Keep Store independent of net by
+passing a private-recovery reservation callback from admitted callers. Ordinary
+Windows replacement/deletion must use a working safe primitive; cross-compilation
+does not replace the later required Windows runtime evidence.
 
 - [ ] Commit, record real network evidence, and obtain independent spec/quality review.
 
