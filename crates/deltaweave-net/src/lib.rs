@@ -378,9 +378,10 @@ pub async fn start_server_observed(
         max_connections > 0,
         "max_connections must be greater than zero"
     );
-    let root_lease = Arc::new(root_admission::acquire(
+    let root_lease = Arc::new(root_admission::acquire_with_private(
         &destination_root,
         root_admission::RootUse::Legacy,
+        std::slice::from_ref(&state_root),
     )?);
     let replica = ReplicaId(Hash32::digest(secret_key.public().as_bytes()));
     let (destination_root, state_root) = prepare_server_roots(&destination_root, &state_root)?;

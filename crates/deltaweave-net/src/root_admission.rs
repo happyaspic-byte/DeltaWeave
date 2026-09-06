@@ -15,6 +15,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+const PRIVATE: TableDefinition<&str, &[u8]> = TableDefinition::new("private_roots_v1");
+
 const ROOTS: TableDefinition<&str, &[u8]> = TableDefinition::new("root_admission_v1");
 
 /// Publication/mutation role for a root. Managed bindings survive lease release.
@@ -47,15 +49,59 @@ struct Entry {
 /// Uses the fixed private directory for the current OS user's application data.
 /// Configurable state paths and web data directories do not affect admission.
 pub fn acquire(path: impl AsRef<Path>, kind: RootUse) -> Result<RootLease> {
+    acquire_with_private(path, kind, &[])
+}
+
+/// Atomically preflights a public root and all its external private directories.
+/// Private reservations are durable; retain the returned public lease through all
+/// handlers. No target directory is created when namespace preflight is denied.
+pub fn acquire_with_private(
+    path: impl AsRef<Path>,
+    kind: RootUse,
+    private: &[PathBuf],
+) -> Result<RootLease> {
+    Ok(admit_with_private(path.as_ref(), kind, private, |_, _| Ok(()))?.0)
+}
+
+/// Permanently excludes a private directory from every current-binary public
+/// namespace, even after shutdown. Private/private nesting is allowed. Call this
+/// before writing device state, member state, or an external recovery vault.
+/// Successful reservation creates the directory; later preparation failures keep
+/// the reservation. This API never removes ownership or private reservations.
+pub fn reserve_private(path: impl AsRef<Path>) -> Result<PathBuf> {
+    let (_, root) = admit_at(
+        &registry_path()?,
+        None,
+        &[path.as_ref().to_path_buf()],
+        |_, private| Ok(private[0].clone()),
+    )?;
+    Ok(root)
+}
+
+fn registry_path() -> Result<PathBuf> {
     #[cfg(windows)]
     let home = std::env::var_os("USERPROFILE").context("user profile is unavailable")?;
     #[cfg(not(windows))]
     let home = std::env::var_os("HOME").context("user home is unavailable")?;
-    acquire_at(
-        &PathBuf::from(home).join(".deltaweave/root-admission"),
-        path.as_ref(),
-        kind,
-    )
+    Ok(PathBuf::from(home).join(".deltaweave/root-admission"))
+}
+
+/// Lock order: service lifecycle -> global admission file lock -> short catalog
+/// callback. The callback must not recurse into admission or await. Runtime gates
+/// and disk handlers are acquired only after this function returns.
+pub(crate) fn admit_with_private<T>(
+    path: &Path,
+    kind: RootUse,
+    private: &[PathBuf],
+    prepare: impl FnOnce(&Path, &[PathBuf]) -> Result<T>,
+) -> Result<(RootLease, T)> {
+    let (lease, result) = admit_at(
+        &registry_path()?,
+        Some((path, kind)),
+        private,
+        |root, private| prepare(root.context("missing public admission")?, private),
+    )?;
+    Ok((lease.context("missing public lease")?, result))
 }
 
 pub(crate) fn private_directory(path: &Path) -> Result<()> {
@@ -144,37 +190,72 @@ fn write_marker(entry: &Entry) -> Result<()> {
     Ok(())
 }
 
+/// Resolves existing components (including aliases) and then missing suffixes
+/// without mkdir. Parent components are evaluated against the canonical prefix.
+fn prospective_root(path: &Path) -> Result<PathBuf> {
+    use std::path::Component;
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut root = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::ParentDir => {
+                root.pop();
+            }
+            Component::CurDir => {}
+            other => {
+                root.push(other.as_os_str());
+                match fs::symlink_metadata(&root) {
+                    Ok(_) => {
+                        root = fs::canonicalize(&root).context("cannot resolve admitted path")?
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+    }
+    Ok(root)
+}
+fn overlaps(a: &Path, b: &Path) -> bool {
+    a.starts_with(b) || b.starts_with(a)
+}
+
+#[cfg(test)]
 fn acquire_at(registry: &Path, path: &Path, kind: RootUse) -> Result<RootLease> {
-    private_directory(registry)?;
-    let registry = fs::canonicalize(registry)?;
-    let global = private_file(&registry.join("registry.lock"))?;
-    fs2::FileExt::lock_exclusive(&global)?;
+    Ok(admit_at(registry, Some((path, kind)), &[], |_, _| Ok(()))?
+        .0
+        .unwrap())
+}
+
+#[derive(Default)]
+struct AdmissionCatalog {
+    public: Vec<(String, Entry)>,
+    private: Vec<PathBuf>,
+}
+fn read_admission(path: &Path) -> Result<AdmissionCatalog> {
     if !path.exists() {
-        fs::create_dir_all(path)?;
+        return Ok(AdmissionCatalog::default());
     }
-    let root = fs::canonicalize(path).context("cannot canonicalize admitted root")?;
-    ensure!(
-        !registry.starts_with(&root),
-        "network root contains private admission registry"
-    );
-    if matches!(kind, RootUse::Managed { .. }) {
-        ensure!(root.is_dir(), "managed root must be a directory");
-        sidecar_path(&root)?;
-    }
-    let key = binding(&root)?;
-    let db = Database::create(registry.join("roots.redb"))?;
-    #[cfg(unix)]
-    File::open(&registry)?.sync_all()?;
-    {
-        let tx = db.begin_write()?;
-        tx.open_table(ROOTS)?;
-        tx.commit()?;
-    }
-    let entries: Vec<(String, Entry)> = {
-        let read = db.begin_read()?;
-        read.open_table(ROOTS)?
-            .iter()?
-            .map(|row| {
+    let db = match redb::ReadOnlyDatabase::open(path) {
+        Ok(db) => db,
+        Err(redb::DatabaseError::RepairAborted) => {
+            // A process may die after committing intent but before redb saves
+            // allocator state on close. Recover only that specific condition,
+            // under the global lock, without resetting either reservation table.
+            drop(Database::open(path)?);
+            redb::ReadOnlyDatabase::open(path)?
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let read = db.begin_read()?;
+    let mut entries = Vec::new();
+    match read.open_table(ROOTS) {
+        Ok(table) => {
+            for row in table.iter()? {
                 let (key, value) = row?;
                 ensure!(value.value().len() <= 32768, "admission entry too large");
                 let entry: Entry = postcard::from_bytes(value.value())?;
@@ -187,68 +268,223 @@ fn acquire_at(registry: &Path, path: &Path, kind: RootUse) -> Result<RootLease> 
                     entry.version == 1 && binding(&entry.root)? == key.value(),
                     "invalid admission binding"
                 );
-                Ok((key.value().to_owned(), entry))
-            })
-            .collect::<Result<_>>()?
-    };
-    for (other_key, mut entry) in entries {
+                entries.push((key.value().to_owned(), entry));
+            }
+        }
+        Err(redb::TableError::TableDoesNotExist(_)) => {}
+        Err(error) => return Err(error.into()),
+    }
+    let mut private = Vec::new();
+    match read.open_table(PRIVATE) {
+        Ok(table) => {
+            for row in table.iter()? {
+                let (key, value) = row?;
+                ensure!(
+                    value.value().len() <= 32768,
+                    "private reservation too large"
+                );
+                let root: PathBuf = postcard::from_bytes(value.value())?;
+                ensure!(
+                    postcard::to_stdvec(&root)? == value.value() && binding(&root)? == key.value(),
+                    "invalid private reservation"
+                );
+                private.push(root);
+            }
+        }
+        Err(redb::TableError::TableDoesNotExist(_)) => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(AdmissionCatalog {
+        public: entries,
+        private,
+    })
+}
+
+fn admit_at<T>(
+    registry: &Path,
+    public: Option<(&Path, RootUse)>,
+    private: &[PathBuf],
+    prepare: impl FnOnce(Option<&Path>, &[PathBuf]) -> Result<T>,
+) -> Result<(Option<RootLease>, T)> {
+    // The registry itself is private even before the initial bootstrap mkdir.
+    let proposed_registry = prospective_root(registry)?;
+    if let Some((path, _)) = &public {
+        ensure!(
+            !overlaps(&prospective_root(path)?, &proposed_registry),
+            "network root overlaps private admission registry"
+        );
+    }
+    private_directory(registry)?;
+    let registry = fs::canonicalize(registry)?;
+    let global = private_file(&registry.join("registry.lock"))?;
+    fs2::FileExt::lock_exclusive(&global)?;
+    let public = public
+        .map(|(path, kind)| Ok::<_, anyhow::Error>((prospective_root(path)?, kind)))
+        .transpose()?;
+    let private: Vec<PathBuf> = private
+        .iter()
+        .map(|path| prospective_root(path))
+        .collect::<Result<_>>()?;
+    if let Some((root, kind)) = &public {
+        ensure!(
+            !overlaps(root, &registry),
+            "network root overlaps private admission registry"
+        );
+        ensure!(
+            !private.iter().any(|path| overlaps(root, path)),
+            "network root overlaps requested private state"
+        );
+        if matches!(kind, RootUse::Managed { .. }) {
+            sidecar_path(root)?;
+        }
+    }
+    let catalog = read_admission(&registry.join("roots.redb"))?;
+    for root in catalog.private {
+        if let Some((public, _)) = &public {
+            ensure!(
+                !overlaps(public, &root),
+                "network root overlaps reserved private state"
+            );
+        }
+    }
+    let mut stale = Vec::new();
+    for (other_key, mut entry) in catalog.public {
         let lock = private_file(&registry.join(format!("{other_key}.lease")))?;
         let live = fs2::FileExt::try_lock_exclusive(&lock).is_err();
         if entry.kind == RootUse::Legacy && !live {
-            let tx = db.begin_write()?;
-            tx.open_table(ROOTS)?.remove(other_key.as_str())?;
-            tx.commit()?;
+            stale.push(other_key);
             continue;
         }
+        ensure!(
+            !private.iter().any(|path| overlaps(path, &entry.root)),
+            "private state overlaps an active or managed root"
+        );
         if matches!(entry.kind, RootUse::Managed { .. }) {
             if entry.preparing {
                 write_marker(&entry)?;
                 entry.preparing = false;
-                persist(&db, &other_key, &entry)?;
+                // Recovery of previously committed intent is independent of this request.
+                persist(
+                    &Database::open(registry.join("roots.redb"))?,
+                    &other_key,
+                    &entry,
+                )?;
             } else {
-                let marker = sidecar_path(&entry.root)?;
                 ensure!(
-                    fs::read(marker)? == postcard::to_stdvec(&entry)?,
+                    fs::read(sidecar_path(&entry.root)?)? == postcard::to_stdvec(&entry)?,
                     "managed ownership marker missing or inconsistent"
                 );
             }
         }
-        if root.starts_with(&entry.root) || entry.root.starts_with(&root) {
+        if let Some((root, kind)) = &public
+            && overlaps(root, &entry.root)
+        {
             ensure!(
-                !live && root == entry.root && kind == entry.kind && kind != RootUse::Legacy,
+                !live && *root == entry.root && *kind == entry.kind && *kind != RootUse::Legacy,
                 "network root overlaps an active or managed root"
             );
         }
     }
-    let lock = private_file(&registry.join(format!("{key}.lease")))?;
-    fs2::FileExt::try_lock_exclusive(&lock).context("network root already leased")?;
-    let mut entry = Entry {
-        version: 1,
-        root: root.clone(),
-        preparing: matches!(kind, RootUse::Managed { .. }),
-        kind,
-    };
-    // Detect an orphaned marker even if a previous registry creation was interrupted.
-    let marker = sidecar_path(&root)?;
-    if marker.exists() {
-        let bytes = fs::read(marker)?;
-        ensure!(bytes.len() <= 32768, "managed marker too large");
-        let stored: Entry = postcard::from_bytes(&bytes)?;
+    // Complete every overlap check before touching any requested directory or
+    // calling the catalog writer. Global serialization continues through commit.
+    let public_state = if let Some((root, kind)) = public {
+        let key = binding(&root)?;
+        let lock = private_file(&registry.join(format!("{key}.lease")))?;
+        fs2::FileExt::try_lock_exclusive(&lock).context("network root already leased")?;
+        let entry = Entry {
+            version: 1,
+            root: root.clone(),
+            preparing: matches!(kind, RootUse::Managed { .. }),
+            kind,
+        };
+        let marker = sidecar_path(&root)?;
+        if marker.exists() {
+            let bytes = fs::read(marker)?;
+            ensure!(bytes.len() <= 32768, "managed marker too large");
+            let stored: Entry = postcard::from_bytes(&bytes)?;
+            ensure!(
+                stored.version == 1
+                    && stored.root == root
+                    && stored.kind == entry.kind
+                    && entry.kind != RootUse::Legacy,
+                "managed ownership marker conflicts with requested root use"
+            );
+        }
+        if !root.exists() {
+            fs::create_dir_all(&root)?;
+        }
         ensure!(
-            stored.version == 1
-                && stored.root == root
-                && stored.kind == entry.kind
-                && entry.kind != RootUse::Legacy,
-            "managed ownership marker conflicts with requested root use"
+            fs::canonicalize(&root)? == root,
+            "admitted root changed during preparation"
+        );
+        if matches!(entry.kind, RootUse::Managed { .. }) {
+            ensure!(root.is_dir(), "managed root must be a directory");
+        }
+        Some((key, entry, RootLease { root, _lock: lock }))
+    } else {
+        None
+    };
+    for path in &private {
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(path)?;
+        ensure!(
+            fs::canonicalize(path)? == *path,
+            "private root changed during preparation"
         );
     }
-    persist(&db, &key, &entry)?;
-    if entry.preparing {
-        write_marker(&entry)?;
-        entry.preparing = false;
-        persist(&db, &key, &entry)?;
+    let db = Database::create(registry.join("roots.redb"))?;
+    // The writable catalog is opened only after namespace preflight succeeds.
+    if db.begin_read()?.open_table(ROOTS).is_err() {
+        let tx = db.begin_write()?;
+        tx.open_table(ROOTS)?;
+        tx.commit()?;
     }
-    Ok(RootLease { root, _lock: lock })
+    #[cfg(unix)]
+    File::open(&registry)?.sync_all()?;
+    // Persist private exclusions before the callback may write any sensitive data.
+    // A later preparation failure intentionally leaves conservative reservations.
+    if !private.is_empty() || !stale.is_empty() {
+        let tx = db.begin_write()?;
+        {
+            let mut table = tx.open_table(PRIVATE)?;
+            for path in &private {
+                table.insert(
+                    binding(path)?.as_str(),
+                    postcard::to_stdvec(path)?.as_slice(),
+                )?;
+            }
+        }
+        for key in stale {
+            tx.open_table(ROOTS)?.remove(key.as_str())?;
+        }
+        tx.commit()?;
+    }
+    let result = prepare(
+        public_state.as_ref().map(|(_, _, lease)| lease.root()),
+        &private,
+    )?;
+    let lease = if let Some((key, mut entry, lease)) = public_state {
+        ensure!(
+            fs::canonicalize(lease.root())? == lease.root(),
+            "admitted root changed during preparation"
+        );
+        persist(&db, &key, &entry)?;
+        if entry.preparing {
+            write_marker(&entry)?;
+            entry.preparing = false;
+            persist(&db, &key, &entry)?;
+        }
+        Some(lease)
+    } else {
+        None
+    };
+    Ok((lease, result))
 }
 
 #[cfg(test)]
@@ -350,6 +586,77 @@ mod tests {
         );
         drop(lease);
     }
+
+    #[test]
+    fn admission_registry_is_private_before_bootstrap_and_for_descendants() {
+        let temp = TempDir::new().unwrap();
+        let registry = temp.path().join("not-created/private-admission");
+        for root in [
+            &temp.path().join("not-created"),
+            &registry,
+            &registry.join("missing"),
+        ] {
+            assert!(acquire_at(&registry, root, RootUse::Legacy).is_err());
+            assert!(!temp.path().join("not-created").exists());
+        }
+    }
+
+    #[test]
+    fn private_reservations_nest_persist_and_block_public_in_both_orders() {
+        let temp = TempDir::new().unwrap();
+        let registry = temp.path().join("registry");
+        let private = temp.path().join("private");
+        for root in [&private, &private.join("nested")] {
+            admit_at(&registry, None, std::slice::from_ref(root), |_, _| Ok(())).unwrap();
+        }
+        for root in [&private, &private.join("new/deep"), temp.path()] {
+            assert!(acquire_at(&registry, root, RootUse::Legacy).is_err());
+        }
+        assert!(!private.join("new").exists());
+        let public = temp.path().join("public");
+        let lease = acquire_at(&registry, &public, managed()).unwrap();
+        let before = fs::read(registry.join("roots.redb")).unwrap();
+        for root in [&public, &public.join("new/deep"), temp.path()] {
+            assert!(
+                admit_at(
+                    &registry,
+                    None,
+                    std::slice::from_ref(&root.to_path_buf()),
+                    |_, _| Ok(())
+                )
+                .is_err()
+            );
+            assert!(
+                fs::read(registry.join("roots.redb")).unwrap() == before,
+                "denial changed admission catalog"
+            );
+        }
+        assert!(!public.join("new").exists());
+        drop(lease);
+        assert!(admit_at(&registry, None, &[public], |_, _| Ok(())).is_err());
+    }
+
+    #[test]
+    fn failed_valid_preparation_retains_private_reservation_without_public_intent() {
+        let temp = TempDir::new().unwrap();
+        let registry = temp.path().join("registry");
+        let public = temp.path().join("public");
+        let private = temp.path().join("state");
+        assert!(
+            admit_at(
+                &registry,
+                Some((&public, managed())),
+                std::slice::from_ref(&private),
+                |_, _| -> Result<()> { anyhow::bail!("preparation failed") }
+            )
+            .is_err()
+        );
+        assert!(public.is_dir());
+        assert!(private.is_dir());
+        assert!(!sidecar_path(&public).unwrap().exists());
+        assert!(acquire_at(&registry, &private, RootUse::Legacy).is_err());
+        assert!(acquire_at(&registry, &public, managed()).is_ok());
+    }
     fn wait_file(path: &Path) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         while !path.exists() {
@@ -376,7 +683,17 @@ mod tests {
             RootUse::Legacy
         };
         let selected = std::env::var("DW_ADMISSION_ROOT").unwrap_or_else(|_| "public".into());
-        let lease = acquire_at(&base.join("registry"), &base.join(selected), kind);
+        let lease = if role == "private" {
+            admit_at(
+                &base.join("registry"),
+                None,
+                &[base.join(selected)],
+                |_, _| Ok(()),
+            )
+            .map(|_| None)
+        } else {
+            acquire_at(&base.join("registry"), &base.join(selected), kind).map(Some)
+        };
         fs::write(
             base.join(format!("{role}.result.tmp")),
             if lease.is_ok() {
@@ -497,5 +814,92 @@ mod tests {
                 assert_eq!(denied, b"denied");
             }
         }
+    }
+    #[test]
+    fn separate_process_private_public_hierarchy_preflight_has_one_winner() {
+        for (private_root, public_root) in [
+            ("area", "area"),
+            ("area", "area/nested"),
+            ("area/nested", "area"),
+        ] {
+            let temp = TempDir::new().unwrap();
+            let base = temp.path();
+            let mut private = child_at(base, "private", private_root);
+            let mut public = child_at(base, "managed", public_root);
+            wait_file(&base.join("private.ready"));
+            wait_file(&base.join("managed.ready"));
+            fs::write(base.join("go"), b"go").unwrap();
+            wait_file(&base.join("private.result"));
+            wait_file(&base.join("managed.result"));
+            let a = fs::read(base.join("private.result")).unwrap();
+            let b = fs::read(base.join("managed.result")).unwrap();
+            fs::write(base.join("release"), b"release").unwrap();
+            assert!(private.wait().unwrap().success());
+            assert!(public.wait().unwrap().success());
+            assert_ne!(
+                a == b"ok",
+                b == b"ok",
+                "private/public registration race did not have exactly one winner"
+            );
+        }
+    }
+    #[test]
+    fn dirty_catalog_worker() {
+        let Some(base) = std::env::var_os("DW_DIRTY_ADMISSION") else {
+            return;
+        };
+        let base = PathBuf::from(base);
+        let db = Database::open(base.join("registry/roots.redb")).unwrap();
+        let tx = db.begin_write().unwrap();
+        let root = base.join("private");
+        tx.open_table(PRIVATE)
+            .unwrap()
+            .insert(
+                binding(&root).unwrap().as_str(),
+                postcard::to_stdvec(&root).unwrap().as_slice(),
+            )
+            .unwrap();
+        tx.commit().unwrap();
+        fs::write(base.join("dirty-ready"), b"ready").unwrap();
+        wait_file(&base.join("never-release"));
+        drop(db);
+    }
+    #[test]
+    fn dirty_catalog_recovers_without_losing_private_reservations() {
+        let temp = TempDir::new().unwrap();
+        let base = temp.path();
+        admit_at(
+            &base.join("registry"),
+            None,
+            &[base.join("private")],
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "root_admission::tests::dirty_catalog_worker",
+                "--nocapture",
+            ])
+            .env("DW_DIRTY_ADMISSION", base)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        wait_file(&base.join("dirty-ready"));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(
+            acquire_at(&base.join("registry"), &base.join("public"), managed()).is_ok(),
+            "dirty admission catalog prevented recovery"
+        );
+        assert!(
+            acquire_at(
+                &base.join("registry"),
+                &base.join("private/missing"),
+                RootUse::Legacy
+            )
+            .is_err()
+        );
+        assert!(!base.join("private/missing").exists());
     }
 }

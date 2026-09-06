@@ -36,22 +36,38 @@ fn legacy_server_rejects_managed_root_with_alternate_state() {
         .unwrap();
         std::fs::write(root.join("protected.txt"), b"keep").unwrap();
         drop(lease);
-        let result = start_server(ServerConfig {
-            secret_key: SecretKey::generate(),
-            destination_root: root.clone(),
-            state_root: temp.path().join("alternate-state"),
-            peer_policy: PeerPolicy::AnyAuthenticated,
-            network_mode: NetworkMode::DirectOnly,
-            bind_address: None,
-            max_connections: 8,
-            min_free_space_bytes: 0,
-        })
-        .await;
-        if let Ok(server) = result {
-            server.shutdown().await.unwrap();
-            panic!("legacy server reopened a managed root");
+        let candidates = vec![root.clone(), root.join("missing/deep")];
+        #[cfg(unix)]
+        let candidates = {
+            std::os::unix::fs::symlink(&root, temp.path().join("alias")).unwrap();
+            let mut paths = candidates;
+            paths.push(temp.path().join("alias/missing/deep"));
+            paths
+        };
+        for candidate in candidates {
+            let result = start_server(ServerConfig {
+                secret_key: SecretKey::generate(),
+                destination_root: candidate,
+                state_root: temp.path().join("alternate-state"),
+                peer_policy: PeerPolicy::AnyAuthenticated,
+                network_mode: NetworkMode::DirectOnly,
+                bind_address: None,
+                max_connections: 8,
+                min_free_space_bytes: 0,
+            })
+            .await;
+            if let Ok(server) = result {
+                server.shutdown().await.unwrap();
+                panic!("legacy server reopened a managed root");
+            }
+            assert_eq!(std::fs::read(root.join("protected.txt")).unwrap(), b"keep");
+            assert!(
+                !root.join("missing").exists(),
+                "denied admission mutated managed root"
+            );
+            assert!(!temp.path().join("alternate-state").exists());
+            assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
         }
-        assert_eq!(std::fs::read(root.join("protected.txt")).unwrap(), b"keep");
     });
 }
 

@@ -327,6 +327,10 @@ impl Registry {
                     }
                 }
             };
+            ensure!(
+                entry.known.contains(&replica) || entry.known.len() < MAX_REPLICAS,
+                ShareError::Busy
+            );
             entry.known.insert(replica);
             let member = Membership {
                 share_id: entry.config.share_id,

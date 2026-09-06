@@ -60,6 +60,11 @@ fn actual_quic_enrollment_is_scoped_read_only_and_durable() {
                 );
                 let grant = member.enroll(&ticket, None).await.unwrap();
                 assert_eq!(grant.permission, Permission::ReadOnly);
+                let stronger = share
+                    .issue_key(Permission::ReadWrite, None, owner.endpoint_addr())
+                    .unwrap();
+                assert_eq!(member.enroll(&stronger, None).await.unwrap(), grant);
+                assert_eq!(share.members().unwrap(), vec![grant.clone()]);
                 let session = member.open_session(grant.owner, grant.share_id).unwrap();
                 let empty = deltaweave_reconcile::MerkleTree::from_records(Vec::new()).unwrap();
                 let snapshot = session.fetch_snapshot(&empty).await.unwrap();
@@ -1228,4 +1233,256 @@ fn incomplete_creation_resumes_from_durable_intent() {
             owner.shutdown().await.unwrap();
         })
     });
+}
+
+fn tree_bytes(root: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    fn visit(
+        base: &std::path::Path,
+        path: &std::path::Path,
+        out: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>,
+    ) {
+        for item in std::fs::read_dir(path).unwrap() {
+            let item = item.unwrap();
+            let path = item.path();
+            if item.file_type().unwrap().is_symlink() {
+                continue;
+            }
+            if path.is_dir() {
+                out.insert(path.strip_prefix(base).unwrap().into(), Vec::new());
+                visit(base, &path, out);
+            } else {
+                out.insert(
+                    path.strip_prefix(base).unwrap().into(),
+                    std::fs::read(&path).unwrap(),
+                );
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    visit(root, root, &mut out);
+    out
+}
+
+#[test]
+fn private_state_and_denied_descendants_never_enter_served_namespaces() {
+    isolated(
+        "private_state_and_denied_descendants_never_enter_served_namespaces",
+        || {
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                let temp = tempfile::tempdir().unwrap();
+                let base = temp.path();
+                let owner =
+                    ShareService::open(base.join("private/device"), NetworkMode::DirectOnly, None)
+                        .await
+                        .unwrap();
+                let initial = owner.owned_configs().unwrap();
+                let private_before = tree_bytes(&base.join("private"));
+                for (i, root) in [
+                    base.join("private/device"),
+                    base.join("private"),
+                    base.join("private/device/new/deep"),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let state = base.join(format!("denied-state-{i}"));
+                    assert!(
+                        owner
+                            .create_owned_share("Denied".into(), root, state.clone(), None, 0)
+                            .await
+                            .is_err(),
+                        "device namespace admitted"
+                    );
+                    assert!(!state.exists());
+                    assert_eq!(owner.owned_configs().unwrap(), initial);
+                    assert!(
+                        tree_bytes(&base.join("private")) == private_before,
+                        "protected device tree changed"
+                    );
+                }
+                let share = owner
+                    .create_owned_share(
+                        "A".into(),
+                        base.join("public"),
+                        base.join("a-state"),
+                        None,
+                        0,
+                    )
+                    .await
+                    .unwrap();
+                std::fs::write(base.join("public/visible"), b"public bytes").unwrap();
+                let before = tree_bytes(&base.join("public"));
+                let configs = owner.owned_configs().unwrap();
+                let owner_catalog = std::fs::read(base.join("private/device/shares.redb")).unwrap();
+                for (root, state) in [
+                    (base.join("other-root"), base.join("public/b-state")),
+                    (base.join("public/new/deep"), base.join("denied-state")),
+                ] {
+                    assert!(
+                        owner
+                            .create_owned_share(
+                                "Denied".into(),
+                                root.clone(),
+                                state.clone(),
+                                None,
+                                0
+                            )
+                            .await
+                            .is_err()
+                    );
+                    assert!(!root.exists());
+                    assert!(!state.exists());
+                    assert_eq!(owner.owned_configs().unwrap(), configs);
+                    assert!(
+                        std::fs::read(base.join("private/device/shares.redb")).unwrap()
+                            == owner_catalog,
+                        "denied share changed device catalog"
+                    );
+                    assert!(tree_bytes(&base.join("public")) == before);
+                }
+                assert!(
+                    ShareService::open(
+                        base.join("public/other-device"),
+                        NetworkMode::DirectOnly,
+                        None
+                    )
+                    .await
+                    .is_err()
+                );
+                assert!(!base.join("public/other-device").exists());
+                let other =
+                    ShareService::open(base.join("other-device"), NetworkMode::DirectOnly, None)
+                        .await
+                        .unwrap();
+                let b = other
+                    .create_owned_share(
+                        "B".into(),
+                        base.join("b-public"),
+                        base.join("b-private/store"),
+                        None,
+                        0,
+                    )
+                    .await
+                    .unwrap();
+                std::fs::write(
+                    base.join("b-private/store/hidden"),
+                    b"other share private bytes",
+                )
+                .unwrap();
+                let b_before = tree_bytes(&base.join("b-private"));
+                assert!(
+                    owner
+                        .create_owned_share(
+                            "Denied".into(),
+                            base.join("b-private"),
+                            base.join("denied-reverse-state"),
+                            None,
+                            0
+                        )
+                        .await
+                        .is_err()
+                );
+                assert!(!base.join("denied-reverse-state").exists());
+                assert!(tree_bytes(&base.join("b-private")) == b_before);
+                #[cfg(unix)]
+                {
+                    std::os::unix::fs::symlink(base.join("private"), base.join("alias-private"))
+                        .unwrap();
+                    std::os::unix::fs::symlink(base.join("public"), base.join("alias-public"))
+                        .unwrap();
+                    assert!(
+                        other
+                            .create_owned_share(
+                                "Denied".into(),
+                                base.join("alias-private/device"),
+                                base.join("alias-denied-state"),
+                                None,
+                                0
+                            )
+                            .await
+                            .is_err()
+                    );
+                    assert!(
+                        other
+                            .create_owned_share(
+                                "Denied".into(),
+                                base.join("alias-public/missing/deep"),
+                                base.join("alias-desc-state"),
+                                None,
+                                0
+                            )
+                            .await
+                            .is_err()
+                    );
+                    assert!(!base.join("alias-denied-state").exists());
+                    assert!(!base.join("alias-desc-state").exists());
+                    assert!(!base.join("public/missing").exists());
+                }
+                let ticket = share
+                    .issue_key(Permission::ReadOnly, None, owner.endpoint_addr())
+                    .unwrap();
+                let grant = other.enroll(&ticket, None).await.unwrap();
+                assert!(
+                    other
+                        .admit_member_root(grant.owner, grant.share_id, base.join("private"))
+                        .is_err()
+                );
+                assert!(
+                    other
+                        .admit_member_root(
+                            grant.owner,
+                            grant.share_id,
+                            base.join("b-private/store/new")
+                        )
+                        .is_err()
+                );
+                assert!(!base.join("b-private/store/new").exists());
+                let session = other.open_session(grant.owner, grant.share_id).unwrap();
+                let empty = deltaweave_reconcile::MerkleTree::from_records(Vec::new()).unwrap();
+                let snapshot = session.fetch_snapshot(&empty).await.unwrap();
+                assert_eq!(snapshot.records.len(), 1);
+                let visible = snapshot.records[0].clone();
+                assert_eq!(visible.path.as_str(), "visible");
+                let store = std::sync::Arc::new(
+                    deltaweave_store::Store::open(base.join("received-store")).unwrap(),
+                );
+                let pull = session
+                    .pull_record(visible.clone(), store.clone())
+                    .await
+                    .unwrap();
+                let output = base.join("received");
+                std::fs::create_dir(&output).unwrap();
+                store
+                    .materialize(&pull.manifest, &visible.path, &output)
+                    .unwrap();
+                assert_eq!(
+                    std::fs::read(output.join("visible")).unwrap(),
+                    b"public bytes"
+                );
+                for (path, secret) in [
+                    (
+                        "device/device.key",
+                        std::fs::read(base.join("private/device/device.key")).unwrap(),
+                    ),
+                    ("b-state/hidden", b"other share private bytes".to_vec()),
+                ] {
+                    let mut forged = visible.clone();
+                    forged.path = deltaweave_core::WirePath::new(path).unwrap();
+                    forged.size = secret.len() as u64;
+                    forged.content_hash = Some(Hash32::digest(&secret));
+                    assert!(
+                        session.pull_record(forged, store.clone()).await.is_err(),
+                        "private bytes were served"
+                    );
+                    assert!(!tree_bytes(&output).values().any(|bytes| bytes == &secret));
+                }
+                assert!(tree_bytes(&base.join("public")) == before);
+                drop(session);
+                drop(b);
+                drop(share);
+                other.shutdown().await.unwrap();
+                owner.shutdown().await.unwrap();
+            });
+        },
+    );
 }

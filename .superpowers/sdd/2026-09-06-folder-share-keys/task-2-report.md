@@ -391,3 +391,181 @@ state, bounded metadata preflight, and legacy Router-cancellation lease lifetime
   of every causal vector or an unlimited provenance history.
 - The common network file is already large; edits there are limited to verified
   connection reuse, optional authorization hooks, lease/task lifetimes, and tests.
+
+## Fix round 1 — independent review C1 / I2 / I3
+
+Reviewed `.superpowers/sdd/2026-09-06-folder-share-keys/task-2-review.md` in full.
+This round addresses all three findings and the adjacent existing-member RO/RW
+invitation regression. The review base is `83697d8`; root's intervening commits
+through `19847c1` contain documentation only. No index, store, control, CLI, UI,
+or worker implementation was changed in this round.
+
+### Private/public admission and unchanged denial
+
+The common fixed admission registry now has a dedicated durable `private_roots_v1`
+table. Every managed service reserves its device/catalog directory before writing
+its identity. Owner creation and loading atomically admit the public root together
+with its private state directory. The underlying legacy server and SyncEngine
+also use public/private admission for their already-external state directories.
+Every public admission, including member roots and legacy publication, checks
+private reservations in both hierarchy directions. Private/private nesting is
+allowed. Reservations persist after service/worker shutdown and are shared across
+all service instances using the fixed user profile registry.
+
+The registry itself is an implicit private root. Public requests equal to,
+containing, or beneath it are rejected before initial registry bootstrap creates
+anything. The protected directory is independent of service state or web data-dir.
+
+Admission resolves the existing canonical ancestor and missing components without
+mkdir, then repeats resolution under the global file lock. It completes all
+public/public, public/private, and paired-root overlap checks before creating
+requested directories or invoking the owner catalog writer. Canonical roots are
+revalidated after creation and before public registration. Exact roots, ancestors,
+missing descendants, aliases, alternate state paths, and separate-process races
+are covered. Clean ordinary rejection opens the admission catalog read-only;
+this avoids redb header/checkpoint writes on rejected requests as well as avoiding
+logical catalog changes.
+
+Existing preparing managed intents continue to recover their outside-root marker.
+A redb catalog left dirty by process death is repaired only after read-only open
+specifically reports `RepairAborted`, while holding the global admission lock;
+other open errors fail closed. Recovery never clears either reservation table.
+Recovery of already-committed intent may update the existing registry, independently
+of the requested admission; it does not create the denied requested namespace.
+
+### Public API additions and caller obligations
+
+Existing public signatures remain unchanged. Two public APIs were added in
+`deltaweave_net::root_admission`:
+
+```rust
+pub fn reserve_private(path: impl AsRef<Path>) -> anyhow::Result<PathBuf>;
+
+pub fn acquire_with_private(
+    path: impl AsRef<Path>,
+    kind: RootUse,
+    private: &[PathBuf],
+) -> anyhow::Result<RootLease>;
+```
+
+`reserve_private` creates and returns the canonical private directory after
+successful preflight, then permanently excludes it from current-binary public
+admission. Task 3 must call this before writing member private state or an
+external recovery vault. Private nesting is permitted; no release/reset API is
+provided. It does not grant publication rights. `acquire_with_private` performs
+one serialized preflight for a public root and all requested external private
+directories and returns the public lifetime lease. Keep that lease through every
+active disk handler, as with `acquire`. Existing `acquire` delegates with an empty
+private list. Existing member-root admission therefore inherits protection of
+all registered device, catalog, state, and vault namespaces.
+
+A crate-private `admit_with_private<T>` accepts a synchronous preparation callback
+so owner catalog intent can be committed after preflight and before managed
+marker registration. Lock order is service lifecycle -> global admission OS lock
+-> short catalog callback. The callback checks retained index binding and commits
+catalog intent; it must not await, recurse into admission, acquire a runtime gate,
+or run disk handlers. Runtime construction and scanning happen after admission
+returns and use the returned lease without reopening it.
+
+Successful preflight may create the requested directories. Private reservations
+are committed before the callback can write sensitive state. If valid preparation
+then fails, those private reservations and created directories deliberately remain;
+no later caller may publish the failed preparation's private data. If the callback
+fails before committing owner intent, no public managed marker is registered. If
+owner intent committed and later marker/runtime preparation fails, the existing
+preparing owner catalog entry and durable reservation permit explicit load/retry.
+Tests cover a failed callback retaining private exclusion and the original
+incomplete-runtime preparation/restart path. Namespace preflight rejection invokes
+no callback and creates neither requested public nor alternate private directories.
+
+### Bounded enrollment and existing-member permission
+
+Retained-key enrollment now checks whether selecting its replica would add a new
+ID at `MAX_REPLICAS`, before inserting either a reservation or membership. The
+fresh path retains its existing limit. At capacity, an unbound valid historical
+ID already in the known set succeeds; an unknown old-key proof fails atomically.
+The test seeds 4096 durable known IDs, includes an already-enrolled writer, and
+uses actual QUIC enrollment. It compares the exact owner catalog bytes before
+and after rejection, reopens the owner, verifies the denied claim is absent,
+enrolls a known historical proof, and proves both the incumbent and admitted
+historical writer can adopt a valid directory record. Original file bytes remain
+unchanged. Existing RO membership is also re-enrolled using a distinct active RW
+invitation: both the returned and persisted grant stay RO, and raw mutation
+requests still fail remotely in the existing QUIC test.
+
+### RED/GREEN evidence
+
+All tests use fresh temporary roots. Service/network tests re-exec in an isolated
+profile; full verification used a dedicated temporary HOME/USERPROFILE while
+retaining only the Rust toolchain/cache directories. No live registry, retained
+migration fixture, main/preserve worktree, or user process was modified.
+
+- C1 RED: `cargo test --locked -p deltaweave-net --test shares
+  private_state_and_denied_descendants -- --nocapture` failed with
+  `device namespace admitted`. Log `/tmp/dw-fix1-private-red.log`.
+  GREEN log `/tmp/dw-fix1-private-green.log`, then final suite.
+  The full test compares protected device/public/other-share trees and owner
+  catalog bytes on denial; tries both creation orders, aliases, another service,
+  and member admission; a real RO session pulls the public file but cannot pull
+  forged device-key or other-share-private paths. Secret bytes are never printed.
+- I2 RED: `cargo test --locked -p deltaweave-net --test admission
+  legacy_server_rejects -- --nocapture` failed with
+  `denied admission mutated managed root`. Log `/tmp/dw-fix1-desc-red.log`.
+  GREEN final net and sync suites cover the original exact-root rejection plus
+  missing descendants through direct and alias paths; complete single-file tree
+  shape/bytes stay unchanged and every alternate state path remains absent.
+- I3 RED: `cargo test --locked -p deltaweave-net --lib
+  proof_at_replica_capacity -- --nocapture` failed with
+  `unknown retained replica exceeded capacity`.
+  Logs `/tmp/dw-fix1-capacity-red.log` and `/tmp/dw-fix1-capacity-green.log`;
+  final suite includes the expanded incumbent-writer checks.
+- Common admission tests compare exact admission-catalog bytes on clean denial,
+  test private nesting and persistence, test initial catalog containment without
+  bootstrap mkdir, and race private/public equal/ancestor/descendant registration
+  in separate processes. Exactly one process succeeds.
+- Self-review RED: a real killed redb writer made read-only preflight fail to
+  recover an unrelated valid root (`dirty admission catalog prevented recovery`).
+  Logs `/tmp/dw-fix1-dirty-red.log` and `/tmp/dw-fix1-dirty-green.log`.
+  The fix preserves the committed private reservation through allocator recovery.
+- The initial impacted suites passed. Initial clippy identified only a complex
+  tuple return and collapsible conditional; an `AdmissionCatalog` struct and the
+  suggested conditional form resolved both without suppressions.
+
+### Final verification
+
+Final evidence directory: `/tmp/deltaweave-task2-fix1-r0exr828`.
+Runner: `/tmp/dw-fix1-verify.py`. Counts below exclude repeated child-process
+harness output. All commands exited zero:
+
+```text
+cargo test --locked -p deltaweave-net --all-targets --all-features
+PASS: 52 unit + 2 admission + 13 share integration = 67 tests
+Log: net-tests.log
+
+cargo test --locked -p deltaweave-sync -p deltaweave-control --all-targets --all-features
+PASS: 13 sync + 15 control = 28 tests
+Log: sync-control-tests.log
+
+cargo clippy --locked -p deltaweave-net -p deltaweave-sync -p deltaweave-control \
+  --all-targets --all-features -- -D warnings
+PASS
+Log: clippy.log
+
+cargo check --locked --target x86_64-pc-windows-gnu \
+  -p deltaweave-net -p deltaweave-sync -p deltaweave-control
+PASS
+Log: windows.log
+
+cargo fmt --all -- --check
+PASS
+
+git diff --check
+PASS
+```
+
+No remaining concern is known for C1, I2, I3, or the re-enrollment case. The existing
+Task 3 cross-filesystem storage work and required Windows runtime CI remain later
+gates. This round's Windows result is compilation only. Root separately recorded
+an actual v3 N0 ID-only/changed-port probe in its documentation; that evidence is
+not attributed to this fix round. Local administrative deletion/replacement of
+private registry files remains outside the remote authorization model.

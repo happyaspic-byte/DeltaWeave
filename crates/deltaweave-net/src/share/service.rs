@@ -49,7 +49,7 @@ impl ShareService {
         mode: NetworkMode,
         bind: Option<SocketAddr>,
     ) -> Result<Self> {
-        let state = state.as_ref().to_path_buf();
+        let state = root_admission::reserve_private(state)?;
         root_admission::private_directory(&state)?;
         let key = load_or_create_identity(state.join("device.key"))?.secret_key;
         let registry = Arc::new(Registry::open(&state, key.public())?);
@@ -107,26 +107,39 @@ impl ShareService {
             !name.is_empty() && name.len() <= 255 && !name.chars().any(char::is_control),
             ShareError::InvalidTicket
         );
-        let (root, state_root) = prepare_server_roots(&root, &state_root)?;
-        let retained = LocalIndex::read_bound_replica(&root, state_root.join("index.redb"))?;
-        if let (Some(requested), Some(retained)) = (replica, retained) {
-            ensure!(requested == retained, ShareError::ReplicaClaimRejected);
-        }
-        let config = OwnedShareConfig {
-            share_id: ShareId(super::ticket::random_bytes()),
-            owner: self.endpoint_id(),
-            name,
-            root,
-            state_root,
-            replica: retained
-                .or(replica)
-                .unwrap_or_else(|| ReplicaId(Hash32::from_bytes(super::ticket::random_bytes()))),
-            min_free_space_bytes,
-        };
-        // Persist recoverable intent before the outside-root managed marker.
-        self.registry
-            .insert_share(config.clone(), BTreeSet::new())?;
-        self.load_config(config).await
+        let share_id = ShareId(super::ticket::random_bytes());
+        let (lease, config) = root_admission::admit_with_private(
+            &root,
+            RootUse::Managed {
+                share: share_id.0,
+                owner: *self.endpoint_id().as_bytes(),
+            },
+            &[state_root],
+            |root, private| {
+                let state_root = &private[0];
+                let retained = LocalIndex::read_bound_replica(root, state_root.join("index.redb"))?;
+                if let (Some(requested), Some(retained)) = (replica, retained) {
+                    ensure!(requested == retained, ShareError::ReplicaClaimRejected);
+                }
+                let config = OwnedShareConfig {
+                    share_id,
+                    owner: self.endpoint_id(),
+                    name,
+                    root: root.to_path_buf(),
+                    state_root: state_root.clone(),
+                    replica: retained.or(replica).unwrap_or_else(|| {
+                        ReplicaId(Hash32::from_bytes(super::ticket::random_bytes()))
+                    }),
+                    min_free_space_bytes,
+                };
+                // Short synchronous intent commit under admission serialization;
+                // no runtime lock or disk handler may be acquired here.
+                self.registry
+                    .insert_share(config.clone(), BTreeSet::new())?;
+                Ok(config)
+            },
+        )?;
+        self.load_config_with_lease(config, lease).await
     }
     pub async fn load_owned_share(&self, share: ShareId) -> Result<OwnerShare> {
         let _lifecycle = self.lifecycle.lock().await;
@@ -139,16 +152,25 @@ impl ShareService {
         self.load_config(self.registry.config(share)?).await
     }
     async fn load_config(&self, config: OwnedShareConfig) -> Result<OwnerShare> {
+        let lease = root_admission::acquire_with_private(
+            &config.root,
+            RootUse::Managed {
+                share: config.share_id.0,
+                owner: *config.owner.as_bytes(),
+            },
+            std::slice::from_ref(&config.state_root),
+        )?;
+        self.load_config_with_lease(config, lease).await
+    }
+    async fn load_config_with_lease(
+        &self,
+        config: OwnedShareConfig,
+        lease: RootLease,
+    ) -> Result<OwnerShare> {
         let registry = self.registry.clone();
         let ready = registry.is_ready(config.share_id)?;
         let runtime = tokio::task::spawn_blocking(move || -> Result<_> {
-            let lease = Arc::new(root_admission::acquire(
-                &config.root,
-                RootUse::Managed {
-                    share: config.share_id.0,
-                    owner: *config.owner.as_bytes(),
-                },
-            )?);
+            let lease = Arc::new(lease);
             if ready {
                 ensure!(
                     config.state_root.join("index.redb").is_file()
@@ -613,6 +635,164 @@ mod tests {
                 finished,
                 "an already-denied idle connection kept revocation waiting"
             );
+        });
+    }
+}
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::super::{Permission, registry::MAX_REPLICAS};
+    use super::*;
+
+    #[test]
+    fn proof_at_replica_capacity_is_atomic_and_existing_writer_survives_restart() {
+        let name = "share::service::capacity_tests::proof_at_replica_capacity_is_atomic_and_existing_writer_survives_restart";
+        if std::env::var("DW_CAPACITY_CHILD").ok().as_deref() != Some(name) {
+            let profile = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture"])
+                .env("DW_CAPACITY_CHILD", name)
+                .env("HOME", profile.path())
+                .env("USERPROFILE", profile.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let device = temp.path().join("device");
+            let owner = ShareService::open(&device, NetworkMode::DirectOnly, None)
+                .await
+                .unwrap();
+            let member =
+                ShareService::open(temp.path().join("member"), NetworkMode::DirectOnly, None)
+                    .await
+                    .unwrap();
+            let root = temp.path().join("root");
+            let share = owner
+                .create_owned_share(
+                    "Files".into(),
+                    root.clone(),
+                    temp.path().join("state"),
+                    None,
+                    0,
+                )
+                .await
+                .unwrap();
+            std::fs::write(root.join("file"), b"original").unwrap();
+            let ticket = share
+                .issue_key(Permission::ReadWrite, None, owner.endpoint_addr())
+                .unwrap();
+            let writer =
+                ShareService::open(temp.path().join("writer"), NetworkMode::DirectOnly, None)
+                    .await
+                    .unwrap();
+            let writer_grant = writer.enroll(&ticket, None).await.unwrap();
+            let known_key = SecretKey::generate();
+            let known_id = ReplicaId(Hash32::digest(known_key.public().as_bytes()));
+            let mut known = owner.registry.known(share.config().share_id).unwrap();
+            known.insert(known_id);
+            for n in 0u64.. {
+                if known.len() == MAX_REPLICAS {
+                    break;
+                }
+                known.insert(ReplicaId(Hash32::digest(&n.to_le_bytes())));
+            }
+            owner
+                .registry
+                .remember_replicas(share.config().share_id, known.clone())
+                .unwrap();
+            let unknown_key = SecretKey::generate();
+            let unknown_id = ReplicaId(Hash32::digest(unknown_key.public().as_bytes()));
+            assert!(!known.contains(&unknown_id));
+            let proof =
+                LegacyProof::create(&ticket, &unknown_key, member.endpoint_id(), unknown_id)
+                    .unwrap();
+            let catalog_before = std::fs::read(device.join("shares.redb")).unwrap();
+            assert!(
+                member.enroll(&ticket, Some(proof)).await.is_err(),
+                "unknown retained replica exceeded capacity"
+            );
+            assert!(
+                std::fs::read(device.join("shares.redb")).unwrap() == catalog_before,
+                "denied enrollment wrote catalog"
+            );
+            assert_eq!(
+                owner.registry.known(share.config().share_id).unwrap(),
+                known
+            );
+            assert_eq!(share.members().unwrap(), vec![writer_grant.clone()]);
+            let config = share.config().clone();
+            drop(share);
+            owner.shutdown().await.unwrap();
+            let owner = ShareService::open(&device, NetworkMode::DirectOnly, None)
+                .await
+                .unwrap();
+            let share = owner.load_owned_share(config.share_id).await.unwrap();
+            assert_eq!(owner.registry.known(config.share_id).unwrap(), known);
+            assert_eq!(share.members().unwrap(), vec![writer_grant.clone()]);
+            let ticket = share
+                .issue_key(Permission::ReadWrite, None, owner.endpoint_addr())
+                .unwrap();
+            let proof =
+                LegacyProof::create(&ticket, &known_key, member.endpoint_id(), known_id).unwrap();
+            let grant = member.enroll(&ticket, Some(proof)).await.unwrap();
+            assert_eq!(grant.replica, known_id);
+            assert_eq!(owner.registry.known(config.share_id).unwrap(), known);
+            assert_eq!(writer.enroll(&ticket, None).await.unwrap(), writer_grant);
+            let incumbent = writer
+                .open_session(writer_grant.owner, writer_grant.share_id)
+                .unwrap();
+            let empty = MerkleTree::from_records(Vec::new()).unwrap();
+            let mut incumbent_record = incumbent
+                .fetch_snapshot(&empty)
+                .await
+                .unwrap()
+                .records
+                .remove(0);
+            incumbent_record.path = deltaweave_core::WirePath::new("incumbent-created").unwrap();
+            incumbent_record.kind = deltaweave_core::SyncEntryKind::Directory;
+            incumbent_record.content_hash = None;
+            incumbent_record.size = 0;
+            incumbent_record
+                .version
+                .increment(writer_grant.replica)
+                .unwrap();
+            incumbent.apply_metadata(incumbent_record).await.unwrap();
+            assert!(root.join("incumbent-created").is_dir());
+            drop(incumbent);
+            let session = member.open_session(grant.owner, grant.share_id).unwrap();
+            let empty = MerkleTree::from_records(Vec::new()).unwrap();
+            let mut record = session
+                .fetch_snapshot(&empty)
+                .await
+                .unwrap()
+                .records
+                .remove(0);
+            record.path = deltaweave_core::WirePath::new("created").unwrap();
+            record.kind = deltaweave_core::SyncEntryKind::Directory;
+            record.content_hash = None;
+            record.size = 0;
+            record.version.increment(grant.replica).unwrap();
+            session.apply_metadata(record.clone()).await.unwrap();
+            assert_eq!(
+                session
+                    .fetch_snapshot(&empty)
+                    .await
+                    .unwrap()
+                    .records
+                    .into_iter()
+                    .find(|item| item.path == record.path)
+                    .unwrap(),
+                record
+            );
+            assert_eq!(std::fs::read(root.join("file")).unwrap(), b"original");
+            drop(session);
+            drop(share);
+            writer.shutdown().await.unwrap();
+            member.shutdown().await.unwrap();
+            owner.shutdown().await.unwrap();
         });
     }
 }
