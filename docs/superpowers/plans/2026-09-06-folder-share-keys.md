@@ -17,6 +17,7 @@
 - Preserve all existing worktrees, preserve branches, live user process and user data.
 - Keep device secrets, web administrator credentials, invitation bearers and session credentials separate; never log, snapshot or expose secrets in errors or activities.
 - Use one persistent device-wide identity/endpoint for new managed shares. Legacy folders retain their existing identity and data.
+- Keep each imported index's DB-bound logical ReplicaId independent of the new transport identity; never reset vectors or weaken normal root/replica binding.
 - Only the owner serves managed snapshots. Members only synchronize against the authenticated issuing endpoint. Read/write membership does not grant membership management.
 - Check actual durable issuance/membership records, folder scope and current permission on every request and at mutation; revocation affects existing sessions and persists.
 - RO synchronization preserves local work outside the shared root and never propagates local modifications or tombstones; OS readonly flags have a different meaning.
@@ -59,6 +60,7 @@ cargo test --locked -p deltaweave-net -p deltaweave-sync --all-targets --all-fea
 - [ ] Implement the signed versioned envelope with bounded decoding and durable separate invitation/member records. Enrollment uses the authenticated `connection.remote_id()`; online authoritative validation precedes durable membership. Offline preview is clearly distinguishable from accepted enrollment.
 - [ ] Implement `deltaweave/share/3`, multiplexed owner runtimes and the common transfer session adapter. Test v1/v2 negotiation fails on the share endpoint and all RO write/delete/directory requests are denied. Recheck permissions inside query loops, after chunk reception and before materialization/adoption.
 - [ ] Add tracked connection cancellation and synchronization with in-flight disk operations so completed revocation is effective immediately. Persist key and member revocation separately and test restart. Reject same-identity re-enrollment after removal; test that a new identity with another still-active invitation has explicitly documented behavior.
+- [ ] Use one per-share mutation gate through final authorization, materialization and adoption. Revocation persists denial, closes tracked connections and drains already-started blocking operations/chunk writers before returning. Test with deterministic barriers, not a sleep-based assumption.
 - [ ] Add canonical managed-root ownership markers outside public roots, shared by legacy CLI/control/SyncEngine admission checks. Reject legacy operations on managed roots even when another state path is supplied. Local OS administrators remain outside the remote attacker model.
 - [ ] Use iroh N0 discovery/relay for internet mode, retain direct hints for bootstrap and explicit DirectOnly mode. Record verified upstream docs and run actual multi-folder/multi-identity QUIC tests.
 
@@ -79,6 +81,7 @@ cargo clippy --locked -p deltaweave-net --all-targets --all-features -- -D warni
 - [ ] Adapt existing RW reconciliation to shared sessions without bypassing content verification, pre-apply rescan or convergence checks. Keep legacy `sync_once` behavior intact.
 - [ ] Write failing RO tests: local edit and remote edit preserve exact local bytes; local-only additions never reach owner/RW; local deletions restore from owner; remote deletions preserve modified local bytes outside root; file/directory transitions and restarts retain safe recovery.
 - [ ] Implement authoritative RO application: observe local changes, stage and verify owner content, persist local conflict copies/metadata in private state, recheck local preconditions, apply owner actions, adopt complete authoritative records, then verify filesystem/index against owner. Abort/retry on racing local modifications.
+- [ ] Persist prepared/preserved/materialized/adopted recovery stages and the last trusted owner checkpoint. Inject interruption at each stage; prove exact local bytes survive and owner rollback/equal-version divergence/missing tombstones are rejected.
 - [ ] Test laundering resistance using a malicious RO v2/v3 snapshot endpoint: managed RW refuses it because only the issuer owner is a valid source. Prove unchanged owner and another RW root, not merely a disabled client button.
 
 ```bash
@@ -97,6 +100,7 @@ cargo clippy --locked -p deltaweave-index -p deltaweave-sync --all-targets --all
 - [ ] Write Manager/API tests for key preview without enrollment, storage selection and automatic enrollment; distinct local identities; persistence/restart; private-path/root-overlap protection; management forbidden on participant roles; CSRF/Origin/Host/auth checks on all new routes.
 - [ ] Integrate one device-wide shared endpoint with separate owner folders/member workers. Poll and retry automatically with bounded backoff. Persist pending enrollment securely for an offline issuer. On revocation stop syncing and surface revoked, never continue on cached permission.
 - [ ] Implement real server folder browsing and explicit conversion of existing configured folders while preserving root/state/index. Existing manual connections continue under advanced settings. Document which old peer connections need a key during conversion.
+- [ ] Exercise conversion of a non-empty index using its retained logical ReplicaId with the new transport identity, then restart and edit again. Make creation/enrollment retries idempotent across marker, registry and control-config writes; persist pending invitation only in private state and discard it after membership succeeds.
 - [ ] Implement primary `폴더 공유` and `키로 연결` flows, both permission-key copy controls, permission preview and destination selection, result details, connected devices, key rotation/revocation and member removal. Explain scope of each revocation and rejoin limitations at the relevant action.
 - [ ] Show waiting/offline/initial-sync/up-to-date/local-conflict/revoked/invalid-key distinctly using actual runtime evidence. Protect long key entry from layout overflow, keep secrets out of persistent browser storage and debug/activity output, and clear sensitive UI before screenshots.
 - [ ] Test copy success/failure, labels, keyboard movement/focus restoration, mobile width, contrast and all existing console navigation/settings/activity features.
