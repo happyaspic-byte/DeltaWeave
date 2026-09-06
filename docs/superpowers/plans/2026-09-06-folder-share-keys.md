@@ -78,11 +78,12 @@ exposed through a general arbitrary-key mutation API.
 
 ### Task 3: Reuse causal RW sync and implement preserving RO application
 
-**Files:** `crates/deltaweave-sync/src/lib.rs`, new `read_only.rs`/shared sync module, focused `deltaweave-index` authoritative snapshot adoption method if necessary, `crates/deltaweave-sync/tests/shares.rs`.
+**Files:** `crates/deltaweave-sync/src/lib.rs`, new `read_only.rs`/shared sync module, focused `deltaweave-index` authoritative snapshot adoption method if necessary, preserving move/recovery helpers in `deltaweave-store`, `crates/deltaweave-sync/tests/shares.rs` and focused store regressions.
 
 **Interfaces:** consumes the authenticated shared-session surface from Task 2. Produces managed RW synchronization with existing `SyncReport` semantics, separate RO synchronization, and a serializable RO report including preserved conflict locations. `LocalIndex` authoritative adoption validates all records and namespace and durably removes local-only versions without changing existing data schemas.
 
 - [ ] With separate owner/RW/RO identities and real endpoints, write tests for RW initial join, two-way add/edit/delete, deterministic conflict preservation and restart.
+- [ ] Fix the reproduced preexisting cross-filesystem preservation failure: actual v2 initial transfer succeeds with root and private state on separate filesystems, but replacement fails at `fs::rename(destination, private_trash)` with EXDEV. Preserve existing symlink/path/race/hash protections while providing durable verified preservation across filesystems for replacement and deletion. Prove exact original bytes survive interruptions and errors, then actual update/delete and RO recovery converge with private recovery outside the shared namespace. Do not use an unchecked copy-then-unlink fallback.
 - [ ] Adapt existing RW reconciliation to shared sessions without bypassing content verification, pre-apply rescan or convergence checks. Keep legacy `sync_once` behavior intact.
 - [ ] Write failing RO tests: local edit and remote edit preserve exact local bytes; local-only additions never reach owner/RW; local deletions restore from owner; remote deletions preserve modified local bytes outside root; file/directory transitions and restarts retain safe recovery.
 - [ ] Implement authoritative RO application: observe local changes, stage and verify owner content, persist local conflict copies/metadata in private state, recheck local preconditions, apply owner actions, adopt complete authoritative records, then verify filesystem/index against owner. Abort/retry on racing local modifications.
@@ -93,6 +94,9 @@ exposed through a general arbitrary-key mutation API.
 cargo test --locked -p deltaweave-index -p deltaweave-sync --all-targets --all-features
 cargo clippy --locked -p deltaweave-index -p deltaweave-sync --all-targets --all-features -- -D warnings
 ```
+
+Include store tests/static checks and an actual two-filesystem transfer/recovery
+run for the preservation fix; record the filesystem identities in evidence.
 
 - [ ] Commit, record real network evidence, and obtain independent spec/quality review.
 

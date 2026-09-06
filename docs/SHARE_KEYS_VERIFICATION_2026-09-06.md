@@ -56,6 +56,19 @@ iroh 1.1.0의 [N0 preset](https://docs.rs/iroh/1.1.0/iroh/endpoint/presets/struc
 각 인덱스를 기존 콘솔 설정에 일시 정지한 수동 폴더로 가져왔으며, 파일과 기존
 identity를 유지했다. 실제 공유 키 전환은 아직 이 준비 단계의 증거가 아니다.
 
+## 기존 파일시스템 간 복구 결함
+
+기준 `22664cf`의 실제 v2 CLI로 root를 `/tmp` 파일시스템, 사설 상태를
+`/dev/shm` 파일시스템에 두고 시험했다. 최초 전송은 성공했지만 원격 편집 적용은
+기존 파일을 사설 trash로 `rename`하는 단계에서 `Invalid cross-device link`
+(EXDEV)로 실패했다. 기존 파일의 원본 바이트는 남았다. 다음 삭제 단계는 편집
+실패 때문에 실행하지 않았으며 통과로 계산하지 않는다.
+
+이는 선행 통합 이전에도 존재하는 결함이다. 공유 키의 저장 위치 선택과 RO 복구에도
+영향을 주므로 동기화·저장 복구 구현 단계에서 해결하고 실제 두 파일시스템으로
+다시 검증한다. 증거는 `/tmp/deltaweave-crossfs-probe-zstw7got/result.json`과
+`/dev/shm/deltaweave-crossfs-state-gnobqc4z/`에 있다. 해당 시험 프로세스는 종료했다.
+
 ## 증거 위치와 남은 필수 검증
 
 작업 환경의 임시 증거 위치:
