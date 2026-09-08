@@ -919,6 +919,76 @@ describe("managed share web contract", () => {
     }
   });
 
+  it("keeps a pending revoke request id across an unrelated key expiry", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-09-08T00:00:00Z"));
+      const api = new Api();
+      vi.spyOn(api, "listKeys").mockResolvedValue([]);
+      vi.spyOn(api, "listMembers").mockResolvedValue([member]);
+      const revoke = vi
+        .spyOn(api, "revokeMember")
+        .mockRejectedValueOnce(new ApiError("offline", 503, "offline"))
+        .mockResolvedValueOnce({
+          request_id: "revoke-request",
+          accepted: true,
+          status: "waiting",
+          completion: "pending",
+          retry_at: null,
+        });
+      vi.spyOn(api, "issueKey").mockResolvedValue({
+        request_id: "expiring-issue",
+        share_id: shareId,
+        invitation_id: invitationId,
+        permission: "read_only",
+        expires_at: Math.floor(Date.now() / 1000) + 1,
+        key: "expiring-key",
+      });
+      render(
+        <ShareDetailFlow
+          share={share}
+          api={api}
+          onClose={() => {}}
+          onRefresh={async () => {}}
+        />,
+      );
+
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      fireEvent.click(screen.getByRole("button", { name: "멤버 철회" }));
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(revoke).toHaveBeenCalledOnce();
+      expect(screen.getByText(/소유자에 연결할 수 없습니다/)).toBeVisible();
+
+      fireEvent.click(screen.getByRole("button", { name: "읽기 전용 키 발급" }));
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(screen.getByText("expiring-key")).toBeVisible();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1000);
+      });
+      expect(screen.queryByText("expiring-key")).not.toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole("button", { name: "멤버 철회" }));
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(revoke).toHaveBeenCalledTimes(2);
+      expect(revoke.mock.calls[1][2]).toBe(revoke.mock.calls[0][2]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("retries a member revoke with the same request id after a lost response", async () => {
     const user = userEvent.setup();
     const api = new Api();

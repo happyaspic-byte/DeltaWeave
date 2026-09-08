@@ -1385,7 +1385,6 @@ export function ShareDetailFlow({
       if (!mounted.current || requestGeneration !== generation.current) return;
       setIssued(null);
       setActionError("발급된 키가 만료되어 화면에서 지웠습니다.");
-      mutationRequests.current.forEach((request) => request.reset());
     });
   }, [issued]);
 
