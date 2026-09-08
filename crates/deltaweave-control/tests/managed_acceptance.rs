@@ -578,7 +578,24 @@ fn managed_pending_resume_survives_ticket_loss_and_owner_offline() {
             .await
             .unwrap();
         wait_status(&member, share, ManagedStatus::Complete).await;
+        let original_record = managed_record(&member_data, share);
+        let members_before_resume = member_summary(owner.list_members(share).await.unwrap());
+        let owner_id = original_record["owner"]
+            .as_str()
+            .unwrap()
+            .parse::<iroh::EndpointId>()
+            .unwrap();
         member.shutdown().await.unwrap();
+        let member_service = deltaweave_net::share::ShareService::open(
+            member_data.join("managed").join("service"),
+            deltaweave_net::NetworkMode::DirectOnly,
+            None,
+        )
+        .await
+        .unwrap();
+        member_service.forget_membership(owner_id, share).unwrap();
+        assert!(member_service.open_session(owner_id, share).is_err());
+        member_service.shutdown().await.unwrap();
         owner
             .revoke_key(RevokeKeyInput {
                 request_id: "revoke-expiring-ticket".into(),
@@ -588,7 +605,6 @@ fn managed_pending_resume_survives_ticket_loss_and_owner_offline() {
             .await
             .unwrap();
 
-        let original_record = managed_record(&member_data, share);
         let ticket_path = member_data
             .join("managed")
             .join("pending")
@@ -644,6 +660,18 @@ fn managed_pending_resume_survives_ticket_loss_and_owner_offline() {
             ))
         );
         assert!(!ticket_path.exists(), "resume must remove stale raw ticket");
+        assert_eq!(
+            member_summary(owner.list_members(share).await.unwrap()),
+            members_before_resume,
+            "resume must not mint or mutate the owner membership"
+        );
+        let resumed_record = managed_record(&member_data, share);
+        for key in ["permission", "replica", "enrolled_at", "membership_epoch"] {
+            assert_eq!(
+                resumed_record[key], original_record[key],
+                "binding field {key}"
+            );
+        }
         resumed.shutdown().await.unwrap();
 
         let offline_key = owner
