@@ -133,6 +133,163 @@ async fn protected_data_requires_an_authenticated_session() {
 }
 
 #[tokio::test]
+async fn managed_routes_keep_session_host_origin_csrf_and_input_boundaries() {
+    let h = Harness::new().await;
+    let share = "0".repeat(64);
+    let invitation = "1".repeat(64);
+    let member = "2".repeat(64);
+    let anonymous_gets = [
+        "/api/v1/shares",
+        "/api/v1/shares/0000000000000000000000000000000000000000000000000000000000000000",
+        "/api/v1/shares/0000000000000000000000000000000000000000000000000000000000000000/keys",
+        "/api/v1/shares/0000000000000000000000000000000000000000000000000000000000000000/members",
+    ];
+    for uri in anonymous_gets {
+        let response = h
+            .request("GET", uri, Value::Null, None, None, None, "localhost:8390")
+            .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
+    }
+    let anonymous_mutations: Vec<(String, String, Value)> = vec![
+        (
+            "POST".into(),
+            "/api/v1/shares".into(),
+            json!({"request_id":"create"}),
+        ),
+        (
+            "POST".into(),
+            "/api/v1/shares/preview".into(),
+            json!({"request_id":"preview","key":"bad-key"}),
+        ),
+        (
+            "POST".into(),
+            "/api/v1/shares/validate".into(),
+            json!({"request_id":"validate","key":"bad-key"}),
+        ),
+        (
+            "POST".into(),
+            "/api/v1/shares/join".into(),
+            json!({"request_id":"join","key":"bad-key","destination_root":"/tmp"}),
+        ),
+        (
+            "POST".into(),
+            "/api/v1/shares/resume".into(),
+            json!({"request_id":"resume","share_id":share.clone()}),
+        ),
+        (
+            "POST".into(),
+            format!("/api/v1/shares/{share}/keys"),
+            json!({"request_id":"issue","permission":"read_only"}),
+        ),
+        (
+            "POST".into(),
+            format!("/api/v1/shares/{share}/keys/{invitation}/revoke"),
+            json!({"request_id":"revoke-key"}),
+        ),
+        (
+            "POST".into(),
+            format!("/api/v1/shares/{share}/members/{member}/revoke"),
+            json!({"request_id":"revoke-member"}),
+        ),
+        (
+            "DELETE".into(),
+            format!("/api/v1/shares/{share}"),
+            json!({"request_id":"remove"}),
+        ),
+        (
+            "POST".into(),
+            format!("/api/v1/shares/{share}/sync"),
+            json!({"request_id":"sync"}),
+        ),
+    ];
+    for (method, uri, body) in anonymous_mutations {
+        let response = h
+            .request(
+                &method,
+                &uri,
+                body,
+                None,
+                None,
+                Some("http://localhost:8390"),
+                "localhost:8390",
+            )
+            .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "{method} {uri}"
+        );
+    }
+
+    let (cookie, csrf) = h.login(&h.admin).await;
+    let missing_csrf = h
+        .request(
+            "POST",
+            "/api/v1/shares/preview",
+            json!({"request_id":"preview","key":"bad-key"}),
+            Some(&cookie),
+            None,
+            Some("http://localhost:8390"),
+            "localhost:8390",
+        )
+        .await;
+    assert_eq!(missing_csrf.status(), StatusCode::FORBIDDEN);
+    let hostile_origin = h
+        .request(
+            "POST",
+            "/api/v1/shares/preview",
+            json!({"request_id":"preview","key":"bad-key"}),
+            Some(&cookie),
+            Some(&csrf),
+            Some("http://evil.example:8390"),
+            "localhost:8390",
+        )
+        .await;
+    assert_eq!(hostile_origin.status(), StatusCode::FORBIDDEN);
+    let hostile_host = h
+        .request(
+            "GET",
+            "/api/v1/shares",
+            Value::Null,
+            Some(&cookie),
+            None,
+            None,
+            "evil.example:8390",
+        )
+        .await;
+    assert_eq!(hostile_host.status(), StatusCode::FORBIDDEN);
+
+    let bad_id = h
+        .request(
+            "GET",
+            "/api/v1/shares/not-a-share-id",
+            Value::Null,
+            Some(&cookie),
+            None,
+            None,
+            "localhost:8390",
+        )
+        .await;
+    assert_eq!(bad_id.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let bad_key = h
+        .request(
+            "POST",
+            "/api/v1/shares/preview",
+            json!({"request_id":"preview-bad-key","key":"bad-key"}),
+            Some(&cookie),
+            Some(&csrf),
+            Some("http://localhost:8390"),
+            "localhost:8390",
+        )
+        .await;
+    assert_eq!(bad_key.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let bad_key_body = json_body(bad_key).await;
+    assert_eq!(bad_key_body["error_code"], "invalid_ticket");
+    assert!(!bad_key_body.to_string().contains("bad-key"));
+    h.state.manager.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn host_origin_csrf_login_replay_logout_and_expiry_are_enforced() {
     let h = Harness::new().await;
     for host in [

@@ -23,6 +23,8 @@ use std::{
     time::Duration,
 };
 
+mod share_routes;
+
 pub(crate) struct AppState {
     pub manager: Arc<Manager>,
     pub auth: Arc<Auth>,
@@ -145,6 +147,9 @@ pub(crate) fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/session", get(session).post(login).delete(logout))
         .route("/api/v1/state", get(snapshot))
         .route("/api/v1/events", get(events))
+        // The managed-share router registers its fixed paths before the
+        // `/{share_id}` paths so preview/validate/join cannot be parsed as IDs.
+        .merge(share_routes::router())
         .route("/api/v1/folders", post(add_folder))
         .route(
             "/api/v1/folders/{id}",

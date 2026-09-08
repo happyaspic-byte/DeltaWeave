@@ -1127,7 +1127,7 @@ export function CopyButton({
   }
   return (
     <>
-      <button className="btn subtle small" onClick={copy}>
+      <button type="button" className="btn subtle small" onClick={copy}>
         {copied ? <CheckCircle size={15} /> : <Copy size={15} />}
         {copied ? "복사됨" : label}
       </button>
