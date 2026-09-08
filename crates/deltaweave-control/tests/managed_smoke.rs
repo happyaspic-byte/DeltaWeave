@@ -113,6 +113,95 @@ fn managed_owner_member_and_key_lifecycle() {
 }
 
 #[test]
+fn managed_join_service_init_failure_keeps_pending_binding_leased() {
+    isolated(
+        "managed_join_service_init_failure_keeps_pending_binding_leased",
+        || {
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                let temp = tempfile::tempdir().unwrap();
+                let owner_data = temp.path().join("owner-admin");
+                let owner_root = temp.path().join("owner-files");
+                let member_data = temp.path().join("member-admin");
+                let member_root = temp.path().join("member-files");
+                std::fs::create_dir_all(&owner_root).unwrap();
+                std::fs::write(owner_root.join("seed.txt"), b"seed").unwrap();
+                let options = ManagerOptions {
+                    managed_network: deltaweave_control::NetworkMode::DirectOnly,
+                    managed_bind: None,
+                };
+                let owner = Manager::open_with_options(owner_data, options)
+                    .await
+                    .unwrap();
+                let share = owner
+                    .create_share(CreateShareInput {
+                        request_id: "service-failure-create".into(),
+                        name: "Files".into(),
+                        root: owner_root,
+                        min_free_space_mib: Some(0),
+                    })
+                    .await
+                    .unwrap();
+                let share_id: ShareId =
+                    ShareId(hex::decode(&share.share_id).unwrap().try_into().unwrap());
+                let key = owner
+                    .issue_key(IssueKeyInput {
+                        request_id: "service-failure-key".into(),
+                        share: share_id,
+                        permission: Permission::ReadWrite,
+                        expires_at: None,
+                    })
+                    .await
+                    .unwrap();
+                let ticket = deltaweave_net::share::ShareTicket::parse(&key.key).unwrap();
+                let preview = ticket.preview();
+
+                // A file at the managed service directory makes only service
+                // initialization fail.  The pending root/state lease was
+                // already acquired and must be returned unchanged.
+                std::fs::create_dir_all(member_data.join("managed")).unwrap();
+                std::fs::write(member_data.join("managed/service"), b"not a directory").unwrap();
+                let member = Manager::open_with_options(member_data.clone(), options)
+                    .await
+                    .unwrap();
+                let error = member
+                    .join_share(JoinShareInput {
+                        request_id: "service-failure-join".into(),
+                        encoded_key: key.key,
+                        destination_root: member_root,
+                    })
+                    .await
+                    .expect_err("managed service initialization should fail closed");
+                assert_eq!(classify_managed_error(&error).code, "invalid_input");
+
+                let config: serde_json::Value = serde_json::from_slice(
+                    &std::fs::read(member_data.join("config.json")).unwrap(),
+                )
+                .unwrap();
+                let pending = &config["managed"]["pending"];
+                assert_eq!(pending.as_array().unwrap().len(), 1);
+                let pending = &pending[0];
+                let root = std::path::PathBuf::from(pending["root"].as_str().unwrap());
+                let state_root = std::path::PathBuf::from(pending["state_root"].as_str().unwrap());
+                assert!(
+                    deltaweave_net::root_admission::acquire_with_private(
+                        &root,
+                        deltaweave_net::root_admission::RootUse::Managed {
+                            share: preview.share_id.0,
+                            owner: *preview.owner.as_bytes(),
+                        },
+                        std::slice::from_ref(&state_root),
+                    )
+                    .is_err(),
+                    "service-init failure must retain the pending root/state lease"
+                );
+                member.shutdown().await.unwrap();
+                owner.shutdown().await.unwrap();
+            });
+        },
+    );
+}
+
+#[test]
 fn mixed_manual_and_managed_reopen_preserves_manual_worker_during_clock_quarantine() {
     isolated(
         "mixed_manual_and_managed_reopen_preserves_manual_worker_during_clock_quarantine",

@@ -2603,10 +2603,7 @@ impl Manager {
                 *slot.operation.lock().await = Some(worker);
                 Ok(())
             }
-            Err(error) => {
-                self.install_pending_slot(&pending).await?;
-                Err(error)
-            }
+            Err(error) => Err(error),
         }
     }
 
@@ -3324,13 +3321,58 @@ impl Manager {
         service: Arc<ShareService>,
         lease: Option<Arc<RootLease>>,
     ) -> Result<ManagedWorker> {
-        ensure!(
-            member.share_id == parse_share_id(&pending.share_id)?
-                && member.owner == endpoint_id(&pending.owner)?
-                && member.revoked_at.is_none(),
-            ShareError::MemberRevoked
-        );
-        let member_id = self.member_handle(member.share_id, member.endpoint).await?;
+        // A pending transition must already own the admission lease.  A
+        // missing lease is corrupt/legacy state; opening a fresh lease here
+        // would recreate the pending-to-active TOCTOU this handoff closes.
+        let Some(lease) = lease else {
+            return Err(ShareError::StateUnavailable.into());
+        };
+        let share = match parse_share_id(&pending.share_id) {
+            Ok(share) => share,
+            Err(error) => {
+                if let Err(reinstall) = self
+                    .install_pending_slot_with_lease(&pending, Arc::clone(&lease))
+                    .await
+                {
+                    self.record_managed_error(reinstall);
+                }
+                return Err(error);
+            }
+        };
+        let owner = match endpoint_id(&pending.owner) {
+            Ok(owner) => owner,
+            Err(error) => {
+                if let Err(reinstall) = self
+                    .install_pending_slot_with_lease(&pending, Arc::clone(&lease))
+                    .await
+                {
+                    self.record_managed_error(reinstall);
+                }
+                return Err(error);
+            }
+        };
+        if member.share_id != share || member.owner != owner || member.revoked_at.is_some() {
+            let error = anyhow::Error::new(ShareError::MemberRevoked);
+            if let Err(reinstall) = self
+                .install_pending_slot_with_lease(&pending, Arc::clone(&lease))
+                .await
+            {
+                self.record_managed_error(reinstall);
+            }
+            return Err(error);
+        }
+        let member_id = match self.member_handle(member.share_id, member.endpoint).await {
+            Ok(member_id) => member_id,
+            Err(error) => {
+                if let Err(reinstall) = self
+                    .install_pending_slot_with_lease(&pending, Arc::clone(&lease))
+                    .await
+                {
+                    self.record_managed_error(reinstall);
+                }
+                return Err(error);
+            }
+        };
         let record = config::ManagedShareRecord {
             share_id: pending.share_id.clone(),
             role: ShareRole::Member,
@@ -3368,7 +3410,6 @@ impl Manager {
                 .find(|request| request.request_id == pending.request_id)
                 .map(|request| request.request_hash.clone())
         };
-        let owner = member.owner;
         let share = member.share_id;
         let sync_config = ManagedSyncConfig {
             root: PathBuf::from(&pending.root),
@@ -3380,25 +3421,22 @@ impl Manager {
         // engine must not drop and reacquire it between enrollment and opening
         // its index/store: that gap would let another process claim either
         // root before the active member owns the binding.
-        let engine_result = match lease.as_ref() {
-            Some(lease) => ManagedSyncEngine::open_with_lease(
-                &service,
-                owner,
-                share,
-                sync_config,
-                Arc::clone(lease),
-            ),
-            None => ManagedSyncEngine::open(&service, owner, share, sync_config),
-        };
+        let engine_result = ManagedSyncEngine::open_with_lease(
+            &service,
+            owner,
+            share,
+            sync_config,
+            Arc::clone(&lease),
+        );
         let engine = match engine_result {
             Ok(engine) => engine,
             Err(error) => {
                 // Keep the exact Arc-backed lease in the pending slot when
                 // opening fails.  Reacquiring here would recreate the same
                 // handoff gap this path is designed to close.
-                if let Some(lease) = lease
-                    && let Err(reinstall) =
-                        self.install_pending_slot_with_lease(&pending, lease).await
+                if let Err(reinstall) = self
+                    .install_pending_slot_with_lease(&pending, Arc::clone(&lease))
+                    .await
                 {
                     self.record_managed_error(reinstall);
                 }
@@ -3460,9 +3498,9 @@ impl Manager {
                 if let Err(shutdown_error) = engine.shutdown().await {
                     self.record_managed_error(shutdown_error);
                 }
-                if let Some(lease) = lease
-                    && let Err(reinstall) =
-                        self.install_pending_slot_with_lease(&pending, lease).await
+                if let Err(reinstall) = self
+                    .install_pending_slot_with_lease(&pending, Arc::clone(&lease))
+                    .await
                 {
                     self.record_managed_error(reinstall);
                 }
@@ -3652,10 +3690,7 @@ impl Manager {
                             .await;
                         let worker = match worker {
                             Ok(worker) => worker,
-                            Err(error) => {
-                                self.install_pending_slot(&pending).await?;
-                                return Err(error);
-                            }
+                            Err(error) => return Err(error),
                         };
                         let slot = self
                             .managed_slots
@@ -3826,8 +3861,12 @@ impl Manager {
             let service = match self.ensure_managed_service().await {
                 Ok(service) => service,
                 Err(error) => {
-                    drop(lease);
-                    self.install_pending_slot(&pending).await?;
+                    if let Err(reinstall) = self
+                        .install_pending_slot_with_lease(&pending, Arc::clone(&lease))
+                        .await
+                    {
+                        self.record_managed_error(reinstall);
+                    }
                     return Err(error);
                 }
             };
@@ -3891,10 +3930,7 @@ impl Manager {
                 .await;
             let worker = match worker {
                 Ok(worker) => worker,
-                Err(error) => {
-                    self.install_pending_slot(&pending).await?;
-                    return Err(error);
-                }
+                Err(error) => return Err(error),
             };
             self.managed_slots
                 .lock()
@@ -3954,10 +3990,7 @@ impl Manager {
             .await
         {
             Ok(worker) => worker,
-            Err(error) => {
-                self.install_pending_slot(&pending).await?;
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
         self.managed_slots
             .lock()
@@ -5520,6 +5553,218 @@ mod managed_error_tests {
                 .await
                 .unwrap();
             reopened.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn pending_preengine_failure_reattaches_the_exact_admission_lease() {
+        if std::env::var_os("DELTAWEAVE_PREENGINE_LEASE_CHILD").is_none() {
+            let home = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "managed_error_tests::pending_preengine_failure_reattaches_the_exact_admission_lease",
+                    "--nocapture",
+                ])
+                .env("DELTAWEAVE_PREENGINE_LEASE_CHILD", "1")
+                .env("HOME", home.path())
+                .env("USERPROFILE", home.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let data_dir = temp.path().join("admin");
+            let root = temp.path().join("member-root");
+            let state_root = temp.path().join("member-state");
+            std::fs::create_dir_all(&root).unwrap();
+
+            let manager = Manager::open_with_options(
+                data_dir.clone(),
+                ManagerOptions {
+                    managed_network: NetworkMode::DirectOnly,
+                    managed_bind: None,
+                },
+            )
+            .await
+            .unwrap();
+            let owner_secret = iroh::SecretKey::generate();
+            let member_secret = iroh::SecretKey::generate();
+            let owner = owner_secret.public();
+            let share = ShareId([1; 32]);
+            root_admission::reserve_private(&state_root).unwrap();
+            private::prepare_directory(&state_root).unwrap();
+            let lease = Arc::new(
+                root_admission::acquire_with_private(
+                    &root,
+                    RootUse::Managed {
+                        share: share.0,
+                        owner: *owner.as_bytes(),
+                    },
+                    std::slice::from_ref(&state_root),
+                )
+                .unwrap(),
+            );
+            let lease_weak = Arc::downgrade(&lease);
+            let pending = config::PendingRecord {
+                request_id: "preengine-lease".into(),
+                share_id: share_id_string(share),
+                owner: owner.to_string(),
+                owner_address: None,
+                name: "preengine".into(),
+                permission: Some(Permission::ReadWrite),
+                root: root.to_string_lossy().into_owned(),
+                state_root: state_root.to_string_lossy().into_owned(),
+                ticket_file: data_dir
+                    .join("managed/pending")
+                    .join(format!("{}.ticket", "aa".repeat(32)))
+                    .to_string_lossy()
+                    .into_owned(),
+                created_at: managed_now(),
+                expires_at: None,
+                status: ManagedStatus::Waiting,
+                retry_at: None,
+                min_free_space_bytes: 0,
+            };
+            manager
+                .managed_slots
+                .lock()
+                .expect("managed slots mutex")
+                .insert(
+                    pending.share_id.clone(),
+                    Arc::new(ManagedSlot {
+                        operation: AsyncMutex::new(Some(ManagedWorker::Pending(PendingWorker {
+                            request_id: pending.request_id.clone(),
+                            lease: Some(Arc::clone(&lease)),
+                        }))),
+                    }),
+                );
+            drop(lease);
+            let taken_lease = manager
+                .take_pending_lease(&pending.share_id)
+                .await
+                .unwrap()
+                .expect("pending caller must own the lease");
+            let service = Arc::new(
+                ShareService::open(
+                    data_dir.join("standalone-service"),
+                    NetworkMode::DirectOnly,
+                    None,
+                )
+                .await
+                .unwrap(),
+            );
+            let malformed = NetMembership {
+                share_id: ShareId([2; 32]),
+                owner,
+                endpoint: member_secret.public(),
+                permission: Permission::ReadWrite,
+                replica: deltaweave_core::ReplicaId(deltaweave_core::Hash32::from_bytes([3; 32])),
+                enrolled_at: managed_now(),
+                revoked_at: None,
+                epoch: 1,
+            };
+            let error = match manager
+                .complete_pending_membership(
+                    pending.clone(),
+                    malformed,
+                    Arc::clone(&service),
+                    Some(taken_lease),
+                )
+                .await
+            {
+                Ok(_) => panic!("malformed membership must fail before engine open"),
+                Err(error) => error,
+            };
+            assert!(is_share_error(&error, ShareError::MemberRevoked));
+
+            let slot = manager
+                .managed_slots
+                .lock()
+                .expect("managed slots mutex")
+                .get(&pending.share_id)
+                .cloned()
+                .expect("pending slot reattached");
+            let operation = slot.operation.lock().await;
+            let Some(ManagedWorker::Pending(restored)) = operation.as_ref() else {
+                panic!("pre-engine failure must restore pending worker");
+            };
+            let Some(restored_lease) = restored.lease.as_ref() else {
+                panic!("pending worker lost its admission lease");
+            };
+            let original_lease = lease_weak
+                .upgrade()
+                .expect("the original lease allocation must remain alive");
+            assert!(Arc::ptr_eq(restored_lease, &original_lease));
+            drop(original_lease);
+            drop(operation);
+            assert!(
+                root_admission::acquire_with_private(
+                    &root,
+                    RootUse::Managed {
+                        share: share.0,
+                        owner: *owner.as_bytes(),
+                    },
+                    std::slice::from_ref(&state_root),
+                )
+                .is_err(),
+                "a competing admission attempt must not acquire the pending binding"
+            );
+            std::fs::create_dir_all(data_dir.join("managed/member-handle.key")).unwrap();
+            let valid_member = NetMembership {
+                share_id: share,
+                owner,
+                endpoint: member_secret.public(),
+                permission: Permission::ReadWrite,
+                replica: deltaweave_core::ReplicaId(deltaweave_core::Hash32::from_bytes([3; 32])),
+                enrolled_at: managed_now(),
+                revoked_at: None,
+                epoch: 1,
+            };
+            let handle_error = match manager
+                .complete_pending_membership(
+                    pending.clone(),
+                    valid_member,
+                    Arc::clone(&service),
+                    Some(
+                        manager
+                            .take_pending_lease(&pending.share_id)
+                            .await
+                            .unwrap()
+                            .expect("pending caller must own the lease"),
+                    ),
+                )
+                .await
+            {
+                Ok(_) => panic!("member handle failure must stop before engine open"),
+                Err(error) => error,
+            };
+            assert!(!classify_managed_error(&handle_error).code.is_empty());
+            let slot = manager
+                .managed_slots
+                .lock()
+                .expect("managed slots mutex")
+                .get(&pending.share_id)
+                .cloned()
+                .expect("pending slot survives member handle failure");
+            let operation = slot.operation.lock().await;
+            let Some(ManagedWorker::Pending(restored)) = operation.as_ref() else {
+                panic!("member handle failure must restore pending worker");
+            };
+            let Some(restored_lease) = restored.lease.as_ref() else {
+                panic!("member handle failure lost admission lease");
+            };
+            let original_lease = lease_weak
+                .upgrade()
+                .expect("the original lease allocation must remain alive");
+            assert!(Arc::ptr_eq(restored_lease, &original_lease));
+            drop(original_lease);
+            drop(operation);
+            manager.shutdown().await.unwrap();
+            Arc::try_unwrap(service).unwrap().shutdown().await.unwrap();
         });
     }
 
