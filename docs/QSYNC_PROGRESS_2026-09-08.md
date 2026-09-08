@@ -7,7 +7,7 @@
 작성 agent: `qsync_contracts` / Luna Max
 
 현재 단계: B control 구현 checkpoint. A 계약 문서는 `121d042`로 통합되었고,
-B의 현재 source/test checkpoint는 `976cbf8`이다. B 완료·통합·push로 표시하지 않는다.
+B의 현재 source/test checkpoint는 `6c864fa`이다. B 완료·통합·push로 표시하지 않는다.
 
 ## 작업 공간과 agent
 
@@ -17,7 +17,7 @@ B의 현재 source/test checkpoint는 `976cbf8`이다. B 완료·통합·push로
 | A contracts | `/home/ubuntu/project/DeltaWeave-qsync-contracts-20260908` | `feat/qsync-contracts-20260908` | `121d042` 완료 |
 | A protocol audit | 별도 agent `qsync_protocol_audit` | root 기록 예정 | `8d50a14` network 계약 완료, D/E 입력 |
 | baseline validation | `luna_protocol_plan` 재사용 | root 기록 예정 | CI 실패 원인 조사 |
-| B control | `/home/ubuntu/project/DeltaWeave-qsync-control-20260908` | `feat/qsync-control-20260908` | `976cbf8` checkpoint, acceptance 일부 검증, 계속 구현 |
+| B control | `/home/ubuntu/project/DeltaWeave-qsync-control-20260908` | `feat/qsync-control-20260908` | `6c864fa` pending-retry API checkpoint, focused 검증 통과, B 계속 구현 |
 | C web | `/home/ubuntu/project/DeltaWeave-qsync-web-20260908` | `feat/qsync-web-20260908` | 병렬 구현 진행 |
 | validation | `/home/ubuntu/project/DeltaWeave-qsync-verification-20260908` | `test/qsync-verification-20260908` | 후속 검증 |
 
@@ -28,6 +28,10 @@ B의 현재 source/test checkpoint는 `976cbf8`이다. B 완료·통합·push로
 - `ManagerOptions`, `create_share`, `preview_share_key`, `validate_share_key`,
   `join_share`, `resume_membership`, `list_keys`, `issue_key`, `rotate_key`,
   `revoke_key`, `list_members`, `revoke_member`, `remove_share`, `share_command`와
+  응답 유실 pending 전용 `RetryPendingJoinInput { request_id, share }` 및
+  `retry_pending_join`을 고정했다. 이 endpoint는 기존 join request journal과
+  pending share binding을 확인하고 private ticket으로 재시도하며, 이미 enrolled인
+  request는 같은 membership 결과를 반환하고 새 key/ReplicaId를 만들지 않는다.
   `AppSnapshot` additive `#[serde(default)] shares`/pending을 고정했다.
 - ShareId/InvitationId는 lowercase hex 64자, permission/role/status는 snake_case,
   timestamp는 UTC Unix seconds `u64`이다. unknown API enum은 422, persisted unknown은
@@ -54,15 +58,17 @@ B의 현재 source/test checkpoint는 `976cbf8`이다. B 완료·통합·push로
 | current control/web/net/sync boundaries | 읽기 완료 | spec 참고 코드 목록 |
 | existing ShareService/OwnerShare/ManagedSyncEngine | API 존재, Manager/web 연결 미완료 | spec current-code section |
 | required web asset guard | `DELTAWEAVE_REQUIRE_WEB_ASSETS=1` workflow 확인 | plan Task B/C/F |
-| B source checkpoint | `f68b2ea` | control/net managed lifecycle, DTO/worker/recovery 및 smoke 추가 |
+| B source checkpoint | `6c864fa` | managed lifecycle crash/recovery plus durable pending-join retry API, provenance lease handoff, duplicate binding, key intent/rotation, per-test profile harness |
 | A docs validation | `git diff --cached --check` exit 0; allowed-file list 3개 | 이 commit |
 | required cargo check | exit `0`, 10.91s; `deltaweave-net`, `deltaweave-sync`, `deltaweave-control` 검사 | `b-control/check-20260908-current.log` |
 | managed owner→RW smoke | `1 passed, 0 failed, 0 ignored`, exit `0`, 2.35s; 실제 파일 수신 확인 | `b-control/managed-smoke-20260908-current.log` |
 | control focused lifecycle | isolated process별 5개 `1 passed`, exit `0`; admission fixture 오염을 숨기지 않고 격리 재실행 근거 보존 | `b-control/control-focused-20260908-current.log`, `b-control/control-focused-isolated-retry-20260908-current.log` |
 | net resume binding | exact permission/ReplicaId/epoch/revoke binding test `1 passed`, exit `0` | `b-control/net-registry-resume-20260908-current.log` |
-| managed acceptance | `managed_acceptance` 4개 독립 시나리오 `4 passed, 0 failed`, exit `0`, 61.89s; source tree는 `a831019`에서 검증 후 `976cbf8`로 resume 변형 추가 | `b-control/managed-acceptance-all-tmpdir-20260908-current.log` |
+| managed acceptance | child profile/TMPDIR harness의 6개 독립 시나리오 `6 passed, 0 failed`, exit `0`, 147.06s; 같은 결과를 기존 isolated run과 중복 집계하지 않음 | `b-control/test-managed-acceptance-harness-20260908T223255Z.log` |
 | resume without local relationship | 성공 join 뒤 local `ShareService::forget_membership` 후 재시작, active owner membership의 member 목록/permission/ReplicaId/enrolled_at/epoch 보존 `1 passed`, exit `0`, 40.71s | `b-control/managed-pending-resume-forgot-20260908-current.log` |
-| current build/lint/format | current source `cargo check` exit `0`(5.41s), strict clippy exit `0`(1.63s), resume 변형 포함 fmt exit `0` 및 diff check exit `0` | `b-control/check-managed-acceptance-20260908-current.log`, `b-control/clippy-pending-forgot-20260908-current.log`, `b-control/fmt-pending-forgot-20260908-current.log` |
+| current build/lint/format | `cargo check --locked -p deltaweave-control -p deltaweave-net --all-targets --all-features` exit `0`(7.84s), strict clippy exit `0`(12.38s), fmt/diff check exit `0` | `b-control/cargo-check-pending-api-20260908T230238Z.log`, `b-control/cargo-clippy-pending-api-20260908T230252Z.log` |
+| current focused regressions | control managed unit `5 passed`, root admission `16 passed`, smoke `6 passed`, exit `0`; lease provenance/duplicate binding/key orphan/rotation included | `b-control/test-control-unit-managed-20260908T223623Z.log`, `b-control/test-net-root-admission-20260908T223651Z.log`, `b-control/test-managed-smoke-20260908T222615Z.log` |
+| public pending retry API | wrong-share conflict, wrong-operation rejection, pending-only owner-offline waiting, owner-return enrollment, same-request member/permission replay, and expired pending terminal mapping `1 passed`, exit `0`, 135.73s | `b-control/test-pending-retry-api-final-20260908T225952Z.log`; started `2026-09-08T22:59:52Z` against the pending API tree and committed as `6c864fa`; this is a durable pending fixture, not packet-loss or HTTP response-loss evidence |
 | npm/Windows/Internet/full CI | 아직 실행하지 않음 | 후속 evidence 필요 |
 
 ## baseline 실패와 남은 문제
@@ -79,7 +85,7 @@ UID/GID 65532 self-test receiver `PermissionDenied`였다. Security run
 body 충돌, owner/RW/RO 가입 후 restart의 permission/ReplicaId/endpoint/enrolled_at/epoch
 보존, ticket 만료·철회 뒤 active membership resume 및 owner offline pending, RW 양방향
 실제 파일 전송, RO local 변경 private 보존·복구와 `Conflict`, `Revoked`, observer 0,
-pause/remove/shutdown drain을 `976cbf8`의 네 테스트에서 확인했다. response-loss durable
+pause/remove/shutdown drain을 `e8122ac`의 네 테스트에서 확인했다. response-loss durable
 pending 변형은 local relationship을 별도로 잊은 뒤 owner active membership만으로 복구하고
 owner member 목록 및 binding 필드를 보존하는 exact test로 추가 확인했다. 이 결과를 실제
 패킷 손실이나 인증 HTTP 응답 유실로 해석하지 않는다. 테스트들은 B evidence
@@ -97,12 +103,27 @@ tmpfs `usrquota`의 `EDQUOT`로 중단되었으며 제품 오류로 분류하지
 flow, D N0/relay/address update, E swarm grant/manifest/max-8/fallback, root safety의
 전체 경로, Windows native 제품 검증, external Internet, full CI 및 main push.
 
-B checkpoint 뒤 남은 구현·검증: 전체 Manager CRUD/API와 C 인증 경계 통합, pending malformed/
-lease fail-closed와 create-intent orphan recovery의 추가 fault tests, paused/revoked
-복구·remove tombstone의 독립 관측, member별 revocation-pending와 snapshot managed totals,
-Windows 제품 runtime/ACL 및 npm asset guard 검증이다. C 소유 `private.rs` Windows native/
-DACL 증거와 Docker HOME/UID 검증은 B가 수정하지 않고 C가 담당한다. baseline Linux UDP
-rebind/Windows watcher/container 실패는 원인 수정 전까지 실패로 유지한다.
+## e8122ac finding 매핑
+
+| finding/게이트 | 현재 상태 | 근거와 남은 검증 |
+| --- | --- | --- |
+| durable key intent, exact replay, RW/RO rotate permission | fixed + tested | `test-managed-smoke-20260908T222615Z.log`, `test-managed-acceptance-harness-20260908T223255Z.log`; file/registry crash fault injection의 모든 경계는 후속 보강 |
+| mixed clock/manual 보존, startup 전체 cleanup | fixed + tested | `test-control-unit-managed-20260908T223623Z.log`, smoke의 mixed reopen; 실제 fault-injected post-worker-start failure는 후속 |
+| pending GC mutation serialization, private ancestor/filename guard | fixed + tested | `test-control-unit-managed-20260908T223623Z.log`; live-ticket write/commit barrier의 독립 fault fixture는 후속 |
+| per-share failure isolation | fixed in tick path | bad pending이 healthy share를 막지 않도록 per-share 오류를 기록하고 계속한다; 두 share fault fixture는 후속 |
+| remove tombstone replay와 ghost-worker 경합 | fixed + tested for replay; lock protected | `test-managed-smoke-20260908T222615Z.log`; deterministic restore/remove barrier와 observer/lease absence 증거는 후속 |
+| duplicate pending/active binding 및 immutable root/state | fixed + tested | `test-duplicate-binding-20260908T222550Z.log`, `test-managed-acceptance-harness-20260908T223255Z.log` |
+| same-Arc lease handoff 및 provenance(role/share/private root) | fixed; metadata tested | `test-admission-provenance-20260908T222455Z.log`, `test-net-root-admission-20260908T223651Z.log`; forced engine-open failure에서 동일 lease 유지 회귀는 후속 |
+| pending-only join retry API 및 response-loss journal mapping | fixed + tested | `test-pending-retry-api-final-20260908T225952Z.log`; background completion race는 preflight 없이 helper 후 journal/record를 재조회해 enrolled 결과를 우선하며 C의 authenticated HTTP adapter는 후속 |
+| per-member revoke pending/drain and observer zeroing | implemented; immediate owner drain tested | acceptance에서 `Revoked`/observer 0 확인; delayed writer ACK의 `Pending → Complete` 실제 증거는 D/E transport hook 후속 |
+| D/E network ownership | pending dependency | provider/requester remote-id, monotonic lease, cancellation/admission-close, roster/heartbeat/address refresh는 B가 구현하지 않으며 protocol audit/root가 선행 확정 |
+
+B checkpoint 뒤 남은 구현·검증: C 인증 경계와 실제 API 통합, pending malformed/lease
+fail-closed와 create-intent orphan recovery의 추가 fault tests, paused/revoked 복구,
+member별 delayed revocation-pending, snapshot managed totals, Windows 제품 runtime/ACL 및
+npm asset guard 검증이다. C 소유 `private.rs` Windows native/DACL 증거와 Docker HOME/UID
+검증은 B가 수정하지 않고 C가 담당한다. baseline Linux UDP rebind/Windows watcher/container
+실패는 원인 수정 전까지 실패로 유지한다.
 
 release 범위: workspace `0.4.0`을 올리지 않고 기존 published `v0.4.0`을 재사용한다.
 최종 successful main CI 뒤 release prepare의 `publish=false`, existing tag/no new tag를
@@ -115,7 +136,7 @@ root가 확인한다. Container image artifact는 운영 배포 증거와 구분
 
 ## 다음 작업과 인계
 
-1. root가 `f68b2ea`와 이 진행 대장 commit을 B/C 통합 기준으로 전달한다. source 변경은
+1. root가 `f68b2ea`, `e8122ac`, `6c864fa`와 이 진행 대장 commit을 B/C 통합 기준으로 전달한다. source 변경은
    현재 worktree에 보존하며 push/merge하지 않는다.
 2. B는 위 남은 수명주기·멱등성·복구 항목과 focused tests를 이어서 실행한다. C는 이
    문서의 route/DTO/auth 계약과 Windows private namespace를 소비한다.

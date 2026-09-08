@@ -139,7 +139,7 @@ impl ShareService {
                 Ok(config)
             },
         )?;
-        self.load_config_with_lease(config, lease).await
+        self.load_config_with_lease(config, lease, false).await
     }
     pub async fn load_owned_share(&self, share: ShareId) -> Result<OwnerShare> {
         let _lifecycle = self.lifecycle.lock().await;
@@ -150,6 +150,30 @@ impl ShareService {
             });
         }
         self.load_config(self.registry.config(share)?).await
+    }
+
+    /// Loads an owner runtime with admission disabled before it enters the
+    /// endpoint map.  Restart recovery uses this for a durable Paused state so
+    /// no peer can observe a transient enabled window.
+    pub async fn load_owned_share_paused(&self, share: ShareId) -> Result<OwnerShare> {
+        let _lifecycle = self.lifecycle.lock().await;
+        if let Some(runtime) = self.runtimes.read().expect("runtime map").get(&share) {
+            runtime.disable();
+            return Ok(OwnerShare {
+                runtime: runtime.clone(),
+                key: self.key.clone(),
+            });
+        }
+        let config = self.registry.config(share)?;
+        let lease = root_admission::acquire_with_private(
+            &config.root,
+            RootUse::Managed {
+                share: share.0,
+                owner: *config.owner.as_bytes(),
+            },
+            std::slice::from_ref(&config.state_root),
+        )?;
+        self.load_config_with_lease(config, lease, true).await
     }
 
     /// Pauses and drains a managed owner runtime before deleting only its
@@ -175,12 +199,13 @@ impl ShareService {
             },
             std::slice::from_ref(&config.state_root),
         )?;
-        self.load_config_with_lease(config, lease).await
+        self.load_config_with_lease(config, lease, false).await
     }
     async fn load_config_with_lease(
         &self,
         config: OwnedShareConfig,
         lease: RootLease,
+        paused: bool,
     ) -> Result<OwnerShare> {
         let registry = self.registry.clone();
         let ready = registry.is_ready(config.share_id)?;
@@ -215,6 +240,9 @@ impl ShareService {
             })?);
             store.recover_path_changes(&root)?;
             let runtime = OwnedRuntime::new(config, registry, index, store, lease)?;
+            if paused {
+                runtime.disable();
+            }
             let report = runtime.index.scan()?;
             crate::ensure_index_report_safe(&report)?;
             runtime.refresh_causal_state()?;

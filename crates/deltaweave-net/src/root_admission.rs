@@ -30,11 +30,25 @@ pub enum RootUse {
 #[derive(Debug)]
 pub struct RootLease {
     root: PathBuf,
+    kind: RootUse,
+    private: Vec<PathBuf>,
     _lock: File,
 }
 impl RootLease {
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Admission identity captured when this lease was acquired.  Consumers
+    /// transferring a lease between lifecycle stages must validate this
+    /// binding instead of relying on the public path alone.
+    pub fn kind(&self) -> &RootUse {
+        &self.kind
+    }
+
+    /// Canonical private roots reserved together with the public lease.
+    pub fn private_roots(&self) -> &[PathBuf] {
+        &self.private
     }
 }
 
@@ -455,7 +469,16 @@ fn admit_at_with_files<T>(
         if matches!(entry.kind, RootUse::Managed { .. }) {
             ensure!(root.is_dir(), "managed root must be a directory");
         }
-        Some((key, entry, RootLease { root, _lock: lock }))
+        Some((
+            key,
+            entry.clone(),
+            RootLease {
+                root,
+                kind: entry.kind,
+                private: private.clone(),
+                _lock: lock,
+            },
+        ))
     } else {
         None
     };
@@ -557,6 +580,29 @@ mod tests {
             share: [1; 32],
             owner: [2; 32],
         }
+    }
+
+    #[test]
+    fn managed_lease_retains_public_and_private_binding_for_transfer() {
+        let temp = TempDir::new().unwrap();
+        let registry = temp.path().join("registry");
+        let root = temp.path().join("public");
+        let state = temp.path().join("private/state");
+        let expected_root = fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+        let expected_kind = managed();
+        let lease = admit_at(
+            &registry,
+            Some((&root, expected_kind.clone())),
+            std::slice::from_ref(&state),
+            |_, _| Ok(()),
+        )
+        .unwrap()
+        .0
+        .unwrap();
+
+        assert_eq!(lease.root(), expected_root);
+        assert_eq!(lease.kind(), &expected_kind);
+        assert_eq!(lease.private_roots(), &[fs::canonicalize(state).unwrap()]);
     }
 
     #[test]

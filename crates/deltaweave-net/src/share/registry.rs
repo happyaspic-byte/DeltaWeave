@@ -235,6 +235,17 @@ impl Registry {
             .clone())
     }
     pub fn issue(&self, ticket: &ShareTicket) -> Result<()> {
+        self.issue_with_revocation(ticket, None)
+    }
+
+    /// Commits one signed issuance and, for rotation, revokes the old
+    /// invitation in the same catalog transaction. Replaying an already
+    /// committed signed ticket is exact and never changes revocation state.
+    pub fn issue_with_revocation(
+        &self,
+        ticket: &ShareTicket,
+        revoke: Option<InvitationId>,
+    ) -> Result<()> {
         ticket.verify_at(now())?;
         self.update(|catalog| {
             let entry = catalog
@@ -245,6 +256,43 @@ impl Registry {
                 entry.config.owner == ticket.body.owner && entry.config.name == ticket.body.name,
                 ShareError::InvalidTicket
             );
+            let digest = ticket.issuance_digest()?;
+            if let Some(existing) = entry.invitations.get(&ticket.body.invitation_id) {
+                // A recovered issuance intent may replay the same signed
+                // ticket.  It must be an exact replay and can never resurrect
+                // a revoked invitation or overwrite its durable role/expiry.
+                ensure!(
+                    existing.share_id == ticket.body.share_id
+                        && existing.permission == ticket.body.permission
+                        && existing.expires_at == ticket.body.expires_at
+                        && existing.digest == digest
+                        && existing.revoked_at.is_none(),
+                    ShareError::InvalidTicket
+                );
+                if let Some(revoke) = revoke {
+                    ensure!(
+                        revoke != ticket.body.invitation_id,
+                        ShareError::InvalidTicket
+                    );
+                    let old = entry
+                        .invitations
+                        .get_mut(&revoke)
+                        .ok_or(ShareError::InvalidTicket)?;
+                    old.revoked_at.get_or_insert(now());
+                }
+                return Ok(());
+            }
+            if let Some(revoke) = revoke {
+                ensure!(
+                    revoke != ticket.body.invitation_id,
+                    ShareError::InvalidTicket
+                );
+                let old = entry
+                    .invitations
+                    .get_mut(&revoke)
+                    .ok_or(ShareError::InvalidTicket)?;
+                old.revoked_at.get_or_insert(now());
+            }
             ensure!(entry.invitations.len() < 4096, ShareError::Busy);
             entry.invitations.insert(
                 ticket.body.invitation_id,
@@ -254,7 +302,7 @@ impl Registry {
                     permission: ticket.body.permission,
                     expires_at: ticket.body.expires_at,
                     revoked_at: None,
-                    digest: ticket.issuance_digest()?,
+                    digest,
                 },
             );
             Ok(())
@@ -550,6 +598,10 @@ mod tests {
             .revoke_key(share, ticket.preview().invitation_id)
             .unwrap();
         assert!(registry.validate(&ticket).is_err());
+        assert!(
+            registry.issue(&ticket).is_err(),
+            "replaying a revoked issuance must never resurrect its invitation"
+        );
         assert!(registry.authorize(share, peer, false).is_ok());
         assert!(registry.authorize(share, peer, true).is_err());
         registry.revoke_member(share, peer).unwrap();

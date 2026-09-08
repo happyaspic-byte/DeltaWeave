@@ -42,6 +42,16 @@ pub(crate) struct ManagedConfig {
     pub requests: Vec<RequestRecord>,
     #[serde(default)]
     pub tombstones: Vec<String>,
+    #[serde(default)]
+    pub revocations: Vec<PendingRevocation>,
+    #[serde(default)]
+    pub key_intents: Vec<KeyIntent>,
+    #[serde(default)]
+    pub removals: Vec<RemovalIntent>,
+    /// Highest accepted managed wall-clock second.  A persisted future value
+    /// makes a later clock rollback fail closed instead of extending TTLs.
+    #[serde(default)]
+    pub clock_last: u64,
 }
 
 impl Default for ManagedConfig {
@@ -53,6 +63,10 @@ impl Default for ManagedConfig {
             intents: Vec::new(),
             requests: Vec::new(),
             tombstones: Vec::new(),
+            revocations: Vec::new(),
+            key_intents: Vec::new(),
+            removals: Vec::new(),
+            clock_last: 0,
         }
     }
 }
@@ -117,6 +131,51 @@ pub(crate) struct PendingRecord {
     pub status: ManagedStatus,
     #[serde(default)]
     pub retry_at: Option<u64>,
+    #[serde(default)]
+    pub min_free_space_bytes: u64,
+}
+
+/// Durable per-member denial whose network writer drain has not yet completed.
+/// The member is revoked in the owner registry before this record is written;
+/// retaining the record makes response loss and restart safe without exposing
+/// a share-wide pending flag.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct PendingRevocation {
+    pub request_id: String,
+    pub share_id: String,
+    pub member_id: String,
+    pub endpoint: String,
+    pub created_at: u64,
+    #[serde(default)]
+    pub retry_at: Option<u64>,
+}
+
+/// Durable staged issuance metadata. The signed bearer remains only in the
+/// private response file; this record lets a retry commit that exact ticket
+/// after a crash without minting a second invitation.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct KeyIntent {
+    pub request_id: String,
+    pub operation: String,
+    pub request_hash: String,
+    pub share_id: String,
+    pub permission: Permission,
+    pub expires_at: Option<u64>,
+    pub invitation_id: String,
+    pub response_file: String,
+    pub rotate_invitation: Option<String>,
+    pub created_at: u64,
+}
+
+/// Durable removal intent paired with a tombstone. Keeping the request hash
+/// through restart lets a retry complete the same removal after recovery has
+/// already unloaded and forgotten the configured share.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct RemovalIntent {
+    pub request_id: String,
+    pub request_hash: String,
+    pub share_id: String,
+    pub created_at: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

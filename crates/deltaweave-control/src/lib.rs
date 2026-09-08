@@ -40,6 +40,7 @@ pub enum ManagedErrorKind {
     ShuttingDown,
     IdempotencyCapacity,
     PendingExpired,
+    ClockRollback,
 }
 
 #[derive(Debug)]
@@ -78,6 +79,7 @@ impl ManagedErrorKind {
             Self::ShuttingDown => "shutting_down",
             Self::IdempotencyCapacity => "idempotency_capacity",
             Self::PendingExpired => "pending_expired",
+            Self::ClockRollback => "clock_rollback",
         }
     }
 
@@ -93,6 +95,7 @@ impl ManagedErrorKind {
             Self::ShuttingDown => "manager is shutting down",
             Self::IdempotencyCapacity => "managed request journal has no available capacity",
             Self::PendingExpired => "pending enrollment has expired",
+            Self::ClockRollback => "managed clock moved backwards; state is temporarily locked",
         }
     }
 }
@@ -188,6 +191,17 @@ fn managed_now() -> u64 {
     now() / 1000
 }
 
+fn managed_clock_required(managed: &config::ManagedConfig) -> bool {
+    !managed.shares.is_empty()
+        || !managed.pending.is_empty()
+        || !managed.intents.is_empty()
+        || !managed.requests.is_empty()
+        || !managed.tombstones.is_empty()
+        || !managed.revocations.is_empty()
+        || !managed.key_intents.is_empty()
+        || !managed.removals.is_empty()
+}
+
 fn validate_request_id(request_id: &str) -> Result<()> {
     ensure!(
         !request_id.is_empty()
@@ -217,6 +231,24 @@ fn parse_share_id(value: &str) -> Result<ShareId> {
     Ok(ShareId(id))
 }
 
+fn parse_invitation_id(value: &str) -> Result<InvitationId> {
+    ensure!(
+        value.len() == 64
+            && value.as_bytes().iter().all(u8::is_ascii_hexdigit)
+            && value == value.to_ascii_lowercase(),
+        ManagedError::new(ManagedErrorKind::InvalidInput)
+    );
+    let bytes = hex::decode(value)
+        .map_err(|_| anyhow::Error::new(ManagedError::new(ManagedErrorKind::InvalidInput)))?;
+    ensure!(
+        bytes.len() == 32,
+        ManagedError::new(ManagedErrorKind::InvalidInput)
+    );
+    let mut id = [0_u8; 32];
+    id.copy_from_slice(&bytes);
+    Ok(InvitationId(id))
+}
+
 fn share_id_string(id: ShareId) -> String {
     hex::encode(id.0)
 }
@@ -244,6 +276,55 @@ fn is_share_error(error: &anyhow::Error, expected: ShareError) -> bool {
     error
         .downcast_ref::<ShareError>()
         .is_some_and(|actual| *actual == expected)
+}
+
+fn is_terminal_pending_error(error: &anyhow::Error) -> bool {
+    [
+        ShareError::Expired,
+        ShareError::InvitationRevoked,
+        ShareError::MemberRevoked,
+        ShareError::InvalidTicket,
+        ShareError::UnsupportedVersion,
+    ]
+    .into_iter()
+    .any(|expected| is_share_error(error, expected))
+}
+
+fn is_terminal_pending_storage_error(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<ManagedError>().is_some_and(|error| {
+        matches!(
+            error.kind(),
+            ManagedErrorKind::NotFound
+                | ManagedErrorKind::InvalidPath
+                | ManagedErrorKind::InvalidInput
+        )
+    })
+}
+
+fn pending_terminal_ref(error: Option<&anyhow::Error>, share_id: &str) -> String {
+    let kind = error
+        .and_then(|error| {
+            error
+                .downcast_ref::<ShareError>()
+                .map(|error| match error {
+                    ShareError::InvitationRevoked | ShareError::MemberRevoked => "revoked",
+                    ShareError::InvalidTicket | ShareError::UnsupportedVersion => "invalid",
+                    ShareError::Expired => "expired",
+                    _ => "expired",
+                })
+                .or_else(|| {
+                    error
+                        .downcast_ref::<ManagedError>()
+                        .map(|error| match error.kind() {
+                            ManagedErrorKind::NotFound
+                            | ManagedErrorKind::InvalidPath
+                            | ManagedErrorKind::InvalidInput => "invalid",
+                            _ => "expired",
+                        })
+                })
+        })
+        .unwrap_or("expired");
+    format!("{kind}:{share_id}")
 }
 
 static IDS: AtomicU64 = AtomicU64::new(1);
@@ -310,7 +391,16 @@ enum ManagedWorker {
 }
 
 struct PendingWorker {
-    lease: Option<RootLease>,
+    /// The durable request that owns this share slot.  Share slots are
+    /// intentionally single-binding; a different join request may not
+    /// silently inherit or discard this lease.
+    request_id: String,
+    lease: Option<Arc<RootLease>>,
+}
+
+struct RevocationTask {
+    pending: config::PendingRevocation,
+    task: JoinHandle<Result<()>>,
 }
 
 struct IssueKeyRequest<'a> {
@@ -358,6 +448,7 @@ pub struct Manager {
     member_handle_key: AsyncMutex<Option<[u8; 32]>>,
     managed_mutations: AsyncMutex<()>,
     background: AsyncMutex<Vec<JoinHandle<()>>>,
+    revocation_tasks: AsyncMutex<Vec<RevocationTask>>,
     managed_options: ManagerOptions,
     persistence: AsyncMutex<()>,
     lifecycle: RwLock<()>,
@@ -463,6 +554,7 @@ impl Manager {
             member_handle_key: AsyncMutex::new(None),
             managed_mutations: AsyncMutex::new(()),
             background: AsyncMutex::new(Vec::new()),
+            revocation_tasks: AsyncMutex::new(Vec::new()),
             managed_options,
             persistence: AsyncMutex::new(()),
             lifecycle: RwLock::new(()),
@@ -470,70 +562,85 @@ impl Manager {
             stopped: AtomicBool::new(false),
             started_at: now(),
         });
-        for mut view in config.folders {
-            let others = manager
-                .shared
-                .lock()
-                .expect("snapshot mutex")
-                .folders
-                .values()
-                .cloned()
-                .collect::<Vec<_>>();
-            view.input = config::normalize(
-                view.input,
-                &view.id,
-                &manager.data_dir,
-                &others,
-                config.settings.poll_interval_seconds,
-            )?;
-            view.status = "starting".into();
-            view.addresses.clear();
-            view.phase = None;
-            view.current_path = None;
-            manager
-                .shared
-                .lock()
-                .expect("snapshot mutex")
-                .folders
-                .insert(view.id.clone(), view.clone());
-            let slot = Arc::new(Slot {
-                operation: AsyncMutex::new(None),
-            });
-            manager
-                .slots
-                .lock()
-                .expect("slots mutex")
-                .insert(view.id.clone(), slot.clone());
-            match Worker::start(view.clone(), manager.shared.clone()).await {
-                Ok(worker) => *slot.operation.lock().await = Some(worker),
-                Err(error) => {
-                    let mut state = manager.shared.lock().expect("snapshot mutex");
-                    if let Some(folder) = state.folders.get_mut(&view.id) {
-                        folder.status = "error".into();
-                        folder.last_error = Some(format!("{error:#}"));
+        let startup = async {
+            for mut view in config.folders {
+                let others = manager
+                    .shared
+                    .lock()
+                    .expect("snapshot mutex")
+                    .folders
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                view.input = config::normalize(
+                    view.input,
+                    &view.id,
+                    &manager.data_dir,
+                    &others,
+                    config.settings.poll_interval_seconds,
+                )?;
+                view.status = "starting".into();
+                view.addresses.clear();
+                view.phase = None;
+                view.current_path = None;
+                manager
+                    .shared
+                    .lock()
+                    .expect("snapshot mutex")
+                    .folders
+                    .insert(view.id.clone(), view.clone());
+                let slot = Arc::new(Slot {
+                    operation: AsyncMutex::new(None),
+                });
+                manager
+                    .slots
+                    .lock()
+                    .expect("slots mutex")
+                    .insert(view.id.clone(), slot.clone());
+                match Worker::start(view.clone(), manager.shared.clone()).await {
+                    Ok(worker) => *slot.operation.lock().await = Some(worker),
+                    Err(error) => {
+                        let mut state = manager.shared.lock().expect("snapshot mutex");
+                        if let Some(folder) = state.folders.get_mut(&view.id) {
+                            folder.status = "error".into();
+                            folder.last_error = Some(format!("{error:#}"));
+                        }
+                        state.activity(Some(view.id), "error", format!("{error:#}"), None);
                     }
-                    state.activity(Some(view.id), "error", format!("{error:#}"), None);
                 }
             }
-        }
-        // Persist dynamically allocated receiver ports before callers can copy connection details.
-        let bound = manager
-            .shared
-            .lock()
-            .expect("snapshot mutex")
-            .folders
-            .clone();
-        manager
-            .persist(|config| {
-                for folder in &mut config.folders {
-                    if let Some(observed) = bound.get(&folder.id) {
-                        folder.input.bind = observed.input.bind.clone();
+            // Persist dynamically allocated receiver ports before callers can copy connection details.
+            let bound = manager
+                .shared
+                .lock()
+                .expect("snapshot mutex")
+                .folders
+                .clone();
+            manager
+                .persist(|config| {
+                    for folder in &mut config.folders {
+                        if let Some(observed) = bound.get(&folder.id) {
+                            folder.input.bind = observed.input.bind.clone();
+                        }
                     }
-                }
-                Ok(())
-            })
-            .await?;
-        manager.recover_managed().await?;
+                    Ok(())
+                })
+                .await?;
+            manager.recover_managed().await
+        }
+        .await;
+        if let Err(error) = startup {
+            // Recovery runs after legacy workers have started.  Treat it as a
+            // startup transaction so an error cannot leave a detached watcher,
+            // listener, root lease, or managed endpoint behind the failed open.
+            let cleanup_failed = manager.shutdown().await.is_err();
+            if cleanup_failed {
+                return Err(anyhow::anyhow!(
+                    "managed recovery failed and startup cleanup failed"
+                ));
+            }
+            return Err(error);
+        }
         let weak = Arc::downgrade(&manager);
         let persistence_task = tokio::spawn(async move {
             let mut saved_revision = 0;
@@ -677,7 +784,17 @@ impl Manager {
             config
         };
         let before = serde_json::to_value(&config)?;
+        let before_managed = serde_json::to_value(&config.managed)?;
         mutate(&mut config)?;
+        let managed_changed = serde_json::to_value(&config.managed)? != before_managed;
+        if managed_changed {
+            let wall_now = managed_now();
+            ensure!(
+                config.managed.clock_last == 0 || wall_now >= config.managed.clock_last,
+                ManagedError::new(ManagedErrorKind::ClockRollback)
+            );
+            config.managed.clock_last = wall_now;
+        }
         let changed = serde_json::to_value(&config)? != before;
         let dir = self.data_dir.clone();
         let saved = config.clone();
@@ -689,6 +806,20 @@ impl Manager {
             state.revision += 1;
         }
         Ok(())
+    }
+
+    /// Returns the durable managed time and rejects a wall-clock rollback.
+    /// A rollback must never turn an expired ticket or response into a valid one.
+    fn managed_time(&self) -> Result<u64> {
+        let wall_now = managed_now();
+        let state = self.shared.lock().expect("snapshot mutex");
+        if managed_clock_required(&state.config.managed) {
+            ensure!(
+                state.config.managed.clock_last == 0 || wall_now >= state.config.managed.clock_last,
+                ManagedError::new(ManagedErrorKind::ClockRollback)
+            );
+        }
+        Ok(wall_now)
     }
 
     async fn ensure_managed_service(&self) -> Result<Arc<ShareService>> {
@@ -855,18 +986,294 @@ impl Manager {
         Ok(())
     }
 
+    fn pending_deadline(pending: &config::PendingRecord) -> u64 {
+        pending.expires_at.unwrap_or_else(|| {
+            pending
+                .created_at
+                .saturating_add(MANAGED_PENDING_MAX_SECONDS)
+        })
+    }
+
+    fn is_generated_private_path(root: &Path, path: &Path, suffix: &str) -> bool {
+        let Some(parent) = path.parent() else {
+            return false;
+        };
+        if parent != root {
+            return false;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            return false;
+        };
+        let Some(hash) = name.strip_suffix(suffix) else {
+            return false;
+        };
+        hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }
+
+    fn pending_ticket_path(&self, pending: &config::PendingRecord) -> Result<PathBuf> {
+        let root = self.data_dir.join("managed").join("pending");
+        private::prepare_directory(&root)?;
+        let path = PathBuf::from(&pending.ticket_file);
+        ensure!(
+            Self::is_generated_private_path(&root, &path, ".ticket"),
+            ManagedError::new(ManagedErrorKind::InvalidPath)
+        );
+        Ok(path)
+    }
+
+    async fn install_pending_slot_with_lease(
+        &self,
+        pending: &config::PendingRecord,
+        lease: Arc<RootLease>,
+    ) -> Result<()> {
+        let id = pending.share_id.clone();
+        let existing = self
+            .managed_slots
+            .lock()
+            .expect("managed slots mutex")
+            .get(&id)
+            .cloned();
+        if let Some(slot) = existing {
+            let mut operation = slot.operation.lock().await;
+            match operation.as_ref() {
+                None => {
+                    *operation = Some(ManagedWorker::Pending(PendingWorker {
+                        request_id: pending.request_id.clone(),
+                        lease: Some(lease),
+                    }));
+                    return Ok(());
+                }
+                Some(ManagedWorker::Pending(existing))
+                    if existing.request_id == pending.request_id =>
+                {
+                    // The existing worker owns the admission lease for this
+                    // request.  The newly acquired duplicate is dropped.
+                    return Ok(());
+                }
+                Some(ManagedWorker::Pending(_))
+                | Some(ManagedWorker::Owner(_))
+                | Some(ManagedWorker::Member(_)) => {
+                    return Err(ManagedError::new(ManagedErrorKind::Busy).into());
+                }
+            }
+        }
+        self.managed_slots
+            .lock()
+            .expect("managed slots mutex")
+            .insert(
+                id,
+                Arc::new(ManagedSlot {
+                    operation: AsyncMutex::new(Some(ManagedWorker::Pending(PendingWorker {
+                        request_id: pending.request_id.clone(),
+                        lease: Some(lease),
+                    }))),
+                }),
+            );
+        Ok(())
+    }
+
+    async fn install_pending_slot(&self, pending: &config::PendingRecord) -> Result<()> {
+        let id = pending.share_id.clone();
+        let existing = self
+            .managed_slots
+            .lock()
+            .expect("managed slots mutex")
+            .get(&id)
+            .cloned();
+        if let Some(slot) = existing {
+            let mut operation = slot.operation.lock().await;
+            if let Some(existing) = operation.as_ref() {
+                match existing {
+                    ManagedWorker::Pending(existing)
+                        if existing.request_id == pending.request_id =>
+                    {
+                        return Ok(());
+                    }
+                    ManagedWorker::Pending(_)
+                    | ManagedWorker::Owner(_)
+                    | ManagedWorker::Member(_) => {
+                        return Err(ManagedError::new(ManagedErrorKind::Busy).into());
+                    }
+                }
+            }
+            let share = parse_share_id(&pending.share_id)?;
+            let owner = endpoint_id(&pending.owner)?;
+            let lease = Arc::new(root_admission::acquire_with_private(
+                Path::new(&pending.root),
+                RootUse::Managed {
+                    share: share.0,
+                    owner: *owner.as_bytes(),
+                },
+                std::slice::from_ref(&PathBuf::from(&pending.state_root)),
+            )?);
+            *operation = Some(ManagedWorker::Pending(PendingWorker {
+                request_id: pending.request_id.clone(),
+                lease: Some(lease),
+            }));
+            return Ok(());
+        }
+        let share = parse_share_id(&pending.share_id)?;
+        let owner = endpoint_id(&pending.owner)?;
+        let lease = Arc::new(root_admission::acquire_with_private(
+            Path::new(&pending.root),
+            RootUse::Managed {
+                share: share.0,
+                owner: *owner.as_bytes(),
+            },
+            std::slice::from_ref(&PathBuf::from(&pending.state_root)),
+        )?);
+        self.managed_slots
+            .lock()
+            .expect("managed slots mutex")
+            .insert(
+                id,
+                Arc::new(ManagedSlot {
+                    operation: AsyncMutex::new(Some(ManagedWorker::Pending(PendingWorker {
+                        request_id: pending.request_id.clone(),
+                        lease: Some(lease),
+                    }))),
+                }),
+            );
+        Ok(())
+    }
+
+    /// Removes only a pending worker.  If a completed worker replaced the
+    /// pending operation concurrently, it is put back into the slot.
+    async fn remove_pending_slot(&self, share_id: &str) {
+        let slot = self
+            .managed_slots
+            .lock()
+            .expect("managed slots mutex")
+            .remove(share_id);
+        let Some(slot) = slot else { return };
+        let operation = slot.operation.lock().await.take();
+        match operation {
+            None | Some(ManagedWorker::Pending(_)) => {}
+            Some(worker) => {
+                self.managed_slots
+                    .lock()
+                    .expect("managed slots mutex")
+                    .insert(share_id.to_owned(), slot.clone());
+                *slot.operation.lock().await = Some(worker);
+            }
+        }
+    }
+
+    async fn take_pending_lease(&self, share_id: &str) -> Result<Option<Arc<RootLease>>> {
+        let slot = self
+            .managed_slots
+            .lock()
+            .expect("managed slots mutex")
+            .get(share_id)
+            .cloned();
+        let Some(slot) = slot else { return Ok(None) };
+        let operation = { slot.operation.lock().await.take() };
+        match operation {
+            Some(ManagedWorker::Pending(pending)) => Ok(pending.lease),
+            None => Ok(None),
+            Some(worker) => {
+                *slot.operation.lock().await = Some(worker);
+                Err(ManagedError::new(ManagedErrorKind::Busy).into())
+            }
+        }
+    }
+
+    /// Commits terminal pending state before releasing the lease and raw ticket.
+    /// The metadata remains available until the owner has authenticated the
+    /// caller as NotMember; an offline owner never causes an active membership
+    /// to be discarded.
+    async fn terminalize_pending(
+        &self,
+        pending: &config::PendingRecord,
+        result_ref: String,
+    ) -> Result<()> {
+        let ticket_path = self.pending_ticket_path(pending)?;
+        self.persist(|config| {
+            config
+                .managed
+                .pending
+                .retain(|item| item.request_id != pending.request_id);
+            if let Some(request) = config
+                .managed
+                .requests
+                .iter_mut()
+                .find(|request| request.request_id == pending.request_id)
+            {
+                request.result_ref = result_ref.clone();
+            }
+            Ok(())
+        })
+        .await?;
+        self.remove_pending_slot(&pending.share_id).await;
+        Self::remove_private_file(&ticket_path)
+    }
+
+    /// Removes unreferenced ticket files left by a crash between writing the
+    /// secret and committing its PendingRecord.  Referenced expired secrets are
+    /// removed while their trusted owner/share metadata is retained for resume.
+    async fn gc_pending_tickets(&self) -> Result<()> {
+        // Join writes the raw ticket before committing its PendingRecord.
+        // Serializing this scan with the mutation lock prevents the background
+        // tick from mistaking that in-flight ticket for an orphan.
+        let _mutation = self.managed_mutations.lock().await;
+        let root = self.data_dir.join("managed").join("pending");
+        if !root.is_dir() {
+            return Ok(());
+        }
+        // Validate every existing component before reading or removing a
+        // child.  A symlink/reparse ancestor must never redirect cleanup
+        // outside the managed private namespace.
+        private::prepare_directory(&root)?;
+        let now = self.managed_time()?;
+        let referenced = {
+            let state = self.shared.lock().expect("snapshot mutex");
+            let mut referenced = BTreeMap::new();
+            for pending in &state.config.managed.pending {
+                let path = PathBuf::from(&pending.ticket_file);
+                ensure!(
+                    Self::is_generated_private_path(&root, &path, ".ticket"),
+                    ManagedError::new(ManagedErrorKind::InvalidPath)
+                );
+                referenced.insert(path, Self::pending_deadline(pending) <= now);
+            }
+            referenced
+        };
+        for entry in std::fs::read_dir(&root)? {
+            let entry = entry?;
+            let path = entry.path();
+            if !entry.file_type()?.is_file() || path.is_symlink() {
+                continue;
+            }
+            if !Self::is_generated_private_path(&root, &path, ".ticket") {
+                continue;
+            }
+            if referenced
+                .get(&path)
+                .copied()
+                .is_none_or(|is_expired| is_expired)
+            {
+                Self::remove_private_file(&path)?;
+            }
+        }
+        Ok(())
+    }
+
     fn gc_key_responses(&self) -> Result<()> {
         let root = self.data_dir.join("managed").join("responses");
         if !root.is_dir() {
             return Ok(());
         }
-        let cutoff = std::time::SystemTime::now()
-            .checked_sub(std::time::Duration::from_secs(MANAGED_KEY_RESPONSE_SECONDS))
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        for entry in std::fs::read_dir(root)? {
+        private::prepare_directory(&root)?;
+        let now = self.managed_time()?;
+        let cutoff = UNIX_EPOCH
+            + std::time::Duration::from_secs(now.saturating_sub(MANAGED_KEY_RESPONSE_SECONDS));
+        for entry in std::fs::read_dir(&root)? {
             let entry = entry?;
             let path = entry.path();
-            if !path.is_file() || path.is_symlink() {
+            if !entry.file_type()?.is_file() || path.is_symlink() {
+                continue;
+            }
+            if !Self::is_generated_private_path(&root, &path, ".ticket") {
                 continue;
             }
             if entry
@@ -913,6 +1320,99 @@ impl Manager {
             .iter()
             .find(|record| record.request_id == request_id)
             .cloned()
+    }
+
+    fn removal_intent(&self, request_id: &str) -> Option<config::RemovalIntent> {
+        self.shared
+            .lock()
+            .expect("snapshot mutex")
+            .config
+            .managed
+            .removals
+            .iter()
+            .find(|intent| intent.request_id == request_id)
+            .cloned()
+    }
+
+    fn key_intent(&self, request_id: &str) -> Option<config::KeyIntent> {
+        self.shared
+            .lock()
+            .expect("snapshot mutex")
+            .config
+            .managed
+            .key_intents
+            .iter()
+            .find(|intent| intent.request_id == request_id)
+            .cloned()
+    }
+
+    fn key_intent_path(&self, intent: &config::KeyIntent) -> Result<PathBuf> {
+        let root = self.data_dir.join("managed").join("responses");
+        private::prepare_directory(&root)?;
+        let path = PathBuf::from(&intent.response_file);
+        ensure!(
+            Self::is_generated_private_path(&root, &path, ".ticket"),
+            ManagedError::new(ManagedErrorKind::InvalidPath)
+        );
+        Ok(path)
+    }
+
+    fn validate_key_intent(
+        intent: &config::KeyIntent,
+        request: &IssueKeyRequest<'_>,
+    ) -> Result<InvitationId> {
+        ensure!(
+            intent.operation == request.operation
+                && intent.request_hash == request.hash
+                && intent.share_id == share_id_string(request.share)
+                && intent.permission == request.permission
+                && intent.expires_at == request.expires_at
+                && intent
+                    .rotate_invitation
+                    .as_ref()
+                    .map(|id| id.to_ascii_lowercase())
+                    == request.rotate_invitation.map(invitation_id_string),
+            ManagedError::new(ManagedErrorKind::IdempotencyConflict)
+        );
+        parse_invitation_id(&intent.invitation_id)
+    }
+
+    async fn remove_key_intent(&self, request_id: &str) -> Result<()> {
+        self.persist(|config| {
+            config
+                .managed
+                .key_intents
+                .retain(|intent| intent.request_id != request_id);
+            Ok(())
+        })
+        .await
+    }
+
+    async fn expire_key_intent(
+        &self,
+        intent: &config::KeyIntent,
+        path: &Path,
+        owner: &OwnerShare,
+    ) -> Result<IssuedKey> {
+        let invitation = parse_invitation_id(&intent.invitation_id)?;
+        if let Some(existing) = owner
+            .keys()?
+            .into_iter()
+            .find(|existing| existing.id == invitation)
+            && existing.revoked_at.is_none()
+        {
+            owner.revoke_key(invitation)?;
+        }
+        self.record_request(
+            intent.request_id.clone(),
+            &intent.operation,
+            intent.request_hash.clone(),
+            path.to_string_lossy().into_owned(),
+        )
+        .await?;
+        Self::remove_private_file(path)?;
+        self.remove_key_intent(&intent.request_id).await?;
+        Err(ManagedError::new(ManagedErrorKind::KeyResponseExpired).into())
     }
 
     fn ensure_request_capacity(&self, request_id: &str) -> Result<()> {
@@ -969,10 +1469,83 @@ impl Manager {
         .await
     }
 
+    async fn complete_removed_request(
+        &self,
+        request_id: &str,
+        request_hash: &str,
+        share_id: &str,
+    ) -> Result<()> {
+        self.persist(|config| {
+            if let Some(existing) = config
+                .managed
+                .requests
+                .iter()
+                .find(|record| record.request_id == request_id)
+            {
+                ensure!(
+                    existing.operation == "remove_share" && existing.request_hash == request_hash,
+                    ManagedError::new(ManagedErrorKind::IdempotencyConflict)
+                );
+            } else {
+                ensure!(
+                    config.managed.requests.len() < MANAGED_REQUEST_CAPACITY,
+                    ManagedError::new(ManagedErrorKind::IdempotencyCapacity)
+                );
+                config.managed.requests.push(config::RequestRecord {
+                    request_id: request_id.into(),
+                    operation: "remove_share".into(),
+                    request_hash: request_hash.into(),
+                    result_ref: format!("mutation:{share_id}"),
+                    recorded_at: managed_now(),
+                });
+            }
+            config
+                .managed
+                .removals
+                .retain(|intent| intent.request_id != request_id);
+            Ok(())
+        })
+        .await
+    }
+
     fn record_managed_error(&self, error: anyhow::Error) {
         let summary = classify_managed_error(&error);
         let mut state = self.shared.lock().expect("snapshot mutex");
         state.activity(None, "managed_error", summary.message, None);
+    }
+
+    fn mark_managed_memory_failure(&self, share: ShareId, error: &anyhow::Error) {
+        let summary = classify_managed_error(error);
+        let id = share_id_string(share);
+        let mut state = self.shared.lock().expect("snapshot mutex");
+        if let Some(record) = state
+            .config
+            .managed
+            .shares
+            .iter_mut()
+            .find(|record| record.share_id == id)
+        {
+            record.status = match summary.code.as_str() {
+                "member_revoked" => ManagedStatus::Revoked,
+                "offline" => ManagedStatus::Offline,
+                _ => ManagedStatus::Error,
+            };
+            record.phase = Some(
+                if summary.code == "member_revoked" {
+                    "revoked"
+                } else {
+                    "error"
+                }
+                .into(),
+            );
+            record.retry_at = if summary.code == "member_revoked" {
+                None
+            } else {
+                Some(managed_now().saturating_add(MANAGED_TICK_SECONDS))
+            };
+            record.last_error = Some(summary);
+            state.revision += 1;
+        }
     }
 
     fn managed_record(&self, share: ShareId) -> Result<config::ManagedShareRecord> {
@@ -1049,12 +1622,68 @@ impl Manager {
         Ok(())
     }
 
+    /// Enforces the one-device/one-share binding before writing a new pending
+    /// ticket or reserving a second pair of roots.  The pending/active rows
+    /// are durable even when their worker is temporarily missing, so a new
+    /// request must never replace that binding.
+    fn ensure_new_join_binding(&self, share: ShareId, request_id: &str) -> Result<()> {
+        let id = share_id_string(share);
+        let state = self.shared.lock().expect("snapshot mutex");
+        if state
+            .config
+            .managed
+            .tombstones
+            .iter()
+            .any(|tombstone| tombstone == &id)
+        {
+            return Err(ManagedError::new(ManagedErrorKind::NotFound).into());
+        }
+        if state
+            .config
+            .managed
+            .pending
+            .iter()
+            .any(|pending| pending.share_id == id && pending.request_id != request_id)
+        {
+            return Err(ManagedError::new(ManagedErrorKind::Busy).into());
+        }
+        if state
+            .config
+            .managed
+            .shares
+            .iter()
+            .any(|record| record.share_id == id)
+        {
+            return Err(ManagedError::new(ManagedErrorKind::Busy).into());
+        }
+        Ok(())
+    }
+
     async fn recover_managed(&self) -> Result<()> {
+        // A rollback in managed time quarantines managed recovery while still
+        // allowing the legacy manager and its manual workers to open.  The
+        // durable managed rows remain untouched; once the wall clock catches
+        // up, the normal background tick can recover them.
+        if let Err(error) = self.managed_time() {
+            if error
+                .downcast_ref::<ManagedError>()
+                .is_some_and(|error| error.kind() == ManagedErrorKind::ClockRollback)
+            {
+                self.record_managed_error(error);
+                return Ok(());
+            }
+            return Err(error);
+        }
+        self.gc_pending_tickets().await?;
         let has_managed = {
             let state = self.shared.lock().expect("snapshot mutex");
             !state.config.managed.shares.is_empty()
                 || !state.config.managed.pending.is_empty()
                 || !state.config.managed.intents.is_empty()
+                || !state.config.managed.tombstones.is_empty()
+                || !state.config.managed.revocations.is_empty()
+                || !state.config.managed.key_intents.is_empty()
+                || !state.config.managed.removals.is_empty()
         };
         if !has_managed {
             return Ok(());
@@ -1069,6 +1698,8 @@ impl Manager {
                 state.config.managed.intents.clone(),
             )
         };
+        self.cleanup_tombstones(&service, &tombstones, &configured)
+            .await?;
         let mut recovered = Vec::new();
         let mut recovered_requests = Vec::new();
         for owned_config in owned {
@@ -1169,37 +1800,118 @@ impl Manager {
         self.restore_managed_workers(service).await
     }
 
+    async fn cleanup_tombstones(
+        &self,
+        service: &Arc<ShareService>,
+        tombstones: &[String],
+        configured: &[config::ManagedShareRecord],
+    ) -> Result<()> {
+        for id in tombstones {
+            let share = parse_share_id(id)?;
+            if let Some(record) = configured.iter().find(|record| record.share_id == *id)
+                && record.role == ShareRole::Member
+            {
+                let owner = endpoint_id(&record.owner)?;
+                service.forget_membership(owner, share)?;
+                continue;
+            }
+            match service.unload_owned_share(share).await {
+                Ok(()) => {}
+                Err(error) if is_share_error(&error, ShareError::UnknownShare) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        self.persist(|config| {
+            config
+                .managed
+                .shares
+                .retain(|record| !tombstones.iter().any(|id| id == &record.share_id));
+            config
+                .managed
+                .pending
+                .retain(|pending| !tombstones.iter().any(|id| id == &pending.share_id));
+            config
+                .managed
+                .revocations
+                .retain(|pending| !tombstones.iter().any(|id| id == &pending.share_id));
+            Ok(())
+        })
+        .await
+    }
+
     async fn restore_managed_workers(&self, service: Arc<ShareService>) -> Result<()> {
-        let records = self
+        let (records, tombstones) = {
+            let state = self.shared.lock().expect("snapshot mutex");
+            (
+                state.config.managed.shares.clone(),
+                state
+                    .config
+                    .managed
+                    .tombstones
+                    .iter()
+                    .cloned()
+                    .collect::<std::collections::BTreeSet<_>>(),
+            )
+        };
+        // A completed row and a pending row for the same share would give
+        // recovery two competing immutable roots. Refuse the configuration
+        // before opening either worker instead of silently choosing one.
+        let mut seen_bindings = std::collections::BTreeSet::new();
+        for record in &records {
+            ensure!(
+                seen_bindings.insert(record.share_id.clone()),
+                ShareError::StateUnavailable
+            );
+        }
+        let pending_snapshot = self
             .shared
             .lock()
             .expect("snapshot mutex")
             .config
             .managed
-            .shares
+            .pending
             .clone();
+        for pending in &pending_snapshot {
+            ensure!(
+                seen_bindings.insert(pending.share_id.clone()),
+                ShareError::StateUnavailable
+            );
+        }
         for record in records {
             let id = record.share_id.clone();
+            if tombstones.contains(&id) {
+                continue;
+            }
             let share = parse_share_id(&id)?;
             let worker = match record.role {
-                ShareRole::Owner => match service.load_owned_share(share).await {
-                    Ok(owner) => {
-                        self.install_owner_observer(share, &owner).await?;
-                        if matches!(
-                            record.status,
-                            ManagedStatus::Paused | ManagedStatus::Revoked
-                        ) {
-                            owner.pause().await;
-                        } else {
-                            self.update_owner_inventory(share, &owner).await?;
+                ShareRole::Owner => {
+                    let load = if matches!(
+                        record.status,
+                        ManagedStatus::Paused | ManagedStatus::Revoked
+                    ) {
+                        service.load_owned_share_paused(share).await
+                    } else {
+                        service.load_owned_share(share).await
+                    };
+                    match load {
+                        Ok(owner) => {
+                            self.install_owner_observer(share, &owner).await?;
+                            if matches!(
+                                record.status,
+                                ManagedStatus::Paused | ManagedStatus::Revoked
+                            ) {
+                                owner.pause().await;
+                            } else {
+                                self.update_owner_inventory(share, &owner).await?;
+                            }
+                            Some(ManagedWorker::Owner(owner))
                         }
-                        Some(ManagedWorker::Owner(owner))
+                        Err(error) => {
+                            self.update_managed_failure(share, &error).await?;
+                            None
+                        }
                     }
-                    Err(error) => {
-                        self.update_managed_failure(share, &error).await?;
-                        None
-                    }
-                },
+                }
                 ShareRole::Member => {
                     if record.status == ManagedStatus::Revoked {
                         continue;
@@ -1238,37 +1950,10 @@ impl Manager {
                     );
             }
         }
-        let pending = self
-            .shared
-            .lock()
-            .expect("snapshot mutex")
-            .config
-            .managed
-            .pending
-            .clone();
-        for item in pending {
-            let share = parse_share_id(&item.share_id)?;
-            let owner = endpoint_id(&item.owner)?;
-            let lease = root_admission::acquire_with_private(
-                Path::new(&item.root),
-                RootUse::Managed {
-                    share: share.0,
-                    owner: *owner.as_bytes(),
-                },
-                std::slice::from_ref(&PathBuf::from(&item.state_root)),
-            )?;
-            self.managed_slots
-                .lock()
-                .expect("managed slots mutex")
-                .insert(
-                    item.share_id.clone(),
-                    Arc::new(ManagedSlot {
-                        operation: AsyncMutex::new(Some(ManagedWorker::Pending(PendingWorker {
-                            lease: Some(lease),
-                        }))),
-                    }),
-                );
+        for item in pending_snapshot {
+            self.install_pending_slot(&item).await?;
         }
+        self.restore_pending_revocations().await?;
         Ok(())
     }
 
@@ -1400,12 +2085,302 @@ impl Manager {
         Ok(())
     }
 
+    async fn schedule_revocation_drain(
+        &self,
+        pending: config::PendingRevocation,
+        owner: OwnerShare,
+    ) -> Result<()> {
+        let peer = endpoint_id(&pending.endpoint)?;
+        ensure!(
+            owner.config().share_id == parse_share_id(&pending.share_id)?,
+            ShareError::StateUnavailable
+        );
+        let mut tasks = self.revocation_tasks.lock().await;
+        if tasks
+            .iter()
+            .any(|task| task.pending.request_id == pending.request_id)
+        {
+            return Ok(());
+        }
+        let task_owner = owner.clone();
+        let task = tokio::spawn(async move { task_owner.drain_member(peer).await });
+        tasks.push(RevocationTask { pending, task });
+        Ok(())
+    }
+
+    async fn complete_revocation(&self, pending: &config::PendingRevocation) -> Result<()> {
+        self.persist(|config| {
+            config.managed.revocations.retain(|item| {
+                !(item.request_id == pending.request_id
+                    && item.share_id == pending.share_id
+                    && item.member_id == pending.member_id)
+            });
+            Ok(())
+        })
+        .await
+    }
+
+    async fn retry_revocation(&self, pending: &config::PendingRevocation) -> Result<()> {
+        let retry_at = self.managed_time()?.saturating_add(MANAGED_TICK_SECONDS);
+        self.persist(|config| {
+            if let Some(item) = config
+                .managed
+                .revocations
+                .iter_mut()
+                .find(|item| item.request_id == pending.request_id)
+            {
+                item.retry_at = Some(retry_at);
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    async fn restore_pending_revocations(&self) -> Result<()> {
+        let pending = self
+            .shared
+            .lock()
+            .expect("snapshot mutex")
+            .config
+            .managed
+            .revocations
+            .clone();
+        for item in pending {
+            let share = parse_share_id(&item.share_id)?;
+            let owner = self.owner_share(share).await?;
+            self.schedule_revocation_drain(item, owner).await?;
+        }
+        Ok(())
+    }
+
+    async fn tick_revocations(&self) -> Result<()> {
+        let _mutation = self.managed_mutations.lock().await;
+        let mut finished = Vec::new();
+        {
+            let mut tasks = self.revocation_tasks.lock().await;
+            let mut active = Vec::with_capacity(tasks.len());
+            for task in tasks.drain(..) {
+                if task.task.is_finished() {
+                    finished.push(task);
+                } else {
+                    active.push(task);
+                }
+            }
+            *tasks = active;
+        }
+        for item in finished {
+            match item.task.await {
+                Ok(Ok(())) => {
+                    if let Err(error) = self.complete_revocation(&item.pending).await {
+                        self.record_managed_error(error);
+                    }
+                }
+                Ok(Err(error)) => {
+                    if let Err(error) = self.retry_revocation(&item.pending).await {
+                        self.record_managed_error(error);
+                    }
+                    self.record_managed_error(error);
+                }
+                Err(error) => {
+                    let error = anyhow::anyhow!("revocation drain task failed: {error}");
+                    if let Err(retry_error) = self.retry_revocation(&item.pending).await {
+                        self.record_managed_error(retry_error);
+                    }
+                    self.record_managed_error(error);
+                }
+            }
+        }
+        let now = self.managed_time()?;
+        let pending = self
+            .shared
+            .lock()
+            .expect("snapshot mutex")
+            .config
+            .managed
+            .revocations
+            .clone();
+        for item in pending {
+            if item.retry_at.is_some_and(|retry_at| retry_at > now) {
+                continue;
+            }
+            let share = match parse_share_id(&item.share_id) {
+                Ok(share) => share,
+                Err(error) => {
+                    self.record_managed_error(error);
+                    continue;
+                }
+            };
+            let owner = match self.owner_share(share).await {
+                Ok(owner) => owner,
+                Err(error) => {
+                    if let Err(retry_error) = self.retry_revocation(&item).await {
+                        self.record_managed_error(retry_error);
+                    }
+                    self.record_managed_error(error);
+                    continue;
+                }
+            };
+            if let Err(error) = self.schedule_revocation_drain(item.clone(), owner).await {
+                if let Err(retry_error) = self.retry_revocation(&item).await {
+                    self.record_managed_error(retry_error);
+                }
+                self.record_managed_error(error);
+            }
+        }
+        Ok(())
+    }
+
+    async fn await_revocation_tasks(&self, share_id: Option<&str>) -> Result<()> {
+        let selected = {
+            let mut tasks = self.revocation_tasks.lock().await;
+            let mut selected = Vec::new();
+            let mut remaining = Vec::with_capacity(tasks.len());
+            for task in tasks.drain(..) {
+                if share_id.is_none_or(|share| task.pending.share_id == share) {
+                    selected.push(task);
+                } else {
+                    remaining.push(task);
+                }
+            }
+            *tasks = remaining;
+            selected
+        };
+        let mut failure = None;
+        for item in selected {
+            match item.task.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => failure = Some(error),
+                Err(error) => {
+                    failure = Some(anyhow::anyhow!("revocation drain task failed: {error}"))
+                }
+            }
+        }
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        Ok(())
+    }
+
     fn member_observer(&self, share: ShareId) -> deltaweave_net::TransferObserver {
         self.managed_observer(share, BTreeMap::new())
     }
 
+    async fn restore_missing_managed_workers(&self) -> Result<()> {
+        // Worker construction performs network/session and filesystem awaits.
+        // Keep the same mutation lock through the snapshot and publication so
+        // remove_share cannot commit a tombstone and then have this stale
+        // worker reappear after its await points.
+        let _mutation = self.managed_mutations.lock().await;
+        let now = self.managed_time()?;
+        let records = self
+            .shared
+            .lock()
+            .expect("snapshot mutex")
+            .config
+            .managed
+            .shares
+            .clone();
+        let tombstones = self
+            .shared
+            .lock()
+            .expect("snapshot mutex")
+            .config
+            .managed
+            .tombstones
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        for record in records {
+            if tombstones.contains(&record.share_id)
+                || matches!(
+                    record.status,
+                    ManagedStatus::Paused | ManagedStatus::Revoked
+                )
+                || record.retry_at.is_some_and(|retry_at| retry_at > now)
+                || self
+                    .managed_slots
+                    .lock()
+                    .expect("managed slots mutex")
+                    .contains_key(&record.share_id)
+            {
+                continue;
+            }
+            let share = parse_share_id(&record.share_id)?;
+            let service = self.ensure_managed_service().await?;
+            let worker = match record.role {
+                ShareRole::Owner => match service.load_owned_share(share).await {
+                    Ok(owner) => {
+                        if let Err(error) = self.install_owner_observer(share, &owner).await {
+                            owner.pause().await;
+                            Err(error)
+                        } else {
+                            Ok(ManagedWorker::Owner(owner))
+                        }
+                    }
+                    Err(error) => Err(error),
+                },
+                ShareRole::Member => {
+                    let owner = record
+                        .owner_address
+                        .as_ref()
+                        .map(|address| address.id)
+                        .ok_or_else(|| {
+                            anyhow::Error::new(ManagedError::new(ManagedErrorKind::InvalidInput))
+                        });
+                    match owner {
+                        Ok(owner) => ManagedSyncEngine::resume(
+                            &service,
+                            owner,
+                            share,
+                            ManagedSyncConfig {
+                                root: PathBuf::from(&record.root),
+                                state_root: PathBuf::from(&record.state_root),
+                                profile: deltaweave_core::ChunkingProfile::default(),
+                                min_free_space_bytes: record.min_free_space_bytes,
+                            },
+                        )
+                        .map(ManagedWorker::Member),
+                        Err(error) => Err(error),
+                    }
+                }
+            };
+            match worker {
+                Ok(worker) => {
+                    self.managed_slots
+                        .lock()
+                        .expect("managed slots mutex")
+                        .entry(record.share_id)
+                        .or_insert_with(|| {
+                            Arc::new(ManagedSlot {
+                                operation: AsyncMutex::new(Some(worker)),
+                            })
+                        });
+                }
+                Err(error) => {
+                    self.update_managed_failure(share, &error).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn tick_managed(&self) -> Result<()> {
+        // See recover_managed: preserve manual workers during a managed-only
+        // clock quarantine and retry recovery after the durable high-water
+        // value becomes reachable again.
+        if let Err(error) = self.managed_time() {
+            if error
+                .downcast_ref::<ManagedError>()
+                .is_some_and(|error| error.kind() == ManagedErrorKind::ClockRollback)
+            {
+                return Ok(());
+            }
+            return Err(error);
+        }
+        self.gc_pending_tickets().await?;
         self.gc_key_responses()?;
+        self.tick_revocations().await?;
+        self.restore_missing_managed_workers().await?;
         let slots = self
             .managed_slots
             .lock()
@@ -1434,7 +2409,18 @@ impl Manager {
             if pending.is_some() {
                 drop(pending);
                 drop(slot);
-                self.retry_pending(&id).await?;
+                if let Err(error) = self.retry_pending(&id, None, false).await {
+                    let device_wide = error.downcast_ref::<ManagedError>().is_some_and(|error| {
+                        matches!(
+                            error.kind(),
+                            ManagedErrorKind::ClockRollback | ManagedErrorKind::ShuttingDown
+                        )
+                    });
+                    if device_wide {
+                        return Err(error);
+                    }
+                    self.record_managed_error(error);
+                }
                 continue;
             }
             let status = self
@@ -1451,6 +2437,7 @@ impl Manager {
             match worker {
                 ManagedWorker::Owner(owner) => {
                     if let Err(error) = self.update_owner_inventory(share, owner).await {
+                        self.mark_managed_memory_failure(share, &error);
                         self.record_managed_error(error);
                     }
                 }
@@ -1461,13 +2448,18 @@ impl Manager {
                                 if let Err(error) =
                                     self.persist_member_report(share, &report, inventory).await
                                 {
+                                    self.mark_managed_memory_failure(share, &error);
                                     self.record_managed_error(error);
                                 }
                             }
-                            Err(error) => self.record_managed_error(error),
+                            Err(error) => {
+                                self.mark_managed_memory_failure(share, &error);
+                                self.record_managed_error(error);
+                            }
                         },
                         Err(error) => {
                             if let Err(error) = self.persist_member_error(share, error).await {
+                                self.mark_managed_memory_failure(share, &error);
                                 self.record_managed_error(error);
                             }
                         }
@@ -1479,7 +2471,14 @@ impl Manager {
         Ok(())
     }
 
-    async fn retry_pending(&self, id: &str) -> Result<()> {
+    async fn retry_pending(
+        &self,
+        id: &str,
+        expected_request_id: Option<&str>,
+        // An authenticated user retry may bypass the background backoff;
+        // ticker calls keep it so an offline owner cannot be hammered.
+        force: bool,
+    ) -> Result<()> {
         let _mutation = self.managed_mutations.lock().await;
         let pending = {
             let state = self.shared.lock().expect("snapshot mutex");
@@ -1494,8 +2493,14 @@ impl Manager {
         let Some(pending) = pending else {
             return Ok(());
         };
-        let now = managed_now();
-        if pending.retry_at.is_some_and(|retry_at| retry_at > now) {
+        if let Some(expected_request_id) = expected_request_id {
+            ensure!(
+                pending.request_id == expected_request_id,
+                ManagedError::new(ManagedErrorKind::IdempotencyConflict)
+            );
+        }
+        let now = self.managed_time()?;
+        if !force && pending.retry_at.is_some_and(|retry_at| retry_at > now) {
             return Ok(());
         }
         let address = pending
@@ -1503,6 +2508,7 @@ impl Manager {
             .clone()
             .ok_or_else(|| anyhow::Error::new(ManagedError::new(ManagedErrorKind::InvalidInput)))?;
         let share = parse_share_id(id)?;
+        self.install_pending_slot(&pending).await?;
         let service = self.ensure_managed_service().await?;
         let member = match service
             .resume_membership(address.id, share, address.clone())
@@ -1510,36 +2516,43 @@ impl Manager {
         {
             Ok(member) => member,
             Err(error) if is_share_error(&error, ShareError::NotMember) => {
-                let encoded =
-                    match Self::read_private_text(Path::new(&pending.ticket_file), 32 * 1024) {
-                        Ok(encoded) => encoded,
-                        Err(error) => return Err(error),
-                    };
-                let ticket = match ShareTicket::parse(&encoded) {
-                    Ok(ticket) if pending.expires_at.is_none_or(|expires_at| expires_at > now) => {
-                        ticket
-                    }
-                    Ok(_) | Err(ShareError::Expired) => {
-                        self.persist(|config| {
-                            config
-                                .managed
-                                .pending
-                                .retain(|item| item.request_id != pending.request_id);
-                            if let Some(request) = config
-                                .managed
-                                .requests
-                                .iter_mut()
-                                .find(|request| request.request_id == pending.request_id)
-                            {
-                                request.result_ref = format!("expired:{id}");
-                            }
-                            Ok(())
-                        })
+                if Self::pending_deadline(&pending) <= now {
+                    self.terminalize_pending(&pending, pending_terminal_ref(None, id))
                         .await?;
-                        Self::remove_private_file(Path::new(&pending.ticket_file))?;
+                    return Ok(());
+                }
+                let ticket_path = self.pending_ticket_path(&pending)?;
+                let encoded = match Self::read_private_text(&ticket_path, 32 * 1024) {
+                    Ok(encoded) => encoded,
+                    Err(error) => {
+                        if is_terminal_pending_storage_error(&error) {
+                            self.terminalize_pending(
+                                &pending,
+                                pending_terminal_ref(Some(&error), id),
+                            )
+                            .await?;
+                        }
+                        return Err(error);
+                    }
+                };
+                let ticket = match ShareTicket::parse(&encoded) {
+                    Ok(ticket) if Self::pending_deadline(&pending) > now => ticket,
+                    Ok(_) | Err(ShareError::Expired) => {
+                        self.terminalize_pending(&pending, pending_terminal_ref(None, id))
+                            .await?;
                         return Ok(());
                     }
-                    Err(error) => return Err(error.into()),
+                    Err(error) => {
+                        let error = anyhow::Error::new(error);
+                        if is_terminal_pending_error(&error) {
+                            self.terminalize_pending(
+                                &pending,
+                                pending_terminal_ref(Some(&error), id),
+                            )
+                            .await?;
+                        }
+                        return Err(error);
+                    }
                 };
                 match service.enroll(&ticket, None).await {
                     Ok(member) => member,
@@ -1547,12 +2560,22 @@ impl Manager {
                         self.update_pending_retry(&pending).await?;
                         return Ok(());
                     }
+                    Err(error) if is_terminal_pending_error(&error) => {
+                        self.terminalize_pending(&pending, pending_terminal_ref(Some(&error), id))
+                            .await?;
+                        return Err(error);
+                    }
                     Err(error) => return Err(error),
                 }
             }
             Err(error) if is_share_error(&error, ShareError::Offline) => {
                 self.update_pending_retry(&pending).await?;
                 return Ok(());
+            }
+            Err(error) if is_terminal_pending_error(&error) => {
+                self.terminalize_pending(&pending, pending_terminal_ref(Some(&error), id))
+                    .await?;
+                return Err(error);
             }
             Err(error) => return Err(error),
         };
@@ -1568,19 +2591,128 @@ impl Manager {
             Some(ManagedWorker::Pending(pending_worker)) => pending_worker.lease,
             Some(other) => {
                 *slot.operation.lock().await = Some(other);
-                None
+                return Ok(());
             }
             None => None,
         };
-        let worker = self
-            .complete_pending_membership(pending, member, service, lease)
-            .await?;
-        *slot.operation.lock().await = Some(worker);
-        Ok(())
+        match self
+            .complete_pending_membership(pending.clone(), member, service, lease)
+            .await
+        {
+            Ok(worker) => {
+                *slot.operation.lock().await = Some(worker);
+                Ok(())
+            }
+            Err(error) => {
+                self.install_pending_slot(&pending).await?;
+                Err(error)
+            }
+        }
+    }
+
+    /// Retries the durable join request identified by `request_id`.
+    ///
+    /// A pending join is intentionally different from `resume_membership`:
+    /// the latter only applies to a member row which is already present in
+    /// the local managed catalog, while this operation also covers the
+    /// response-loss window where only the durable pending row remains.  The
+    /// bearer is read from the private pending-ticket file by
+    /// `retry_pending`; callers never submit it again and a retry never
+    /// allocates a new replica or invitation.
+    pub async fn retry_pending_join(&self, input: RetryPendingJoinInput) -> Result<JoinResult> {
+        let _active = self.lifecycle.read().await;
+        self.running()?;
+        validate_request_id(&input.request_id)?;
+        let share_id = share_id_string(input.share);
+        let request = self
+            .request_record(&input.request_id)
+            .ok_or_else(|| anyhow::Error::new(ManagedError::new(ManagedErrorKind::NotFound)))?;
+        ensure!(
+            request.operation == "join_share",
+            ManagedError::new(ManagedErrorKind::IdempotencyConflict)
+        );
+
+        let (kind, recorded_share) = request
+            .result_ref
+            .split_once(':')
+            .ok_or_else(|| anyhow::Error::new(ShareError::StateUnavailable))?;
+        ensure!(
+            recorded_share == share_id,
+            ManagedError::new(ManagedErrorKind::IdempotencyConflict)
+        );
+
+        match kind {
+            "share" => {
+                // The request already completed before the response arrived.
+                // Reconstruct the stable result from the persisted managed row.
+                let record = self.managed_record(input.share)?;
+                Ok(Self::join_result_from_record(input.request_id, record))
+            }
+            "pending" => {
+                // Let the helper take the mutation lock and validate the
+                // expected request ID.  Do not preflight the pending row under
+                // a separate snapshot lock: the background ticker may finish
+                // this request between that read and the helper.  The journal
+                // and managed row below are the authoritative post-operation
+                // state in either ordering.
+                if let Err(error) = self
+                    .retry_pending(&share_id, Some(&input.request_id), true)
+                    .await
+                {
+                    // Terminalization records the stable result before the
+                    // helper returns the protocol error.  Prefer that
+                    // journal value so invitation revocation and expiry use
+                    // the same public mapping as a retry after response loss.
+                    if is_terminal_pending_error(&error)
+                        && let Some(terminal) = self.request_record(&input.request_id)
+                        && !terminal.result_ref.starts_with("pending:")
+                    {
+                        return Self::pending_result_error(&terminal.result_ref, &share_id);
+                    }
+                    return Err(error);
+                }
+
+                let state = self.shared.lock().expect("snapshot mutex");
+                if let Some(record) = state
+                    .config
+                    .managed
+                    .shares
+                    .iter()
+                    .find(|record| record.share_id == share_id)
+                    .cloned()
+                {
+                    return Ok(Self::join_result_from_record(input.request_id, record));
+                }
+                if let Some(pending) = state
+                    .config
+                    .managed
+                    .pending
+                    .iter()
+                    .find(|pending| {
+                        pending.request_id == input.request_id && pending.share_id == share_id
+                    })
+                    .cloned()
+                {
+                    return Ok(Self::waiting_join_result(&pending));
+                }
+                drop(state);
+                // `retry_pending` may have terminalized an expired or
+                // revoked ticket while returning success.  Read the journal
+                // again and expose its stable, credential-free error.
+                let terminal = self
+                    .request_record(&input.request_id)
+                    .ok_or_else(|| anyhow::Error::new(ShareError::StateUnavailable))?;
+                Self::pending_result_error(&terminal.result_ref, &share_id)
+            }
+            "revoked" => Err(ShareError::MemberRevoked.into()),
+            "invalid" => Err(ShareError::InvalidTicket.into()),
+            "expired" => Err(ManagedError::new(ManagedErrorKind::PendingExpired).into()),
+            _ => Err(ShareError::StateUnavailable.into()),
+        }
     }
 
     async fn update_pending_retry(&self, pending: &config::PendingRecord) -> Result<()> {
-        let retry_at = managed_now().saturating_add(MANAGED_TICK_SECONDS);
+        let retry_at = self.managed_time()?.saturating_add(MANAGED_TICK_SECONDS);
         self.persist(|config| {
             if let Some(item) = config
                 .managed
@@ -1741,20 +2873,42 @@ impl Manager {
 
     fn mutation_result(&self, request_id: String, share: ShareId) -> Result<MutationResult> {
         let record = self.managed_record(share)?;
+        let (pending, member_revoke) = {
+            let state = self.shared.lock().expect("snapshot mutex");
+            let pending = state
+                .config
+                .managed
+                .revocations
+                .iter()
+                .find(|pending| pending.request_id == request_id)
+                .cloned();
+            let member_revoke = state
+                .config
+                .managed
+                .requests
+                .iter()
+                .find(|request| request.request_id == request_id)
+                .is_some_and(|request| request.operation == "revoke_member");
+            (pending, member_revoke)
+        };
+        let completion_pending = pending.is_some();
+        let retry_at = pending.as_ref().and_then(|pending| pending.retry_at);
         Ok(MutationResult {
             request_id,
             accepted: true,
-            completion: if record.revocation_pending {
+            completion: if completion_pending {
                 MutationCompletion::Pending
             } else {
                 MutationCompletion::Complete
             },
-            retry_at: if record.revocation_pending {
-                record.retry_at
+            retry_at,
+            status: if completion_pending {
+                ManagedStatus::Waiting
+            } else if member_revoke {
+                ManagedStatus::Revoked
             } else {
-                None
+                record.status
             },
-            status: record.status,
         })
     }
 
@@ -1871,6 +3025,7 @@ impl Manager {
             let share = parse_share_id(result_ref.strip_prefix("share:").unwrap_or(&result_ref))?;
             return self.managed_view_for(share);
         }
+        self.managed_time()?;
         self.ensure_request_capacity(&input.request_id)?;
         let root = config::candidate(&input.root)
             .map_err(|_| anyhow::Error::new(ManagedError::new(ManagedErrorKind::InvalidPath)))?;
@@ -2138,6 +3293,7 @@ impl Manager {
                 issuance: KeyIssuance::Validated,
             });
         }
+        self.managed_time()?;
         self.ensure_request_capacity(&input.request_id)?;
         let ticket = ShareTicket::parse(&input.encoded_key)?;
         let service = self.ensure_managed_service().await?;
@@ -2166,7 +3322,7 @@ impl Manager {
         pending: config::PendingRecord,
         member: NetMembership,
         service: Arc<ShareService>,
-        lease: Option<RootLease>,
+        lease: Option<Arc<RootLease>>,
     ) -> Result<ManagedWorker> {
         ensure!(
             member.share_id == parse_share_id(&pending.share_id)?
@@ -2183,7 +3339,7 @@ impl Manager {
             root: pending.root.clone(),
             state_root: pending.state_root.clone(),
             owner: member.owner.to_string(),
-            min_free_space_bytes: 0,
+            min_free_space_bytes: pending.min_free_space_bytes,
             owner_address: pending.owner_address.clone(),
             member_id: Some(member_id),
             replica: Some(member.replica),
@@ -2212,61 +3368,148 @@ impl Manager {
                 .find(|request| request.request_id == pending.request_id)
                 .map(|request| request.request_hash.clone())
         };
-        self.persist(|config| {
-            if let Some(existing) = config
-                .managed
-                .shares
-                .iter_mut()
-                .find(|existing| existing.share_id == record.share_id)
-            {
-                ensure!(
-                    existing.role == record.role
-                        && existing.owner == record.owner
-                        && existing.replica == record.replica
-                        && existing.permission == record.permission
-                        && existing.enrolled_at == record.enrolled_at
-                        && existing.membership_epoch == record.membership_epoch,
-                    ManagedError::new(ManagedErrorKind::IdempotencyConflict)
-                );
-                *existing = record.clone();
-            } else {
-                config.managed.shares.push(record.clone());
-            }
-            config
-                .managed
-                .pending
-                .retain(|item| item.request_id != pending.request_id);
-            if let Some(request) = config
-                .managed
-                .requests
-                .iter_mut()
-                .find(|request| request.request_id == pending.request_id)
-            {
-                request.result_ref = format!("share:{}", record.share_id);
-            } else if let Some(request_hash) = request_hash.as_ref() {
-                config.managed.requests.push(config::RequestRecord {
-                    request_id: pending.request_id.clone(),
-                    operation: "join_share".into(),
-                    request_hash: request_hash.clone(),
-                    result_ref: format!("share:{}", record.share_id),
-                    recorded_at: managed_now(),
-                });
-            }
-            Ok(())
-        })
-        .await?;
-        Self::remove_private_file(Path::new(&pending.ticket_file))?;
-        drop(lease);
         let owner = member.owner;
         let share = member.share_id;
         let sync_config = ManagedSyncConfig {
             root: PathBuf::from(&pending.root),
             state_root: PathBuf::from(&pending.state_root),
             profile: deltaweave_core::ChunkingProfile::default(),
-            min_free_space_bytes: 0,
+            min_free_space_bytes: pending.min_free_space_bytes,
         };
-        let engine = ManagedSyncEngine::open(&service, owner, share, sync_config)?;
+        // Transfer the PendingWorker lease directly into ReplicaState.  The
+        // engine must not drop and reacquire it between enrollment and opening
+        // its index/store: that gap would let another process claim either
+        // root before the active member owns the binding.
+        let engine_result = match lease.as_ref() {
+            Some(lease) => ManagedSyncEngine::open_with_lease(
+                &service,
+                owner,
+                share,
+                sync_config,
+                Arc::clone(lease),
+            ),
+            None => ManagedSyncEngine::open(&service, owner, share, sync_config),
+        };
+        let engine = match engine_result {
+            Ok(engine) => engine,
+            Err(error) => {
+                // Keep the exact Arc-backed lease in the pending slot when
+                // opening fails.  Reacquiring here would recreate the same
+                // handoff gap this path is designed to close.
+                if let Some(lease) = lease
+                    && let Err(reinstall) =
+                        self.install_pending_slot_with_lease(&pending, lease).await
+                {
+                    self.record_managed_error(reinstall);
+                }
+                return Err(error);
+            }
+        };
+        match self
+            .persist(|config| {
+                if let Some(existing) = config
+                    .managed
+                    .shares
+                    .iter_mut()
+                    .find(|existing| existing.share_id == record.share_id)
+                {
+                    ensure!(
+                        existing.role == record.role
+                            && existing.owner == record.owner
+                            && existing.replica == record.replica
+                            && existing.permission == record.permission
+                            && existing.enrolled_at == record.enrolled_at
+                            && existing.membership_epoch == record.membership_epoch
+                            && existing.name == record.name
+                            && existing.root == record.root
+                            && existing.state_root == record.state_root
+                            && existing.min_free_space_bytes == record.min_free_space_bytes
+                            && existing.owner_address == record.owner_address,
+                        ManagedError::new(ManagedErrorKind::IdempotencyConflict)
+                    );
+                    *existing = record.clone();
+                } else {
+                    config.managed.shares.push(record.clone());
+                }
+                config
+                    .managed
+                    .pending
+                    .retain(|item| item.request_id != pending.request_id);
+                if let Some(request) = config
+                    .managed
+                    .requests
+                    .iter_mut()
+                    .find(|request| request.request_id == pending.request_id)
+                {
+                    request.result_ref = format!("share:{}", record.share_id);
+                } else if let Some(request_hash) = request_hash.as_ref() {
+                    config.managed.requests.push(config::RequestRecord {
+                        request_id: pending.request_id.clone(),
+                        operation: "join_share".into(),
+                        request_hash: request_hash.clone(),
+                        result_ref: format!("share:{}", record.share_id),
+                        recorded_at: managed_now(),
+                    });
+                }
+                Ok(())
+            })
+            .await
+        {
+            Ok(()) => {}
+            Err(error) => {
+                if let Err(shutdown_error) = engine.shutdown().await {
+                    self.record_managed_error(shutdown_error);
+                }
+                if let Some(lease) = lease
+                    && let Err(reinstall) =
+                        self.install_pending_slot_with_lease(&pending, lease).await
+                {
+                    self.record_managed_error(reinstall);
+                }
+                return Err(error);
+            }
+        }
+        if let Err(error) = self
+            .pending_ticket_path(&pending)
+            .and_then(|path| Self::remove_private_file(&path))
+        {
+            self.record_managed_error(error);
+        }
         Ok(ManagedWorker::Member(engine))
+    }
+
+    fn join_result_from_record(
+        request_id: String,
+        record: config::ManagedShareRecord,
+    ) -> JoinResult {
+        JoinResult {
+            request_id,
+            share_id: record.share_id,
+            enrollment: if record.status == ManagedStatus::Revoked {
+                EnrollmentState::Revoked
+            } else {
+                EnrollmentState::Enrolled
+            },
+            status: record.status,
+            permission: record.permission,
+            member_id: record.member_id,
+        }
+    }
+
+    fn pending_result_error(result_ref: &str, share_id: &str) -> Result<JoinResult> {
+        let (kind, recorded_share) = result_ref
+            .split_once(':')
+            .ok_or_else(|| anyhow::Error::new(ShareError::StateUnavailable))?;
+        ensure!(
+            recorded_share == share_id,
+            ManagedError::new(ManagedErrorKind::IdempotencyConflict)
+        );
+        match kind {
+            "revoked" => Err(ShareError::MemberRevoked.into()),
+            "invalid" => Err(ShareError::InvalidTicket.into()),
+            "expired" => Err(ManagedError::new(ManagedErrorKind::PendingExpired).into()),
+            _ => Err(ShareError::StateUnavailable.into()),
+        }
     }
 
     fn waiting_join_result(pending: &config::PendingRecord) -> JoinResult {
@@ -2293,9 +3536,9 @@ impl Manager {
         })
     }
 
-    fn check_expiry(expires_at: Option<u64>) -> Result<()> {
+    fn check_expiry(&self, expires_at: Option<u64>) -> Result<()> {
         if let Some(expires_at) = expires_at {
-            let now = managed_now();
+            let now = self.managed_time()?;
             ensure!(
                 expires_at > now && expires_at <= now.saturating_add(30 * 24 * 60 * 60),
                 ManagedError::new(ManagedErrorKind::InvalidInput)
@@ -2322,7 +3565,16 @@ impl Manager {
         if let Some(result_ref) = self.request_lookup(&input.request_id, "join_share", &hash)?
             && pending_existing.is_none()
         {
-            let share = parse_share_id(result_ref.strip_prefix("share:").unwrap_or(&result_ref))?;
+            let Some(share_ref) = result_ref.strip_prefix("share:") else {
+                return Err(if result_ref.starts_with("revoked:") {
+                    ShareError::MemberRevoked.into()
+                } else if result_ref.starts_with("invalid:") {
+                    ShareError::InvalidTicket.into()
+                } else {
+                    ManagedError::new(ManagedErrorKind::PendingExpired).into()
+                });
+            };
+            let share = parse_share_id(share_ref)?;
             let record = self.managed_record(share)?;
             return Ok(JoinResult {
                 request_id: input.request_id,
@@ -2349,10 +3601,9 @@ impl Manager {
                 .cloned()
         };
         if let Some(result_ref) = self.request_lookup(&input.request_id, "join_share", &hash)? {
-            if let Some(pending) = pending_existing.as_ref() {
-                return Ok(Self::waiting_join_result(pending));
-            }
-            if let Some(share_ref) = result_ref.strip_prefix("share:") {
+            if pending_existing.is_none()
+                && let Some(share_ref) = result_ref.strip_prefix("share:")
+            {
                 let share = parse_share_id(share_ref)?;
                 let record = self.managed_record(share)?;
                 return Ok(JoinResult {
@@ -2368,11 +3619,20 @@ impl Manager {
                     member_id: record.member_id,
                 });
             }
-            return Err(ManagedError::new(ManagedErrorKind::PendingExpired).into());
+            if pending_existing.is_none() {
+                return Err(if result_ref.starts_with("revoked:") {
+                    ShareError::MemberRevoked.into()
+                } else if result_ref.starts_with("invalid:") {
+                    ShareError::InvalidTicket.into()
+                } else {
+                    ManagedError::new(ManagedErrorKind::PendingExpired).into()
+                });
+            }
         }
+        self.managed_time()?;
         self.ensure_request_capacity(&input.request_id)?;
         let (ticket, pending) = if let Some(pending) = pending_existing.clone() {
-            let path = PathBuf::from(&pending.ticket_file);
+            let path = self.pending_ticket_path(&pending)?;
             let service = self.ensure_managed_service().await?;
             if let Some(address) = pending.owner_address.clone() {
                 match service
@@ -2381,28 +3641,7 @@ impl Manager {
                 {
                     Ok(member) => {
                         let id = parse_share_id(&pending.share_id)?;
-                        let slot = self
-                            .managed_slots
-                            .lock()
-                            .expect("managed slots mutex")
-                            .get(&pending.share_id)
-                            .cloned();
-                        let lease = if let Some(slot) = slot {
-                            let taken = { slot.operation.lock().await.take() };
-                            match taken {
-                                Some(ManagedWorker::Pending(pending_worker)) => {
-                                    pending_worker.lease
-                                }
-                                other => {
-                                    if let Some(other) = other {
-                                        let _ = slot.operation.lock().await.replace(other);
-                                    }
-                                    None
-                                }
-                            }
-                        } else {
-                            None
-                        };
+                        let lease = self.take_pending_lease(&pending.share_id).await?;
                         let worker = self
                             .complete_pending_membership(
                                 pending.clone(),
@@ -2410,8 +3649,16 @@ impl Manager {
                                 service,
                                 lease,
                             )
-                            .await?;
-                        self.managed_slots
+                            .await;
+                        let worker = match worker {
+                            Ok(worker) => worker,
+                            Err(error) => {
+                                self.install_pending_slot(&pending).await?;
+                                return Err(error);
+                            }
+                        };
+                        let slot = self
+                            .managed_slots
                             .lock()
                             .expect("managed slots mutex")
                             .entry(pending.share_id.clone())
@@ -2420,10 +3667,8 @@ impl Manager {
                                     operation: AsyncMutex::new(None),
                                 })
                             })
-                            .operation
-                            .try_lock()
-                            .expect("new managed slot lock")
-                            .replace(worker);
+                            .clone();
+                        *slot.operation.lock().await = Some(worker);
                         return Ok(JoinResult {
                             request_id: input.request_id,
                             share_id: pending.share_id,
@@ -2434,18 +3679,60 @@ impl Manager {
                         });
                     }
                     Err(error) if is_share_error(&error, ShareError::Offline) => {
+                        self.install_pending_slot(&pending).await?;
                         return Ok(Self::waiting_join_result(&pending));
                     }
+                    Err(error) if is_terminal_pending_error(&error) => {
+                        self.terminalize_pending(
+                            &pending,
+                            pending_terminal_ref(Some(&error), &pending.share_id),
+                        )
+                        .await?;
+                        return Err(error);
+                    }
                     Err(error) if !is_share_error(&error, ShareError::NotMember) => {
+                        self.install_pending_slot(&pending).await?;
                         return Err(error);
                     }
                     Err(_) => {}
                 }
             }
-            let encoded = Self::read_private_text(&path, 32 * 1024)?;
-            (ShareTicket::parse(&encoded)?, pending)
+            if Self::pending_deadline(&pending) <= self.managed_time()? {
+                self.terminalize_pending(&pending, pending_terminal_ref(None, &pending.share_id))
+                    .await?;
+                return Err(ManagedError::new(ManagedErrorKind::PendingExpired).into());
+            }
+            let encoded = match Self::read_private_text(&path, 32 * 1024) {
+                Ok(encoded) => encoded,
+                Err(error) => {
+                    if is_terminal_pending_storage_error(&error) {
+                        self.terminalize_pending(
+                            &pending,
+                            pending_terminal_ref(Some(&error), &pending.share_id),
+                        )
+                        .await?;
+                    }
+                    return Err(error);
+                }
+            };
+            let ticket = match ShareTicket::parse(&encoded) {
+                Ok(ticket) => ticket,
+                Err(error) => {
+                    let error = anyhow::Error::new(error);
+                    if is_terminal_pending_error(&error) {
+                        self.terminalize_pending(
+                            &pending,
+                            pending_terminal_ref(Some(&error), &pending.share_id),
+                        )
+                        .await?;
+                    }
+                    return Err(error);
+                }
+            };
+            (ticket, pending)
         } else {
             let ticket = ShareTicket::parse(&input.encoded_key)?;
+            self.ensure_new_join_binding(ticket.preview().share_id, &input.request_id)?;
             let root = config::candidate(&input.destination_root).map_err(|_| {
                 anyhow::Error::new(ManagedError::new(ManagedErrorKind::InvalidPath))
             })?;
@@ -2467,17 +3754,17 @@ impl Manager {
             self.managed_paths_conflict(&root, &state_root)?;
             root_admission::reserve_private(&state_root)?;
             private::prepare_directory(&state_root)?;
-            let lease = root_admission::acquire_with_private(
+            let lease = Arc::new(root_admission::acquire_with_private(
                 &root,
                 RootUse::Managed {
                     share: ticket.preview().share_id.0,
                     owner: *ticket.preview().owner.as_bytes(),
                 },
                 std::slice::from_ref(&state_root),
-            )?;
+            )?);
             let ticket_path = self.private_text_path("pending", &hash, "ticket")?;
             Self::write_private_text(&ticket_path, &ticket.encode(), 32 * 1024)?;
-            let now = managed_now();
+            let now = self.managed_time()?;
             let expires_at = Some(
                 ticket
                     .preview()
@@ -2499,37 +3786,51 @@ impl Manager {
                 expires_at,
                 status: ManagedStatus::Waiting,
                 retry_at: Some(now),
+                min_free_space_bytes: 0,
             };
-            self.persist(|config| {
-                config
-                    .managed
-                    .pending
-                    .retain(|item| item.request_id != input.request_id);
-                config.managed.pending.push(pending.clone());
-                if let Some(request) = config
-                    .managed
-                    .requests
-                    .iter_mut()
-                    .find(|request| request.request_id == input.request_id)
-                {
-                    ensure!(
-                        request.operation == "join_share" && request.request_hash == hash,
-                        ManagedError::new(ManagedErrorKind::IdempotencyConflict)
-                    );
-                    request.result_ref = format!("pending:{}", pending.share_id);
-                } else {
-                    config.managed.requests.push(config::RequestRecord {
-                        request_id: input.request_id.clone(),
-                        operation: "join_share".into(),
-                        request_hash: hash.clone(),
-                        result_ref: format!("pending:{}", pending.share_id),
-                        recorded_at: now,
-                    });
+            if let Err(error) = self
+                .persist(|config| {
+                    config
+                        .managed
+                        .pending
+                        .retain(|item| item.request_id != input.request_id);
+                    config.managed.pending.push(pending.clone());
+                    if let Some(request) = config
+                        .managed
+                        .requests
+                        .iter_mut()
+                        .find(|request| request.request_id == input.request_id)
+                    {
+                        ensure!(
+                            request.operation == "join_share" && request.request_hash == hash,
+                            ManagedError::new(ManagedErrorKind::IdempotencyConflict)
+                        );
+                        request.result_ref = format!("pending:{}", pending.share_id);
+                    } else {
+                        config.managed.requests.push(config::RequestRecord {
+                            request_id: input.request_id.clone(),
+                            operation: "join_share".into(),
+                            request_hash: hash.clone(),
+                            result_ref: format!("pending:{}", pending.share_id),
+                            recorded_at: now,
+                        });
+                    }
+                    Ok(())
+                })
+                .await
+            {
+                let _ = Self::remove_private_file(&ticket_path);
+                drop(lease);
+                return Err(error);
+            }
+            let service = match self.ensure_managed_service().await {
+                Ok(service) => service,
+                Err(error) => {
+                    drop(lease);
+                    self.install_pending_slot(&pending).await?;
+                    return Err(error);
                 }
-                Ok(())
-            })
-            .await?;
-            let service = self.ensure_managed_service().await?;
+            };
             let member = match service
                 .resume_membership(
                     ticket.preview().owner,
@@ -2543,41 +3844,58 @@ impl Manager {
                     match service.enroll(&ticket, None).await {
                         Ok(member) => member,
                         Err(error) if is_share_error(&error, ShareError::Offline) => {
-                            self.managed_slots
-                                .lock()
-                                .expect("managed slots mutex")
-                                .insert(
-                                    pending.share_id.clone(),
-                                    Arc::new(ManagedSlot {
-                                        operation: AsyncMutex::new(Some(ManagedWorker::Pending(
-                                            PendingWorker { lease: Some(lease) },
-                                        ))),
-                                    }),
-                                );
+                            self.install_pending_slot_with_lease(&pending, lease)
+                                .await?;
                             return Ok(Self::waiting_join_result(&pending));
                         }
-                        Err(error) => return Err(error),
+                        Err(error) if is_terminal_pending_error(&error) => {
+                            self.terminalize_pending(
+                                &pending,
+                                pending_terminal_ref(Some(&error), &pending.share_id),
+                            )
+                            .await?;
+                            drop(lease);
+                            return Err(error);
+                        }
+                        Err(error) => {
+                            self.update_pending_retry(&pending).await?;
+                            self.install_pending_slot_with_lease(&pending, lease)
+                                .await?;
+                            return Err(error);
+                        }
                     }
                 }
                 Err(error) if is_share_error(&error, ShareError::Offline) => {
-                    self.managed_slots
-                        .lock()
-                        .expect("managed slots mutex")
-                        .insert(
-                            pending.share_id.clone(),
-                            Arc::new(ManagedSlot {
-                                operation: AsyncMutex::new(Some(ManagedWorker::Pending(
-                                    PendingWorker { lease: Some(lease) },
-                                ))),
-                            }),
-                        );
+                    self.install_pending_slot_with_lease(&pending, lease)
+                        .await?;
                     return Ok(Self::waiting_join_result(&pending));
                 }
-                Err(error) => return Err(error),
+                Err(error) if is_terminal_pending_error(&error) => {
+                    self.terminalize_pending(
+                        &pending,
+                        pending_terminal_ref(Some(&error), &pending.share_id),
+                    )
+                    .await?;
+                    drop(lease);
+                    return Err(error);
+                }
+                Err(error) => {
+                    self.update_pending_retry(&pending).await?;
+                    self.install_pending_slot_with_lease(&pending, lease)
+                        .await?;
+                    return Err(error);
+                }
             };
             let worker = self
                 .complete_pending_membership(pending.clone(), member, service, Some(lease))
-                .await?;
+                .await;
+            let worker = match worker {
+                Ok(worker) => worker,
+                Err(error) => {
+                    self.install_pending_slot(&pending).await?;
+                    return Err(error);
+                }
+            };
             self.managed_slots
                 .lock()
                 .expect("managed slots mutex")
@@ -2611,7 +3929,7 @@ impl Manager {
                 service.enroll(&ticket, None).await?
             }
             Err(error) if is_share_error(&error, ShareError::Offline) => {
-                let now = managed_now();
+                let now = self.managed_time()?;
                 self.persist(|config| {
                     if let Some(item) = config
                         .managed
@@ -2630,9 +3948,17 @@ impl Manager {
             Err(error) => return Err(error),
         };
         let share = member.share_id;
-        let worker = self
-            .complete_pending_membership(pending.clone(), member.clone(), service, None)
-            .await?;
+        let lease = self.take_pending_lease(&pending.share_id).await?;
+        let worker = match self
+            .complete_pending_membership(pending.clone(), member.clone(), service, lease)
+            .await
+        {
+            Ok(worker) => worker,
+            Err(error) => {
+                self.install_pending_slot(&pending).await?;
+                return Err(error);
+            }
+        };
         self.managed_slots
             .lock()
             .expect("managed slots mutex")
@@ -2695,6 +4021,7 @@ impl Manager {
                 member_id: record.member_id,
             });
         }
+        self.managed_time()?;
         self.ensure_request_capacity(&input.request_id)?;
         let record = self.managed_record(input.share)?;
         ensure!(
@@ -2759,7 +4086,7 @@ impl Manager {
                 root: PathBuf::from(&record.root),
                 state_root: PathBuf::from(&record.state_root),
                 profile: deltaweave_core::ChunkingProfile::default(),
-                min_free_space_bytes: 0,
+                min_free_space_bytes: record.min_free_space_bytes,
             };
             let engine =
                 ManagedSyncEngine::resume(&service, member.owner, input.share, sync_config)?;
@@ -2826,6 +4153,7 @@ impl Manager {
     pub async fn list_keys(&self, share: ShareId) -> Result<Vec<KeySummary>> {
         let _active = self.lifecycle.read().await;
         self.running()?;
+        self.managed_time()?;
         let owner = self.owner_share(share).await?;
         Ok(owner
             .keys()?
@@ -2854,14 +4182,16 @@ impl Manager {
             record.request_hash == hash,
             ManagedError::new(ManagedErrorKind::IdempotencyConflict)
         );
+        let current = self.managed_time()?;
         ensure!(
-            managed_now().saturating_sub(record.recorded_at) <= MANAGED_KEY_RESPONSE_SECONDS,
+            current >= record.recorded_at
+                && current - record.recorded_at <= MANAGED_KEY_RESPONSE_SECONDS,
             ManagedError::new(ManagedErrorKind::KeyResponseExpired)
         );
         let response_root = self.data_dir.join("managed").join("responses");
         let path = PathBuf::from(result_ref);
         ensure!(
-            path.starts_with(&response_root),
+            Self::is_generated_private_path(&response_root, &path, ".ticket"),
             ManagedError::new(ManagedErrorKind::InvalidPath)
         );
         let encoded = Self::read_private_text(&path, 32 * 1024).map_err(|_| {
@@ -2880,35 +4210,204 @@ impl Manager {
             hash,
             rotate_invitation,
         } = request;
-        Self::check_expiry(expires_at)?;
+        self.check_expiry(expires_at)?;
         if let Some(result_ref) = self.request_lookup(&request_id, operation, &hash)? {
             return self
                 .read_key_response(&request_id, &hash, &result_ref)
                 .await;
         }
-        self.ensure_request_capacity(&request_id)?;
-        let path = self.private_text_path("responses", &hash, "ticket")?;
-        let reserved = root_admission::reserve_private_file(&path)?;
-        self.persist(|config| {
-            config.managed.requests.push(config::RequestRecord {
+        self.managed_time()?;
+        let owner = self.owner_share(share).await?;
+        // Rotation inherits the permission of the invitation being rotated.
+        // The public RotateKeyInput has no permission field, and forcing a
+        // default here would silently downgrade an RW grant to RO.
+        let permission = if let Some(invitation) = rotate_invitation {
+            owner
+                .keys()?
+                .into_iter()
+                .find(|existing| existing.id == invitation)
+                .ok_or(ShareError::InvalidTicket)?
+                .permission
+        } else {
+            permission
+        };
+        let service = self.ensure_managed_service().await?;
+        let request_spec = IssueKeyRequest {
+            request_id: request_id.clone(),
+            share,
+            permission,
+            expires_at,
+            operation,
+            hash: hash.clone(),
+            rotate_invitation,
+        };
+        let mut intent = self.key_intent(&request_id);
+        let mut staged = None;
+        if let Some(existing) = intent.as_ref() {
+            let invitation = Self::validate_key_intent(existing, &request_spec)?;
+            let path = self.key_intent_path(existing)?;
+            let current = self.managed_time()?;
+            ensure!(
+                current >= existing.created_at,
+                ManagedError::new(ManagedErrorKind::ClockRollback)
+            );
+            let existing_invitation = owner
+                .keys()?
+                .into_iter()
+                .find(|existing| existing.id == invitation);
+            if current - existing.created_at > MANAGED_KEY_RESPONSE_SECONDS {
+                return self.expire_key_intent(existing, &path, &owner).await;
+            }
+            if !path.exists() {
+                if existing_invitation.is_some() {
+                    return self.expire_key_intent(existing, &path, &owner).await;
+                }
+                self.remove_key_intent(&request_id).await?;
+                intent = None;
+            } else {
+                let encoded = Self::read_private_text(&path, 32 * 1024)?;
+                let parsed = match ShareTicket::parse(&encoded) {
+                    Ok(ticket) => Some(ticket),
+                    Err(error) => {
+                        let error = anyhow::Error::new(error);
+                        if !is_terminal_pending_error(&error) {
+                            return Err(error);
+                        }
+                        if existing_invitation.is_some() {
+                            return self.expire_key_intent(existing, &path, &owner).await;
+                        }
+                        // Remove the staged file first.  If that cleanup
+                        // fails, retain the intent so a retry cannot write a
+                        // different ticket through write_private_text's
+                        // existing-file no-op path.  A crash after the file
+                        // removal but before intent removal is safe: the next
+                        // retry sees the missing file and regenerates only
+                        // after the old staged artifact is gone.
+                        Self::remove_private_file(&path)?;
+                        self.remove_key_intent(&request_id).await?;
+                        intent = None;
+                        None
+                    }
+                };
+                if let Some(ticket) = parsed {
+                    let preview = ticket.preview();
+                    ensure!(
+                        preview.share_id == share
+                            && preview.permission == permission
+                            && preview.expires_at == expires_at
+                            && preview.invitation_id == invitation,
+                        ManagedError::new(ManagedErrorKind::IdempotencyConflict)
+                    );
+                    staged = Some((ticket, path));
+                }
+            }
+        }
+        if staged.is_none() {
+            self.ensure_request_capacity(&request_id)?;
+            let path = self.private_text_path("responses", &hash, "ticket")?;
+            let reserved = root_admission::reserve_private_file(&path)?;
+            if let Some(existing) = intent.as_ref() {
+                ensure!(
+                    existing.response_file == reserved.to_string_lossy(),
+                    ManagedError::new(ManagedErrorKind::IdempotencyConflict)
+                );
+            }
+            let parent = reserved
+                .parent()
+                .context("private response parent is unavailable")?;
+            private::prepare_directory(parent)?;
+            // A crash may leave the deterministic response path without its
+            // durable KeyIntent.  Never let write_private_text's existing-file
+            // no-op pair a newly generated invitation with that old bytes:
+            // parse and bind a valid orphan to this request, or remove an
+            // invalid orphan successfully before generating anything.
+            let orphan = if reserved.exists() {
+                let encoded = Self::read_private_text(&reserved, 32 * 1024)?;
+                match ShareTicket::parse(&encoded) {
+                    Ok(ticket) => {
+                        let preview = ticket.preview();
+                        ensure!(
+                            preview.share_id == share
+                                && preview.owner == owner.config().owner
+                                && preview.permission == permission
+                                && preview.expires_at == expires_at,
+                            ManagedError::new(ManagedErrorKind::IdempotencyConflict)
+                        );
+                        Some(ticket)
+                    }
+                    Err(error) => {
+                        let error = anyhow::Error::new(error);
+                        if !is_terminal_pending_error(&error) {
+                            return Err(error);
+                        }
+                        // Keep the request uncommitted until the old secret is
+                        // actually removed.  A failed removal must be retried
+                        // with the same path and cannot mint a replacement.
+                        Self::remove_private_file(&reserved)?;
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let ticket = match orphan {
+                Some(ticket) => ticket,
+                None => owner.prepare_key(permission, expires_at, service.endpoint_addr())?,
+            };
+            let preview = ticket.preview();
+            let staged_intent = config::KeyIntent {
                 request_id: request_id.clone(),
                 operation: operation.into(),
                 request_hash: hash.clone(),
-                result_ref: reserved.to_string_lossy().into_owned(),
-                recorded_at: managed_now(),
-            });
-            Ok(())
-        })
+                share_id: share_id_string(share),
+                permission,
+                expires_at,
+                invitation_id: invitation_id_string(preview.invitation_id),
+                response_file: reserved.to_string_lossy().into_owned(),
+                rotate_invitation: rotate_invitation.map(invitation_id_string),
+                created_at: self.managed_time()?,
+            };
+            self.persist(|config| {
+                if let Some(existing) = config
+                    .managed
+                    .key_intents
+                    .iter()
+                    .find(|existing| existing.request_id == request_id)
+                {
+                    ensure!(
+                        existing.request_hash == staged_intent.request_hash
+                            && existing.response_file == staged_intent.response_file
+                            && existing.invitation_id == staged_intent.invitation_id,
+                        ManagedError::new(ManagedErrorKind::IdempotencyConflict)
+                    );
+                } else {
+                    config.managed.key_intents.push(staged_intent.clone());
+                }
+                Ok(())
+            })
+            .await?;
+            Self::write_private_text(&reserved, &ticket.encode(), 32 * 1024)?;
+            intent = Some(staged_intent);
+            staged = Some((ticket, reserved));
+        }
+        let (ticket, response_path) = staged.expect("staged issuance ticket");
+        owner.commit_key(&ticket, rotate_invitation)?;
+        // Keep the intent and response file when the journal write fails. A
+        // retry will replay this exact signed ticket and registry invitation
+        // after a crash or durable-journal failure.
+        self.record_request(
+            request_id.clone(),
+            operation,
+            hash,
+            response_path.to_string_lossy().into_owned(),
+        )
         .await?;
-        let owner = self.owner_share(share).await?;
-        let service = self.ensure_managed_service().await?;
-        let ticket = if let Some(invitation) = rotate_invitation {
-            owner.rotate_key(invitation, expires_at, service.endpoint_addr())?
-        } else {
-            owner.issue_key(permission, expires_at, service.endpoint_addr())?
-        };
-        let encoded = ticket.encode();
-        Self::write_private_text(&reserved, &encoded, 32 * 1024)?;
+        if let Some(intent) = intent
+            && let Err(error) = self.remove_key_intent(&intent.request_id).await
+        {
+            self.record_managed_error(error);
+        }
+        let encoded = Self::read_private_text(&response_path, 32 * 1024)?;
         Self::issued_key(request_id, encoded)
     }
 
@@ -2951,14 +4450,26 @@ impl Manager {
     pub async fn list_members(&self, share: ShareId) -> Result<Vec<MemberView>> {
         let _active = self.lifecycle.read().await;
         self.running()?;
+        self.managed_time()?;
         let owner = self.owner_share(share).await?;
         let mut members = Vec::new();
         for member in owner.members()? {
             let member_id = self.member_handle(share, member.endpoint).await?;
+            let revocation_pending = self
+                .shared
+                .lock()
+                .expect("snapshot mutex")
+                .config
+                .managed
+                .revocations
+                .iter()
+                .any(|pending| {
+                    pending.share_id == share_id_string(share) && pending.member_id == member_id
+                });
             members.push(MemberView {
                 member_id,
                 permission: member.permission,
-                revocation_pending: false,
+                revocation_pending,
                 enrolled_at: member.enrolled_at,
                 revoked_at: member.revoked_at,
                 active_operations: 0,
@@ -2986,6 +4497,7 @@ impl Manager {
         {
             return self.mutation_result(input.request_id, input.share);
         }
+        self.managed_time()?;
         self.ensure_request_capacity(&input.request_id)?;
         let owner = self.owner_share(input.share).await?;
         owner.revoke_key(input.invitation)?;
@@ -3023,6 +4535,7 @@ impl Manager {
         {
             return self.mutation_result(input.request_id, input.share);
         }
+        self.managed_time()?;
         self.ensure_request_capacity(&input.request_id)?;
         let owner = self.owner_share(input.share).await?;
         let mut found = None;
@@ -3034,27 +4547,58 @@ impl Manager {
         }
         let member = found
             .ok_or_else(|| anyhow::Error::new(ManagedError::new(ManagedErrorKind::NotFound)))?;
-        owner.revoke_member(member.endpoint).await?;
+        let now = self.managed_time()?;
+        owner.deny_member(member.endpoint)?;
+        let share_id = share_id_string(input.share);
+        let pending = config::PendingRevocation {
+            request_id: input.request_id.clone(),
+            share_id: share_id.clone(),
+            member_id: input.member_id.clone(),
+            endpoint: member.endpoint.to_string(),
+            created_at: now,
+            retry_at: None,
+        };
+        let revocation_pending = !owner.member_drain_ready(member.endpoint);
         self.persist(|config| {
-            if let Some(record) = config
+            if revocation_pending {
+                if let Some(existing) = config
+                    .managed
+                    .revocations
+                    .iter()
+                    .find(|existing| existing.request_id == input.request_id)
+                {
+                    ensure!(
+                        existing.share_id == pending.share_id
+                            && existing.member_id == pending.member_id
+                            && existing.endpoint == pending.endpoint,
+                        ManagedError::new(ManagedErrorKind::IdempotencyConflict)
+                    );
+                } else {
+                    config.managed.revocations.push(pending.clone());
+                }
+            }
+            if !config
                 .managed
-                .shares
-                .iter_mut()
-                .find(|record| record.share_id == share_id_string(input.share))
+                .requests
+                .iter()
+                .any(|request| request.request_id == input.request_id)
             {
-                record.revocation_pending = false;
-                record.retry_at = None;
+                config.managed.requests.push(config::RequestRecord {
+                    request_id: input.request_id.clone(),
+                    operation: "revoke_member".into(),
+                    request_hash: hash.clone(),
+                    result_ref: format!("mutation:{share_id}:{}", input.member_id),
+                    recorded_at: managed_now(),
+                });
             }
             Ok(())
         })
         .await?;
-        self.record_request(
-            input.request_id.clone(),
-            "revoke_member",
-            hash,
-            format!("mutation:{}", share_id_string(input.share)),
-        )
-        .await?;
+        if revocation_pending
+            && let Err(error) = self.schedule_revocation_drain(pending, owner).await
+        {
+            self.record_managed_error(error);
+        }
         self.mutation_result(input.request_id, input.share)
     }
 
@@ -3076,8 +4620,42 @@ impl Manager {
         {
             return Ok(Self::removed_mutation_result(input.request_id));
         }
-        self.ensure_request_capacity(&input.request_id)?;
+        self.managed_time()?;
         let id = share_id_string(input.share);
+        if let Some(intent) = self.removal_intent(&input.request_id) {
+            ensure!(
+                intent.request_hash == hash && intent.share_id == id,
+                ManagedError::new(ManagedErrorKind::IdempotencyConflict)
+            );
+            let (tombstoned, configured) = {
+                let state = self.shared.lock().expect("snapshot mutex");
+                (
+                    state
+                        .config
+                        .managed
+                        .tombstones
+                        .iter()
+                        .any(|tombstone| tombstone == &id),
+                    state
+                        .config
+                        .managed
+                        .shares
+                        .iter()
+                        .any(|record| record.share_id == id),
+                )
+            };
+            ensure!(
+                tombstoned,
+                ManagedError::new(ManagedErrorKind::InvalidInput)
+            );
+            if !configured {
+                self.ensure_request_capacity(&input.request_id)?;
+                self.complete_removed_request(&input.request_id, &hash, &id)
+                    .await?;
+                return Ok(Self::removed_mutation_result(input.request_id));
+            }
+        }
+        self.ensure_request_capacity(&input.request_id)?;
         let record = self.managed_record(input.share)?;
         self.persist(|config| {
             if !config
@@ -3088,9 +4666,28 @@ impl Manager {
             {
                 config.managed.tombstones.push(id.clone());
             }
+            if let Some(existing) = config
+                .managed
+                .removals
+                .iter()
+                .find(|intent| intent.request_id == input.request_id)
+            {
+                ensure!(
+                    existing.request_hash == hash && existing.share_id == id,
+                    ManagedError::new(ManagedErrorKind::IdempotencyConflict)
+                );
+            } else {
+                config.managed.removals.push(config::RemovalIntent {
+                    request_id: input.request_id.clone(),
+                    request_hash: hash.clone(),
+                    share_id: id.clone(),
+                    created_at: managed_now(),
+                });
+            }
             Ok(())
         })
         .await?;
+        self.await_revocation_tasks(Some(&id)).await?;
         let slot = self
             .managed_slots
             .lock()
@@ -3125,13 +4722,33 @@ impl Manager {
                 .managed
                 .pending
                 .retain(|pending| pending.share_id != id);
-            config.managed.requests.push(config::RequestRecord {
-                request_id: input.request_id.clone(),
-                operation: "remove_share".into(),
-                request_hash: hash.clone(),
-                result_ref: format!("mutation:{id}"),
-                recorded_at: managed_now(),
-            });
+            config
+                .managed
+                .revocations
+                .retain(|pending| pending.share_id != id);
+            config
+                .managed
+                .removals
+                .retain(|intent| intent.request_id != input.request_id);
+            if let Some(existing) = config
+                .managed
+                .requests
+                .iter()
+                .find(|record| record.request_id == input.request_id)
+            {
+                ensure!(
+                    existing.operation == "remove_share" && existing.request_hash == hash,
+                    ManagedError::new(ManagedErrorKind::IdempotencyConflict)
+                );
+            } else {
+                config.managed.requests.push(config::RequestRecord {
+                    request_id: input.request_id.clone(),
+                    operation: "remove_share".into(),
+                    request_hash: hash.clone(),
+                    result_ref: format!("mutation:{id}"),
+                    recorded_at: managed_now(),
+                });
+            }
             Ok(())
         })
         .await?;
@@ -3183,6 +4800,7 @@ impl Manager {
         {
             return self.managed_view_for(input.share);
         }
+        self.managed_time()?;
         self.ensure_request_capacity(&input.request_id)?;
         let id = share_id_string(input.share);
         let slot = self
@@ -3198,24 +4816,24 @@ impl Manager {
             .ok_or_else(|| anyhow::Error::new(ManagedError::new(ManagedErrorKind::Busy)))?;
         match (worker, input.command) {
             (ManagedWorker::Owner(owner), ShareCommand::Pause) => {
-                owner.pause().await;
-                self.clear_managed_observation(input.share);
                 self.set_managed_status(input.share, ManagedStatus::Paused, "paused")
                     .await?;
+                owner.pause().await;
+                self.clear_managed_observation(input.share);
             }
             (ManagedWorker::Owner(owner), ShareCommand::Resume) => {
-                owner.resume();
                 self.set_managed_status(input.share, ManagedStatus::InitialSync, "initial_sync")
                     .await?;
+                owner.resume();
                 self.update_owner_inventory(input.share, owner).await?;
             }
             (ManagedWorker::Owner(owner), ShareCommand::Sync) => {
                 self.update_owner_inventory(input.share, owner).await?;
             }
             (ManagedWorker::Member(_), ShareCommand::Pause) => {
-                self.clear_managed_observation(input.share);
                 self.set_managed_status(input.share, ManagedStatus::Paused, "paused")
                     .await?;
+                self.clear_managed_observation(input.share);
             }
             (ManagedWorker::Member(engine), ShareCommand::Resume)
             | (ManagedWorker::Member(engine), ShareCommand::Sync) => {
@@ -3686,6 +5304,9 @@ impl Manager {
                 error = Some(anyhow::anyhow!("background task failed"));
             }
         }
+        if let Err(failure) = self.await_revocation_tasks(None).await {
+            error = Some(failure);
+        }
         let slots = self
             .slots
             .lock()
@@ -3829,5 +5450,108 @@ mod managed_error_tests {
         assert_eq!(summary.code, "member_revoked");
         assert_eq!(summary.message, "membership revoked");
         assert!(!summary.message.contains("secret"));
+    }
+
+    #[test]
+    fn manual_only_manager_ignores_stale_managed_clock_high_water() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let data_dir = temp.path().join("admin");
+            let manager = Manager::open(data_dir.clone()).await.unwrap();
+            {
+                let mut state = manager.shared.lock().expect("snapshot mutex");
+                state.config.managed.clock_last = managed_now().saturating_add(3600);
+            }
+            manager
+                .update_settings(Settings {
+                    node_name: "Manual".into(),
+                    poll_interval_seconds: 30,
+                    history_limit: 300,
+                })
+                .await
+                .unwrap();
+            manager.shutdown().await.unwrap();
+
+            let reopened = Manager::open(data_dir).await.unwrap();
+            assert_eq!(reopened.snapshot().await.settings.node_name, "Manual");
+            reopened.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn managed_clock_rollback_quarantines_managed_state_without_losing_manual_open() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let data_dir = temp.path().join("admin");
+            let manager = Manager::open(data_dir.clone()).await.unwrap();
+            {
+                let mut state = manager.shared.lock().expect("snapshot mutex");
+                state.config.managed.clock_last = managed_now().saturating_add(3600);
+                state.config.managed.pending.push(config::PendingRecord {
+                    request_id: "rollback-test".into(),
+                    share_id: "00".repeat(32),
+                    owner: "owner".into(),
+                    owner_address: None,
+                    name: "test".into(),
+                    permission: Some(Permission::ReadOnly),
+                    root: temp.path().join("root").to_string_lossy().into_owned(),
+                    state_root: temp.path().join("state").to_string_lossy().into_owned(),
+                    ticket_file: data_dir
+                        .join("managed/pending/")
+                        .join(format!("{}.ticket", "00".repeat(32)))
+                        .to_string_lossy()
+                        .into_owned(),
+                    created_at: managed_now(),
+                    expires_at: None,
+                    status: ManagedStatus::Waiting,
+                    retry_at: None,
+                    min_free_space_bytes: 0,
+                });
+            }
+            manager.shutdown().await.unwrap();
+            let reopened = Manager::open(data_dir).await.unwrap();
+            assert_eq!(reopened.snapshot().await.pending.len(), 1);
+            reopened
+                .update_settings(Settings {
+                    node_name: "Manual after rollback".into(),
+                    poll_interval_seconds: 30,
+                    history_limit: 300,
+                })
+                .await
+                .unwrap();
+            reopened.shutdown().await.unwrap();
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_gc_rejects_symlinked_ancestor_and_preserves_unrecognized_files() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            use std::os::unix::fs::symlink;
+
+            let temp = tempfile::tempdir().unwrap();
+            let data_dir = temp.path().join("admin");
+            let manager = Manager::open(data_dir.clone()).await.unwrap();
+            let external = temp.path().join("external");
+            std::fs::create_dir_all(&external).unwrap();
+            let sentinel = external.join("sentinel.txt");
+            std::fs::write(&sentinel, b"must survive").unwrap();
+            std::fs::create_dir_all(data_dir.join("managed")).unwrap();
+            symlink(&external, data_dir.join("managed/pending")).unwrap();
+            assert!(manager.gc_pending_tickets().await.is_err());
+            assert_eq!(std::fs::read(&sentinel).unwrap(), b"must survive");
+            std::fs::remove_file(data_dir.join("managed/pending")).unwrap();
+
+            let pending = data_dir.join("managed/pending");
+            private::prepare_directory(&pending).unwrap();
+            let unrecognized = pending.join("user.ticket");
+            let generated = pending.join(format!("{}.ticket", "cd".repeat(32)));
+            std::fs::write(&unrecognized, b"user data").unwrap();
+            std::fs::write(&generated, b"generated data").unwrap();
+            manager.gc_pending_tickets().await.unwrap();
+            assert!(unrecognized.is_file());
+            assert!(!generated.exists());
+            manager.shutdown().await.unwrap();
+        });
     }
 }

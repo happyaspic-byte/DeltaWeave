@@ -64,7 +64,7 @@ pub struct SyncEngine {
 #[derive(Debug)]
 #[doc(hidden)]
 pub struct ReplicaState {
-    _root_lease: deltaweave_net::root_admission::RootLease,
+    _root_lease: Arc<deltaweave_net::root_admission::RootLease>,
     root: PathBuf,
     index: Arc<LocalIndex>,
     store: Arc<Store>,
@@ -141,11 +141,11 @@ impl SyncEngine {
 
     /// Opens durable state while reserving free space across local CAS and file writes.
     pub fn open_with_min_free_space(config: SyncConfig, min_free_space_bytes: u64) -> Result<Self> {
-        let root_lease = deltaweave_net::root_admission::acquire_with_private(
+        let root_lease = Arc::new(deltaweave_net::root_admission::acquire_with_private(
             &config.root,
             deltaweave_net::root_admission::RootUse::Legacy,
             std::slice::from_ref(&config.state_root),
-        )?;
+        )?);
         config.profile.validate()?;
         fs::create_dir_all(&config.root).with_context(|| {
             format!(
