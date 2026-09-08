@@ -149,6 +149,40 @@ pub fn classify_managed_error(error: &anyhow::Error) -> ErrorSummary {
             deltaweave_net::share::ShareError::TransferFailed => {
                 ("transfer_failed", "share transfer failed")
             }
+            deltaweave_net::share::ShareError::HeartbeatExpired => {
+                ("heartbeat_expired", "share heartbeat expired")
+            }
+            deltaweave_net::share::ShareError::HeartbeatReplay => {
+                ("heartbeat_replay", "share heartbeat replayed")
+            }
+            deltaweave_net::share::ShareError::EpochMismatch => {
+                ("epoch_mismatch", "share permission epoch mismatch")
+            }
+            deltaweave_net::share::ShareError::EndpointMismatch => {
+                ("endpoint_mismatch", "share endpoint mismatch")
+            }
+            deltaweave_net::share::ShareError::ClockRollback => (
+                "clock_rollback",
+                "managed clock moved backwards; state is temporarily locked",
+            ),
+            deltaweave_net::share::ShareError::RosterStale => {
+                ("roster_stale", "share roster is stale")
+            }
+            deltaweave_net::share::ShareError::GrantExpired => {
+                ("grant_expired", "share grant expired")
+            }
+            deltaweave_net::share::ShareError::GrantReplay => {
+                ("grant_replay", "share grant replayed")
+            }
+            deltaweave_net::share::ShareError::ManifestMismatch => {
+                ("manifest_mismatch", "share manifest mismatch")
+            }
+            deltaweave_net::share::ShareError::CasUnavailable => {
+                ("cas_unavailable", "share content unavailable")
+            }
+            deltaweave_net::share::ShareError::RevocationPending => {
+                ("revocation_pending", "share revocation is pending")
+            }
         };
         return ErrorSummary {
             code: code.into(),
@@ -5483,6 +5517,29 @@ mod managed_error_tests {
         assert_eq!(summary.code, "member_revoked");
         assert_eq!(summary.message, "membership revoked");
         assert!(!summary.message.contains("secret"));
+    }
+
+    #[test]
+    fn newly_added_share_errors_have_stable_safe_codes() {
+        let cases = [
+            (ShareError::HeartbeatExpired, "heartbeat_expired"),
+            (ShareError::HeartbeatReplay, "heartbeat_replay"),
+            (ShareError::EpochMismatch, "epoch_mismatch"),
+            (ShareError::EndpointMismatch, "endpoint_mismatch"),
+            (ShareError::ClockRollback, "clock_rollback"),
+            (ShareError::RosterStale, "roster_stale"),
+            (ShareError::GrantExpired, "grant_expired"),
+            (ShareError::GrantReplay, "grant_replay"),
+            (ShareError::ManifestMismatch, "manifest_mismatch"),
+            (ShareError::CasUnavailable, "cas_unavailable"),
+            (ShareError::RevocationPending, "revocation_pending"),
+        ];
+        for (error, expected_code) in cases {
+            let summary = classify_managed_error(&anyhow::Error::new(error));
+            assert_eq!(summary.code, expected_code);
+            assert!(!summary.message.contains("/"));
+            assert!(!summary.message.contains("key="));
+        }
     }
 
     #[test]
