@@ -59,6 +59,46 @@ async fn idle(app: &WebApp) -> Value {
     .await
     .unwrap()
 }
+async fn wait_for_receiving(app: &WebApp) {
+    let readiness = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if request(app, "/api/state", None).await.1["phase"] == "receiving" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    if readiness.is_err() {
+        let state = request(app, "/api/state", None).await.1;
+        let phase = state["phase"].as_str().unwrap_or("invalid");
+        let activity_status = state["activity"][0]["status"].as_str().unwrap_or("missing");
+        let activity_error = state["activity"][0]["error"].as_str().unwrap_or("");
+        let error_class = if activity_error
+            .to_ascii_lowercase()
+            .contains("address already in use")
+        {
+            "address_in_use"
+        } else if activity_error
+            .to_ascii_lowercase()
+            .contains("permission denied")
+        {
+            "permission_denied"
+        } else if activity_error
+            .to_ascii_lowercase()
+            .contains("failed to bind")
+        {
+            "bind_failure"
+        } else if activity_error.is_empty() {
+            "missing"
+        } else {
+            "other"
+        };
+        eprintln!("receiver readiness timeout: phase={phase} activity_status={activity_status}");
+        eprintln!("receiver readiness error class: {error_class}");
+    }
+    readiness.unwrap();
+}
 #[tokio::test]
 async fn authenticates_and_blocks_cross_origin_and_rebinding() {
     let (_temp, app) = fixture().await;
@@ -176,16 +216,7 @@ async fn scans_real_files_and_reuses_index_across_receiver_mode() {
             .0,
         StatusCode::ACCEPTED
     );
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if request(&app, "/api/state", None).await.1["phase"] == "receiving" {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap();
+    wait_for_receiving(&app).await;
     assert_eq!(
         request(&app, "/api/scan", Some(json!({}))).await.0,
         StatusCode::CONFLICT
@@ -251,17 +282,8 @@ async fn syncs_two_real_peers_and_denies_unlisted_identity() {
         Some(json!({"peer_id":left_id})),
     )
     .await;
-    let receiver = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let s = request(&right, "/api/state", None).await.1;
-            if s["phase"] == "receiving" {
-                break s["receiver"].clone();
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap();
+    wait_for_receiving(&right).await;
+    let receiver = request(&right, "/api/state", None).await.1["receiver"].clone();
     let payload = json!({"peer_id":receiver["endpoint_id"],"direct_address":receiver["direct_addresses"][0],"confirm":true});
     assert_eq!(
         request(&left, "/api/sync", Some(payload.clone())).await.0,
