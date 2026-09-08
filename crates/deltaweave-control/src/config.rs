@@ -1,5 +1,7 @@
 use crate::model::*;
 use anyhow::{Context, Result, ensure};
+use deltaweave_core::ReplicaId;
+use iroh::EndpointAddr;
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
@@ -20,6 +22,181 @@ pub(crate) struct Config {
     pub activities: Vec<Activity>,
     #[serde(default)]
     pub history: Vec<HistoryPoint>,
+    #[serde(default)]
+    pub managed: ManagedConfig,
+}
+
+/// Additive managed state. The outer config remains version 1 so existing manual
+/// configurations and their tagged roles continue to deserialize unchanged.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct ManagedConfig {
+    #[serde(default = "managed_schema_version")]
+    pub schema_version: u32,
+    #[serde(default)]
+    pub shares: Vec<ManagedShareRecord>,
+    #[serde(default)]
+    pub pending: Vec<PendingRecord>,
+    #[serde(default)]
+    pub intents: Vec<CreateIntent>,
+    #[serde(default)]
+    pub requests: Vec<RequestRecord>,
+    #[serde(default)]
+    pub tombstones: Vec<String>,
+    #[serde(default)]
+    pub revocations: Vec<PendingRevocation>,
+    #[serde(default)]
+    pub key_intents: Vec<KeyIntent>,
+    #[serde(default)]
+    pub removals: Vec<RemovalIntent>,
+    /// Highest accepted managed wall-clock second.  A persisted future value
+    /// makes a later clock rollback fail closed instead of extending TTLs.
+    #[serde(default)]
+    pub clock_last: u64,
+}
+
+impl Default for ManagedConfig {
+    fn default() -> Self {
+        Self {
+            schema_version: managed_schema_version(),
+            shares: Vec::new(),
+            pending: Vec::new(),
+            intents: Vec::new(),
+            requests: Vec::new(),
+            tombstones: Vec::new(),
+            revocations: Vec::new(),
+            key_intents: Vec::new(),
+            removals: Vec::new(),
+            clock_last: 0,
+        }
+    }
+}
+
+fn managed_schema_version() -> u32 {
+    1
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct ManagedShareRecord {
+    pub share_id: String,
+    pub role: ShareRole,
+    pub permission: Option<Permission>,
+    pub name: String,
+    pub root: String,
+    pub state_root: String,
+    pub owner: String,
+    #[serde(default)]
+    pub min_free_space_bytes: u64,
+    #[serde(default)]
+    pub owner_address: Option<EndpointAddr>,
+    pub member_id: Option<String>,
+    #[serde(default)]
+    pub replica: Option<ReplicaId>,
+    #[serde(default)]
+    pub enrolled_at: Option<u64>,
+    #[serde(default)]
+    pub membership_epoch: Option<u64>,
+    #[serde(default)]
+    pub revocation_pending: bool,
+    pub status: ManagedStatus,
+    pub phase: Option<String>,
+    pub last_sync_at: Option<u64>,
+    pub retry_at: Option<u64>,
+    pub files_count: u64,
+    pub total_bytes: u64,
+    pub transferred_bytes: u64,
+    pub speed_bps: u64,
+    #[serde(default)]
+    pub active_peer_count: u32,
+    #[serde(default)]
+    pub connected_devices: Vec<ConnectedDeviceView>,
+    pub last_error: Option<ErrorSummary>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct PendingRecord {
+    pub request_id: String,
+    pub share_id: String,
+    pub owner: String,
+    #[serde(default)]
+    pub owner_address: Option<EndpointAddr>,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub permission: Option<Permission>,
+    pub root: String,
+    pub state_root: String,
+    pub ticket_file: String,
+    pub created_at: u64,
+    pub expires_at: Option<u64>,
+    pub status: ManagedStatus,
+    #[serde(default)]
+    pub retry_at: Option<u64>,
+    #[serde(default)]
+    pub min_free_space_bytes: u64,
+}
+
+/// Durable per-member denial whose network writer drain has not yet completed.
+/// The member is revoked in the owner registry before this record is written;
+/// retaining the record makes response loss and restart safe without exposing
+/// a share-wide pending flag.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct PendingRevocation {
+    pub request_id: String,
+    pub share_id: String,
+    pub member_id: String,
+    pub endpoint: String,
+    pub created_at: u64,
+    #[serde(default)]
+    pub retry_at: Option<u64>,
+}
+
+/// Durable staged issuance metadata. The signed bearer remains only in the
+/// private response file; this record lets a retry commit that exact ticket
+/// after a crash without minting a second invitation.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct KeyIntent {
+    pub request_id: String,
+    pub operation: String,
+    pub request_hash: String,
+    pub share_id: String,
+    pub permission: Permission,
+    pub expires_at: Option<u64>,
+    pub invitation_id: String,
+    pub response_file: String,
+    pub rotate_invitation: Option<String>,
+    pub created_at: u64,
+}
+
+/// Durable removal intent paired with a tombstone. Keeping the request hash
+/// through restart lets a retry complete the same removal after recovery has
+/// already unloaded and forgotten the configured share.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct RemovalIntent {
+    pub request_id: String,
+    pub request_hash: String,
+    pub share_id: String,
+    pub created_at: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct CreateIntent {
+    pub request_id: String,
+    pub request_hash: String,
+    pub name: String,
+    pub root: String,
+    pub state_root: String,
+    #[serde(default)]
+    pub owner: Option<String>,
+    pub created_at: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct RequestRecord {
+    pub request_id: String,
+    pub operation: String,
+    pub request_hash: String,
+    pub result_ref: String,
+    pub recorded_at: u64,
 }
 fn version() -> u32 {
     1
@@ -37,6 +214,10 @@ pub(crate) fn read(dir: &Path) -> Result<Config> {
     ensure!(
         config.version == 1,
         "unsupported management configuration version"
+    );
+    ensure!(
+        config.managed.schema_version == 1,
+        "unsupported managed configuration version"
     );
     Ok(config)
 }

@@ -76,7 +76,21 @@ impl ManagedSyncEngine {
         share: ShareId,
         config: ManagedSyncConfig,
     ) -> Result<Self> {
-        Self::open_inner(service, owner, share, config, false)
+        Self::open_inner(service, owner, share, config, false, None)
+    }
+
+    /// Opens a newly enrolled member while transferring an already acquired
+    /// admission lease into the engine.  The caller acquired this lease for
+    /// the exact public root and private state root before contacting the
+    /// owner; retaining it here closes the pending-to-active TOCTOU window.
+    pub fn open_with_lease(
+        service: &ShareService,
+        owner: iroh::EndpointId,
+        share: ShareId,
+        config: ManagedSyncConfig,
+        lease: Arc<root_admission::RootLease>,
+    ) -> Result<Self> {
+        Self::open_inner(service, owner, share, config, false, Some(lease))
     }
 
     /// Resumes an existing member only if both the index and recovery journal still exist.
@@ -87,7 +101,7 @@ impl ManagedSyncEngine {
         share: ShareId,
         config: ManagedSyncConfig,
     ) -> Result<Self> {
-        Self::open_inner(service, owner, share, config, true)
+        Self::open_inner(service, owner, share, config, true, None)
     }
 
     fn open_inner(
@@ -96,6 +110,7 @@ impl ManagedSyncEngine {
         share: ShareId,
         config: ManagedSyncConfig,
         resume: bool,
+        transferred_lease: Option<Arc<root_admission::RootLease>>,
     ) -> Result<Self> {
         let index_exists = config.state_root.join("index.redb").is_file();
         let store_exists = config.state_root.join("store/metadata.redb").is_file();
@@ -107,14 +122,24 @@ impl ManagedSyncEngine {
         let session = service.open_session(owner, share)?;
         let member = session.membership();
         config.profile.validate()?;
-        let lease = root_admission::acquire_with_private(
-            &config.root,
-            root_admission::RootUse::Managed {
-                share: share.0,
-                owner: *owner.as_bytes(),
-            },
-            std::slice::from_ref(&config.state_root),
-        )?;
+        let lease = if let Some(lease) = transferred_lease {
+            // A transferred lease is meaningful only for the binding that
+            // was admitted by the controller.  Path equality alone would
+            // allow a Legacy or another share's lease to be transplanted, so
+            // validate the complete public/private admission binding before
+            // opening the index/store.
+            validate_transferred_lease(&lease, owner, share, &config)?;
+            lease
+        } else {
+            Arc::new(root_admission::acquire_with_private(
+                &config.root,
+                root_admission::RootUse::Managed {
+                    share: share.0,
+                    owner: *owner.as_bytes(),
+                },
+                std::slice::from_ref(&config.state_root),
+            )?)
+        };
         let root = lease.root().to_path_buf();
         let state = fs::canonicalize(&config.state_root)?;
         let index = Arc::new(LocalIndex::open(
@@ -267,4 +292,33 @@ impl ManagedSyncEngine {
         inner.session.close().await;
         Ok(())
     }
+}
+
+fn validate_transferred_lease(
+    lease: &root_admission::RootLease,
+    owner: iroh::EndpointId,
+    share: ShareId,
+    config: &ManagedSyncConfig,
+) -> Result<()> {
+    ensure!(
+        fs::canonicalize(&config.root)? == lease.root(),
+        ShareError::StateUnavailable
+    );
+    ensure!(
+        lease.kind()
+            == &root_admission::RootUse::Managed {
+                share: share.0,
+                owner: *owner.as_bytes(),
+            },
+        ShareError::StateUnavailable
+    );
+    let state = fs::canonicalize(&config.state_root)?;
+    ensure!(
+        lease
+            .private_roots()
+            .iter()
+            .any(|private| private == &state),
+        ShareError::StateUnavailable
+    );
+    Ok(())
 }

@@ -19,6 +19,9 @@ pub(crate) enum Operation {
         proof: Option<Box<LegacyProof>>,
     },
     Session,
+    /// Queries an existing membership without issuing a ticket or allocating a replica.
+    /// Appended after the v3 variants so existing peers retain their wire ordinals.
+    Resume,
 }
 #[derive(Serialize, Deserialize)]
 pub(crate) enum Reply {
@@ -26,6 +29,8 @@ pub(crate) enum Reply {
     Enrolled(Membership),
     Accepted,
     Error(ShareError),
+    /// Existing authenticated membership returned by the owner.
+    Resumed(Membership),
 }
 
 pub(crate) async fn read_hello(receive: &mut RecvStream) -> Result<Hello> {

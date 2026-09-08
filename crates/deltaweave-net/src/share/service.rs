@@ -139,7 +139,7 @@ impl ShareService {
                 Ok(config)
             },
         )?;
-        self.load_config_with_lease(config, lease).await
+        self.load_config_with_lease(config, lease, false).await
     }
     pub async fn load_owned_share(&self, share: ShareId) -> Result<OwnerShare> {
         let _lifecycle = self.lifecycle.lock().await;
@@ -151,6 +151,45 @@ impl ShareService {
         }
         self.load_config(self.registry.config(share)?).await
     }
+
+    /// Loads an owner runtime with admission disabled before it enters the
+    /// endpoint map.  Restart recovery uses this for a durable Paused state so
+    /// no peer can observe a transient enabled window.
+    pub async fn load_owned_share_paused(&self, share: ShareId) -> Result<OwnerShare> {
+        let _lifecycle = self.lifecycle.lock().await;
+        if let Some(runtime) = self.runtimes.read().expect("runtime map").get(&share) {
+            runtime.disable();
+            return Ok(OwnerShare {
+                runtime: runtime.clone(),
+                key: self.key.clone(),
+            });
+        }
+        let config = self.registry.config(share)?;
+        let lease = root_admission::acquire_with_private(
+            &config.root,
+            RootUse::Managed {
+                share: share.0,
+                owner: *config.owner.as_bytes(),
+            },
+            std::slice::from_ref(&config.state_root),
+        )?;
+        self.load_config_with_lease(config, lease, true).await
+    }
+
+    /// Pauses and drains a managed owner runtime before deleting only its
+    /// transport catalog entry. The manager retains local files and state.
+    pub async fn unload_owned_share(&self, share: ShareId) -> Result<()> {
+        let _lifecycle = self.lifecycle.lock().await;
+        let runtime = self.runtimes.write().expect("runtime map").remove(&share);
+        if let Some(runtime) = runtime {
+            runtime.pause().await;
+        }
+        self.registry.remove_share(share)
+    }
+
+    pub fn forget_membership(&self, owner: EndpointId, share: ShareId) -> Result<()> {
+        self.registry.forget_relationship(owner, share)
+    }
     async fn load_config(&self, config: OwnedShareConfig) -> Result<OwnerShare> {
         let lease = root_admission::acquire_with_private(
             &config.root,
@@ -160,12 +199,13 @@ impl ShareService {
             },
             std::slice::from_ref(&config.state_root),
         )?;
-        self.load_config_with_lease(config, lease).await
+        self.load_config_with_lease(config, lease, false).await
     }
     async fn load_config_with_lease(
         &self,
         config: OwnedShareConfig,
         lease: RootLease,
+        paused: bool,
     ) -> Result<OwnerShare> {
         let registry = self.registry.clone();
         let ready = registry.is_ready(config.share_id)?;
@@ -200,6 +240,9 @@ impl ShareService {
             })?);
             store.recover_path_changes(&root)?;
             let runtime = OwnedRuntime::new(config, registry, index, store, lease)?;
+            if paused {
+                runtime.disable();
+            }
             let report = runtime.index.scan()?;
             crate::ensure_index_report_safe(&report)?;
             runtime.refresh_causal_state()?;
@@ -277,6 +320,54 @@ impl ShareService {
             _ => Err(ShareError::Protocol.into()),
         }
     }
+
+    /// Restores a durable membership after a lost enrollment response.
+    ///
+    /// This path intentionally has no ticket and never allocates a membership or
+    /// logical replica. The owner authenticates the caller from the QUIC peer ID and
+    /// returns only the currently active binding for the requested share.
+    pub async fn resume_membership(
+        &self,
+        owner: EndpointId,
+        share: ShareId,
+        address: EndpointAddr,
+    ) -> Result<Membership> {
+        ensure!(owner != self.endpoint_id(), ShareError::OwnerMismatch);
+        ensure!(address.id == owner, ShareError::OwnerMismatch);
+        let connection = self
+            .router
+            .endpoint()
+            .connect(address.clone(), ALPN_V3)
+            .await
+            .map_err(|_| ShareError::Offline)?;
+        let result = wire::exchange(
+            &connection,
+            Hello {
+                version: 3,
+                share_id: share,
+                operation: Operation::Resume,
+            },
+        )
+        .await;
+        connection.close(0u8.into(), b"membership resume complete");
+        match result? {
+            Reply::Resumed(member) => {
+                ensure!(
+                    member.owner == owner
+                        && member.share_id == share
+                        && member.endpoint == self.endpoint_id(),
+                    ShareError::OwnerMismatch
+                );
+                self.registry.store_relationship(MemberRelationship {
+                    membership: member.clone(),
+                    address,
+                })?;
+                ensure!(member.revoked_at.is_none(), ShareError::MemberRevoked);
+                Ok(member)
+            }
+            _ => Err(ShareError::Protocol.into()),
+        }
+    }
     async fn connect_ticket(&self, ticket: &ShareTicket) -> Result<Connection> {
         ensure!(
             ticket.preview().owner != self.endpoint_id(),
@@ -339,6 +430,7 @@ impl ShareService {
         for runtime in runtimes {
             runtime.pause().await;
         }
+        self.runtimes.write().expect("runtime map").clear();
         self.router.shutdown().await?;
         let _drained = self.active.write().await;
         Ok(())
@@ -481,6 +573,11 @@ impl Handler {
                     self.registry.authorize(hello.share_id, peer, false)?;
                     Ok(Reply::Accepted)
                 }
+                Operation::Resume => Ok(Reply::Resumed(self.registry.authorize(
+                    hello.share_id,
+                    peer,
+                    false,
+                )?)),
             }
         })();
         let reply = result.unwrap_or_else(|error| Reply::Error(safe_error(&error)));
