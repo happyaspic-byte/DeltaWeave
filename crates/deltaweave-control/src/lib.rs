@@ -2409,7 +2409,7 @@ impl Manager {
             if pending.is_some() {
                 drop(pending);
                 drop(slot);
-                if let Err(error) = self.retry_pending(&id).await {
+                if let Err(error) = self.retry_pending(&id, None, false).await {
                     let device_wide = error.downcast_ref::<ManagedError>().is_some_and(|error| {
                         matches!(
                             error.kind(),
@@ -2471,7 +2471,14 @@ impl Manager {
         Ok(())
     }
 
-    async fn retry_pending(&self, id: &str) -> Result<()> {
+    async fn retry_pending(
+        &self,
+        id: &str,
+        expected_request_id: Option<&str>,
+        // An authenticated user retry may bypass the background backoff;
+        // ticker calls keep it so an offline owner cannot be hammered.
+        force: bool,
+    ) -> Result<()> {
         let _mutation = self.managed_mutations.lock().await;
         let pending = {
             let state = self.shared.lock().expect("snapshot mutex");
@@ -2486,8 +2493,14 @@ impl Manager {
         let Some(pending) = pending else {
             return Ok(());
         };
+        if let Some(expected_request_id) = expected_request_id {
+            ensure!(
+                pending.request_id == expected_request_id,
+                ManagedError::new(ManagedErrorKind::IdempotencyConflict)
+            );
+        }
         let now = self.managed_time()?;
-        if pending.retry_at.is_some_and(|retry_at| retry_at > now) {
+        if !force && pending.retry_at.is_some_and(|retry_at| retry_at > now) {
             return Ok(());
         }
         let address = pending
@@ -2594,6 +2607,107 @@ impl Manager {
                 self.install_pending_slot(&pending).await?;
                 Err(error)
             }
+        }
+    }
+
+    /// Retries the durable join request identified by `request_id`.
+    ///
+    /// A pending join is intentionally different from `resume_membership`:
+    /// the latter only applies to a member row which is already present in
+    /// the local managed catalog, while this operation also covers the
+    /// response-loss window where only the durable pending row remains.  The
+    /// bearer is read from the private pending-ticket file by
+    /// `retry_pending`; callers never submit it again and a retry never
+    /// allocates a new replica or invitation.
+    pub async fn retry_pending_join(&self, input: RetryPendingJoinInput) -> Result<JoinResult> {
+        let _active = self.lifecycle.read().await;
+        self.running()?;
+        validate_request_id(&input.request_id)?;
+        let share_id = share_id_string(input.share);
+        let request = self
+            .request_record(&input.request_id)
+            .ok_or_else(|| anyhow::Error::new(ManagedError::new(ManagedErrorKind::NotFound)))?;
+        ensure!(
+            request.operation == "join_share",
+            ManagedError::new(ManagedErrorKind::IdempotencyConflict)
+        );
+
+        let (kind, recorded_share) = request
+            .result_ref
+            .split_once(':')
+            .ok_or_else(|| anyhow::Error::new(ShareError::StateUnavailable))?;
+        ensure!(
+            recorded_share == share_id,
+            ManagedError::new(ManagedErrorKind::IdempotencyConflict)
+        );
+
+        match kind {
+            "share" => {
+                // The request already completed before the response arrived.
+                // Reconstruct the stable result from the persisted managed row.
+                let record = self.managed_record(input.share)?;
+                Ok(Self::join_result_from_record(input.request_id, record))
+            }
+            "pending" => {
+                // Let the helper take the mutation lock and validate the
+                // expected request ID.  Do not preflight the pending row under
+                // a separate snapshot lock: the background ticker may finish
+                // this request between that read and the helper.  The journal
+                // and managed row below are the authoritative post-operation
+                // state in either ordering.
+                if let Err(error) = self
+                    .retry_pending(&share_id, Some(&input.request_id), true)
+                    .await
+                {
+                    // Terminalization records the stable result before the
+                    // helper returns the protocol error.  Prefer that
+                    // journal value so invitation revocation and expiry use
+                    // the same public mapping as a retry after response loss.
+                    if is_terminal_pending_error(&error)
+                        && let Some(terminal) = self.request_record(&input.request_id)
+                        && !terminal.result_ref.starts_with("pending:")
+                    {
+                        return Self::pending_result_error(&terminal.result_ref, &share_id);
+                    }
+                    return Err(error);
+                }
+
+                let state = self.shared.lock().expect("snapshot mutex");
+                if let Some(record) = state
+                    .config
+                    .managed
+                    .shares
+                    .iter()
+                    .find(|record| record.share_id == share_id)
+                    .cloned()
+                {
+                    return Ok(Self::join_result_from_record(input.request_id, record));
+                }
+                if let Some(pending) = state
+                    .config
+                    .managed
+                    .pending
+                    .iter()
+                    .find(|pending| {
+                        pending.request_id == input.request_id && pending.share_id == share_id
+                    })
+                    .cloned()
+                {
+                    return Ok(Self::waiting_join_result(&pending));
+                }
+                drop(state);
+                // `retry_pending` may have terminalized an expired or
+                // revoked ticket while returning success.  Read the journal
+                // again and expose its stable, credential-free error.
+                let terminal = self
+                    .request_record(&input.request_id)
+                    .ok_or_else(|| anyhow::Error::new(ShareError::StateUnavailable))?;
+                Self::pending_result_error(&terminal.result_ref, &share_id)
+            }
+            "revoked" => Err(ShareError::MemberRevoked.into()),
+            "invalid" => Err(ShareError::InvalidTicket.into()),
+            "expired" => Err(ManagedError::new(ManagedErrorKind::PendingExpired).into()),
+            _ => Err(ShareError::StateUnavailable.into()),
         }
     }
 
@@ -3362,6 +3476,40 @@ impl Manager {
             self.record_managed_error(error);
         }
         Ok(ManagedWorker::Member(engine))
+    }
+
+    fn join_result_from_record(
+        request_id: String,
+        record: config::ManagedShareRecord,
+    ) -> JoinResult {
+        JoinResult {
+            request_id,
+            share_id: record.share_id,
+            enrollment: if record.status == ManagedStatus::Revoked {
+                EnrollmentState::Revoked
+            } else {
+                EnrollmentState::Enrolled
+            },
+            status: record.status,
+            permission: record.permission,
+            member_id: record.member_id,
+        }
+    }
+
+    fn pending_result_error(result_ref: &str, share_id: &str) -> Result<JoinResult> {
+        let (kind, recorded_share) = result_ref
+            .split_once(':')
+            .ok_or_else(|| anyhow::Error::new(ShareError::StateUnavailable))?;
+        ensure!(
+            recorded_share == share_id,
+            ManagedError::new(ManagedErrorKind::IdempotencyConflict)
+        );
+        match kind {
+            "revoked" => Err(ShareError::MemberRevoked.into()),
+            "invalid" => Err(ShareError::InvalidTicket.into()),
+            "expired" => Err(ManagedError::new(ManagedErrorKind::PendingExpired).into()),
+            _ => Err(ShareError::StateUnavailable.into()),
+        }
     }
 
     fn waiting_join_result(pending: &config::PendingRecord) -> JoinResult {

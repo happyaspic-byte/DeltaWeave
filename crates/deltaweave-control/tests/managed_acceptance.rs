@@ -1,7 +1,7 @@
 use deltaweave_control::{
     CreateShareInput, EnrollmentState, IssueKeyInput, JoinShareInput, ManagedShareView,
-    ManagedStatus, Manager, ManagerOptions, MutationCompletion, Permission, RevokeKeyInput,
-    RevokeMemberInput, RotateKeyInput, ShareCommand, ShareCommandInput, ShareId,
+    ManagedStatus, Manager, ManagerOptions, MutationCompletion, Permission, RetryPendingJoinInput,
+    RevokeKeyInput, RevokeMemberInput, RotateKeyInput, ShareCommand, ShareCommandInput, ShareId,
     classify_managed_error,
 };
 use serde_json::{Value, json};
@@ -781,6 +781,17 @@ fn managed_pending_resume_survives_ticket_loss_and_owner_offline() {
                     })
                     .await
                     .unwrap();
+                let wrong_operation = owner
+                    .retry_pending_join(RetryPendingJoinInput {
+                        request_id: "expiring-key".into(),
+                        share,
+                    })
+                    .await
+                    .expect_err("a key issuance journal entry is not a join request");
+                assert_eq!(
+                    classify_managed_error(&wrong_operation).code,
+                    "idempotency_conflict"
+                );
                 let member_data = workspace.path().join("member-admin");
                 let member_root = workspace.path().join("member-root");
                 let member = open_manager(member_data.clone(), None).await;
@@ -922,7 +933,45 @@ fn managed_pending_resume_survives_ticket_loss_and_owner_offline() {
 
                 let offline_reopened = open_manager(offline_data.clone(), None).await;
                 assert_eq!(offline_reopened.snapshot().await.pending.len(), 1);
-                let owner_reopened = open_manager(owner_data, Some(owner_port)).await;
+                let wrong_share = offline_reopened
+                    .retry_pending_join(RetryPendingJoinInput {
+                        request_id: "offline-join".into(),
+                        share: ShareId([0xff; 32]),
+                    })
+                    .await
+                    .expect_err("a pending request cannot be replayed for another share");
+                assert_eq!(
+                    classify_managed_error(&wrong_share).code,
+                    "idempotency_conflict"
+                );
+                let still_waiting = offline_reopened
+                    .retry_pending_join(RetryPendingJoinInput {
+                        request_id: "offline-join".into(),
+                        share,
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(still_waiting.enrollment, EnrollmentState::Waiting);
+                let owner_reopened = open_manager(owner_data.clone(), Some(owner_port)).await;
+                let retried = offline_reopened
+                    .retry_pending_join(RetryPendingJoinInput {
+                        request_id: "offline-join".into(),
+                        share,
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(retried.enrollment, EnrollmentState::Enrolled);
+                assert_eq!(retried.permission, Some(Permission::ReadWrite));
+                let replayed = offline_reopened
+                    .retry_pending_join(RetryPendingJoinInput {
+                        request_id: "offline-join".into(),
+                        share,
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(replayed.enrollment, EnrollmentState::Enrolled);
+                assert_eq!(replayed.member_id, retried.member_id);
+                assert_eq!(replayed.permission, retried.permission);
                 wait_status(&offline_reopened, share, ManagedStatus::Complete).await;
                 assert!(
                     config_value(&offline_data)["managed"]["pending"]
@@ -932,7 +981,56 @@ fn managed_pending_resume_survives_ticket_loss_and_owner_offline() {
                 );
                 assert!(!offline_ticket.exists());
                 offline_reopened.shutdown().await.unwrap();
+
+                // A pending request whose bearer expires while the owner is
+                // offline must become a stable terminal result once the owner
+                // can authenticate the NotMember state.  This exercises the
+                // public retry endpoint's terminal mapping without exposing
+                // the raw ticket.
+                let expired_join_key = owner_reopened
+                    .issue_key(IssueKeyInput {
+                        request_id: "expired-join-key".into(),
+                        share,
+                        permission: Permission::ReadOnly,
+                        expires_at: Some(now_seconds().saturating_add(5)),
+                    })
+                    .await
+                    .unwrap();
                 owner_reopened.shutdown().await.unwrap();
+
+                let expired_data = workspace.path().join("expired-admin");
+                let expired_root = workspace.path().join("expired-root");
+                let expired = open_manager(expired_data.clone(), None).await;
+                let expired_waiting = expired
+                    .join_share(JoinShareInput {
+                        request_id: "expired-join".into(),
+                        encoded_key: expired_join_key.key,
+                        destination_root: expired_root,
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(expired_waiting.enrollment, EnrollmentState::Waiting);
+                tokio::time::sleep(Duration::from_secs(6)).await;
+                let owner_final = open_manager(owner_data, Some(owner_port)).await;
+                let expired_error = expired
+                    .retry_pending_join(RetryPendingJoinInput {
+                        request_id: "expired-join".into(),
+                        share,
+                    })
+                    .await
+                    .expect_err("expired pending enrollment must be terminal");
+                assert_eq!(
+                    classify_managed_error(&expired_error).code,
+                    "pending_expired"
+                );
+                assert!(
+                    config_value(&expired_data)["managed"]["pending"]
+                        .as_array()
+                        .unwrap()
+                        .is_empty()
+                );
+                expired.shutdown().await.unwrap();
+                owner_final.shutdown().await.unwrap();
                 retain_workspace(workspace);
             });
         },
