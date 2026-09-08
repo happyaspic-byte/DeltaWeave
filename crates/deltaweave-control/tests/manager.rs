@@ -80,6 +80,26 @@ async fn persistence_identity_ownership_and_preserved_files() {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_pair_sync_idle_pause_and_reopen() {
+    async fn manual_sync(manager: &Manager, id: &str) {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                match manager.command(id, FolderCommand::Sync).await {
+                    Ok(()) => break,
+                    Err(error)
+                        if error.to_string()
+                            == "folder is busy; retry after its current command" =>
+                    {
+                        // Watcher events can start an automatic cycle between manual requests.
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    Err(error) => panic!("manual sync failed: {error:#}"),
+                }
+            }
+        })
+        .await
+        .expect("manual sync must complete after any active watcher cycle");
+    }
+
     let temp = tempfile::tempdir().unwrap();
     let data = temp.path().join("admin");
     let manager = Manager::open(data.clone()).await.unwrap();
@@ -108,21 +128,12 @@ async fn real_pair_sync_idle_pause_and_reopen() {
         b"hello from web",
     )
     .unwrap();
-    tokio::time::timeout(
-        Duration::from_secs(30),
-        manager.command(&local.id, FolderCommand::Sync),
-    )
-    .await
-    .unwrap()
-    .unwrap();
+    manual_sync(&manager, &local.id).await;
     assert_eq!(
         std::fs::read(Path::new(&remote.input.root).join("hello.txt")).unwrap(),
         b"hello from web"
     );
-    manager
-        .command(&local.id, FolderCommand::Sync)
-        .await
-        .unwrap();
+    manual_sync(&manager, &local.id).await;
     let view = manager
         .snapshot()
         .await
@@ -144,10 +155,7 @@ async fn real_pair_sync_idle_pause_and_reopen() {
         b"hello from receiver",
     )
     .unwrap();
-    manager
-        .command(&local.id, FolderCommand::Sync)
-        .await
-        .unwrap();
+    manual_sync(&manager, &local.id).await;
     assert_eq!(
         std::fs::read(Path::new(&local.input.root).join("reply.txt")).unwrap(),
         b"hello from receiver"
