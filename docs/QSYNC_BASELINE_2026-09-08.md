@@ -32,7 +32,15 @@ run·job URL, HEAD 대조, 원문 오류 발췌는 [github-status-20260908.txt](
 
 ## 접근 환경과 증거 경계
 
-검사 호스트는 `roobicom-server-01` Linux 한 대다. GNU cross compiler와 `x86_64-pc-windows-gnu` target은 설치되어 있으나 `cargo-xwin`, PowerShell, Chrome/Chromium/Firefox는 로컬에 없다. 교차 빌드는 native Windows 실행의 증거가 아니다. GitHub Windows runner와 승인된 격리 서버 `172.30.1.15` 경로는 후속 검증 대상으로 확인했지만 이번에 원격 접속·credential 사용·서비스 변경은 하지 않았다. 브라우저·N0/relay도 실행하지 않았다. 로컬 테스트가 내부적으로 여러 논리 peer를 만들더라도 세 물리 기기 검증으로 세지 않는다.
+검사 호스트는 `roobicom-server-01` Linux 한 대다. GNU cross compiler와 `x86_64-pc-windows-gnu` target은 설치되어 있으나 `cargo-xwin`, PowerShell, `agent-browser`, web worktree의 Playwright package는 PATH/의존성에 없다. 다만 `/home/ubuntu/.cache/ms-playwright`에 실행 가능한 Chromium 151/153과 headless shell이 있다. 기존 실제 Chromium smoke 산출물 [report.json](/home/ubuntu/project/DeltaWeave-integration-evidence/2026-09-08/browser/report.json)과 1440px/390px screenshots는 성공, console/page error 0, cleanup 완료를 기록한다. 이 산출물은 이번에 재실행하지 않았으므로 새 browser 실행 증거로 중복 집계하지 않는다. 저장소의 [browser.py](/home/ubuntu/project/DeltaWeave-qsync-verification-20260908/crates/deltaweave-web/tests/browser.py)는 `agent-browser`와 선택적 `--browser-executable`을 요구한다. 교차 빌드는 native Windows 실행의 증거가 아니다. GitHub Windows runner와 승인된 격리 서버 `172.30.1.15` 경로는 후속 검증 대상으로 확인했지만 이번에 원격 접속·credential 사용·서비스 변경은 하지 않았다. 브라우저 smoke 재실행·N0/relay도 하지 않았다. 로컬 테스트가 내부적으로 여러 논리 peer를 만들더라도 세 물리 기기 검증으로 세지 않는다. 캐시·도구 확인 내역은 [browser-capabilities-20260908.txt](/home/ubuntu/project/DeltaWeave-qsync-evidence/2026-09-08/browser-capabilities-20260908.txt), 승인된 Windows/WinRM 격리 실행 경로의 메타데이터는 [windows-native-route-20260908.txt](/home/ubuntu/project/DeltaWeave-qsync-evidence/2026-09-08/windows-native-route-20260908.txt)에 있다.
+
+## 추가 read-only CI 원인 감사
+
+- Linux 재현 경로는 `crates/deltaweave-sync/tests/shares.rs:926-1001`이다. owner를 `127.0.0.1:0`에 열고 `endpoint_addr().ip_addrs().next()`로 실제 포트를 저장한 뒤 `owner.shutdown()` 직후 같은 주소를 새 iroh endpoint에 넘긴다. iroh Endpoint 문서와 구현은 close 중 QUIC drain 및 endpoint clone drop 이후 socket close를 설명하므로, 로그의 `Address already in use`는 즉시 bind 실패로 확정된다. 세부 포트 재사용 시점은 재현 전 가설이다. 수정은 무기한 retry가 아니라 실제 socket 소유권 종료를 기다리는 bounded readiness 계약과 테스트 재현으로 제한한다.
+- Windows 경로는 `crates/deltaweave-control/src/worker.rs:314-356`와 `crates/deltaweave-index/src/lib.rs:2043-2100`, 검증 대기는 `crates/deltaweave-control/tests/manager.rs:191-209`이다. watcher 준비 완료 신호 없이 task가 spawn되고, 250ms poll·300ms debounce·2s maximum delay 뒤 10초 동안 원격 파일을 기다린다. 현재 확정된 원인은 watcher timeout이며, startup race와 native filesystem event 지연을 분리 재현해야 한다.
+- Container 경로는 `Dockerfile:57-68`, `crates/deltaweave-cli/src/main.rs:1700-1719`, `crates/deltaweave-net/src/lib.rs:412-442`, `crates/deltaweave-net/src/root_admission.rs:102-107`이다. UID/GID 65532에 home을 만들지 않고 실행하지만 self-test receiver 시작 전에 `$HOME/.deltaweave/root-admission`을 만들려 하므로 `Permission denied`가 발생한다. 최소 방향은 non-root가 쓰는 명시적 private registry 경로/`HOME` 계약을 image와 runtime에 일치시키고, `/data` 권한·read-only 정책을 보존하는 것이다.
+
+세 원인의 source 경로와 관찰/가설 구분은 [ci-audit-20260908.txt](/home/ubuntu/project/DeltaWeave-qsync-evidence/2026-09-08/ci-audit-20260908.txt)에 별도로 기록했다.
 
 ## F 단계의 후속 명령과 완료 조건
 
