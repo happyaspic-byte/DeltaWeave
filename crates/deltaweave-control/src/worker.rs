@@ -7,6 +7,7 @@ use deltaweave_net::{
 };
 use deltaweave_sync::{SyncConfig, SyncEngine, SyncReport};
 use std::{
+    path::Path,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -150,6 +151,20 @@ impl Worker {
             .await??;
             Engine::Sync(Arc::new(engine))
         };
+        let watcher = if view.input.role == "sync" {
+            match initialize_watcher(Path::new(&view.input.root)) {
+                Ok(watcher) => {
+                    watcher_diagnostic("watcher_init=ready");
+                    Some(watcher)
+                }
+                Err(error) => {
+                    watcher_diagnostic("watcher_init=error");
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
         let paused = view.input.enabled == Some(false);
         set_status(
             &shared,
@@ -163,7 +178,7 @@ impl Worker {
             },
         );
         let (sender, receiver) = mpsc::channel(8);
-        let task = tokio::spawn(run(engine, view, observer, shared, receiver));
+        let task = tokio::spawn(run(engine, view, observer, shared, receiver, watcher));
         Ok(Self { sender, task })
     }
     pub async fn command(&self, command: FolderCommand) -> Result<()> {
@@ -201,6 +216,23 @@ enum Engine {
     Receive(Server),
     Sync(Arc<SyncEngine>),
 }
+
+fn initialize_watcher(root: &Path) -> Result<deltaweave_index::WatchService> {
+    deltaweave_index::WatchService::new(
+        root,
+        &[],
+        Duration::from_millis(300),
+        Duration::from_secs(2),
+    )
+    .map_err(|_| anyhow::anyhow!("folder watcher initialization failed"))
+}
+
+fn watcher_diagnostic(message: &str) {
+    if std::env::var("DELTAWEAVE_WATCH_DIAGNOSTICS").ok().as_deref() == Some("1") {
+        eprintln!("deltaweave-control {message}");
+    }
+}
+
 fn set_status(shared: &Arc<Mutex<Runtime>>, id: &str, status: &str) {
     let mut state = shared.lock().expect("snapshot mutex");
     if let Some(folder) = state.folders.get_mut(id) {
@@ -280,6 +312,29 @@ async fn cycle(
     state.revision += 1;
     Ok(())
 }
+
+async fn run_cycle(
+    engine: &Engine,
+    id: &str,
+    observer: &TransferObserver,
+    shared: &Arc<Mutex<Runtime>>,
+    reason: &'static str,
+) -> Result<()> {
+    watcher_diagnostic(match reason {
+        "manual" => "cycle=start reason=manual",
+        "watcher" => "cycle=start reason=watcher",
+        "interval" => "cycle=start reason=interval",
+        _ => "cycle=start reason=other",
+    });
+    let result = cycle(engine, id, observer, shared).await;
+    watcher_diagnostic(if result.is_ok() {
+        "cycle=complete"
+    } else {
+        "cycle=error"
+    });
+    result
+}
+
 fn record_conflicts(state: &mut Runtime, id: &str, report: &SyncReport) -> Result<()> {
     for conflict in &report.conflicts {
         state.activity(
@@ -305,23 +360,13 @@ async fn run(
     observer: TransferObserver,
     shared: Arc<Mutex<Runtime>>,
     mut receiver: mpsc::Receiver<Message>,
+    mut watcher: Option<deltaweave_index::WatchService>,
 ) {
     let id = view.id;
     let mut paused = view.input.enabled == Some(false);
     let interval = Duration::from_secs(view.input.interval_seconds.unwrap_or(30));
     let mut next = Instant::now() + interval;
     let mut failures = 0u32;
-    let mut watcher = if matches!(&engine, Engine::Sync(_)) {
-        deltaweave_index::WatchService::new(
-            &view.input.root,
-            &[],
-            Duration::from_millis(300),
-            Duration::from_secs(2),
-        )
-        .ok()
-    } else {
-        None
-    };
     let mut ticker = tokio::time::interval(Duration::from_millis(250));
     loop {
         let mut resume_sync = false;
@@ -333,7 +378,7 @@ async fn run(
                     Some(Message { command: Some(command), reply }) => {
                         let result = match command {
                             FolderCommand::Sync => {
-                                if paused { Err(anyhow::anyhow!("folder is paused; resume before syncing")) } else { cycle(&engine, &id, &observer, &shared).await }
+                                if paused { Err(anyhow::anyhow!("folder is paused; resume before syncing")) } else { run_cycle(&engine, &id, &observer, &shared, "manual").await }
                             },
                             FolderCommand::Pause => {
                                 set_status(&shared, &id, "pausing");
@@ -352,9 +397,20 @@ async fn run(
                 }
             },
             _ = ticker.tick() => {
-                let changed = watcher.as_mut().and_then(|watcher| watcher.poll(Instant::now())).is_some();
-                if !paused && matches!(&engine, Engine::Sync(_)) && (Instant::now() >= next || (changed && failures == 0)) {
-                    (cycle(&engine, &id, &observer, &shared).await, None, false)
+                let trigger = watcher.as_mut().and_then(|watcher| watcher.poll(Instant::now()));
+                if let Some(trigger) = &trigger {
+                    watcher_diagnostic(&format!(
+                        "watcher_trigger=ready event_count={} rescan_required={} changed_paths={}",
+                        trigger.event_count,
+                        trigger.rescan_required,
+                        trigger.changed_paths.len(),
+                    ));
+                }
+                let changed = trigger.is_some();
+                let interval_due = Instant::now() >= next;
+                if !paused && matches!(&engine, Engine::Sync(_)) && (interval_due || (changed && failures == 0)) {
+                    let reason = if interval_due { "interval" } else { "watcher" };
+                    (run_cycle(&engine, &id, &observer, &shared, reason).await, None, false)
                 } else {
                     if let Ok(inventory) = inventory(&engine).await {
                         let mut state = shared.lock().expect("snapshot mutex");
@@ -470,5 +526,18 @@ mod tests {
         let record: serde_json::Value = serde_json::from_str(&activity.detail).unwrap();
         assert_eq!(record["path"], "directory");
         assert!(record["conflict_path"].is_null());
+    }
+
+    #[test]
+    fn watcher_initialization_failure_is_explicit() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing");
+
+        let error = initialize_watcher(&missing).expect_err("missing root must reject watcher");
+        assert_eq!(error.to_string(), "folder watcher initialization failed");
+
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        initialize_watcher(&root).expect("real directory must initialize watcher");
     }
 }
