@@ -80,6 +80,14 @@ pub struct JoinShareInput {
     pub destination_root: PathBuf,
 }
 
+/// Resumes the durable pending state created by an earlier join request.
+/// The original bearer ticket is read only from the manager's private store.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RetryPendingJoinInput {
+    pub request_id: String,
+    pub share: ShareId,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ResumeMembershipInput {
     pub request_id: String,
