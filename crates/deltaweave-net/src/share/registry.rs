@@ -565,6 +565,10 @@ mod tests {
             .revoke_key(share, ticket.preview().invitation_id)
             .unwrap();
         assert!(registry.validate(&ticket).is_err());
+        assert!(
+            registry.issue(&ticket).is_err(),
+            "replaying a revoked issuance must never resurrect its invitation"
+        );
         assert!(registry.authorize(share, peer, false).is_ok());
         assert!(registry.authorize(share, peer, true).is_err());
         registry.revoke_member(share, peer).unwrap();
