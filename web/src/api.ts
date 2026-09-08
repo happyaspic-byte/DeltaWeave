@@ -147,16 +147,18 @@ export class Api {
       body: JSON.stringify(input),
     });
   }
-  async previewShareKey(request_id: string, key: string) {
+  async previewShareKey(request_id: string, key: string, signal?: AbortSignal) {
     return this.request<KeyPreview>("/shares/preview", {
       method: "POST",
       body: JSON.stringify({ request_id, key }),
+      signal,
     });
   }
-  async validateShareKey(request_id: string, key: string) {
+  async validateShareKey(request_id: string, key: string, signal?: AbortSignal) {
     return this.request<KeyPreview>("/shares/validate", {
       method: "POST",
       body: JSON.stringify({ request_id, key }),
+      signal,
     });
   }
   async joinShare(request_id: string, key: string, destination_root: string) {
@@ -167,6 +169,12 @@ export class Api {
   }
   async resumeMembership(request_id: string, share_id: string) {
     return this.request<JoinResult>("/shares/resume", {
+      method: "POST",
+      body: JSON.stringify({ request_id, share_id }),
+    });
+  }
+  async retryPendingJoin(request_id: string, share_id: string) {
+    return this.request<JoinResult>("/shares/pending/retry", {
       method: "POST",
       body: JSON.stringify({ request_id, share_id }),
     });
@@ -220,9 +228,10 @@ export class Api {
       { method: "POST", body: JSON.stringify({ request_id }) },
     );
   }
-  async listMembers(shareId: string) {
+  async listMembers(shareId: string, signal?: AbortSignal) {
     return this.request<MemberView[]>(
       `/shares/${encodeURIComponent(shareId)}/members`,
+      { signal },
     );
   }
   async revokeMember(shareId: string, memberId: string, request_id: string) {

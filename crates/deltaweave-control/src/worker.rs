@@ -228,7 +228,11 @@ fn initialize_watcher(root: &Path) -> Result<deltaweave_index::WatchService> {
 }
 
 fn watcher_diagnostic(message: &str) {
-    if std::env::var("DELTAWEAVE_WATCH_DIAGNOSTICS").ok().as_deref() == Some("1") {
+    if std::env::var("DELTAWEAVE_WATCH_DIAGNOSTICS")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
         eprintln!("deltaweave-control {message}");
     }
 }

@@ -1,15 +1,15 @@
 use crate::routes::AppState;
 use axum::{
-    extract::{rejection::JsonRejection, Path, State},
+    Json, Router,
+    extract::{Path, State, rejection::JsonRejection},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
 };
 use deltaweave_control::{
-    classify_managed_error, CreateShareInput, IssueKeyInput, JoinShareInput, PreviewKeyInput,
-    RemoveShareInput, ResumeMembershipInput, RevokeKeyInput, RevokeMemberInput, RotateKeyInput,
-    ShareCommand, ShareCommandInput, ValidateKeyInput,
+    CreateShareInput, IssueKeyInput, JoinShareInput, PreviewKeyInput, RemoveShareInput,
+    ResumeMembershipInput, RetryPendingJoinInput, RevokeKeyInput, RevokeMemberInput,
+    RotateKeyInput, ShareCommand, ShareCommandInput, ValidateKeyInput, classify_managed_error,
 };
 use deltaweave_net::share::{InvitationId, Permission, ShareId};
 use serde::Deserialize;
@@ -70,6 +70,7 @@ pub(crate) fn router() -> Router<Arc<AppState>> {
         .route("/api/v1/shares/preview", post(preview))
         .route("/api/v1/shares/validate", post(validate))
         .route("/api/v1/shares/join", post(join))
+        .route("/api/v1/shares/pending/retry", post(retry_pending_join))
         .route("/api/v1/shares/resume", post(resume_membership))
         .route("/api/v1/shares", get(list).post(create))
         .route(
@@ -213,11 +214,13 @@ fn managed_error(error: anyhow::Error, request_id: Option<&str>) -> Response {
         | "state_unavailable"
         | "transfer_failed"
         | "shutdown"
-        | "idempotency_capacity" => StatusCode::SERVICE_UNAVAILABLE,
+        | "idempotency_capacity"
+        | "clock_rollback" => StatusCode::SERVICE_UNAVAILABLE,
         "invalid_ticket"
         | "unsupported_version"
         | "invitation_revoked"
         | "expired"
+        | "pending_expired"
         | "invalid_path"
         | "invalid_request" => StatusCode::UNPROCESSABLE_ENTITY,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -397,6 +400,42 @@ async fn resume_membership(
             .await,
         Some(&request_id),
     )
+}
+
+async fn retry_pending_join(
+    State(state): State<Arc<AppState>>,
+    input: Result<Json<ResumeBody>, JsonRejection>,
+) -> Response {
+    let Json(input) = match input {
+        Ok(value) => value,
+        Err(error) => return json_error(error),
+    };
+    if let Some(error) = validate_body(&input.request_id) {
+        return error;
+    }
+    let share = match share_id(&input.share_id) {
+        Ok(value) => value,
+        Err(error) => return *error,
+    };
+    let request_id = input.request_id.clone();
+    let value = state
+        .manager
+        .retry_pending_join(RetryPendingJoinInput {
+            request_id: input.request_id,
+            share,
+        })
+        .await;
+    match value {
+        Ok(value) => {
+            let status = if value.enrollment == deltaweave_control::EnrollmentState::Waiting {
+                StatusCode::ACCEPTED
+            } else {
+                StatusCode::OK
+            };
+            (status, Json(value)).into_response()
+        }
+        Err(error) => managed_error(error, Some(&request_id)),
+    }
 }
 
 async fn get_one(State(state): State<Arc<AppState>>, Path(raw_share): Path<String>) -> Response {

@@ -101,6 +101,7 @@ const managedErrorMessages: Record<string, string> = {
   idempotency_conflict: "같은 요청 ID에 다른 내용이 사용되었습니다.",
   key_response_expired: "한 번만 표시되는 키 응답이 만료되었습니다. 새 요청을 시작하세요.",
   idempotency_capacity: "요청을 잠시 처리할 수 없습니다. 다시 시도하세요.",
+  clock_rollback: "장치 시간을 확인한 뒤 다시 시도하세요.",
   pending_expired: "대기 중인 가입 요청이 만료되었습니다.",
   replica_claim_rejected: "이 장치의 기존 멤버 연결을 확인할 수 없습니다.",
   invalid_record: "공유 상태 기록을 확인할 수 없습니다.",
@@ -161,6 +162,43 @@ function operationFingerprint(...values: (string | number | null | undefined)[])
 }
 
 export const MAX_EXPIRY_TIMER_MS = 2_147_000_000;
+export const SHARE_READ_TIMEOUT_MS = 15_000;
+export const MEMBER_REVOKE_POLL_MS = 1_000;
+export const MEMBER_REVOKE_MAX_DELAY_MS = 30_000;
+
+function memberPollDelay(retryAt: number | null) {
+  if (retryAt == null) return MEMBER_REVOKE_POLL_MS;
+  return Math.min(
+    MEMBER_REVOKE_MAX_DELAY_MS,
+    Math.max(MEMBER_REVOKE_POLL_MS, retryAt * 1000 - Date.now()),
+  );
+}
+
+function withAbortTimeout<T>(
+  operation: (signal: AbortSignal) => Promise<T>,
+  timeoutMs: number,
+  parentSignal?: AbortSignal,
+) {
+  const controller = new AbortController();
+  const abortFromParent = () => controller.abort();
+  if (parentSignal) {
+    if (parentSignal.aborted) controller.abort();
+    else parentSignal.addEventListener("abort", abortFromParent, { once: true });
+  }
+  let timer: number | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = window.setTimeout(() => {
+      controller.abort();
+      const error = new Error("request timed out");
+      error.name = "AbortError";
+      reject(error);
+    }, timeoutMs);
+  });
+  return Promise.race([operation(controller.signal), timeout]).finally(() => {
+    if (timer !== undefined) window.clearTimeout(timer);
+    parentSignal?.removeEventListener("abort", abortFromParent);
+  });
+}
 
 export function scheduleExpiry(expiresAt: number, onExpire: () => void) {
   let timer: number | undefined;
@@ -191,7 +229,7 @@ export function ShareDirectoryPicker({
 }: {
   value: string;
   onChange: (value: string) => void;
-  browse: (path: string) => Promise<Directory>;
+  browse: (path: string, signal?: AbortSignal) => Promise<Directory>;
   label: string;
   help: string;
   disabled?: boolean;
@@ -200,34 +238,49 @@ export function ShareDirectoryPicker({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const generation = useRef(0);
+  const abortController = useRef<AbortController | null>(null);
   useEffect(
     () => () => {
       generation.current += 1;
+      abortController.current?.abort();
+      abortController.current = null;
     },
     [],
   );
   async function open(path: string) {
     if (disabled) return;
     const requestGeneration = ++generation.current;
+    abortController.current?.abort();
+    const requestController = new AbortController();
+    abortController.current = requestController;
     setLoading(true);
     setError("");
     try {
-      const result = await browse(path.trim());
+      const result = await withAbortTimeout(
+        (signal) => browse(path.trim(), signal),
+        SHARE_READ_TIMEOUT_MS,
+        requestController.signal,
+      );
       if (requestGeneration !== generation.current) return;
       setDirectory(result);
     } catch (cause) {
       if (requestGeneration === generation.current) setError(safeShareError(cause));
     } finally {
       if (requestGeneration === generation.current) setLoading(false);
+      if (abortController.current === requestController) abortController.current = null;
     }
   }
   function closeDirectory() {
     generation.current += 1;
+    abortController.current?.abort();
+    abortController.current = null;
     setLoading(false);
     setDirectory(null);
   }
   function chooseDirectory(path: string) {
     generation.current += 1;
+    abortController.current?.abort();
+    abortController.current = null;
     setLoading(false);
     onChange(path);
     setDirectory(null);
@@ -317,7 +370,7 @@ export function ShareCreateFlow({
   onComplete,
 }: {
   api: Api;
-  browse: (path: string) => Promise<Directory>;
+  browse: (path: string, signal?: AbortSignal) => Promise<Directory>;
   onClose: () => void;
   onComplete: () => Promise<unknown>;
 }) {
@@ -544,7 +597,7 @@ export function ShareJoinFlow({
   onComplete,
 }: {
   api: Api;
-  browse: (path: string) => Promise<Directory>;
+  browse: (path: string, signal?: AbortSignal) => Promise<Directory>;
   onClose: () => void;
   onComplete: () => Promise<unknown>;
 }) {
@@ -562,10 +615,13 @@ export function ShareJoinFlow({
   const previewRequest = useRef(new OperationRequest());
   const validateRequest = useRef(new OperationRequest());
   const joinRequest = useRef(new OperationRequest());
+  const readAbortController = useRef<AbortController | null>(null);
   const generation = useRef(0);
 
   useEffect(() => () => {
     generation.current += 1;
+    readAbortController.current?.abort();
+    readAbortController.current = null;
     previewRequest.current.reset();
     validateRequest.current.reset();
     joinRequest.current.reset();
@@ -576,6 +632,8 @@ export function ShareJoinFlow({
     // disabled during that mutation; keep this guard for programmatic changes.
     if (busy === "join") return;
     generation.current += 1;
+    readAbortController.current?.abort();
+    readAbortController.current = null;
     setBusy(null);
     setKey(value);
     setJoinSecretExpired(false);
@@ -599,12 +657,19 @@ export function ShareJoinFlow({
       return;
     }
     const requestGeneration = ++generation.current;
+    readAbortController.current?.abort();
+    const requestController = new AbortController();
+    readAbortController.current = requestController;
     const previewRequestId = previewRequest.current.begin(clean);
     const validateRequestId = validateRequest.current.begin(clean);
     setBusy("check");
     setError("");
     try {
-      const value = await api.previewShareKey(previewRequestId, clean);
+      const value = await withAbortTimeout(
+        (signal) => api.previewShareKey(previewRequestId, clean, signal),
+        SHARE_READ_TIMEOUT_MS,
+        requestController.signal,
+      );
       if (requestGeneration !== generation.current) return;
       previewRequest.current.reset();
       setPreview(value);
@@ -618,7 +683,11 @@ export function ShareJoinFlow({
       setValidated(false);
       setOfflineValidation(false);
       try {
-        const validatedValue = await api.validateShareKey(validateRequestId, clean);
+        const validatedValue = await withAbortTimeout(
+          (signal) => api.validateShareKey(validateRequestId, clean, signal),
+          SHARE_READ_TIMEOUT_MS,
+          requestController.signal,
+        );
         if (requestGeneration !== generation.current) return;
         validateRequest.current.reset();
         setPreview(validatedValue);
@@ -641,6 +710,9 @@ export function ShareJoinFlow({
         setError(safeShareError(cause, clean));
     } finally {
       if (requestGeneration === generation.current) setBusy(null);
+      if (readAbortController.current === requestController) {
+        readAbortController.current = null;
+      }
     }
   }
 
@@ -726,8 +798,9 @@ export function ShareJoinFlow({
           <div className="notice">
             <LinkSimple size={18} />
             <span>
-              키는 이 브라우저 메모리에서만 처리합니다. 먼저 서명 정보를 확인한 뒤 소유자에게
-              온라인 검증을 요청하고, 이 장치의 저장 폴더를 선택합니다.
+              키를 브라우저 저장소에 보관하지 않습니다. 먼저 서명 정보를 확인한 뒤 소유자에게
+              온라인 검증을 요청하고, 이 장치의 저장 폴더를 선택합니다. 가입 요청을 보낸 뒤
+              창을 닫아도 요청은 계속 처리될 수 있으며, 결과는 공유 목록에서 확인할 수 있습니다.
             </span>
           </div>
           <Field label="공유 키" help="전달받은 공유 키를 붙여 넣으세요. 가입이 끝나거나 창을 닫으면 지웁니다.">
@@ -1036,24 +1109,23 @@ function PendingShareRow({
 }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const request = useRef(new OperationRequest());
   const mounted = useRef(true);
-  useEffect(
-    () => () => {
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
       mounted.current = false;
-      request.current.reset();
-    },
-    [],
-  );
+    };
+  }, []);
   async function resume() {
     if (busy || !mounted.current) return;
-    const id = request.current.begin(operationFingerprint(item.share_id));
     setBusy(true);
     setError("");
     try {
-      await api.resumeMembership(id, item.share_id);
+      // A pending join is owned by the original join request. The server kept
+      // its ticket and destination, so retrying must never manufacture a
+      // member-resume request or ask for the bearer key again.
+      await api.retryPendingJoin(item.request_id, item.share_id);
       if (!mounted.current) return;
-      request.current.reset();
       await onRefresh();
     } catch (cause) {
       if (mounted.current) setError(safeShareError(cause));
@@ -1099,22 +1171,114 @@ export function ShareDetailFlow({
   const mounted = useRef(true);
   const generation = useRef(0);
   const mutationRequests = useRef(new Map<string, OperationRequest>());
+  const reloadSequence = useRef(0);
+  const memberRequestSequence = useRef(0);
+  const pendingMemberRetryAt = useRef(new Map<string, number | null>());
+  const pendingMemberSnapshots = useRef(new Map<string, MemberView>());
+  const memberReadAbortController = useRef<AbortController | null>(null);
+  const membersRef = useRef<MemberView[]>([]);
+  membersRef.current = members;
+
+  function rememberPendingMembers(nextMembers: MemberView[]) {
+    const mergedMembers = [...nextMembers];
+    for (const memberId of pendingMemberRetryAt.current.keys()) {
+      const member = nextMembers.find((candidate) => candidate.member_id === memberId);
+      // B records the revocation timestamp when new authority is blocked. It
+      // is complete only after the same member is observed with the drain flag
+      // cleared. A missing row is not evidence that the remote stream ended.
+      if (member?.revoked_at != null && !member.revocation_pending) {
+        pendingMemberRetryAt.current.delete(memberId);
+        pendingMemberSnapshots.current.delete(memberId);
+      } else if (!member) {
+        const previous =
+          pendingMemberSnapshots.current.get(memberId) ??
+          membersRef.current.find((candidate) => candidate.member_id === memberId);
+        if (previous) {
+          // Keep a visible pending row while an owner response temporarily
+          // omits the member. The next authoritative response may complete
+          // the drain; absence alone cannot do so.
+          const pending = { ...previous, revocation_pending: true };
+          pendingMemberSnapshots.current.set(memberId, pending);
+          mergedMembers.push(pending);
+        }
+      }
+    }
+    for (const member of nextMembers) {
+      if (member.revocation_pending && !pendingMemberRetryAt.current.has(member.member_id)) {
+        pendingMemberRetryAt.current.set(member.member_id, null);
+      }
+      if (member.revocation_pending) {
+        pendingMemberSnapshots.current.set(member.member_id, member);
+      } else if (member.revoked_at != null) {
+        pendingMemberSnapshots.current.delete(member.member_id);
+      }
+    }
+    return mergedMembers;
+  }
 
   const reload = useCallback(async () => {
     const requestGeneration = generation.current;
+    const requestReloadSequence = ++reloadSequence.current;
     if (!mounted.current) return;
     setLoading(true);
     setError("");
+    let memberController: AbortController | null = null;
+    let requestSequence: number | null = null;
     try {
       const nextKeys = share.role === "owner" ? await api.listKeys(share.share_id) : [];
-      const nextMembers = share.role === "owner" ? await api.listMembers(share.share_id) : [];
-      if (!mounted.current || requestGeneration !== generation.current) return;
+      // A member poll may finish while the key list is loading. Claim the
+      // member read only after the slower key request completes, so that this
+      // reload deliberately supersedes that poll instead of being left stale.
+      requestSequence = ++memberRequestSequence.current;
+      memberController = new AbortController();
+      memberReadAbortController.current?.abort();
+      memberReadAbortController.current = memberController;
+      const nextMembers =
+        share.role === "owner"
+          ? await withAbortTimeout(
+              (signal) => api.listMembers(share.share_id, signal),
+              SHARE_READ_TIMEOUT_MS,
+              memberController.signal,
+            )
+          : [];
+      if (
+        !mounted.current ||
+        requestGeneration !== generation.current ||
+        requestSequence !== memberRequestSequence.current
+      )
+        return;
       setKeys(nextKeys);
-      setMembers(nextMembers);
+      setMembers(rememberPendingMembers(nextMembers));
     } catch (cause) {
-      if (mounted.current && requestGeneration === generation.current) setError(safeShareError(cause));
+      if (
+        mounted.current &&
+        requestGeneration === generation.current &&
+        requestReloadSequence === reloadSequence.current
+      ) {
+        setError(safeShareError(cause));
+        // A failed refresh may have cancelled the poll that was in flight.
+        // Nudge the existing pending state so its effect installs a fresh
+        // bounded retry instead of leaving the row stranded.
+        if (
+          membersRef.current.some(
+            (member) =>
+              member.revocation_pending ||
+              pendingMemberRetryAt.current.has(member.member_id),
+          )
+        ) {
+          setMembers([...membersRef.current]);
+        }
+      }
     } finally {
-      if (mounted.current && requestGeneration === generation.current) setLoading(false);
+      if (memberController && memberReadAbortController.current === memberController) {
+        memberReadAbortController.current = null;
+      }
+      if (
+        mounted.current &&
+        requestGeneration === generation.current &&
+        requestReloadSequence === reloadSequence.current
+      )
+        setLoading(false);
     }
   }, [api, share.role, share.share_id]);
 
@@ -1129,19 +1293,98 @@ export function ShareDetailFlow({
     return () => {
       mounted.current = false;
       if (requestGeneration === generation.current) generation.current += 1;
+      reloadSequence.current += 1;
       mutationRequests.current.forEach((request) => request.reset());
+      memberRequestSequence.current += 1;
+      pendingMemberRetryAt.current.clear();
+      pendingMemberSnapshots.current.clear();
+      memberReadAbortController.current?.abort();
+      memberReadAbortController.current = null;
     };
   }, [reload]);
+
+  useEffect(() => {
+    const pending = members.filter(
+      (member) =>
+        member.revocation_pending || pendingMemberRetryAt.current.has(member.member_id),
+    );
+    if (!pending.length || !mounted.current) return;
+    const requestGeneration = generation.current;
+    let cancelled = false;
+    let timer: number | undefined;
+    let activeController: AbortController | null = null;
+    const retryAt = pending
+      .map((member) => pendingMemberRetryAt.current.get(member.member_id))
+      .find((value): value is number => value != null);
+
+    async function pollMembers() {
+      if (cancelled || !mounted.current || requestGeneration !== generation.current) return;
+      const requestSequence = ++memberRequestSequence.current;
+      let memberController: AbortController | null = null;
+      try {
+        memberController = new AbortController();
+        activeController = memberController;
+        memberReadAbortController.current?.abort();
+        memberReadAbortController.current = memberController;
+        const nextMembers = await withAbortTimeout(
+          (signal) => api.listMembers(share.share_id, signal),
+          SHARE_READ_TIMEOUT_MS,
+          memberController.signal,
+        );
+        if (
+          cancelled ||
+          !mounted.current ||
+          requestGeneration !== generation.current ||
+          requestSequence !== memberRequestSequence.current
+        )
+          return;
+        setMembers(rememberPendingMembers(nextMembers));
+      } catch (cause) {
+        if (
+          !cancelled &&
+          mounted.current &&
+          requestGeneration === generation.current &&
+          requestSequence === memberRequestSequence.current
+        )
+          setActionError(safeShareError(cause));
+      } finally {
+        if (memberController && memberReadAbortController.current === memberController) {
+          memberReadAbortController.current = null;
+        }
+        if (activeController === memberController) activeController = null;
+        if (
+          !cancelled &&
+          mounted.current &&
+          requestGeneration === generation.current &&
+          requestSequence === memberRequestSequence.current
+        ) {
+          timer = window.setTimeout(pollMembers, MEMBER_REVOKE_POLL_MS);
+        }
+      }
+    }
+
+    timer = window.setTimeout(
+      pollMembers,
+      memberPollDelay(retryAt == null ? null : retryAt),
+    );
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+      activeController?.abort();
+      if (activeController && memberReadAbortController.current === activeController) {
+        memberReadAbortController.current = null;
+      }
+      memberRequestSequence.current += 1;
+    };
+  }, [api, members, share.share_id]);
 
   useEffect(() => {
     if (issued?.expires_at == null) return;
     const requestGeneration = generation.current;
     return scheduleExpiry(issued.expires_at, () => {
       if (!mounted.current || requestGeneration !== generation.current) return;
-      generation.current += 1;
       setIssued(null);
       setActionError("발급된 키가 만료되어 화면에서 지웠습니다.");
-      mutationRequests.current.forEach((request) => request.reset());
     });
   }, [issued]);
 
@@ -1231,7 +1474,12 @@ export function ShareDetailFlow({
     try {
       const value = await api.revokeMember(share.share_id, memberId, id);
       if (!mounted.current || requestGeneration !== generation.current) return;
-      if (value.completion === "complete") tracker.reset();
+      if (value.completion === "complete") {
+        tracker.reset();
+        pendingMemberRetryAt.current.delete(memberId);
+      } else {
+        pendingMemberRetryAt.current.set(memberId, value.retry_at);
+      }
       if (value.completion === "pending") {
         setNotice("신규 권한은 막혔습니다. 연결 종료 확인 중이며, 완료 전까지 철회 완료로 표시하지 않습니다.");
       } else if (value.completion === "complete") {
@@ -1282,7 +1530,7 @@ export function ShareDetailFlow({
           </section>
           <section className="share-management-section" aria-labelledby="share-members-heading">
             <div className="detail-section-title"><UsersThree size={16} /><strong id="share-members-heading">멤버</strong><span>{members.length}명</span></div>
-            {loading ? <p className="muted">멤버 목록을 불러오는 중…</p> : members.length ? <div className="member-list">{members.map((member) => <MemberRow key={member.member_id} item={member} action={action} onRevoke={revokeMember} />)}</div> : <p className="muted detail-empty">아직 가입한 멤버가 없습니다.</p>}
+            {loading ? <p className="muted">멤버 목록을 불러오는 중…</p> : members.length ? <div className="member-list">{members.map((member) => <MemberRow key={member.member_id} item={member} action={action} pendingOverride={pendingMemberRetryAt.current.has(member.member_id)} onRevoke={revokeMember} />)}</div> : <p className="muted detail-empty">아직 가입한 멤버가 없습니다.</p>}
           </section>
         </>
       )}
@@ -1322,14 +1570,16 @@ function KeySummaryRow({
 function MemberRow({
   item,
   action,
+  pendingOverride = false,
   onRevoke,
 }: {
   item: MemberView;
   action: string;
+  pendingOverride?: boolean;
   onRevoke: (id: string) => Promise<void>;
 }) {
-  const pending = item.revocation_pending;
-  const revoked = item.revoked_at != null;
+  const pending = item.revocation_pending || pendingOverride;
+  const revoked = !pending && item.revoked_at != null;
   return (
     <div className={`member-row ${revoked ? "revoked" : ""}`}>
       <div className="member-avatar"><UserCircle size={20} /></div>
