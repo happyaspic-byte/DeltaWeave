@@ -72,6 +72,8 @@ jobs:
     name: Windows tests
     runs-on: windows-latest
     timeout-minutes: 30
+    env:
+      DELTAWEAVE_WATCH_DIAGNOSTICS: '1'
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: actions/setup-node@v4
@@ -88,3 +90,7 @@ jobs:
           cache-on-failure: true
       - run: cargo test --locked --workspace --all-targets --all-features
       - run: cargo run --locked -p deltaweave -- self-test
+
+  qsync-native-artifact:
+    if: github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/qsync-native-artifact.yml
