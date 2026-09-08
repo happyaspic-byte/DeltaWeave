@@ -171,6 +171,7 @@ pub struct MemberView {
     pub permission: Permission,
     pub enrolled_at: u64,
     pub revoked_at: Option<u64>,
+    pub revocation_pending: bool,
     pub active_operations: u32,
     pub last_seen_at: Option<u64>,
 }
@@ -206,7 +207,11 @@ pub struct MutationResult {
     pub request_id: String,
     pub accepted: bool,
     pub status: ManagedStatus,
+    pub completion: MutationCompletion,
+    pub retry_at: Option<u64>,
 }
+#[serde(rename_all = "snake_case")]
+pub enum MutationCompletion { Pending, Complete }
 pub type ManagedShareView = ShareView;
 pub struct PendingView {
     pub request_id: String,
@@ -221,6 +226,16 @@ pub struct AppSnapshot {
     #[serde(default)] pub pending: Vec<PendingView>,
 }
 ```
+
+`accepted`는 요청과 신규 권한 denial이 durable하게 접수됐는지를 나타내며,
+writer drain 완료 여부는 `completion`이 나타낸다. `MutationCompletion`은 JSON에서
+`pending`/`complete`로 직렬화한다. `pending`은
+새 권한 deny가 durable하게 반영됐지만 기존 connection/writer/`ApplyStart` drain이
+끝나지 않은 상태다. `MemberView.revocation_pending`은 영향받은 member에만 true이고,
+share 전체를 revoked로 표시하지 않는다. 같은 `request_id`를 다시 받으면 저장한
+Pending을 맹목적으로 반환하지 말고 durable operation/lease 상태를 다시 조회해
+실제로 drain됐을 때만 `complete`를 반환한다. `retry_at`은 다음 조회 힌트이며
+완료를 보장하는 deadline이 아니다.
 
 `ShareView.root`는 사용자가 자기 장치에서 선택한 저장 위치를 확인하는 데
 필요하므로 기존 관리 화면의 로컬 경로 표시와 같이 반환할 수 있다. `state_root`,
@@ -271,7 +286,10 @@ HTTP body의 `key`는 control DTO의 `encoded_key`, `share_id`와
 managed root가 겹치면 403 또는 422의 안전한 path 오류로 거부한다.
 
 `GET /keys`가 반환하는 `KeySummary`는 invitation의 발급·만료·폐기 시각과
-permission만 담는다. digest 자체, bearer, encoded key는 담지 않는다. `POST /keys`
+permission만 담는다. 현재 registry의 `Invitation`에는 발급 시각이 저장되지 않으므로
+`KeySummary.issued_at`은 정직하게 `null`(`Option<u64>::None`)이다. signed ticket를
+재구성해 시각을 추정하거나 다른 시각을 표시하지 않는다. digest 자체, bearer,
+encoded key는 담지 않는다. `POST /keys`
 와 rotate의 raw key는 TLS/QUIC 및 로그인된 HTTPS 응답에서만 한 번 보여 준다.
 동일 `request_id` 재시도는 registry에 중복 invitation을 만들지 않는다. raw 응답을
 안전하게 재구성할 private 0600 response file이 5분 TTL 안에 남아 있으면 같은 key를
@@ -421,8 +439,10 @@ recorded_at}`만 보관한다. `request_hash`는 canonical JSON과 operation dom
 `idempotency_capacity` 오류를 반환한다.
 
 join key raw string은 메모리에서 지우고, owner offline pending을 위해 필요한
-signed ticket만 별도 private 0600 파일에 보관한다. 저장 권한·ACL과 삭제에는
-기존 private-file/Windows ACL helper를 재사용하고 새로운 암호를 설계하지 않는다.
+signed ticket만 별도 private 0600 파일에 보관한다. Unix에서는 확인된 기존
+private-file mode helper를 재사용한다. Windows에서는 새 managed private namespace의
+DACL을 작성 전에 검증·제한하고, ACL 적용·검증이 실패하면 fail closed한다. 기존 운영
+폴더의 ACL은 변경하지 않는다. 새로운 암호를 설계하지 않는다.
 기존 검증된 AEAD helper가 이미 있는 경우에만 그 helper로 envelope를 보호한다.
 완료·취소·만료 후 ticket file을 unlink하고 부모 directory를 sync한다. issue/rotate
 raw key response도 별도 private 0600 response file에 최대 5분만 보관하고 같은
@@ -434,10 +454,10 @@ credential도 쓰지 않는다.
 | 저장소 | 현재 schema | A에서 확정한 migration |
 | --- | --- | --- |
 | `data_dir/config.json` | outer v1 | `managed` missing은 empty default. 기존 v1을 읽고 다음 atomic save 때만 field를 쓴다. unknown outer version은 기존처럼 거부한다. |
-| `data_dir/managed/shares.redb` | `owner_share_catalog_v3`, Catalog version 3 | B/C는 table을 직접 조작하지 않고 기존 `ShareService` API를 사용한다. 새 invitation issued-at metadata는 serde default가 있는 additive field로만 저장하고, old row는 `issued_at: null`로 표시한다. catalog mismatch/corruption은 `state_unavailable`로 닫고 reset하지 않는다. |
+| `data_dir/managed/shares.redb` | `owner_share_catalog_v3`, Catalog version 3 | B/C는 table을 직접 조작하지 않고 기존 `ShareService` API를 사용한다. 현재 registry `Invitation`에는 발급 시각이 없으므로 `KeySummary.issued_at`은 `None`/`null`로 표시한다. 발급 시각을 추정하는 새 catalog field나 schema 변경은 이 단계에 추가하지 않는다. catalog mismatch/corruption은 `state_unavailable`로 닫고 reset하지 않는다. |
 | member/owner `index.redb` | existing root/replica binding, `share_authorization_metadata_v1` slot | missing metadata는 새 managed enrollment에서만 초기화한다. existing index의 binding, causal vectors, counter ceiling은 유지한다. malformed/rollback checkpoint는 거부한다. |
 | managed store | existing path-change journal and CAS | existing `Store` recovery/metadata schema를 재사용한다. RO checkpoint와 causal provenance는 기존 private metadata slot에 version tag를 둔다. |
-| pending enrollment | 없음 | `pending/v1/<request_id>.bin` postcard envelope를 atomic temp write, `sync_all`, rename으로 만든다. 기존 private-file/ACL helper를 사용하고 별도 암호를 만들지 않는다. pending TTL은 `min(ticket expiry, 7 days)`이며 expiry 없는 기존 ticket은 호환해 parse하되 pending 파일은 7일 상한을 적용한다. 최대 크기는 32 KiB이고 raw key는 config/로그에 복사하지 않는다. |
+| pending enrollment | 없음 | `pending/v1/<request_id>.bin` postcard envelope를 atomic temp write, `sync_all`, rename으로 만든다. Unix는 기존 private-file mode helper를 사용하고, Windows는 새 managed private namespace DACL을 작성 전 검증·제한하며 실패 시 fail closed한다. 기존 운영 폴더 ACL은 변경하지 않는다. 별도 암호는 만들지 않는다. pending TTL은 `min(ticket expiry, 7 days)`이며 expiry 없는 기존 ticket은 호환해 parse하되 pending 파일은 7일 상한을 적용한다. 최대 크기는 32 KiB이고 raw key는 config/로그에 복사하지 않는다. |
 
 redb table을 새로 만들어야 하는 구현이라도 manager config와 registry의 한쪽만
 성공한 상태를 성공으로 표시하지 않는다. path admission과 private reservation이
@@ -565,6 +585,12 @@ result를 반환한다. 네트워크 응답이 끊겨도 join의 durable enrollm
 record를 우선 확인한다. 동일 ID로 다른 key/destination/share를 보내면 409이며
 기존 worker·catalog·파일을 변경하지 않는다.
 
+revoke 결과가 `MutationCompletion::Pending`이면 같은 request의 재시도 때 저장된
+Pending 응답을 영구 재생하지 않는다. B는 durable mutation/lease operation과
+`ApplyDrained`·writer 상태를 다시 읽어 실제 drain 완료 시에만
+`MutationCompletion::Complete`를 반환한다. `retry_at`은 다음 조회를 위한 힌트이고,
+owner의 다른 share나 영향받지 않은 member를 revoked로 표시하는 근거가 아니다.
+
 ## 인증·권한·전송 경계
 
 ### Key and enrollment
@@ -602,11 +628,20 @@ index adoption 직전에도 권한을 다시 확인한다.
 
 ### Revocation and shutdown
 
-member revoke는 새 요청을 막는 durable state를 먼저 commit하고 tracked connection을
-닫은 뒤 per-share mutation gate와 already-started blocking writer를 drain한다. 완료
-응답 후 새로운 file/index adoption이나 send가 없어야 한다. `pause`도 같은 writer
-drain 관찰을 사용하지만 revoke처럼 membership을 철회하지 않는다. key revoke는
-초대 신규 사용만 막으며 active member revoke와 별도다.
+member revoke는 새 요청을 막는 durable denial과 member epoch 증가를 먼저 commit하고
+tracked connection을 닫은 뒤 per-share mutation gate와 이미 시작된 blocking writer를
+drain한다. 아직 Activate되지 않은 grant는 이 denial commit에서 즉시 거부하며 120초
+grant TTL을 기다리지 않는다. 활성화된 grant의 monotonic lease는 최대 15초이고 5초
+안전 여유를 둔다. `ApplyStart`가 기록한 filesystem operation, 모든
+`spawn_blocking` write/rename, connection 및 supplier guard의 `ApplyDrained`/close
+ack가 끝나지 않으면 결과는 `MutationCompletion::Pending`으로 남기고
+`MemberView.revocation_pending`을 해당 member에만 true로 둔다. 20초 안전 상한은
+완료를 강제하는 timeout이 아니며 ack 없는 partition에서 `Complete`를 추정하지
+않는다. 완료 이후 새 file/index adoption이나 send가 없어야 하지만 이미
+QUIC/kernel buffer에 들어간 bytes는 회수할 수 없고, 악성 supplier의 별도 재배포를
+막는다고 주장하지 않는다. `pause`도 같은 writer drain 관찰을 사용하지만 revoke처럼
+membership을 철회하지 않는다. key revoke는 초대 신규 사용만 막으며 active member
+revoke와 별도다.
 
 ## D 입력 계약: roster, heartbeat, N0 discovery
 
@@ -628,18 +663,22 @@ pub async fn ShareService::resume_membership(
     &self,
     owner: EndpointId,
     share: ShareId,
-    address: EndpointAddr,
+    address_hint: Option<EndpointAddr>,
 ) -> Result<Membership>;
 
 // wire Operation::Resume / Reply::Resumed(Membership), enum의 마지막 variant로 append
-// server authority: connection.remote_id(), expected share, active epoch only
+// server authority: authenticated connection.remote_id(), expected share, active epoch;
+// address_hint는 transport hint일 뿐 replica/epoch/role 입력이 아니다
 ```
 
 `resume_membership`은 `Operation::Enroll`을 호출하지 않는다. B의 owner-side service handler는
-현재 connection peer의 active membership을 조회해 같은 permission, member binding,
-logical ReplicaId, epoch을 반환한다. owner/share mismatch, nonmember, revoked member,
-expired local address, changed replica는 각각 safe error로 거부한다. 새 binding이나
-role을 만들어 주는 resume 경로는 없다.
+현재 authenticated connection peer의 active membership을 조회해 같은 permission, member
+binding, logical ReplicaId, epoch을 반환한다. 클라이언트가 expected replica/epoch를
+제공하거나 address hint를 authority로 만들지 않는다. owner/share mismatch, nonmember,
+revoked member, identity mismatch, expired local address는 각각 safe error로 거부한다.
+기존 relationship/index가 있으면 persisted replica/permission/epoch와 정확히 대조하고,
+아직 local relationship이 없으면 owner가 인증한 `Reply::Resumed(Membership)`의 결과만
+저장한다. 새 binding, role, enrollment를 만들어 주는 resume 경로는 없다.
 
 D는 `PeerObservation`을 private runtime에 유지한다. authenticated operation start,
 finish, error, address change, heartbeat timestamp를 owner/share/peer에 묶고 UI에는
@@ -656,57 +695,45 @@ N0/relay 규칙은 다음과 같다.
 - 주소가 변경되면 old IP를 UI에 요구하지 않고 endpoint identity/relay observation으로
   갱신한다.
 - 실제 인터넷·NAT·relay 증거와 loopback DirectOnly 증거를 별도 로그로 남긴다.
-- signed peer grant의 `expires_at`은 UTC wire timestamp를 유지하지만, provider가
-  받은 시점부터 적용하는 monotonic lease/deadline 정책은
-  `qsync_protocol_audit`의 보고를 받아 교체할 수 있는 pending contract다. audit
-  결론 전에는 UTC 비교만을 liveness 권한으로 사용하지 않고, clock rollback/forward
-  시험을 기록한다.
+- N0 lookup은 member discovery나 권한 증명이 아니다. owner-signed roster와
+  authenticated heartbeat만 active member/provider 선택에 사용한다.
+- grant `expires_at`은 표시 및 늦은 발급 거부용 UTC 값이다. provider는 owner에
+  fresh `ActivateGrantRequest`를 보낼 때 시작한 local monotonic 15초 deadline과
+  owner의 인증 reply만 사용하며, 지연된 응답이 lease를 연장하지 않는다. clock
+  rollback/forward와 restart 뒤의 old grant 재개는 새 resume/grant/activation 없이는
+  거부한다.
 
 ## E 입력 계약: share-swarm/1
 
-E는 D roster와 B lifecycle을 소비해 관리형 보조 청크 전송을 구현한다. `deltaweave-
-swarm`의 scheduler와 legacy `sync/3` CAS 검증 함수를 안전한 내부 building block으로
-재사용할 수 있지만 legacy handler를 managed endpoint에 직접 붙이지 않는다.
+E의 정확한 타입, owner 서명 범위, manifest/request hash membership, provider CAS
+증명, monotonic activation lease, revoke drain, TOCTOU gate, observer 및 13개 수용
+테스트는 [A단계 독립 네트워크 계약](./2026-09-08-qsync-network-contract.md)을
+단일 참조로 사용한다. 이 문서에는 E 구현자가 지켜야 할 경계만 남긴다.
 
-새 ALPN은 정확히 `deltaweave/share-swarm/1`이다. 첫 request 하나에 owner가 서명한
-grant와 exact manifest scope를 결합한다.
+새 ALPN은 정확히 `deltaweave/share-swarm/1`이며, 동일한 `ShareService` endpoint가
+`deltaweave/share/3` control과 별도 grant-only chunk handler를 소유한다.
+`deltaweave/sync/1`, `/2`, `/3` 또는 legacy `SwarmHandler`를 managed endpoint에
+직접 attach하지 않는다. `deltaweave-swarm`의 scheduler 계산과 기존 hash 검증
+building block은 thin adapter 뒤에서만 재사용할 수 있다.
 
-```rust
-pub struct ShareSwarmGrant {
-    pub version: u8,
-    pub owner: EndpointId,
-    pub share: ShareId,
-    pub requester: EndpointId,
-    pub provider: EndpointId,
-    pub permission_epoch: u64,
-    pub manifest_hash: Hash32,
-    pub requested_hash: Hash32,
-    pub expires_at: u64,
-    pub nonce: [u8; 32],
-    pub signature: Signature,
-}
-pub struct ShareSwarmRequest {
-    pub grant: ShareSwarmGrant,
-    pub manifest: FileManifest,
-}
-```
+각 provider request에는 owner가 Ed25519로 서명한 `ShareGrant`가 있어야 한다.
+서명 범위는 최소 owner/share/consumer/requester/provider/consumer epoch/
+provider epoch/snapshot/manifest/request hash/issued-at/expiry/nonce이며, request
+hash는 attested `FileManifest`의 정렬·중복 없는 실제 chunk subset이어야 한다.
+provider handler의 최종 peer 조건은 `local_id == grant.provider`와
+`connection.remote_id() == grant.consumer`; consumer connector는 반대 remote id를
+확인한다. provider는 owner에 fresh `ActivateGrantRequest`를 보낸 뒤 요청 시작
+시각 기준 monotonic 15초 안에서만 CAS chunk를 보낸다. 120초 grant expiry는 표시·
+추가 거부용이고, 아직 activation되지 않은 grant는 revoke 시 즉시 deny하여 120초를
+기다리지 않는다. 같은 nonce 재연결은 거부하며 retry는 새 nonce로 발급한다.
 
-provider는 owner public key로 grant signature를 검증한다. provider 쪽에서 local
-`endpoint.id()`가 `grant.provider`와 같아야 하고, incoming connection의
-`connection.remote_id()`는 `grant.requester`와 같아야 한다. grant의
-owner/share/requester/provider/epoch/
-manifest/requested hash/expiry/nonce를 모두 서명 domain에 넣는다. `requested_hash`는
-실제 `manifest.chunks`에 포함되어야 하고 manifest file hash와 record size도 exact
-record와 일치해야 한다. 단순 field equality, arbitrary CAS hash lookup, cross-share
-grant, stale epoch, expired nonce는 권한 부여 근거가 아니다.
-
-한 managed fill은 최대 8 provider와 connection/queued-byte/disk budget을 갖는다.
-위조 payload는 BLAKE3 rehash 즉시 폐기하고 source를 재시도/제외한다. provider
-failure는 다른 authorized provider 재시도, pause/resume, owner authenticated
-`deltaweave/share/3` pull fallback 순서다. fallback은 legacy allowlist CAS가 아니다.
-manifest 밖 hash, owner 외 권위 snapshot, revoked epoch, disk reserve 초과는 파일
-materialization 전에 거부한다. pause, root lease, shutdown drain, cancellation,
-writer 완료를 모두 관찰한다.
+provider는 owner manifest에 포함된 hash만 기존 verified CAS에서 읽고, payload의
+BLAKE3 hash/length 검증을 통과한 chunk만 consumer가 저장한다. provider는 path,
+record, metadata, tombstone을 보내지 않는다. 한 fill은 최대 8 provider, provider당
+2 stream, 실제 2-provider transfer 및 source ID 관찰을 만족해야 한다. 실패 시
+fresh authorized provider를 재시도하고 최종 fallback은 owner-authenticated
+`deltaweave/share/3` pull뿐이다. owner metadata 최신성·materialize 전 revalidate·
+`ApplyStart/ApplyDrained` writer drain은 위 독립 네트워크 계약을 그대로 적용한다.
 
 ## 저장·복구·호환성 상세
 
