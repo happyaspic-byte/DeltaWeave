@@ -10,7 +10,7 @@
 use std::{
     fs,
     io::{self, ErrorKind},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 const PRIVATE_ERROR: &str = "managed private directory security check failed";
@@ -127,7 +127,14 @@ fn create_private_leaf(path: &Path) -> io::Result<()> {
 fn reject_reparse_components(path: &Path) -> io::Result<()> {
     let mut current = PathBuf::new();
     for component in path.components() {
+        // A Windows verbatim Prefix (for example, `\\?\C:`) is not a
+        // filesystem path on its own.  Append RootDir before probing it;
+        // relative paths still inspect their first component as usual.
+        let is_prefix = matches!(&component, Component::Prefix(_));
         current.push(component.as_os_str());
+        if is_prefix {
+            continue;
+        }
         match fs::symlink_metadata(&current) {
             Ok(metadata) => {
                 if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
@@ -405,7 +412,8 @@ mod tests {
     #[test]
     fn native_acl_preparation_is_idempotent_and_fails_closed() {
         let root = test_directory();
-        let target = root.0.join("managed");
+        let canonical_parent = fs::canonicalize(&root.0).expect("canonical temp root");
+        let target = canonical_parent.join("managed");
 
         // The first call creates the leaf and validates the real DACL.  A
         // second call exercises the existing-directory path and proves that a
