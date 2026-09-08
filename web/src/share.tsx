@@ -848,7 +848,10 @@ export function ShareJoinFlow({
           </div>
           <div className="permission-note">
             <ShieldCheck size={15} />
-            <span>응답이 늦거나 끊겨도 같은 가입 요청으로 확인할 수 있으며, 키는 더 이상 보관하지 않습니다.</span>
+            <span>
+              키는 이 화면에서 지웠습니다.
+              {result.enrollment === "waiting" && " 소유자 연결이 복구되면 가입 요청을 이어갑니다."}
+            </span>
           </div>
           <div className="form-actions">
             <span className="muted">공유 보드에서 상태와 재개 가능 여부를 확인하세요.</span>
