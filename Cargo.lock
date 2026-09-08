@@ -677,11 +677,13 @@ name = "deltaweave-control"
 version = "0.4.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "deltaweave-core",
  "deltaweave-index",
  "deltaweave-net",
  "deltaweave-sync",
  "fs2",
+ "hex",
  "iroh",
  "serde",
  "serde_json",

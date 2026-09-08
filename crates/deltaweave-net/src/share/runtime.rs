@@ -272,6 +272,15 @@ impl OwnerShare {
     pub fn inventory(&self) -> Result<crate::Inventory> {
         crate::Inventory::from_index(&self.runtime.index)
     }
+    /// Debounced owner-side filesystem refresh used by the managed controller.
+    /// The gate serializes the scan with remote handlers and causal metadata.
+    pub async fn refresh_inventory(&self) -> Result<crate::Inventory> {
+        let _gate = self.runtime.gate.lock().await;
+        let report = self.runtime.index.scan()?;
+        crate::ensure_index_report_safe(&report)?;
+        self.runtime.refresh_causal_state()?;
+        self.inventory()
+    }
     pub fn provenance(&self) -> Result<Vec<MutationProvenance>> {
         Ok(self.runtime.causal_state()?.audit)
     }

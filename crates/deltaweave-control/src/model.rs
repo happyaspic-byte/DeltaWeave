@@ -1,4 +1,7 @@
-pub use deltaweave_net::{NetworkMode, share::{InvitationId, Permission, ShareId}};
+pub use deltaweave_net::{
+    NetworkMode,
+    share::{InvitationId, Permission, ShareId},
+};
 use serde::{Deserialize, Serialize};
 use std::{fmt, net::SocketAddr, path::PathBuf};
 
