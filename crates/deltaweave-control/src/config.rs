@@ -20,6 +20,93 @@ pub(crate) struct Config {
     pub activities: Vec<Activity>,
     #[serde(default)]
     pub history: Vec<HistoryPoint>,
+    #[serde(default)]
+    pub managed: ManagedConfig,
+}
+
+/// Additive managed state. The outer config remains version 1 so existing manual
+/// configurations and their tagged roles continue to deserialize unchanged.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct ManagedConfig {
+    #[serde(default = "managed_schema_version")]
+    pub schema_version: u32,
+    #[serde(default)]
+    pub shares: Vec<ManagedShareRecord>,
+    #[serde(default)]
+    pub pending: Vec<PendingRecord>,
+    #[serde(default)]
+    pub intents: Vec<CreateIntent>,
+    #[serde(default)]
+    pub requests: Vec<RequestRecord>,
+}
+
+impl Default for ManagedConfig {
+    fn default() -> Self {
+        Self {
+            schema_version: managed_schema_version(),
+            shares: Vec::new(),
+            pending: Vec::new(),
+            intents: Vec::new(),
+            requests: Vec::new(),
+        }
+    }
+}
+
+fn managed_schema_version() -> u32 {
+    1
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct ManagedShareRecord {
+    pub share_id: String,
+    pub role: ShareRole,
+    pub permission: Option<Permission>,
+    pub name: String,
+    pub root: String,
+    pub state_root: String,
+    pub owner: String,
+    pub member_id: Option<String>,
+    pub status: ManagedStatus,
+    pub phase: Option<String>,
+    pub last_sync_at: Option<u64>,
+    pub retry_at: Option<u64>,
+    pub files_count: u64,
+    pub total_bytes: u64,
+    pub transferred_bytes: u64,
+    pub speed_bps: u64,
+    pub last_error: Option<ErrorSummary>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct PendingRecord {
+    pub request_id: String,
+    pub share_id: String,
+    pub owner: String,
+    pub root: String,
+    pub state_root: String,
+    pub ticket_file: String,
+    pub created_at: u64,
+    pub expires_at: Option<u64>,
+    pub status: ManagedStatus,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct CreateIntent {
+    pub request_id: String,
+    pub request_hash: String,
+    pub name: String,
+    pub root: String,
+    pub state_root: String,
+    pub created_at: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct RequestRecord {
+    pub request_id: String,
+    pub operation: String,
+    pub request_hash: String,
+    pub result_ref: String,
+    pub recorded_at: u64,
 }
 fn version() -> u32 {
     1
@@ -37,6 +124,10 @@ pub(crate) fn read(dir: &Path) -> Result<Config> {
     ensure!(
         config.version == 1,
         "unsupported management configuration version"
+    );
+    ensure!(
+        config.managed.schema_version == 1,
+        "unsupported managed configuration version"
     );
     Ok(config)
 }

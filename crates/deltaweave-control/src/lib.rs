@@ -435,6 +435,8 @@ impl Manager {
             totals,
             settings: state.config.settings.clone(),
             revision: state.revision,
+            shares: Vec::new(),
+            pending: Vec::new(),
         }
     }
     pub async fn add_folder(&self, input: FolderInput) -> Result<FolderView> {
