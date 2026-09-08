@@ -2,6 +2,7 @@ name: QSync native Windows artifact
 
 on:
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
@@ -53,23 +54,38 @@ jobs:
           $target = 'x86_64-pc-windows-msvc'
           $exe = Join-Path $PWD "target\$target\release\deltaweave.exe"
           $records = [System.Collections.Generic.List[object]]::new()
+          $utf8 = [System.Text.UTF8Encoding]::new($false)
+          $state = [ordered]@{
+            phase = 'initialization'
+            command = ''
+            last_exit_code = 0
+            self_test_exit = 127
+            self_test_status = ''
+          }
 
           function Invoke-RecordedCommand {
             param(
+              [Parameter(Mandatory = $true)][string]$Phase,
               [Parameter(Mandatory = $true)][string]$Command,
               [Parameter(Mandatory = $true)][scriptblock]$Action
             )
+            $state.phase = $Phase
+            $state.command = $Command
             $started = [DateTime]::UtcNow
             $exitCode = 127
+            $commandLog = Join-Path $env:RUNNER_TEMP ("qsync-native-command-{0}.log" -f $records.Count)
             try {
-              & $Action
+              & $Action *> $commandLog
               $exitCode = if ($null -eq $LASTEXITCODE) { 0 } else { [int]$LASTEXITCODE }
+              $state.last_exit_code = $exitCode
               if ($exitCode -ne 0) {
-                throw "command failed with exit code $exitCode"
+                throw 'recorded command returned a nonzero exit code'
               }
             }
             catch {
+              $state.last_exit_code = $exitCode
               $records.Add([pscustomobject]@{
+                phase = $Phase
                 command = $Command
                 started_utc = $started.ToString('o')
                 finished_utc = [DateTime]::UtcNow.ToString('o')
@@ -77,7 +93,11 @@ jobs:
               })
               throw
             }
+            finally {
+              Remove-Item -LiteralPath $commandLog -Force -ErrorAction SilentlyContinue
+            }
             $records.Add([pscustomobject]@{
+              phase = $Phase
               command = $Command
               started_utc = $started.ToString('o')
               finished_utc = [DateTime]::UtcNow.ToString('o')
@@ -85,136 +105,200 @@ jobs:
             })
           }
 
-          $sourceSha = (git rev-parse --verify HEAD).Trim()
-          if ($LASTEXITCODE -ne 0 -or $sourceSha -notmatch '^[0-9a-f]{40}$') {
-            throw 'unable to determine the checked-out source SHA'
-          }
-          if ($sourceSha -ne $env:EVENT_SHA) {
-            throw "checkout SHA does not match workflow SHA: $sourceSha"
-          }
-          if ($env:DELTAWEAVE_REQUIRE_WEB_ASSETS -ne '1') {
-            throw 'DELTAWEAVE_REQUIRE_WEB_ASSETS must remain enabled'
-          }
-
-          Invoke-RecordedCommand 'npm --prefix web ci' {
-            npm --prefix web ci
-          }
-          Invoke-RecordedCommand 'npm --prefix web run build' {
-            npm --prefix web run build
-          }
-
-          $webDist = Join-Path $PWD 'web\dist'
-          $index = Join-Path $webDist 'index.html'
-          $assetDir = Join-Path $webDist 'assets'
-          if (-not (Test-Path -LiteralPath $index -PathType Leaf)) {
-            throw 'web/dist/index.html was not produced'
-          }
-          $assetScripts = @(Get-ChildItem -LiteralPath $assetDir -Filter '*.js' -File -ErrorAction SilentlyContinue)
-          if ($assetScripts.Count -eq 0) {
-            throw 'web/dist/assets contains no JavaScript asset'
-          }
-
-          Invoke-RecordedCommand 'cargo build --locked --release --target x86_64-pc-windows-msvc -p deltaweave' {
-            cargo build --locked --release --target $target -p deltaweave
-          }
-          Invoke-RecordedCommand 'git diff --exit-code -- Cargo.lock' {
-            git diff --exit-code -- Cargo.lock
-          }
-
-          if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
-            throw "release executable was not produced: $exe"
-          }
-
-          $stdoutPath = Join-Path $env:RUNNER_TEMP "qsync-native-self-test-$env:EVENT_RUN_ID.stdout"
-          $stderrPath = Join-Path $env:RUNNER_TEMP "qsync-native-self-test-$env:EVENT_RUN_ID.stderr"
-          $selfTestCommand = ".\target\$target\release\deltaweave.exe self-test"
-          $selfTestStarted = [DateTime]::UtcNow
-          $selfTestExit = 127
-          $selfTestStatus = ''
+          $sourceSha = ''
           try {
-            & $exe self-test 1> $stdoutPath 2> $stderrPath
-            $selfTestExit = if ($null -eq $LASTEXITCODE) { 0 } else { [int]$LASTEXITCODE }
-            if (Test-Path -LiteralPath $stdoutPath -PathType Leaf) {
-              try {
-                $selfTestJson = Get-Content -LiteralPath $stdoutPath -Raw | ConvertFrom-Json
-                $selfTestStatus = [string]$selfTestJson.status
+            $state.phase = 'source_checkout'
+            $state.command = 'git rev-parse --verify HEAD'
+            $sourceSha = (git rev-parse --verify HEAD 2>$null).Trim()
+            $state.last_exit_code = if ($null -eq $LASTEXITCODE) { 0 } else { [int]$LASTEXITCODE }
+            if ($state.last_exit_code -ne 0 -or $sourceSha -notmatch '^[0-9a-f]{40}$') {
+              throw 'checked-out source SHA is unavailable'
+            }
+            if ($sourceSha -ne $env:EVENT_SHA) {
+              throw 'checked-out source SHA does not match workflow SHA'
+            }
+            $state.phase = 'configuration'
+            $state.command = 'DELTAWEAVE_REQUIRE_WEB_ASSETS=1'
+            if ($env:DELTAWEAVE_REQUIRE_WEB_ASSETS -ne '1') {
+              throw 'required web asset gate is disabled'
+            }
+
+            Invoke-RecordedCommand -Phase 'web_install' -Command 'npm --prefix web ci' {
+              npm --prefix web ci
+            }
+            Invoke-RecordedCommand -Phase 'web_build' -Command 'npm --prefix web run build' {
+              npm --prefix web run build
+            }
+
+            $state.phase = 'web_assets'
+            $state.command = 'web/dist asset gate'
+            $webDist = Join-Path $PWD 'web\dist'
+            $index = Join-Path $webDist 'index.html'
+            $assetDir = Join-Path $webDist 'assets'
+            if (-not (Test-Path -LiteralPath $index -PathType Leaf)) {
+              throw 'web/dist/index.html was not produced'
+            }
+            $assetScripts = @(Get-ChildItem -LiteralPath $assetDir -Filter '*.js' -File -ErrorAction SilentlyContinue)
+            if ($assetScripts.Count -eq 0) {
+              throw 'web/dist/assets contains no JavaScript asset'
+            }
+
+            Invoke-RecordedCommand -Phase 'native_build' -Command 'cargo build --locked --release --target x86_64-pc-windows-msvc -p deltaweave' {
+              cargo build --locked --release --target $target -p deltaweave
+            }
+            Invoke-RecordedCommand -Phase 'cargo_lock' -Command 'git diff --exit-code -- Cargo.lock' {
+              git diff --exit-code -- Cargo.lock
+            }
+
+            $state.phase = 'native_output'
+            $state.command = 'release executable presence gate'
+            if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
+              throw 'release executable was not produced'
+            }
+
+            $state.phase = 'self_test'
+            $state.command = ".\target\$target\release\deltaweave.exe self-test"
+            $stdoutPath = Join-Path $env:RUNNER_TEMP "qsync-native-self-test-$env:EVENT_RUN_ID.stdout"
+            $stderrPath = Join-Path $env:RUNNER_TEMP "qsync-native-self-test-$env:EVENT_RUN_ID.stderr"
+            $selfTestCommand = $state.command
+            $selfTestStarted = [DateTime]::UtcNow
+            $selfTestExit = 127
+            $selfTestStatus = ''
+            try {
+              & $exe self-test 1> $stdoutPath 2> $stderrPath
+              $selfTestExit = if ($null -eq $LASTEXITCODE) { 0 } else { [int]$LASTEXITCODE }
+              if (Test-Path -LiteralPath $stdoutPath -PathType Leaf) {
+                try {
+                  $selfTestJson = Get-Content -LiteralPath $stdoutPath -Raw | ConvertFrom-Json
+                  $selfTestStatus = [string]$selfTestJson.status
+                }
+                catch {
+                  $selfTestStatus = ''
+                }
               }
-              catch {
-                $selfTestStatus = ''
+            }
+            catch {
+              $selfTestExit = 1
+            }
+            finally {
+              Remove-Item -LiteralPath $stdoutPath, $stderrPath -Force -ErrorAction SilentlyContinue
+            }
+            $state.self_test_exit = $selfTestExit
+            $state.self_test_status = $selfTestStatus
+            $state.last_exit_code = $selfTestExit
+            $selfTestFinished = [DateTime]::UtcNow
+            $records.Add([pscustomobject]@{
+              phase = 'self_test'
+              command = $selfTestCommand
+              started_utc = $selfTestStarted.ToString('o')
+              finished_utc = $selfTestFinished.ToString('o')
+              exit_code = $selfTestExit
+              status = $selfTestStatus
+            })
+            if ($selfTestExit -ne 0 -or $selfTestStatus -ne 'pass') {
+              throw 'native self-test gate failed'
+            }
+
+            $state.phase = 'artifact'
+            $state.command = 'stage passing native artifact'
+            $artifactDir = Join-Path $PWD 'qsync-native-artifact'
+            if (Test-Path -LiteralPath $artifactDir) {
+              throw 'artifact directory already exists in the checkout'
+            }
+            New-Item -ItemType Directory -Path $artifactDir | Out-Null
+            $artifactExe = Join-Path $artifactDir 'deltaweave.exe'
+            Copy-Item -LiteralPath $exe -Destination $artifactExe
+            $artifactHash = (Get-FileHash -LiteralPath $artifactExe -Algorithm SHA256).Hash.ToLowerInvariant()
+            $sourceHash = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($artifactHash -ne $sourceHash) {
+              throw 'staged executable hash differs from the build output'
+            }
+
+            [System.IO.File]::WriteAllText(
+              (Join-Path $artifactDir 'SHA256SUMS.txt'),
+              "$artifactHash *deltaweave.exe`n",
+              $utf8
+            )
+            [System.IO.File]::WriteAllText(
+              (Join-Path $artifactDir 'SOURCE_SHA.txt'),
+              "$sourceSha`n",
+              $utf8
+            )
+            $manifest = [ordered]@{
+              schema_version = 1
+              status = 'pass'
+              source_sha = $sourceSha
+              workflow_sha = $env:EVENT_SHA
+              workflow_ref = $env:EVENT_REF
+              workflow_run_id = $env:EVENT_RUN_ID
+              runner_os = [System.Environment]::OSVersion.VersionString
+              target = $target
+              environment = [ordered]@{
+                DELTAWEAVE_REQUIRE_WEB_ASSETS = $env:DELTAWEAVE_REQUIRE_WEB_ASSETS
+                node = (node --version 2>$null).Trim()
+                rust = (rustc --version 2>$null).Trim()
               }
+              artifact = [ordered]@{
+                path = 'deltaweave.exe'
+                sha256 = $artifactHash
+                size_bytes = (Get-Item -LiteralPath $artifactExe).Length
+              }
+              commands = $records.ToArray()
+              generated_utc = [DateTime]::UtcNow.ToString('o')
+            }
+            $manifestJson = $manifest | ConvertTo-Json -Depth 8
+            [System.IO.File]::WriteAllText(
+              (Join-Path $artifactDir 'native-verification-manifest.json'),
+              "$manifestJson`n",
+              $utf8
+            )
+            $manifestStatus = (Get-Content -LiteralPath (Join-Path $artifactDir 'native-verification-manifest.json') -Raw | ConvertFrom-Json).status
+            if ($manifestStatus -ne 'pass') {
+              throw 'verification manifest did not record a passing gate'
             }
           }
           catch {
-            $selfTestExit = 1
-          }
-          $selfTestFinished = [DateTime]::UtcNow
-          $records.Add([pscustomobject]@{
-            command = $selfTestCommand
-            started_utc = $selfTestStarted.ToString('o')
-            finished_utc = $selfTestFinished.ToString('o')
-            exit_code = $selfTestExit
-            status = $selfTestStatus
-          })
-          Remove-Item -LiteralPath $stdoutPath, $stderrPath -Force -ErrorAction SilentlyContinue
-          if ($selfTestExit -ne 0 -or $selfTestStatus -ne 'pass') {
-            throw "native self-test gate failed (exit=$selfTestExit, status=$selfTestStatus)"
-          }
-
-          $artifactDir = Join-Path $PWD 'qsync-native-artifact'
-          if (Test-Path -LiteralPath $artifactDir) {
-            throw 'artifact directory already exists in the checkout'
-          }
-          New-Item -ItemType Directory -Path $artifactDir | Out-Null
-          $artifactExe = Join-Path $artifactDir 'deltaweave.exe'
-          Copy-Item -LiteralPath $exe -Destination $artifactExe
-          $artifactHash = (Get-FileHash -LiteralPath $artifactExe -Algorithm SHA256).Hash.ToLowerInvariant()
-          $sourceHash = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($artifactHash -ne $sourceHash) {
-            throw 'staged executable hash differs from the build output'
-          }
-
-          $utf8 = [System.Text.UTF8Encoding]::new($false)
-          [System.IO.File]::WriteAllText(
-            (Join-Path $artifactDir 'SHA256SUMS.txt'),
-            "$artifactHash *deltaweave.exe`n",
-            $utf8
-          )
-          [System.IO.File]::WriteAllText(
-            (Join-Path $artifactDir 'SOURCE_SHA.txt'),
-            "$sourceSha`n",
-            $utf8
-          )
-          $manifest = [ordered]@{
-            schema_version = 1
-            status = 'pass'
-            source_sha = $sourceSha
-            workflow_sha = $env:EVENT_SHA
-            workflow_ref = $env:EVENT_REF
-            workflow_run_id = $env:EVENT_RUN_ID
-            runner_os = [System.Environment]::OSVersion.VersionString
-            target = $target
-            environment = [ordered]@{
-              DELTAWEAVE_REQUIRE_WEB_ASSETS = $env:DELTAWEAVE_REQUIRE_WEB_ASSETS
-              node = (node --version).Trim()
-              rust = (rustc --version).Trim()
+            $failurePhase = [string]$state.phase
+            $failureCategory = switch ($failurePhase) {
+              'source_checkout' { 'source_checkout_failed'; break }
+              'configuration' { 'configuration_gate_failed'; break }
+              'web_install' { 'web_install_failed'; break }
+              'web_build' { 'web_build_failed'; break }
+              'web_assets' { 'web_assets_missing'; break }
+              'native_build' { 'native_build_failed'; break }
+              'cargo_lock' { 'cargo_lock_changed'; break }
+              'native_output' { 'native_output_missing'; break }
+              'self_test' {
+                if ($state.self_test_exit -ne 0) { 'self_test_nonzero' }
+                elseif ($state.self_test_status -ne 'pass') { 'self_test_status_not_pass' }
+                else { 'self_test_failed' }
+                break
+              }
+              'artifact' { 'artifact_staging_failed'; break }
+              default { 'native_verification_failed'; break }
             }
-            artifact = [ordered]@{
-              path = 'deltaweave.exe'
-              sha256 = $artifactHash
-              size_bytes = (Get-Item -LiteralPath $artifactExe).Length
+            $failureExit = if ($state.last_exit_code -is [int]) { [int]$state.last_exit_code } else { 1 }
+            if ($failureExit -eq 0) { $failureExit = 1 }
+            $failureUtc = [DateTime]::UtcNow.ToString('o')
+            $summary = @(
+              '## QSync native verification failed',
+              '',
+              "- phase: ``$failurePhase``",
+              "- category: ``$failureCategory``",
+              "- command: ``$($state.command)``",
+              "- exit_code: ``$failureExit``",
+              "- generated_utc: ``$failureUtc``"
+            ) -join "`n"
+            try {
+              if (-not [string]::IsNullOrWhiteSpace($env:GITHUB_STEP_SUMMARY)) {
+                [System.IO.File]::AppendAllText($env:GITHUB_STEP_SUMMARY, "$summary`n", $utf8)
+              }
             }
-            commands = $records.ToArray()
-            generated_utc = [DateTime]::UtcNow.ToString('o')
-          }
-          $manifestJson = $manifest | ConvertTo-Json -Depth 8
-          [System.IO.File]::WriteAllText(
-            (Join-Path $artifactDir 'native-verification-manifest.json'),
-            "$manifestJson`n",
-            $utf8
-          )
-          $manifestStatus = (Get-Content -LiteralPath (Join-Path $artifactDir 'native-verification-manifest.json') -Raw | ConvertFrom-Json).status
-          if ($manifestStatus -ne 'pass') {
-            throw 'verification manifest did not record a passing gate'
+            catch {
+              # The fixed error annotation below remains the fallback signal.
+            }
+            Write-Host "::error title=QSync native verification failed::phase=$failurePhase; category=$failureCategory; exit_code=$failureExit"
+            throw "native verification failed: phase=$failurePhase; category=$failureCategory; exit_code=$failureExit"
           }
 
       - name: Upload passing native artifact
