@@ -183,6 +183,7 @@ pub(crate) async fn worker(
                     tokio::spawn(async move {
                         let engine = tokio::task::spawn_blocking(move || {
                             SyncEngine::open(SyncConfig {
+                                swarm_sources: Vec::new(),
                                 root: config.root.clone(),
                                 state_root: config.state.clone(),
                                 replica: config.replica(),

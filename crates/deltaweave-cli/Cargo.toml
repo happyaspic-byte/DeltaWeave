@@ -22,6 +22,7 @@ deltaweave-net = { path = "../deltaweave-net" }
 deltaweave-sync = { path = "../deltaweave-sync" }
 deltaweave-web = { path = "../deltaweave-web" }
 hex.workspace = true
+deltaweave-store = { path = "../deltaweave-store" }
 iroh.workspace = true
 serde.workspace = true
 serde_json.workspace = true

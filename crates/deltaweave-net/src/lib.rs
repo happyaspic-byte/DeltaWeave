@@ -26,6 +26,7 @@ use deltaweave_core::{
 use deltaweave_index::{IndexOptions, LocalIndex};
 use deltaweave_reconcile::{MerkleNodeSummary, MerkleTree};
 use deltaweave_store::{Store, VerifiedChunk};
+use deltaweave_swarm::{PeerAvailability, SchedulerLimits, schedule_chunks};
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayUrl, SecretKey, TransportAddr, Watcher,
     endpoint::{Connection, RecvStream, SendStream, presets},
@@ -33,15 +34,23 @@ use iroh::{
 };
 use redb::{Database, ReadableDatabase, TableDefinition};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::{
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    sync::Semaphore,
+};
 use tracing::{info, warn};
 
 /// Versioned ALPN identifier for DeltaWeave's initial push protocol.
 pub const ALPN_V1: &[u8] = b"deltaweave/sync/1";
 /// Versioned ALPN identifier for Merkle state reconciliation and bidirectional transfer.
 pub const ALPN_V2: &[u8] = b"deltaweave/sync/2";
+/// Versioned ALPN identifier for CAS-only multi-peer chunk swarming.
+pub const ALPN_SWARM_V3: &[u8] = b"deltaweave/sync/3";
+/// Compatibility name for the legacy CAS protocol, distinct from `share::ALPN_V3`.
+pub const ALPN_V3: &[u8] = ALPN_SWARM_V3;
 const MAX_CONTROL_FRAME: usize = 16 * 1024 * 1024;
 const MAX_CHUNKS_PER_FILE: usize = 250_000;
+const MAX_CHUNK_PAYLOAD_SIZE: u32 = 16 * 1024 * 1024;
 const MAX_FILE_SIZE: u64 = 16 * 1024 * 1024 * 1024 * 1024;
 const CHUNK_WRITE_BATCH: usize = 8;
 const CHUNK_WRITE_CONCURRENCY: usize = 8;
@@ -284,6 +293,7 @@ pub struct Server {
     network_mode: NetworkMode,
     index: Arc<LocalIndex>,
     admission: Arc<OperationAdmission>,
+    swarm_tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 impl Server {
@@ -339,8 +349,29 @@ impl Server {
             .await
             .context("iroh router shutdown")?;
         let _drained = self.active_handlers.write().await;
-        Ok(())
+        let tasks = std::mem::take(
+            &mut *self
+                .swarm_tasks
+                .lock()
+                .map_err(|_| anyhow::anyhow!("swarm task registry is poisoned"))?,
+        );
+        await_swarm_tasks(tasks).await
     }
+}
+
+async fn await_swarm_tasks(tasks: Vec<tokio::task::JoinHandle<()>>) -> Result<()> {
+    let mut first_error = None;
+    for task in tasks {
+        if let Err(error) = task.await
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    }
+    if let Some(error) = first_error {
+        return Err(error).context("swarm stream task failed");
+    }
+    Ok(())
 }
 
 /// Copyable endpoint information printed by the CLI.
@@ -401,7 +432,11 @@ pub async fn start_server_observed(
     let endpoint = bind_endpoint(
         secret_key,
         network_mode,
-        Some(vec![ALPN_V1.to_vec(), ALPN_V2.to_vec()]),
+        Some(vec![
+            ALPN_V1.to_vec(),
+            ALPN_V2.to_vec(),
+            ALPN_SWARM_V3.to_vec(),
+        ]),
         bind_address,
     )
     .await?;
@@ -425,22 +460,35 @@ pub async fn start_server_observed(
     let sync_handler = SyncHandler {
         active_handlers: Arc::clone(&active_handlers),
         share_authorization: None,
-        _root_lease: root_lease,
+        _root_lease: Arc::clone(&root_lease),
         admission: Arc::clone(&admission),
         observer,
-        store,
+        store: Arc::clone(&store),
         index: Arc::clone(&index),
         destination_root,
-        peer_policy,
+        peer_policy: peer_policy.clone(),
         apply_lock,
-        connection_limit,
+        connection_limit: Arc::clone(&connection_limit),
         min_free_space_bytes,
         state_root,
         receive_admission_lock,
     };
+    let swarm_tasks = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let swarm_handler = SwarmHandler {
+        _root_lease: root_lease,
+        active_handlers: Arc::clone(&active_handlers),
+        admission: Arc::clone(&admission),
+        connection_limit,
+        store,
+        peer_policy,
+        connections: Arc::new(Semaphore::new(SWARM_MAX_CONNECTIONS)),
+        inflight: Arc::new(Semaphore::new(SWARM_MAX_INFLIGHT as usize)),
+        tasks: Arc::clone(&swarm_tasks),
+    };
     let router = Router::builder(endpoint)
         .accept(ALPN_V1, push_handler)
         .accept(ALPN_V2, sync_handler)
+        .accept(ALPN_SWARM_V3, swarm_handler)
         .spawn();
     Ok(Server {
         active_handlers,
@@ -448,6 +496,7 @@ pub async fn start_server_observed(
         network_mode,
         index,
         admission,
+        swarm_tasks,
     })
 }
 
@@ -672,6 +721,19 @@ pub struct PullReceipt {
     pub reused_extents: usize,
 }
 
+/// File manifest returned without transferring chunk payloads.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PullManifestReceipt {
+    /// Exact remote causal record used for the request.
+    pub record: SyncRecord,
+    /// Verified FastCDC manifest associated with the record.
+    pub manifest: FileManifest,
+    /// Payload bytes received from the remote peer. Always zero.
+    pub transferred_bytes: u64,
+    /// Manifest extents left for another content source to provide.
+    pub reused_extents: usize,
+}
+
 impl SyncClient {
     /// Opens one authenticated local endpoint that can serve all calls in a sync pass.
     pub async fn open_session(&self) -> Result<SyncSession> {
@@ -883,6 +945,77 @@ impl SyncClient {
         );
         connection.close(0_u8.into(), b"causal push complete");
         Ok(receipt)
+    }
+
+    /// Retrieves one exact remote live-file manifest without transferring chunk payloads.
+    pub async fn pull_manifest(&self, record: SyncRecord) -> Result<PullManifestReceipt> {
+        record.validate()?;
+        ensure!(
+            !record.tombstone && record.kind == SyncEntryKind::File,
+            "pull_manifest requires a live file record"
+        );
+        let session = self.open_session().await?;
+        let outcome = session.pull_manifest(record).await;
+        session.close().await;
+        outcome
+    }
+
+    async fn pull_manifest_connected(
+        &self,
+        connection: OperationConnection,
+        expected: SyncRecord,
+    ) -> Result<PullManifestReceipt> {
+        let (mut send, mut receive) = connection
+            .open_bi()
+            .await
+            .context("open manifest-only pull stream")?;
+        write_frame(
+            &mut send,
+            &SyncWireRequest::PullRecord {
+                record: expected.clone(),
+            },
+        )
+        .await?;
+        let (record, manifest) = match read_sync_response(&mut receive).await? {
+            SyncWireResponse::PullManifest { record, manifest } => (record, manifest),
+            SyncWireResponse::Error { message } => {
+                bail!("remote rejected manifest-only pull: {message}")
+            }
+            _ => bail!("remote sent an unexpected manifest-only pull response"),
+        };
+        ensure!(record == expected, "remote path changed after snapshot");
+        manifest.validate()?;
+        ensure!(
+            manifest.size == record.size && Some(manifest.file_hash) == record.content_hash,
+            "remote pull manifest does not match causal record"
+        );
+        write_frame(
+            &mut send,
+            &SyncWireRequest::NeedChunks { hashes: Vec::new() },
+        )
+        .await?;
+        send.finish().context("finish manifest-only pull request")?;
+        let receipt = match read_sync_response(&mut receive).await? {
+            SyncWireResponse::Applied(receipt) => receipt,
+            SyncWireResponse::Error { message } => {
+                bail!("remote manifest-only pull failed: {message}")
+            }
+            _ => bail!("remote sent an unexpected manifest-only pull completion"),
+        };
+        ensure!(
+            receipt.path == record.path
+                && receipt.record_hash == record.logical_hash()
+                && receipt.transferred_bytes == 0
+                && receipt.reused_extents == manifest.chunks.len(),
+            "manifest-only pull receipt mismatch"
+        );
+        connection.close(0_u8.into(), b"manifest-only pull complete");
+        Ok(PullManifestReceipt {
+            record,
+            reused_extents: manifest.chunks.len(),
+            manifest,
+            transferred_bytes: 0,
+        })
     }
 
     /// Pulls one exact remote live-file record into `store` without publishing a path yet.
@@ -1172,6 +1305,18 @@ impl SyncSession {
             .await
     }
 
+    /// Retrieves one exact live-file manifest through this reusable endpoint.
+    pub async fn pull_manifest(&self, record: SyncRecord) -> Result<PullManifestReceipt> {
+        record.validate()?;
+        ensure!(
+            !record.tombstone && record.kind == SyncEntryKind::File,
+            "pull_manifest requires a live file record"
+        );
+        self.client
+            .pull_manifest_connected(self.connect().await?, record)
+            .await
+    }
+
     /// Pulls one exact live-file record through this reusable endpoint.
     pub async fn pull_record(&self, record: SyncRecord, store: Arc<Store>) -> Result<PullReceipt> {
         let destination_root = store.state_root().to_path_buf();
@@ -1228,6 +1373,29 @@ impl SyncSession {
         self.client
             .apply_metadata_connected(self.connect().await?, record)
             .await
+    }
+
+    /// Opens persistent V3 connections to authorized swarm sources using this session endpoint.
+    pub async fn connect_swarm_sources(&self, sources: Vec<EndpointAddr>) -> Result<SwarmSources> {
+        ensure!(
+            self.share.is_none(),
+            "managed shares do not use legacy swarm authorization"
+        );
+        connect_swarm_sources(&self.endpoint, sources).await
+    }
+
+    /// Fills missing hashes in a local CAS from multiple authorized V3 sources using this session's endpoint.
+    pub async fn swarm_fill_chunks(
+        &self,
+        sources: Vec<EndpointAddr>,
+        store: Arc<Store>,
+        hashes: Vec<Hash32>,
+    ) -> Result<SwarmFillReceipt> {
+        ensure!(
+            self.share.is_none(),
+            "managed shares do not use legacy swarm authorization"
+        );
+        swarm_fill_chunks_connected(&self.endpoint, sources, store, hashes).await
     }
 
     /// Gracefully closes the reusable local endpoint.
@@ -2521,6 +2689,10 @@ fn ensure_causally_applicable(index: &LocalIndex, incoming: &SyncRecord) -> Resu
 }
 
 fn ensure_index_causally_applicable(index: &LocalIndex, incoming: &SyncRecord) -> Result<()> {
+    ensure!(
+        incoming.version.get(index.replica()) <= index.replica_counter()?,
+        "incoming record advances the local replica counter"
+    );
     let Some(current) = index
         .get(&incoming.path)?
         .map(|record| record.to_sync_record())
@@ -2787,6 +2959,16 @@ impl ChunkWritePipeline {
         }
     }
 
+    async fn finish_after<T>(self, operation: Result<T>) -> Result<T> {
+        match (self.finish().await, operation) {
+            (Ok(()), result) => result,
+            (Err(storage), Ok(_)) => Err(anyhow::Error::new(LocalStorageError(storage))),
+            (Err(storage), Err(transfer)) => Err(anyhow::Error::new(LocalStorageError(
+                storage.context(format!("transfer also failed: {transfer:#}")),
+            ))),
+        }
+    }
+
     async fn join_oldest(&mut self) -> Result<()> {
         let InflightWrite { task, .. } = self.inflight.remove(0);
         if let Err(error) = join_chunk_task(task).await {
@@ -2831,15 +3013,7 @@ impl ChunkWritePipeline {
 }
 
 async fn finish_chunk_writes(writer: ChunkWritePipeline, result: Result<u64>) -> Result<u64> {
-    let persist = writer.finish().await;
-    match (result, persist) {
-        (Ok(bytes), Ok(())) => Ok(bytes),
-        (Ok(_), Err(error)) => Err(error),
-        (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(persist_error)) => {
-            Err(error.context(format!("chunk-store drain also failed: {persist_error:#}")))
-        }
-    }
+    writer.finish_after(result).await
 }
 
 async fn join_chunk_task(task: tokio::task::JoinHandle<Result<usize>>) -> Result<usize> {
@@ -3012,6 +3186,1204 @@ async fn read_sync_response(receive: &mut RecvStream) -> Result<SyncWireResponse
     }
 }
 
+const SWARM_PROTOCOL_VERSION: u16 = 3;
+const SWARM_MAX_CONNECTIONS: usize = 64;
+const SWARM_MAX_INFLIGHT: u16 = 8;
+const SWARM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const SWARM_AVAILABILITY_PAGE_TIMEOUT: Duration = Duration::from_secs(10);
+const SWARM_AVAILABILITY_TOTAL_TIMEOUT: Duration = Duration::from_secs(620);
+const SWARM_STREAM_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const SWARM_FETCH_TIMEOUT: Duration = Duration::from_secs(120);
+const SWARM_MAX_BUFFERED_FETCH_BYTES: usize = 64 * 1024 * 1024;
+const SWARM_MAX_WANT: usize = 64;
+const SWARM_FILL_CHUNKS_PER_SOURCE: usize = 16;
+const SWARM_FILL_STREAMS_PER_SOURCE: usize = 2;
+const SWARM_MAX_AVAILABILITY: usize = 4096;
+
+/// Result of an authorized swarm Hello handshake.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SwarmHelloOk {
+    /// Protocol version advertised by the remote swarm handler.
+    pub protocol_version: u16,
+    /// Maximum concurrent in-flight chunk requests accepted by the remote.
+    pub max_inflight: u16,
+}
+
+/// Result of requesting CAS chunks from an authorized swarm peer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SwarmChunkFetch {
+    /// Verified chunks returned by the remote peer.
+    pub chunks: Vec<(Hash32, Vec<u8>)>,
+    /// Requested hashes that the remote did not have.
+    pub missing: Vec<Hash32>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+enum SwarmWireRequest {
+    Hello { protocol_version: u16 },
+    Availability { hashes: Vec<Hash32> },
+    GetChunks { hashes: Vec<Hash32> },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+enum SwarmWireResponse {
+    HelloOk {
+        protocol_version: u16,
+        max_inflight: u16,
+    },
+    Availability {
+        bits: Vec<bool>,
+    },
+    Chunks {
+        present: Vec<Hash32>,
+        missing: Vec<Hash32>,
+    },
+}
+
+#[derive(Clone)]
+struct SwarmHandler {
+    // This protocol is registered only on a legacy receiver's isolated CAS.
+    _root_lease: Arc<root_admission::RootLease>,
+    active_handlers: Arc<tokio::sync::RwLock<()>>,
+    admission: Arc<OperationAdmission>,
+    connection_limit: Arc<Semaphore>,
+    store: Arc<Store>,
+    peer_policy: PeerPolicy,
+    connections: Arc<Semaphore>,
+    inflight: Arc<Semaphore>,
+    tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+}
+
+impl fmt::Debug for SwarmHandler {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SwarmHandler")
+            .field("peer_policy", &self.peer_policy)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ProtocolHandler for SwarmHandler {
+    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        let peer = connection.remote_id();
+        if !self.peer_policy.allows(peer) {
+            warn!(%peer, "rejected unauthorized DeltaWeave swarm peer");
+            connection.close(0_u8.into(), b"endpoint ID is not allow-listed");
+            return Ok(());
+        }
+        let Ok(_shared_connection_permit) = self.connection_limit.clone().try_acquire_owned()
+        else {
+            connection.close(0_u8.into(), b"server connection limit reached; retry later");
+            return Ok(());
+        };
+        let _connection_permit = match self.connections.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                connection.close(0_u8.into(), b"swarm connection limit reached");
+                return Ok(());
+            }
+        };
+
+        loop {
+            let (mut send, mut receive) = match connection.accept_bi().await {
+                Ok(streams) => streams,
+                Err(_) => return Ok(()),
+            };
+            let Some(operation) = self.admission.admit() else {
+                let _ = send.reset(0_u8.into());
+                let _ = receive.stop(0_u8.into());
+                continue;
+            };
+            let permit = match self.inflight.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    let _ = send.reset(0_u8.into());
+                    let _ = receive.stop(0_u8.into());
+                    continue;
+                }
+            };
+            let handler = self.clone();
+            let active = Arc::clone(&self.active_handlers).read_owned().await;
+            let task = tokio::spawn(async move {
+                let _active = active;
+                let _operation = operation;
+                let _permit = permit;
+                match handler.handle_stream(&mut send, &mut receive).await {
+                    Ok(()) => {
+                        let _ = send.finish();
+                    }
+                    Err(error) => {
+                        let message = public_error_message(&error);
+                        warn!(%peer, error = message, "swarm stream failed");
+                        let _ = send.reset(0_u8.into());
+                    }
+                }
+            });
+            let mut tasks = self.tasks.lock().map_err(|_| {
+                AcceptError::from_err(std::io::Error::other("swarm task registry is poisoned"))
+            })?;
+            tasks.retain(|task| !task.is_finished());
+            tasks.push(task);
+        }
+    }
+}
+
+impl SwarmHandler {
+    async fn handle_stream(&self, send: &mut SendStream, receive: &mut RecvStream) -> Result<()> {
+        let request = tokio::time::timeout(
+            SWARM_STREAM_REQUEST_TIMEOUT,
+            read_frame::<SwarmWireRequest>(receive),
+        )
+        .await
+        .context("swarm request frame timed out")??;
+        match request {
+            SwarmWireRequest::Hello { protocol_version } => {
+                ensure!(
+                    protocol_version == SWARM_PROTOCOL_VERSION,
+                    "unsupported swarm protocol version {protocol_version}"
+                );
+                write_swarm_frame(
+                    send,
+                    &SwarmWireResponse::HelloOk {
+                        protocol_version: SWARM_PROTOCOL_VERSION,
+                        max_inflight: SWARM_MAX_INFLIGHT,
+                    },
+                )
+                .await
+            }
+            SwarmWireRequest::Availability { hashes } => {
+                self.serve_availability(send, hashes).await
+            }
+            SwarmWireRequest::GetChunks { hashes } => self.serve_chunks(send, hashes).await,
+        }
+    }
+
+    async fn serve_availability(&self, send: &mut SendStream, hashes: Vec<Hash32>) -> Result<()> {
+        ensure!(
+            hashes.len() <= SWARM_MAX_AVAILABILITY,
+            "swarm availability request exceeds {SWARM_MAX_AVAILABILITY} hashes"
+        );
+        let unique: HashSet<_> = hashes.iter().copied().collect();
+        ensure!(
+            unique.len() == hashes.len(),
+            "swarm availability request contains duplicates"
+        );
+        let store = Arc::clone(&self.store);
+        let bits = tokio::task::spawn_blocking(move || {
+            hashes
+                .into_iter()
+                .map(|hash| {
+                    store
+                        .chunks()
+                        .verify_bounded(hash, MAX_CHUNK_PAYLOAD_SIZE as usize)
+                        .is_ok()
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .context("swarm availability task failed")?;
+        write_swarm_frame(send, &SwarmWireResponse::Availability { bits }).await
+    }
+
+    async fn serve_chunks(&self, send: &mut SendStream, hashes: Vec<Hash32>) -> Result<()> {
+        ensure!(
+            hashes.len() <= SWARM_MAX_WANT,
+            "swarm chunk request exceeds {SWARM_MAX_WANT} hashes"
+        );
+        let unique: HashSet<_> = hashes.iter().copied().collect();
+        ensure!(
+            unique.len() == hashes.len(),
+            "swarm chunk request contains duplicates"
+        );
+
+        let inventory_store = Arc::clone(&self.store);
+        let inventory_hashes = hashes;
+        let (present, missing) = tokio::task::spawn_blocking(move || {
+            let mut present = Vec::new();
+            let mut missing = Vec::new();
+            for hash in inventory_hashes {
+                if inventory_store
+                    .chunks()
+                    .verify_bounded(hash, MAX_CHUNK_PAYLOAD_SIZE as usize)
+                    .is_ok()
+                {
+                    present.push(hash);
+                } else {
+                    missing.push(hash);
+                }
+            }
+            (present, missing)
+        })
+        .await
+        .context("swarm chunk inventory task failed")?;
+
+        write_swarm_frame(
+            send,
+            &SwarmWireResponse::Chunks {
+                present: present.clone(),
+                missing,
+            },
+        )
+        .await?;
+        for hash in present {
+            let chunk_store = Arc::clone(&self.store);
+            let bytes = tokio::task::spawn_blocking(move || {
+                chunk_store
+                    .chunks()
+                    .read_verified_bounded(hash, MAX_CHUNK_PAYLOAD_SIZE as usize)
+            })
+            .await
+            .context("swarm chunk read task failed")??;
+            write_swarm_frame(
+                send,
+                &ChunkHeader {
+                    hash,
+                    length: u32::try_from(bytes.len()).context("swarm chunk length overflow")?,
+                },
+            )
+            .await?;
+            tokio::time::timeout(SWARM_FETCH_TIMEOUT, send.write_all(&bytes))
+                .await
+                .context("swarm chunk payload write timed out")??;
+        }
+        Ok(())
+    }
+}
+
+/// Completes an authorized swarm Hello handshake against a receiver.
+pub async fn swarm_hello(
+    secret_key: SecretKey,
+    remote: EndpointAddr,
+    mode: NetworkMode,
+) -> Result<SwarmHelloOk> {
+    let endpoint = bind_endpoint(secret_key, mode, None, None).await?;
+    let outcome = async {
+        let connection = tokio::time::timeout(
+            SWARM_CONNECT_TIMEOUT,
+            endpoint.connect(remote, ALPN_SWARM_V3),
+        )
+        .await
+        .context("swarm hello connection timed out")?
+        .context("failed to connect swarm peer")?;
+        let exchange = async {
+            let (mut send, mut receive) = connection
+                .open_bi()
+                .await
+                .context("failed to open swarm hello stream")?;
+            write_frame(
+                &mut send,
+                &SwarmWireRequest::Hello {
+                    protocol_version: SWARM_PROTOCOL_VERSION,
+                },
+            )
+            .await?;
+            send.finish()?;
+            match read_frame::<SwarmWireResponse>(&mut receive).await? {
+                SwarmWireResponse::HelloOk {
+                    protocol_version,
+                    max_inflight,
+                } => Ok(SwarmHelloOk {
+                    protocol_version,
+                    max_inflight,
+                }),
+                SwarmWireResponse::Chunks { .. } | SwarmWireResponse::Availability { .. } => {
+                    bail!("swarm peer sent a data response during hello")
+                }
+            }
+        };
+        let result = tokio::time::timeout(SWARM_FETCH_TIMEOUT, exchange)
+            .await
+            .context("swarm hello exchange timed out")?;
+        connection.close(0_u8.into(), b"swarm hello complete");
+        result
+    }
+    .await;
+    endpoint.close().await;
+    outcome
+}
+
+async fn swarm_availability_on(connection: &Connection, hashes: Vec<Hash32>) -> Result<Vec<bool>> {
+    ensure!(
+        hashes.len() <= SWARM_MAX_AVAILABILITY,
+        "swarm availability request exceeds {SWARM_MAX_AVAILABILITY} hashes"
+    );
+    let unique: HashSet<_> = hashes.iter().copied().collect();
+    ensure!(
+        unique.len() == hashes.len(),
+        "swarm availability request contains duplicates"
+    );
+    let expected_len = hashes.len();
+    let (mut send, mut receive) = connection
+        .open_bi()
+        .await
+        .context("failed to open swarm availability stream")?;
+    write_frame(&mut send, &SwarmWireRequest::Availability { hashes }).await?;
+    send.finish()?;
+    match read_frame::<SwarmWireResponse>(&mut receive).await? {
+        SwarmWireResponse::Availability { bits } => {
+            ensure!(
+                bits.len() == expected_len,
+                "swarm availability bitmap length mismatch"
+            );
+            Ok(bits)
+        }
+        SwarmWireResponse::HelloOk { .. } | SwarmWireResponse::Chunks { .. } => {
+            bail!("swarm peer sent a non-availability response")
+        }
+    }
+}
+
+/// Queries which requested hashes already exist in an authorized swarm peer CAS using an established endpoint.
+pub async fn swarm_availability_connected(
+    endpoint: &Endpoint,
+    remote: EndpointAddr,
+    hashes: Vec<Hash32>,
+) -> Result<Vec<bool>> {
+    let connection = tokio::time::timeout(
+        SWARM_CONNECT_TIMEOUT,
+        endpoint.connect(remote, ALPN_SWARM_V3),
+    )
+    .await
+    .context("swarm availability connection timed out")?
+    .context("failed to connect swarm peer for availability")?;
+    let outcome = tokio::time::timeout(
+        SWARM_FETCH_TIMEOUT,
+        swarm_availability_on(&connection, hashes),
+    )
+    .await
+    .context("swarm availability response timed out")?;
+    connection.close(0_u8.into(), b"swarm availability complete");
+    outcome
+}
+
+/// Queries which requested hashes already exist in an authorized swarm peer CAS.
+pub async fn swarm_availability(
+    secret_key: SecretKey,
+    remote: EndpointAddr,
+    mode: NetworkMode,
+    hashes: Vec<Hash32>,
+) -> Result<Vec<bool>> {
+    let endpoint = bind_endpoint(secret_key, mode, None, None).await?;
+    let outcome = swarm_availability_connected(&endpoint, remote, hashes).await;
+    endpoint.close().await;
+    outcome
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SwarmPartialFill {
+    /// Verified payload bytes received from swarm sources before fallback.
+    pub transferred_bytes: u64,
+    /// Authenticated endpoint IDs of sources that delivered verified chunks before fallback.
+    pub source_ids: Vec<EndpointId>,
+}
+
+impl fmt::Display for SwarmPartialFill {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "swarm partial fill transferred {} byte(s) across {} source(s)",
+            self.transferred_bytes,
+            self.source_ids.len()
+        )
+    }
+}
+
+impl std::error::Error for SwarmPartialFill {}
+
+/// Returns partial swarm fill progress attached to a non-fatal swarm error, if any.
+#[must_use]
+pub fn swarm_partial_fill(error: &anyhow::Error) -> Option<SwarmPartialFill> {
+    error.downcast_ref::<SwarmPartialFill>().cloned()
+}
+
+/// Outcome after filling a local CAS from multiple authorized swarm peers.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SwarmFillReceipt {
+    /// Number of unique chunks durably installed or already present.
+    pub transferred_chunks: usize,
+    /// Verified payload bytes received from source peers.
+    pub transferred_bytes: u64,
+    /// Number of peers that delivered at least one verified chunk.
+    pub sources_used: usize,
+    source_ids: Vec<EndpointId>,
+}
+
+impl SwarmFillReceipt {
+    /// Authenticated endpoint IDs that delivered at least one verified chunk.
+    #[must_use]
+    pub fn source_ids(&self) -> &[EndpointId] {
+        &self.source_ids
+    }
+}
+
+async fn begin_swarm_chunk_fetch(
+    connection: &Connection,
+    hashes: Vec<Hash32>,
+) -> Result<(RecvStream, Vec<Hash32>, Vec<Hash32>)> {
+    ensure!(
+        hashes.len() <= SWARM_MAX_WANT,
+        "swarm chunk request exceeds {SWARM_MAX_WANT} hashes"
+    );
+    let requested_set: HashSet<_> = hashes.iter().copied().collect();
+    ensure!(
+        requested_set.len() == hashes.len(),
+        "swarm chunk request contains duplicates"
+    );
+    let (mut send, mut receive) = connection
+        .open_bi()
+        .await
+        .context("failed to open swarm chunk stream")?;
+    write_frame(
+        &mut send,
+        &SwarmWireRequest::GetChunks {
+            hashes: hashes.clone(),
+        },
+    )
+    .await?;
+    send.finish()?;
+    let response = read_frame::<SwarmWireResponse>(&mut receive).await?;
+    let (present, missing) = match response {
+        SwarmWireResponse::Chunks { present, missing } => (present, missing),
+        SwarmWireResponse::HelloOk { .. } | SwarmWireResponse::Availability { .. } => {
+            bail!("swarm peer sent a non-chunk response")
+        }
+    };
+    validate_swarm_chunk_outcomes(&requested_set, &present, &missing)?;
+    Ok((receive, present, missing))
+}
+
+async fn read_swarm_chunk(
+    receive: &mut RecvStream,
+    expected: Hash32,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    let header: ChunkHeader = read_frame(receive).await?;
+    ensure!(
+        header.hash == expected,
+        "swarm chunk arrived out of inventory order"
+    );
+    ensure!(
+        header.length <= MAX_CHUNK_PAYLOAD_SIZE,
+        "swarm chunk length exceeds maximum payload size"
+    );
+    ensure!(
+        header.length as usize <= max_bytes,
+        "swarm chunk exceeds remaining buffered-fetch budget"
+    );
+    let mut bytes = vec![0_u8; header.length as usize];
+    receive.read_exact(&mut bytes).await?;
+    let actual = Hash32::digest(&bytes);
+    ensure!(
+        actual == expected,
+        "swarm chunk {expected} hashed to {actual}"
+    );
+    Ok(bytes)
+}
+
+async fn swarm_get_chunks_on(
+    connection: &Connection,
+    hashes: Vec<Hash32>,
+) -> Result<SwarmChunkFetch> {
+    let (mut receive, present, missing) = tokio::time::timeout(
+        SWARM_FETCH_TIMEOUT,
+        begin_swarm_chunk_fetch(connection, hashes),
+    )
+    .await
+    .context("swarm chunk response timed out")??;
+    let mut chunks = Vec::with_capacity(present.len());
+    let mut buffered_bytes = 0_usize;
+    for expected in present {
+        let remaining_budget = SWARM_MAX_BUFFERED_FETCH_BYTES.saturating_sub(buffered_bytes);
+        let bytes = tokio::time::timeout(
+            SWARM_FETCH_TIMEOUT,
+            read_swarm_chunk(&mut receive, expected, remaining_budget),
+        )
+        .await
+        .context("swarm chunk payload timed out")??;
+        buffered_bytes = buffered_bytes
+            .checked_add(bytes.len())
+            .context("swarm buffered-byte counter overflow")?;
+        ensure!(
+            buffered_bytes <= SWARM_MAX_BUFFERED_FETCH_BYTES,
+            "swarm buffered fetch exceeds {SWARM_MAX_BUFFERED_FETCH_BYTES} bytes"
+        );
+        chunks.push((expected, bytes));
+    }
+    Ok(SwarmChunkFetch { chunks, missing })
+}
+
+struct SwarmStoredFetch {
+    transferred_chunks: usize,
+    transferred_bytes: u64,
+    missing: Vec<Hash32>,
+}
+
+enum SwarmStoredFetchError {
+    Source,
+    Local(anyhow::Error),
+}
+
+#[derive(Debug)]
+struct LocalStorageError(anyhow::Error);
+
+impl fmt::Display for LocalStorageError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "local durable storage failed: {:#}", self.0)
+    }
+}
+
+impl std::error::Error for LocalStorageError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
+/// Returns whether a swarm fill failed at the local durable CAS boundary.
+#[must_use]
+pub fn is_swarm_local_storage_error(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<LocalStorageError>().is_some()
+}
+
+async fn swarm_store_chunks_on(
+    connection: &Connection,
+    hashes: Vec<Hash32>,
+    store: Arc<Store>,
+    admission: DiskAdmission,
+    write_lock: Arc<tokio::sync::Mutex<()>>,
+) -> std::result::Result<SwarmStoredFetch, SwarmStoredFetchError> {
+    let (mut receive, present, missing) = tokio::time::timeout(
+        SWARM_FETCH_TIMEOUT,
+        begin_swarm_chunk_fetch(connection, hashes),
+    )
+    .await
+    .map_err(|_| SwarmStoredFetchError::Source)?
+    .map_err(|_| SwarmStoredFetchError::Source)?;
+    let mut transferred_bytes = 0_u64;
+    let transferred_chunks = present.len();
+    for expected in present {
+        let bytes = tokio::time::timeout(
+            SWARM_FETCH_TIMEOUT,
+            read_swarm_chunk(&mut receive, expected, MAX_CHUNK_PAYLOAD_SIZE as usize),
+        )
+        .await
+        .map_err(|_| SwarmStoredFetchError::Source)?
+        .map_err(|_| SwarmStoredFetchError::Source)?;
+        transferred_bytes = transferred_bytes
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| SwarmStoredFetchError::Source)?;
+        let chunk_store = Arc::clone(&store);
+        let disk = admission.clone();
+        let write_guard = Arc::clone(&write_lock).lock_owned().await;
+        tokio::task::spawn_blocking(move || {
+            // Keep the budget check and durable write serialized across all sources.
+            // Moving the guard into this task also retains it if the caller is cancelled.
+            let _write_guard = write_guard;
+            disk.check_state(u64::try_from(bytes.len()).context("swarm chunk size overflow")?)?;
+            chunk_store.chunks().put_verified(expected, &bytes)
+        })
+        .await
+        .map_err(|error| {
+            SwarmStoredFetchError::Local(
+                anyhow::Error::new(error).context("local swarm chunk-store task failed"),
+            )
+        })?
+        .map_err(SwarmStoredFetchError::Local)?;
+    }
+    Ok(SwarmStoredFetch {
+        transferred_chunks,
+        transferred_bytes,
+        missing,
+    })
+}
+
+fn validate_swarm_chunk_outcomes(
+    requested: &HashSet<Hash32>,
+    present: &[Hash32],
+    missing: &[Hash32],
+) -> Result<()> {
+    let returned: HashSet<_> = present.iter().chain(missing).copied().collect();
+    ensure!(
+        returned.len() == present.len() + missing.len(),
+        "swarm peer returned duplicate chunk outcomes"
+    );
+    ensure!(
+        &returned == requested,
+        "swarm peer omitted or returned unrequested chunk outcomes"
+    );
+    Ok(())
+}
+
+/// Requests verified CAS chunks from an authorized swarm peer using an established endpoint.
+pub async fn swarm_get_chunks_connected(
+    endpoint: &Endpoint,
+    remote: EndpointAddr,
+    hashes: Vec<Hash32>,
+) -> Result<SwarmChunkFetch> {
+    let connection = tokio::time::timeout(
+        SWARM_CONNECT_TIMEOUT,
+        endpoint.connect(remote, ALPN_SWARM_V3),
+    )
+    .await
+    .context("swarm chunk connection timed out")?
+    .context("failed to connect swarm peer for chunk fetch")?;
+    let outcome = swarm_get_chunks_on(&connection, hashes).await;
+    connection.close(0_u8.into(), b"swarm chunk fetch complete");
+    outcome
+}
+
+/// Requests verified CAS chunks from an authorized swarm peer.
+pub async fn swarm_get_chunks(
+    secret_key: SecretKey,
+    remote: EndpointAddr,
+    mode: NetworkMode,
+    hashes: Vec<Hash32>,
+) -> Result<SwarmChunkFetch> {
+    let endpoint = bind_endpoint(secret_key, mode, None, None).await?;
+    let outcome = swarm_get_chunks_connected(&endpoint, remote, hashes).await;
+    endpoint.close().await;
+    outcome
+}
+
+/// Persistent authenticated V3 connections opened through one sync endpoint.
+pub struct SwarmSources {
+    sources: Vec<EndpointAddr>,
+    connections: Vec<(usize, EndpointAddr, Connection)>,
+}
+
+impl Drop for SwarmSources {
+    fn drop(&mut self) {
+        for (_, _, connection) in self.connections.drain(..) {
+            connection.close(0_u8.into(), b"swarm fill complete");
+        }
+    }
+}
+
+async fn connect_swarm_sources(
+    endpoint: &Endpoint,
+    sources: Vec<EndpointAddr>,
+) -> Result<SwarmSources> {
+    ensure!(
+        !sources.is_empty(),
+        "swarm fill requires at least one source"
+    );
+    ensure!(
+        sources.len() <= 8,
+        "swarm fill supports at most eight sources"
+    );
+    let unique_sources: HashSet<_> = sources.iter().map(|source| source.id).collect();
+    ensure!(
+        unique_sources.len() == sources.len(),
+        "swarm fill contains duplicate endpoint IDs"
+    );
+
+    let mut join_set = tokio::task::JoinSet::new();
+    for (index, source) in sources.iter().cloned().enumerate() {
+        let ep = endpoint.clone();
+        join_set.spawn(async move {
+            let connection = tokio::time::timeout(
+                SWARM_CONNECT_TIMEOUT,
+                ep.connect(source.clone(), ALPN_SWARM_V3),
+            )
+            .await
+            .context("swarm source connection timed out")?
+            .context("failed to establish swarm source connection")?;
+            Ok::<_, anyhow::Error>((index, source, connection))
+        });
+    }
+    let mut connections = Vec::with_capacity(sources.len());
+    while let Some(res) = join_set.join_next().await {
+        if let Ok(Ok(connection)) = res {
+            connections.push(connection);
+        }
+    }
+    ensure!(
+        !connections.is_empty(),
+        "no configured swarm source could be connected"
+    );
+    connections.sort_by_key(|(index, _, _)| *index);
+    Ok(SwarmSources {
+        sources,
+        connections,
+    })
+}
+
+impl SwarmSources {
+    /// Fills missing hashes in a local CAS through these persistent connections.
+    pub async fn fill_chunks(
+        &self,
+        store: Arc<Store>,
+        hashes: Vec<Hash32>,
+    ) -> Result<SwarmFillReceipt> {
+        let state = store.state_root().to_path_buf();
+        let admission = DiskAdmission::new(state.clone(), state, 0, 0);
+        self.fill_chunks_with_admission(store, hashes, admission)
+            .await
+    }
+
+    /// Fills CAS while retaining the configured reserve and pending destination budget.
+    pub async fn fill_chunks_with_admission(
+        &self,
+        store: Arc<Store>,
+        hashes: Vec<Hash32>,
+        admission: DiskAdmission,
+    ) -> Result<SwarmFillReceipt> {
+        swarm_fill_chunks_preconnected(&self.sources, &self.connections, store, hashes, admission)
+            .await
+    }
+}
+
+async fn swarm_fill_chunks_preconnected(
+    sources: &[EndpointAddr],
+    source_connections: &[(usize, EndpointAddr, Connection)],
+    store: Arc<Store>,
+    hashes: Vec<Hash32>,
+    admission: DiskAdmission,
+) -> Result<SwarmFillReceipt> {
+    ensure!(
+        hashes.len() <= MAX_CHUNKS_PER_FILE,
+        "swarm fill exceeds {MAX_CHUNKS_PER_FILE} hashes"
+    );
+    let unique: HashSet<_> = hashes.iter().copied().collect();
+    ensure!(
+        unique.len() == hashes.len(),
+        "swarm fill contains duplicate hashes"
+    );
+
+    let inventory_store = Arc::clone(&store);
+    let inventory_hashes = hashes.clone();
+    let remaining_all = tokio::task::spawn_blocking(move || {
+        inventory_hashes
+            .into_iter()
+            .filter(|hash| {
+                inventory_store
+                    .chunks()
+                    .verify_bounded(*hash, MAX_CHUNK_PAYLOAD_SIZE as usize)
+                    .is_err()
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .context("local swarm inventory task failed")?;
+    if remaining_all.is_empty() {
+        return Ok(SwarmFillReceipt {
+            transferred_chunks: 0,
+            transferred_bytes: 0,
+            sources_used: 0,
+            source_ids: Vec::new(),
+        });
+    }
+    admission
+        .check_state(0)
+        .map_err(|error| anyhow::Error::new(LocalStorageError(error)))?;
+    let write_lock = Arc::new(tokio::sync::Mutex::new(()));
+    let mut remaining: HashSet<_> = remaining_all.iter().copied().collect();
+    let mut join_set = tokio::task::JoinSet::new();
+    for (index, source, connection) in source_connections {
+        let src = source.clone();
+        let conn = connection.clone();
+        let r_vec = remaining_all.clone();
+        let idx = *index;
+        join_set.spawn(async move {
+            let mut available = std::collections::BTreeSet::new();
+            for chunk_slice in r_vec.chunks(SWARM_MAX_AVAILABILITY) {
+                let bits = tokio::time::timeout(
+                    SWARM_AVAILABILITY_PAGE_TIMEOUT,
+                    swarm_availability_on(&conn, chunk_slice.to_vec()),
+                )
+                .await
+                .context("swarm availability page timed out")??;
+                for (hash, present) in chunk_slice.iter().zip(bits) {
+                    if present {
+                        available.insert(*hash);
+                    }
+                }
+            }
+            Ok::<_, anyhow::Error>(PeerAvailability {
+                id: swarm_source_id(&src, idx),
+                available,
+                rtt_ms: 1,
+                queued_bytes: 0,
+                goodput_bytes_per_second: 10 * 1024 * 1024,
+                failure_penalty: 0,
+            })
+        });
+    }
+    let mut peers = Vec::new();
+    let availability_deadline =
+        tokio::time::sleep(swarm_availability_total_timeout(remaining_all.len()));
+    tokio::pin!(availability_deadline);
+    while !join_set.is_empty() {
+        tokio::select! {
+            result = join_set.join_next() => {
+                if let Some(Ok(Ok(peer))) = result {
+                    peers.push(peer);
+                }
+            }
+            () = &mut availability_deadline => {
+                join_set.abort_all();
+                while join_set.join_next().await.is_some() {}
+                break;
+            }
+        }
+    }
+    ensure!(
+        !peers.is_empty(),
+        "no connected swarm source answered availability"
+    );
+
+    let assignments = schedule_chunks(
+        &remaining_all,
+        &peers,
+        SchedulerLimits {
+            max_sources: peers.len().min(8),
+            max_chunks_per_peer: remaining_all.len(),
+            max_assignments: remaining_all.len(),
+        },
+    );
+    let mut queues = vec![VecDeque::new(); sources.len()];
+    for assignment in assignments {
+        let source_idx = source_connections
+            .iter()
+            .find_map(|(index, source, _)| {
+                (swarm_source_id(source, *index) == assignment.peer).then_some(*index)
+            })
+            .context("scheduled swarm peer disappeared")?;
+        queues[source_idx].push_back(assignment.hash);
+    }
+
+    let mut transferred_chunks = 0_usize;
+    let mut transferred_bytes = 0_u64;
+    let mut used_sources = HashSet::new();
+    let mut inflight = vec![0_usize; sources.len()];
+    let mut retried = vec![HashSet::new(); sources.len()];
+    let mut disabled = vec![false; sources.len()];
+    let mut fetch_set = tokio::task::JoinSet::new();
+    let mut local_error = None;
+    let mut source_error = None;
+    loop {
+        if local_error.is_none() && source_error.is_none() {
+            for (source_idx, _, connection) in source_connections {
+                while !disabled[*source_idx]
+                    && inflight[*source_idx] < SWARM_FILL_STREAMS_PER_SOURCE
+                    && !queues[*source_idx].is_empty()
+                {
+                    let assigned: Vec<_> = (0..SWARM_FILL_CHUNKS_PER_SOURCE)
+                        .filter_map(|_| queues[*source_idx].pop_front())
+                        .collect();
+                    inflight[*source_idx] += 1;
+                    let conn = connection.clone();
+                    let local_store = Arc::clone(&store);
+                    let disk = admission.clone();
+                    let writes = Arc::clone(&write_lock);
+                    let idx = *source_idx;
+                    fetch_set.spawn(async move {
+                        let fetch = swarm_store_chunks_on(
+                            &conn,
+                            assigned.clone(),
+                            local_store,
+                            disk,
+                            writes,
+                        )
+                        .await;
+                        (idx, assigned, fetch)
+                    });
+                }
+            }
+        }
+        if fetch_set.is_empty() {
+            break;
+        }
+        let joined = fetch_set
+            .join_next()
+            .await
+            .context("swarm source task missing")?;
+        let (source_idx, assigned, fetch) = match joined {
+            Ok(result) => result,
+            Err(error) => {
+                if source_error.is_none() {
+                    source_error =
+                        Some(anyhow::Error::new(error).context("swarm source task panicked"));
+                }
+                continue;
+            }
+        };
+        inflight[source_idx] -= 1;
+        match fetch {
+            Ok(fetch) => {
+                if fetch.transferred_chunks > 0 {
+                    used_sources.insert(source_idx);
+                }
+                transferred_chunks = transferred_chunks
+                    .checked_add(fetch.transferred_chunks)
+                    .context("swarm transferred-chunk counter overflow")?;
+                transferred_bytes = transferred_bytes
+                    .checked_add(fetch.transferred_bytes)
+                    .context("swarm transferred-byte counter overflow")?;
+                for hash in &assigned {
+                    remaining.remove(hash);
+                }
+                if !fetch.missing.is_empty() {
+                    if let Some(peer) = peers
+                        .iter_mut()
+                        .find(|peer| swarm_source_id(&sources[source_idx], source_idx) == peer.id)
+                    {
+                        for hash in &fetch.missing {
+                            peer.available.remove(hash);
+                        }
+                    }
+                    if source_error.is_none()
+                        && let Err(error) = reassign_swarm_hashes(
+                            &fetch.missing,
+                            &peers,
+                            source_connections,
+                            &disabled,
+                            &mut queues,
+                        )
+                    {
+                        source_error = Some(error);
+                    }
+                }
+            }
+            Err(SwarmStoredFetchError::Source) => {
+                let verify_store = Arc::clone(&store);
+                let verify_hashes = assigned;
+                let assigned_set: HashSet<_> = verify_hashes.iter().copied().collect();
+                let (still_missing, completed, completed_bytes) =
+                    tokio::task::spawn_blocking(move || {
+                        let mut still_missing = Vec::new();
+                        let mut completed = 0_usize;
+                        let mut completed_bytes = 0_u64;
+                        for hash in verify_hashes {
+                            match verify_store
+                                .chunks()
+                                .verify_bounded(hash, MAX_CHUNK_PAYLOAD_SIZE as usize)
+                            {
+                                Ok(length) => {
+                                    completed += 1;
+                                    completed_bytes = completed_bytes
+                                        .checked_add(length)
+                                        .context("swarm transferred-byte counter overflow")?;
+                                }
+                                Err(_) => still_missing.push(hash),
+                            }
+                        }
+                        Ok::<_, anyhow::Error>((still_missing, completed, completed_bytes))
+                    })
+                    .await
+                    .context("local swarm retry inventory task failed")??;
+                if completed > 0 {
+                    used_sources.insert(source_idx);
+                }
+                transferred_chunks = transferred_chunks
+                    .checked_add(completed)
+                    .context("swarm transferred-chunk counter overflow")?;
+                transferred_bytes = transferred_bytes
+                    .checked_add(completed_bytes)
+                    .context("swarm transferred-byte counter overflow")?;
+                for hash in assigned_set
+                    .iter()
+                    .filter(|hash| !still_missing.contains(hash))
+                {
+                    remaining.remove(hash);
+                }
+                for hash in &still_missing {
+                    remaining.insert(*hash);
+                }
+                let mut retry_same_source = Vec::new();
+                let mut reassign = Vec::new();
+                for hash in still_missing {
+                    if !disabled[source_idx] && retried[source_idx].insert(hash) {
+                        retry_same_source.push(hash);
+                    } else {
+                        reassign.push(hash);
+                    }
+                }
+                queues[source_idx].extend(retry_same_source);
+                if !reassign.is_empty() {
+                    disabled[source_idx] = true;
+                    reassign.extend(queues[source_idx].drain(..));
+                    if source_error.is_none()
+                        && let Err(error) = reassign_swarm_hashes(
+                            &reassign,
+                            &peers,
+                            source_connections,
+                            &disabled,
+                            &mut queues,
+                        )
+                    {
+                        source_error = Some(error);
+                    }
+                }
+            }
+            Err(SwarmStoredFetchError::Local(error)) => {
+                if local_error.is_none() {
+                    local_error = Some(error);
+                }
+            }
+        }
+    }
+    let mut partial_source_ids: Vec<_> = used_sources
+        .iter()
+        .map(|source_idx| sources[*source_idx].id)
+        .collect();
+    partial_source_ids.sort();
+    let partial_fill = SwarmPartialFill {
+        transferred_bytes,
+        source_ids: partial_source_ids,
+    };
+
+    if let Some(error) = local_error {
+        return Err(anyhow::Error::new(LocalStorageError(error)));
+    }
+    if let Some(error) = source_error {
+        return Err(error.context(partial_fill));
+    }
+    if !(queues.iter().all(VecDeque::is_empty) && remaining.is_empty()) {
+        return Err(
+            anyhow::anyhow!("swarm fill left {} chunk(s) unresolved", remaining.len())
+                .context(partial_fill),
+        );
+    }
+    let verify_store = Arc::clone(&store);
+    tokio::task::spawn_blocking(move || {
+        for hash in hashes {
+            verify_store
+                .chunks()
+                .verify_bounded(hash, MAX_CHUNK_PAYLOAD_SIZE as usize)
+                .with_context(|| format!("swarm fill left chunk {hash} unavailable"))?;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .context("local swarm verification task failed")??;
+    let mut source_ids: Vec<_> = used_sources
+        .iter()
+        .map(|source_idx| sources[*source_idx].id)
+        .collect();
+    source_ids.sort();
+    Ok(SwarmFillReceipt {
+        transferred_chunks,
+        transferred_bytes,
+        sources_used: source_ids.len(),
+        source_ids,
+    })
+}
+
+fn reassign_swarm_hashes(
+    hashes: &[Hash32],
+    peers: &[PeerAvailability],
+    source_connections: &[(usize, EndpointAddr, Connection)],
+    disabled: &[bool],
+    queues: &mut [VecDeque<Hash32>],
+) -> Result<()> {
+    if hashes.is_empty() {
+        return Ok(());
+    }
+    let eligible: Vec<_> = peers
+        .iter()
+        .filter(|peer| {
+            source_connections.iter().any(|(index, source, _)| {
+                !disabled[*index] && swarm_source_id(source, *index) == peer.id
+            })
+        })
+        .cloned()
+        .collect();
+    let assignments = schedule_chunks(
+        hashes,
+        &eligible,
+        SchedulerLimits {
+            max_sources: eligible.len().min(8),
+            max_chunks_per_peer: hashes.len(),
+            max_assignments: hashes.len(),
+        },
+    );
+    ensure!(
+        assignments.len() == hashes.len(),
+        "swarm sources lack {} reassigned chunk(s)",
+        hashes.len().saturating_sub(assignments.len())
+    );
+    for assignment in assignments {
+        let source_idx = source_connections
+            .iter()
+            .find_map(|(index, source, _)| {
+                (!disabled[*index] && swarm_source_id(source, *index) == assignment.peer)
+                    .then_some(*index)
+            })
+            .context("reassigned swarm peer disappeared")?;
+        queues[source_idx].push_back(assignment.hash);
+    }
+    Ok(())
+}
+
+async fn complete_local_swarm_fill(
+    store: Arc<Store>,
+    hashes: &[Hash32],
+) -> Result<Option<SwarmFillReceipt>> {
+    ensure!(
+        hashes.len() <= MAX_CHUNKS_PER_FILE,
+        "swarm fill exceeds {MAX_CHUNKS_PER_FILE} hashes"
+    );
+    let unique: HashSet<_> = hashes.iter().copied().collect();
+    ensure!(
+        unique.len() == hashes.len(),
+        "swarm fill contains duplicate hashes"
+    );
+    let hashes = hashes.to_vec();
+    let complete = tokio::task::spawn_blocking(move || {
+        hashes.into_iter().all(|hash| {
+            store
+                .chunks()
+                .verify_bounded(hash, MAX_CHUNK_PAYLOAD_SIZE as usize)
+                .is_ok()
+        })
+    })
+    .await
+    .context("local swarm inventory task failed")?;
+    Ok(complete.then_some(SwarmFillReceipt {
+        transferred_chunks: 0,
+        transferred_bytes: 0,
+        sources_used: 0,
+        source_ids: Vec::new(),
+    }))
+}
+
+/// Fills missing hashes in a local CAS from multiple authorized V3 sources using an established endpoint.
+pub async fn swarm_fill_chunks_connected(
+    endpoint: &Endpoint,
+    sources: Vec<EndpointAddr>,
+    store: Arc<Store>,
+    hashes: Vec<Hash32>,
+) -> Result<SwarmFillReceipt> {
+    if let Some(receipt) = complete_local_swarm_fill(Arc::clone(&store), &hashes).await? {
+        return Ok(receipt);
+    }
+    let swarm = connect_swarm_sources(endpoint, sources).await?;
+    swarm.fill_chunks(store, hashes).await
+}
+
+/// Fills missing hashes in a local CAS from multiple authorized V3 sources.
+pub async fn swarm_fill_chunks(
+    secret_key: SecretKey,
+    sources: Vec<EndpointAddr>,
+    mode: NetworkMode,
+    store: Arc<Store>,
+    hashes: Vec<Hash32>,
+) -> Result<SwarmFillReceipt> {
+    if let Some(receipt) = complete_local_swarm_fill(Arc::clone(&store), &hashes).await? {
+        return Ok(receipt);
+    }
+    let endpoint = bind_endpoint(secret_key, mode, None, None).await?;
+    let outcome = swarm_fill_chunks_connected(&endpoint, sources, store, hashes).await;
+    endpoint.close().await;
+    outcome
+}
+
+async fn write_swarm_frame<T: Serialize>(send: &mut SendStream, value: &T) -> Result<()> {
+    tokio::time::timeout(SWARM_FETCH_TIMEOUT, write_frame(send, value))
+        .await
+        .context("swarm response frame write timed out")?
+}
+
 async fn write_frame<T: Serialize>(send: &mut SendStream, value: &T) -> Result<()> {
     let bytes = postcard::to_stdvec(value)?;
     ensure!(
@@ -3033,6 +4405,20 @@ async fn read_frame<T: DeserializeOwned>(receive: &mut RecvStream) -> Result<T> 
     let mut bytes = vec![0_u8; length];
     receive.read_exact(&mut bytes).await?;
     postcard::from_bytes(&bytes).context("malformed control frame")
+}
+
+fn swarm_availability_total_timeout(hash_count: usize) -> Duration {
+    let pages = hash_count.div_ceil(SWARM_MAX_AVAILABILITY).max(1);
+    let page_budget =
+        SWARM_AVAILABILITY_PAGE_TIMEOUT.saturating_mul(u32::try_from(pages).unwrap_or(u32::MAX));
+    SWARM_AVAILABILITY_TOTAL_TIMEOUT.min(page_budget.saturating_add(SWARM_CONNECT_TIMEOUT))
+}
+
+fn swarm_source_id(source: &EndpointAddr, index: usize) -> Hash32 {
+    let mut tagged = Vec::with_capacity(source.id.as_bytes().len() + 8);
+    tagged.extend_from_slice(source.id.as_bytes());
+    tagged.extend_from_slice(&(index as u64).to_le_bytes());
+    Hash32::digest(&tagged)
 }
 
 fn public_error_message(error: &anyhow::Error) -> &'static str {
@@ -3066,6 +4452,9 @@ fn public_error_message(error: &anyhow::Error) -> &'static str {
         }
     }
     match error.to_string().as_str() {
+        "incoming record advances the local replica counter" => {
+            "Incoming record advances the local replica counter; refresh the snapshot and reconcile before retrying."
+        }
         "incoming record is causally stale" => {
             "Incoming record is causally stale; refresh the snapshot and reconcile before retrying."
         }
@@ -3086,7 +4475,7 @@ fn public_error_message(error: &anyhow::Error) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, fs};
+    use std::{collections::HashSet, fs, io};
 
     use deltaweave_core::{SYNC_RECORD_SCHEMA_V1, VersionVector};
     use tempfile::TempDir;
@@ -3322,6 +4711,11 @@ mod tests {
             hash: Hash32::digest(&bytes),
         };
         VerifiedChunk::validate(&descriptor, bytes).expect("test chunk validates")
+    }
+
+    fn test_chunk_path(state: &Path, hash: Hash32) -> PathBuf {
+        let encoded = hash.to_hex();
+        state.join("chunks").join(&encoded[..2]).join(&encoded[2..])
     }
 
     fn version(label: &[u8], counter: u64) -> VersionVector {
@@ -3766,7 +5160,10 @@ mod tests {
     async fn chunk_writer_rechecks_disk_reserve_before_persistence() {
         let state = TempDir::new().expect("state");
         let store = Arc::new(Store::open(state.path()).expect("store"));
-        let reserve = fs2::available_space(state.path()).expect("free space");
+        // Other tests/builds may release disk space after a live measurement.
+        // An impossible reserve proves that the writer checks admission without
+        // relying on unrelated filesystem activity staying constant.
+        let reserve = u64::MAX;
         let mut writer = ChunkWritePipeline::with_admission(
             Arc::clone(&store),
             1,
@@ -3939,6 +5336,120 @@ mod tests {
                 bytes
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_task_drain_waits_for_all_tasks_after_join_error() {
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let delayed_completed = Arc::clone(&completed);
+        let failed = tokio::spawn(async { panic!("expected stream failure") });
+        let delayed = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            delayed_completed.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let result = await_swarm_tasks(vec![failed, delayed]).await;
+
+        assert!(result.is_err());
+        assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn full_availability_query_bound_supports_maximum_hash_count() {
+        assert_eq!(
+            swarm_availability_total_timeout(MAX_CHUNKS_PER_FILE),
+            SWARM_AVAILABILITY_TOTAL_TIMEOUT
+        );
+        assert_eq!(
+            swarm_availability_total_timeout(SWARM_MAX_AVAILABILITY),
+            SWARM_AVAILABILITY_PAGE_TIMEOUT + SWARM_CONNECT_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn swarm_partial_fill_survives_error_context() {
+        let partial = SwarmPartialFill {
+            transferred_bytes: 4096,
+            source_ids: vec![SecretKey::generate().public()],
+        };
+        let error = anyhow::anyhow!("source failed").context(partial.clone());
+
+        assert_eq!(swarm_partial_fill(&error), Some(partial));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn chunk_writer_drains_after_a_transfer_error() {
+        let state = TempDir::new().expect("state directory can be created");
+        let store = Arc::new(Store::open(state.path()).expect("store can open"));
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let delayed_completed = Arc::clone(&completed);
+        let mut writer = ChunkWritePipeline::new(store, 2);
+        writer.inflight.push(InflightWrite {
+            bytes: 0,
+            task: tokio::task::spawn_blocking(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                delayed_completed.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(1)
+            }),
+        });
+
+        let result = writer
+            .finish_after::<()>(Err(anyhow::anyhow!("expected transfer failure")))
+            .await;
+
+        assert!(result.is_err());
+        assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn chunk_writer_prioritizes_local_failure_over_transfer_failure() {
+        let state = TempDir::new().expect("state directory can be created");
+        let store = Arc::new(Store::open(state.path()).expect("store can open"));
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let delayed_completed = Arc::clone(&completed);
+        let mut writer = ChunkWritePipeline::new(store, 2);
+        writer.inflight.push(InflightWrite {
+            bytes: 0,
+            task: tokio::task::spawn_blocking(|| {
+                Err(
+                    io::Error::new(io::ErrorKind::StorageFull, "expected durable write failure")
+                        .into(),
+                )
+            }),
+        });
+        writer.inflight.push(InflightWrite {
+            bytes: 0,
+            task: tokio::task::spawn_blocking(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                delayed_completed.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(1)
+            }),
+        });
+
+        let error = writer
+            .finish_after::<()>(Err(anyhow::anyhow!("expected transfer failure")))
+            .await
+            .expect_err("durable failure remains primary");
+
+        assert!(is_swarm_local_storage_error(&error));
+        assert!(format!("{error:#}").contains("expected durable write failure"));
+        assert!(format!("{error:#}").contains("expected transfer failure"));
+        assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn swarm_chunk_outcomes_require_one_exact_result_per_request() {
+        let first = Hash32::digest(b"first");
+        let second = Hash32::digest(b"second");
+        let requested = HashSet::from([first, second]);
+
+        assert!(validate_swarm_chunk_outcomes(&requested, &[first], &[second]).is_ok());
+        assert!(validate_swarm_chunk_outcomes(&requested, &[], &[]).is_err());
+        assert!(validate_swarm_chunk_outcomes(&requested, &[first, first], &[second]).is_err());
+        assert!(
+            validate_swarm_chunk_outcomes(&requested, &[first], &[Hash32::digest(b"unrequested")],)
+                .is_err()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4373,6 +5884,650 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn swarm_v3_reports_exact_chunk_availability() {
+        let state = TempDir::new().expect("state directory can be created");
+        let destination = TempDir::new().expect("destination can be created");
+        let present = fixture(96 * 1024);
+        let present_hash = Hash32::digest(&present);
+        let missing_hash = Hash32::digest(b"absent availability chunk");
+        {
+            let store = Store::open(state.path()).expect("store can open");
+            store
+                .chunks()
+                .put_verified(present_hash, &present)
+                .expect("seed chunk can be stored");
+        }
+        let client_key = SecretKey::generate();
+        let server = start_server(ServerConfig {
+            secret_key: SecretKey::generate(),
+            destination_root: destination.path().to_path_buf(),
+            state_root: state.path().to_path_buf(),
+            peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
+            network_mode: NetworkMode::DirectOnly,
+            bind_address: None,
+            max_connections: 8,
+            min_free_space_bytes: 0,
+        })
+        .await
+        .expect("server can start");
+
+        let available = swarm_availability(
+            client_key,
+            server.endpoint_addr(),
+            NetworkMode::DirectOnly,
+            vec![present_hash, missing_hash],
+        )
+        .await
+        .expect("authorized peer can query availability");
+
+        assert_eq!(available, vec![true, false]);
+        server.shutdown().await.expect("server shuts down");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn swarm_v3_rejects_duplicate_availability_hashes_before_cas_verification() {
+        let state = TempDir::new().expect("state directory can be created");
+        let destination = TempDir::new().expect("destination can be created");
+        let client_key = SecretKey::generate();
+        let server = start_server(ServerConfig {
+            secret_key: SecretKey::generate(),
+            destination_root: destination.path().to_path_buf(),
+            state_root: state.path().to_path_buf(),
+            peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
+            network_mode: NetworkMode::DirectOnly,
+            bind_address: None,
+            max_connections: 8,
+            min_free_space_bytes: 0,
+        })
+        .await
+        .expect("server can start");
+        let hash = Hash32::digest(b"duplicate availability hash");
+        let chunk_path = test_chunk_path(state.path(), hash);
+        fs::create_dir_all(chunk_path.parent().expect("chunk has parent"))
+            .expect("invalid CAS fixture parent can be created");
+        fs::create_dir(&chunk_path).expect("invalid CAS fixture can be created");
+
+        let endpoint = bind_endpoint(client_key, NetworkMode::DirectOnly, None, None)
+            .await
+            .expect("client endpoint can bind");
+        let connection = endpoint
+            .connect(server.endpoint_addr(), ALPN_SWARM_V3)
+            .await
+            .expect("authorized client can connect");
+        let (mut send, mut receive) = connection
+            .open_bi()
+            .await
+            .expect("availability stream can open");
+        write_frame(
+            &mut send,
+            &SwarmWireRequest::Availability {
+                hashes: vec![hash, hash],
+            },
+        )
+        .await
+        .expect("duplicate request frame can be sent");
+        send.finish().expect("duplicate request can finish");
+
+        read_frame::<SwarmWireResponse>(&mut receive)
+            .await
+            .expect_err("server rejects duplicate availability hashes");
+        assert!(chunk_path.is_dir());
+        connection.close(0_u8.into(), b"duplicate request rejected");
+        endpoint.close().await;
+        server.shutdown().await.expect("server shuts down");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn swarm_v3_retries_not_have_chunks_on_another_source() {
+        let client_key = SecretKey::generate();
+        let bytes = fixture(96 * 1024);
+        let hash = Hash32::digest(&bytes);
+        let mut servers = Vec::new();
+
+        for has_chunk in [false, true] {
+            let state = TempDir::new().expect("server state can be created");
+            let destination = TempDir::new().expect("server destination can be created");
+            if has_chunk {
+                let store = Store::open(state.path()).expect("server store can open");
+                store
+                    .chunks()
+                    .put_verified(hash, &bytes)
+                    .expect("source chunk can be stored");
+            }
+            let server = start_server(ServerConfig {
+                secret_key: SecretKey::generate(),
+                destination_root: destination.path().to_path_buf(),
+                state_root: state.path().to_path_buf(),
+                peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
+                network_mode: NetworkMode::DirectOnly,
+                bind_address: None,
+                max_connections: 8,
+                min_free_space_bytes: 0,
+            })
+            .await
+            .expect("swarm source can start");
+            servers.push((server, state, destination));
+        }
+
+        let local = TempDir::new().expect("local state can be created");
+        let local_store = Arc::new(Store::open(local.path()).expect("local store can open"));
+        let result = swarm_fill_chunks(
+            client_key,
+            servers
+                .iter()
+                .map(|(server, _, _)| server.endpoint_addr())
+                .collect(),
+            NetworkMode::DirectOnly,
+            Arc::clone(&local_store),
+            vec![hash],
+        )
+        .await
+        .expect("missing chunk is retried on second source");
+
+        assert_eq!(result.transferred_chunks, 1);
+        assert_eq!(local_store.chunks().read_verified(hash).unwrap(), bytes);
+        for (server, _, _) in servers {
+            server.shutdown().await.expect("source shuts down");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn swarm_v3_session_endpoint_reuses_connection_for_fill() {
+        let client_key = SecretKey::generate();
+        let first = fixture(96 * 1024);
+        let second = fixture(128 * 1024 + 7);
+        let first_hash = Hash32::digest(&first);
+        let second_hash = Hash32::digest(&second);
+        let mut servers = Vec::new();
+
+        for (bytes, hash) in [(&first, first_hash), (&second, second_hash)] {
+            let state = TempDir::new().expect("server state can be created");
+            let destination = TempDir::new().expect("server destination can be created");
+            {
+                let store = Store::open(state.path()).expect("server store can open");
+                store
+                    .chunks()
+                    .put_verified(hash, bytes)
+                    .expect("source chunk can be stored");
+            }
+            let server = start_server(ServerConfig {
+                secret_key: SecretKey::generate(),
+                destination_root: destination.path().to_path_buf(),
+                state_root: state.path().to_path_buf(),
+                peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
+                network_mode: NetworkMode::DirectOnly,
+                bind_address: None,
+                max_connections: 8,
+                min_free_space_bytes: 0,
+            })
+            .await
+            .expect("swarm source can start");
+            servers.push((server, state, destination));
+        }
+
+        let local = TempDir::new().expect("local state can be created");
+        let local_store = Arc::new(Store::open(local.path()).expect("local store can open"));
+        let client = SyncClient {
+            secret_key: client_key,
+            remote: servers[0].0.endpoint_addr(),
+            network_mode: NetworkMode::DirectOnly,
+        };
+        let session = client.open_session().await.expect("session opens");
+        let sources: Vec<_> = servers
+            .iter()
+            .map(|(server, _, _)| server.endpoint_addr())
+            .collect();
+        let swarm = session
+            .connect_swarm_sources(sources)
+            .await
+            .expect("swarm sources connect through the session endpoint");
+        let result = swarm
+            .fill_chunks(Arc::clone(&local_store), vec![first_hash, second_hash])
+            .await
+            .expect("preconnected swarm fill succeeds");
+        session.close().await;
+
+        assert_eq!(result.transferred_chunks, 2);
+        assert_eq!(result.sources_used, 2);
+        assert_eq!(
+            local_store.chunks().read_verified(first_hash).unwrap(),
+            first
+        );
+        assert_eq!(
+            local_store.chunks().read_verified(second_hash).unwrap(),
+            second
+        );
+
+        for (server, _, _) in servers {
+            server.shutdown().await.expect("source shuts down");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn swarm_v3_balances_mirrored_chunks_across_all_sources() {
+        let client_key = SecretKey::generate();
+        let chunks: Vec<_> = (0..32)
+            .map(|index| {
+                let bytes = fixture(64 * 1024 + index);
+                (Hash32::digest(&bytes), bytes)
+            })
+            .collect();
+        let mut servers = Vec::new();
+
+        for _ in 0..2 {
+            let state = TempDir::new().expect("server state can be created");
+            let destination = TempDir::new().expect("server destination can be created");
+            {
+                let store = Store::open(state.path()).expect("server store can open");
+                for (hash, bytes) in &chunks {
+                    store
+                        .chunks()
+                        .put_verified(*hash, bytes)
+                        .expect("mirrored chunk can be stored");
+                }
+            }
+            let server = start_server(ServerConfig {
+                secret_key: SecretKey::generate(),
+                destination_root: destination.path().to_path_buf(),
+                state_root: state.path().to_path_buf(),
+                peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
+                network_mode: NetworkMode::DirectOnly,
+                bind_address: None,
+                max_connections: 8,
+                min_free_space_bytes: 0,
+            })
+            .await
+            .expect("mirrored source can start");
+            servers.push((server, state, destination));
+        }
+
+        let local = TempDir::new().expect("local state can be created");
+        let local_store = Arc::new(Store::open(local.path()).expect("local store can open"));
+        let receipt = swarm_fill_chunks(
+            client_key,
+            servers
+                .iter()
+                .map(|(server, _, _)| server.endpoint_addr())
+                .collect(),
+            NetworkMode::DirectOnly,
+            Arc::clone(&local_store),
+            chunks.iter().map(|(hash, _)| *hash).collect(),
+        )
+        .await
+        .expect("mirrored swarm fill succeeds");
+
+        assert_eq!(receipt.transferred_chunks, chunks.len());
+        assert_eq!(receipt.sources_used, 2);
+        for (hash, bytes) in chunks {
+            assert_eq!(local_store.chunks().read_verified(hash).unwrap(), bytes);
+        }
+        for (server, _, _) in servers {
+            server.shutdown().await.expect("source shuts down");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn swarm_v3_fetches_available_chunks_before_partial_fallback() {
+        let client_key = SecretKey::generate();
+        let available_bytes = fixture(96 * 1024);
+        let available_hash = Hash32::digest(&available_bytes);
+        let unavailable_hash = Hash32::digest(b"unavailable swarm chunk");
+        let source_state = TempDir::new().expect("source state can be created");
+        let source_destination = TempDir::new().expect("source destination can be created");
+        {
+            let store = Store::open(source_state.path()).expect("source store can open");
+            store
+                .chunks()
+                .put_verified(available_hash, &available_bytes)
+                .expect("available chunk can be stored");
+        }
+        let server = start_server(ServerConfig {
+            secret_key: SecretKey::generate(),
+            destination_root: source_destination.path().to_path_buf(),
+            state_root: source_state.path().to_path_buf(),
+            peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
+            network_mode: NetworkMode::DirectOnly,
+            bind_address: None,
+            max_connections: 8,
+            min_free_space_bytes: 0,
+        })
+        .await
+        .expect("partial source can start");
+        let local = TempDir::new().expect("local state can be created");
+        let local_store = Arc::new(Store::open(local.path()).expect("local store can open"));
+
+        let error = swarm_fill_chunks(
+            client_key,
+            vec![server.endpoint_addr()],
+            NetworkMode::DirectOnly,
+            Arc::clone(&local_store),
+            vec![available_hash, unavailable_hash],
+        )
+        .await
+        .expect_err("incomplete source returns partial progress");
+        let partial = swarm_partial_fill(&error).expect("partial progress is preserved");
+
+        assert_eq!(partial.transferred_bytes, available_bytes.len() as u64);
+        assert_eq!(partial.source_ids, vec![server.endpoint_addr().id]);
+        assert_eq!(
+            local_store.chunks().read_verified(available_hash).unwrap(),
+            available_bytes
+        );
+        assert!(!local_store.chunks().contains(unavailable_hash));
+        server.shutdown().await.expect("source shuts down");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn swarm_v3_downloads_from_two_sources_into_local_cas() {
+        let client_key = SecretKey::generate();
+        let first = fixture(96 * 1024);
+        let second = fixture(128 * 1024 + 7);
+        let first_hash = Hash32::digest(&first);
+        let second_hash = Hash32::digest(&second);
+        let mut servers = Vec::new();
+
+        for (bytes, hash) in [(&first, first_hash), (&second, second_hash)] {
+            let state = TempDir::new().expect("server state can be created");
+            let destination = TempDir::new().expect("server destination can be created");
+            {
+                let store = Store::open(state.path()).expect("server store can open");
+                store
+                    .chunks()
+                    .put_verified(hash, bytes)
+                    .expect("source chunk can be stored");
+            }
+            let server = start_server(ServerConfig {
+                secret_key: SecretKey::generate(),
+                destination_root: destination.path().to_path_buf(),
+                state_root: state.path().to_path_buf(),
+                peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
+                network_mode: NetworkMode::DirectOnly,
+                bind_address: None,
+                max_connections: 8,
+                min_free_space_bytes: 0,
+            })
+            .await
+            .expect("swarm source can start");
+            servers.push((server, state, destination));
+        }
+
+        let local = TempDir::new().expect("local state can be created");
+        let local_store = Arc::new(Store::open(local.path()).expect("local store can open"));
+        let result = swarm_fill_chunks(
+            client_key,
+            servers
+                .iter()
+                .map(|(server, _, _)| server.endpoint_addr())
+                .collect(),
+            NetworkMode::DirectOnly,
+            Arc::clone(&local_store),
+            vec![first_hash, second_hash],
+        )
+        .await
+        .expect("two-source swarm fill succeeds");
+
+        assert_eq!(result.transferred_chunks, 2);
+        assert_eq!(result.sources_used, 2);
+        assert_eq!(
+            result.transferred_bytes,
+            (first.len() + second.len()) as u64
+        );
+        assert_eq!(
+            local_store
+                .chunks()
+                .read_verified(first_hash)
+                .expect("first swarm chunk stored"),
+            first
+        );
+        assert_eq!(
+            local_store
+                .chunks()
+                .read_verified(second_hash)
+                .expect("second swarm chunk stored"),
+            second
+        );
+        for (server, _, _) in servers {
+            server.shutdown().await.expect("source shuts down");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn swarm_v3_replaces_a_corrupt_local_cas_chunk() {
+        let client_key = SecretKey::generate();
+        let source_state = TempDir::new().expect("source state can be created");
+        let source_destination = TempDir::new().expect("source destination can be created");
+        let bytes = fixture(96 * 1024);
+        let hash = Hash32::digest(&bytes);
+        let source_store = Store::open(source_state.path()).expect("source store can open");
+        source_store
+            .chunks()
+            .put_verified(hash, &bytes)
+            .expect("source chunk can be stored");
+        drop(source_store);
+        let server = start_server(ServerConfig {
+            secret_key: SecretKey::generate(),
+            destination_root: source_destination.path().to_path_buf(),
+            state_root: source_state.path().to_path_buf(),
+            peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
+            network_mode: NetworkMode::DirectOnly,
+            bind_address: None,
+            max_connections: 8,
+            min_free_space_bytes: 0,
+        })
+        .await
+        .expect("source server can start");
+        let local_state = TempDir::new().expect("local state can be created");
+        let local_store = Arc::new(Store::open(local_state.path()).expect("local store can open"));
+        local_store
+            .chunks()
+            .put_verified(hash, &bytes)
+            .expect("local chunk can be seeded");
+        fs::write(test_chunk_path(local_state.path(), hash), b"corrupt")
+            .expect("local chunk can be corrupted");
+
+        let result = swarm_fill_chunks(
+            client_key,
+            vec![server.endpoint_addr()],
+            NetworkMode::DirectOnly,
+            Arc::clone(&local_store),
+            vec![hash],
+        )
+        .await
+        .expect("corrupt local chunk is fetched again");
+
+        assert_eq!(result.transferred_chunks, 1);
+        assert_eq!(local_store.chunks().read_verified(hash).unwrap(), bytes);
+        server.shutdown().await.expect("source shuts down");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn swarm_v3_fetches_multiple_valid_large_chunks() {
+        let client_key = SecretKey::generate();
+        let source_state = TempDir::new().expect("source state can be created");
+        let source_destination = TempDir::new().expect("source destination can be created");
+        let first = fixture(9 * 1024 * 1024);
+        let second = fixture(9 * 1024 * 1024 + 1);
+        let first_hash = Hash32::digest(&first);
+        let second_hash = Hash32::digest(&second);
+        let source_store = Store::open(source_state.path()).expect("source store can open");
+        source_store
+            .chunks()
+            .put_verified(first_hash, &first)
+            .expect("first source chunk can be stored");
+        source_store
+            .chunks()
+            .put_verified(second_hash, &second)
+            .expect("second source chunk can be stored");
+        drop(source_store);
+        let server = start_server(ServerConfig {
+            secret_key: SecretKey::generate(),
+            destination_root: source_destination.path().to_path_buf(),
+            state_root: source_state.path().to_path_buf(),
+            peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
+            network_mode: NetworkMode::DirectOnly,
+            bind_address: None,
+            max_connections: 8,
+            min_free_space_bytes: 0,
+        })
+        .await
+        .expect("source server can start");
+
+        let fetched = swarm_get_chunks(
+            client_key,
+            server.endpoint_addr(),
+            NetworkMode::DirectOnly,
+            vec![first_hash, second_hash],
+        )
+        .await
+        .expect("multiple protocol-valid large chunks are accepted");
+
+        assert_eq!(
+            fetched.chunks,
+            vec![(first_hash, first), (second_hash, second)]
+        );
+        server.shutdown().await.expect("source shuts down");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn swarm_v3_reports_corrupt_source_cas_as_missing() {
+        let state = TempDir::new().expect("state directory can be created");
+        let destination = TempDir::new().expect("destination can be created");
+        let bytes = fixture(96 * 1024);
+        let hash = Hash32::digest(&bytes);
+        let store = Store::open(state.path()).expect("store can open");
+        store
+            .chunks()
+            .put_verified(hash, &bytes)
+            .expect("seed chunk can be stored");
+        fs::write(test_chunk_path(state.path(), hash), b"corrupt")
+            .expect("seed chunk can be corrupted");
+        drop(store);
+        let client_key = SecretKey::generate();
+        let server = start_server(ServerConfig {
+            secret_key: SecretKey::generate(),
+            destination_root: destination.path().to_path_buf(),
+            state_root: state.path().to_path_buf(),
+            peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
+            network_mode: NetworkMode::DirectOnly,
+            bind_address: None,
+            max_connections: 8,
+            min_free_space_bytes: 0,
+        })
+        .await
+        .expect("server can start");
+
+        let available = swarm_availability(
+            client_key.clone(),
+            server.endpoint_addr(),
+            NetworkMode::DirectOnly,
+            vec![hash],
+        )
+        .await
+        .expect("availability query completes");
+        let fetched = swarm_get_chunks(
+            client_key,
+            server.endpoint_addr(),
+            NetworkMode::DirectOnly,
+            vec![hash],
+        )
+        .await
+        .expect("corrupt source chunk is classified missing");
+
+        assert_eq!(available, vec![false]);
+        assert!(fetched.chunks.is_empty());
+        assert_eq!(fetched.missing, vec![hash]);
+        server.shutdown().await.expect("server shuts down");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn swarm_v3_serves_only_verified_local_cas_chunks() {
+        let state = TempDir::new().expect("state directory can be created");
+        let destination = TempDir::new().expect("destination can be created");
+        let present = fixture(96 * 1024);
+        let present_hash = Hash32::digest(&present);
+        let missing_hash = Hash32::digest(b"absent swarm chunk");
+        {
+            let store = Store::open(state.path()).expect("store can open");
+            store
+                .chunks()
+                .put_verified(present_hash, &present)
+                .expect("seed chunk can be stored");
+        }
+        let authorized_key = SecretKey::generate();
+        let server = start_server(ServerConfig {
+            secret_key: SecretKey::generate(),
+            destination_root: destination.path().to_path_buf(),
+            state_root: state.path().to_path_buf(),
+            peer_policy: PeerPolicy::AllowListed(HashSet::from([authorized_key.public()])),
+            network_mode: NetworkMode::DirectOnly,
+            bind_address: None,
+            max_connections: 8,
+            min_free_space_bytes: 0,
+        })
+        .await
+        .expect("server can start");
+
+        let fetched = swarm_get_chunks(
+            authorized_key.clone(),
+            server.endpoint_addr(),
+            NetworkMode::DirectOnly,
+            vec![present_hash, missing_hash],
+        )
+        .await
+        .expect("authorized swarm peer can request chunks");
+        assert_eq!(fetched.chunks, vec![(present_hash, present)]);
+        assert_eq!(fetched.missing, vec![missing_hash]);
+
+        let rejected = swarm_get_chunks(
+            SecretKey::generate(),
+            server.endpoint_addr(),
+            NetworkMode::DirectOnly,
+            vec![present_hash],
+        )
+        .await;
+        assert!(rejected.is_err());
+        server.shutdown().await.expect("server shuts down");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn swarm_v3_hello_requires_an_authorized_peer() {
+        let state = TempDir::new().expect("state directory can be created");
+        let destination = TempDir::new().expect("destination can be created");
+        let authorized_key = SecretKey::generate();
+        let server = start_server(ServerConfig {
+            secret_key: SecretKey::generate(),
+            destination_root: destination.path().to_path_buf(),
+            state_root: state.path().to_path_buf(),
+            peer_policy: PeerPolicy::AllowListed(HashSet::from([authorized_key.public()])),
+            network_mode: NetworkMode::DirectOnly,
+            bind_address: None,
+            max_connections: 8,
+            min_free_space_bytes: 0,
+        })
+        .await
+        .expect("server can start");
+
+        let hello = swarm_hello(
+            authorized_key,
+            server.endpoint_addr(),
+            NetworkMode::DirectOnly,
+        )
+        .await
+        .expect("authorized swarm peer completes hello");
+        assert_eq!(hello.protocol_version, 3);
+        assert_eq!(hello.max_inflight, 8);
+
+        let rejected = swarm_hello(
+            SecretKey::generate(),
+            server.endpoint_addr(),
+            NetworkMode::DirectOnly,
+        )
+        .await;
+        assert!(rejected.is_err());
+        server.shutdown().await.expect("server shuts down");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unauthorized_peer_is_rejected() {
         let state = TempDir::new().expect("state directory can be created");
         let destination = TempDir::new().expect("destination can be created");
@@ -4748,6 +6903,116 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reconciliation_v2_manifest_only_pull_transfers_zero_payload() {
+        let server_state = TempDir::new().expect("server state can be created");
+        let server_root = TempDir::new().expect("server root can be created");
+        let bytes = fixture(2 * 1024 * 1024 + 97);
+        fs::write(server_root.path().join("remote.bin"), &bytes).expect("seed file can be written");
+        let client_key = SecretKey::generate();
+        let server = start_server(ServerConfig {
+            secret_key: SecretKey::generate(),
+            destination_root: server_root.path().to_path_buf(),
+            state_root: server_state.path().to_path_buf(),
+            peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
+            network_mode: NetworkMode::DirectOnly,
+            bind_address: None,
+            max_connections: 8,
+            min_free_space_bytes: 0,
+        })
+        .await
+        .expect("server can start");
+        let client = SyncClient {
+            secret_key: client_key,
+            remote: server.endpoint_addr(),
+            network_mode: NetworkMode::DirectOnly,
+        };
+        let empty =
+            MerkleTree::from_records(Vec::<SyncRecord>::new()).expect("empty Merkle tree is valid");
+        let snapshot = client
+            .fetch_snapshot(&empty)
+            .await
+            .expect("remote snapshot can be fetched");
+        let record = snapshot
+            .records
+            .into_iter()
+            .find(|record| record.path.as_str() == "remote.bin")
+            .expect("snapshot contains remote file");
+
+        let receipt = client
+            .pull_manifest(record.clone())
+            .await
+            .expect("manifest-only pull succeeds");
+
+        assert_eq!(receipt.record, record);
+        assert_eq!(receipt.manifest.file_hash, Hash32::digest(&bytes));
+        assert_eq!(receipt.transferred_bytes, 0);
+        assert_eq!(receipt.reused_extents, receipt.manifest.chunks.len());
+        server.shutdown().await.expect("server shuts down");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reconciliation_v2_rejects_receiver_counter_poisoning() {
+        let server_state = TempDir::new().expect("server state can be created");
+        let server_root = TempDir::new().expect("server root can be created");
+        let client_key = SecretKey::generate();
+        let server_key = SecretKey::generate();
+        let receiver_replica = ReplicaId(Hash32::digest(server_key.public().as_bytes()));
+        let server = start_server(ServerConfig {
+            secret_key: server_key,
+            destination_root: server_root.path().to_path_buf(),
+            state_root: server_state.path().to_path_buf(),
+            peer_policy: PeerPolicy::AllowListed(HashSet::from([client_key.public()])),
+            network_mode: NetworkMode::DirectOnly,
+            bind_address: None,
+            max_connections: 8,
+            min_free_space_bytes: 0,
+        })
+        .await
+        .expect("server can start");
+        let client = SyncClient {
+            secret_key: client_key,
+            remote: server.endpoint_addr(),
+            network_mode: NetworkMode::DirectOnly,
+        };
+        let poisoned_path = WirePath::new("poisoned").expect("path is portable");
+        let mut poisoned_version = VersionVector::default();
+        poisoned_version.observe(receiver_replica, u64::MAX);
+        let poisoned = SyncRecord {
+            schema_version: SYNC_RECORD_SCHEMA_V1,
+            path: poisoned_path.clone(),
+            kind: SyncEntryKind::Directory,
+            size: 0,
+            content_hash: None,
+            readonly: false,
+            version: poisoned_version,
+            tombstone: false,
+        };
+
+        let error = client
+            .apply_metadata(poisoned)
+            .await
+            .expect_err("receiver-local counter poisoning is rejected");
+        assert!(error.to_string().contains("local replica counter"));
+        assert!(!server_root.path().join(poisoned_path.as_str()).exists());
+
+        fs::write(server_root.path().join("local.txt"), b"local")
+            .expect("normal local change can be written");
+        let empty =
+            MerkleTree::from_records(Vec::<SyncRecord>::new()).expect("empty tree is valid");
+        let snapshot = client
+            .fetch_snapshot(&empty)
+            .await
+            .expect("normal local scan remains functional");
+        let local = snapshot
+            .records
+            .iter()
+            .find(|record| record.path.as_str() == "local.txt")
+            .expect("local change is indexed");
+        assert_eq!(local.version.get(receiver_replica), 1);
+        server.shutdown().await.expect("server shuts down");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn reconciliation_v2_covers_snapshot_delta_pull_causal_push_and_metadata() {
         let server_state = TempDir::new().expect("server state can be created");
         let server_root = TempDir::new().expect("server root can be created");
@@ -5049,3 +7314,6 @@ mod tests {
             });
     }
 }
+
+#[cfg(test)]
+mod swarm_integration_tests;

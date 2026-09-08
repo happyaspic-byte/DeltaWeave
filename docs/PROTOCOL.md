@@ -195,4 +195,49 @@ the next reconciliation attempt.
 
 Receiver error responses use bounded, static recovery guidance. Internal absolute
 paths and raw storage errors are not transmitted in those responses or copied into
-receiver failure logs. The message schemas and ALPN identifiers are unchanged.
+receiver failure logs. The v2 message schemas and ALPN identifier are unchanged.
+
+## CAS swarm protocol v3
+
+ALPN `deltaweave/sync/3` is a content-plane protocol. It cannot mutate paths,
+version vectors, Merkle state, conflict winners, or apply order. Existing v2
+reconciliation remains the state-plane authority.
+
+The receiver evaluates the authenticated endpoint ID against the same allow-list
+before accepting any stream. An authorized peer may then use:
+
+1. `Hello { protocol_version: 3 }` → `HelloOk { protocol_version, max_inflight }`
+2. `Availability { hashes }` → one exact boolean per requested hash
+3. `GetChunks { hashes }` → `Chunks { present, missing }`, followed by one
+   `ChunkHeader` and exact payload for each present hash
+
+Availability is exact rather than probabilistic. `GetChunks` serves only content
+already present in the local CAS; it never fetches on behalf of the requester.
+Each returned payload is rehashed by the client before durable CAS admission.
+
+### Swarm resource limits
+
+| Limit | v3 value |
+| --- | ---: |
+| Sources per fill | 8 |
+| Availability hashes | 4,096 |
+| Chunk hashes per request | 64 |
+| Scheduler assignments per pass | 64 |
+| Active overlay at 1 / 10 / 100 / 1,000 peers | 1 / 6 / 8 / 12 |
+| Passive overlay maximum | 64 |
+
+The scheduler processes rarest hashes first, then minimizes peer RTT, queued-byte
+cost, and failure penalty. Source selection affects throughput only; BLAKE3 and
+final v2 Merkle verification remain the correctness gates.
+
+The experimental `swarm-fill` command exposes CAS filling for benchmarking. It
+requires one direct address per peer and does not publish a file into the sync
+root.
+
+`sync-once` and `sync` may optionally list up to eight authorized V3 sources
+with matching `--swarm-peer` / `--swarm-direct` arguments. The authoritative
+v2 peer still supplies the causal `SyncRecord` and FastCDC manifest. Missing
+CAS hashes are filled from those V3 sources, then existing v2 materialization,
+causal apply, and final Merkle verification run unchanged. If swarm filling
+cannot complete every required hash, the client falls back to a full v2
+content pull from the authoritative peer.

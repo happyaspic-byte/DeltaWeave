@@ -394,6 +394,17 @@ impl LocalIndex {
         &self.ignored_paths
     }
 
+    /// Returns this index's authoritative local replica identity.
+    #[must_use]
+    pub const fn replica(&self) -> ReplicaId {
+        self.replica
+    }
+
+    /// Returns the durable logical counter for this index's local replica.
+    pub fn replica_counter(&self) -> Result<u64> {
+        self.metadata_value(REPLICA_COUNTER_KEY)
+    }
+
     /// Performs a complete scan and atomically commits all safe observations.
     pub fn scan(&self) -> Result<ScanReport> {
         self.scan_internal(None)
@@ -589,7 +600,7 @@ impl LocalIndex {
                 && Some(observation.file_hash()) == record.content_hash,
             "materialization observation does not match causal record"
         );
-        self.commit_adopted_record(record, Some(observation), None)
+        self.commit_remote_record(record, Some(observation), None)
     }
 
     /// Adopts a verified filesystem state with the exact causal version received from peers.
@@ -599,7 +610,7 @@ impl LocalIndex {
     /// being attached to bytes that were not actually installed.
     pub fn adopt_verified_record(&self, record: &SyncRecord) -> Result<()> {
         record.validate()?;
-        self.commit_adopted_record(record, None, None)
+        self.commit_remote_record(record, None, None)
     }
 
     /// A dedicated bounded opaque slot for owner-share causal ceilings/provenance.
@@ -635,7 +646,7 @@ impl LocalIndex {
             metadata.len() <= MAX_SHARE_METADATA,
             "share metadata exceeds size limit"
         );
-        self.commit_adopted_record(record, None, Some(metadata))
+        self.commit_remote_record(record, None, Some(metadata))
     }
 
     /// Atomically adopts a materialized file and its bounded owner authorization metadata.
@@ -659,7 +670,22 @@ impl LocalIndex {
             metadata.len() <= MAX_SHARE_METADATA,
             "share metadata exceeds size limit"
         );
-        self.commit_adopted_record(record, Some(observation), Some(metadata))
+        self.commit_remote_record(record, Some(observation), Some(metadata))
+    }
+
+    fn commit_remote_record(
+        &self,
+        record: &SyncRecord,
+        observation: Option<&MaterializationObservation>,
+        share_metadata: Option<&[u8]>,
+    ) -> Result<()> {
+        // All peer-record adoption paths share this boundary, including the
+        // observation fast path and atomic authorization metadata updates.
+        ensure!(
+            record.version.get(self.replica) <= self.replica_counter()?,
+            "remote record advances the local replica counter"
+        );
+        self.commit_adopted_record(record, observation, share_metadata)
     }
 
     fn commit_adopted_record(
@@ -806,7 +832,9 @@ impl LocalIndex {
 
     /// Verifies the complete authoritative namespace and atomically replaces all rows and
     /// trusted checkpoint metadata. The root/replica binding and local counter never reset.
-    /// Callers hold their share mutation gate through materialization and this transaction.
+    /// Callers authenticate the owner, validate checkpoint continuity, and hold their share
+    /// mutation gate through materialization and this transaction. Unlike individual peer
+    /// adoption, a trusted checkpoint may restore previously acknowledged local history.
     pub fn adopt_authoritative_snapshot(
         &self,
         snapshot: &[SyncRecord],
@@ -2342,6 +2370,171 @@ mod tests {
         assert!(scan.changes.is_empty());
         assert_eq!(scan.unchanged, 1);
         assert_eq!(index.sync_records().expect("snapshot loads"), vec![remote]);
+    }
+
+    #[test]
+    fn remote_record_cannot_advance_the_durable_local_counter() {
+        let root = TempDir::new().expect("root can be created");
+        let state = TempDir::new().expect("state can be created");
+        fs::write(root.path().join("report.txt"), b"content").expect("file can be written");
+        let index = open_index(root.path(), state.path(), 1_000);
+        index.scan().expect("initial scan succeeds");
+        let before = index.sync_records().expect("snapshot loads");
+        let counter = index.replica_counter().expect("counter loads");
+        let mut remote = before[0].clone();
+        remote.version.observe(replica(), counter + 1);
+
+        let error = index
+            .adopt_verified_record(&remote)
+            .expect_err("remote local-counter advance must be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("remote record advances the local replica counter")
+        );
+        assert_eq!(
+            index.replica_counter().expect("counter remains readable"),
+            counter
+        );
+        assert_eq!(
+            index.sync_records().expect("snapshot remains unchanged"),
+            before
+        );
+    }
+
+    #[test]
+    fn every_remote_adoption_rejects_counter_poisoning_without_changing_share_state() {
+        for route in [
+            "verified",
+            "materialized",
+            "verified-share",
+            "materialized-share",
+        ] {
+            let root = TempDir::new().unwrap();
+            let state = TempDir::new().unwrap();
+            let store_state = TempDir::new().unwrap();
+            let store = deltaweave_store::Store::open(store_state.path()).unwrap();
+            let bytes = b"unchanged authenticated content";
+            let hash = Hash32::digest(bytes);
+            let path = WirePath::new("file.txt").unwrap();
+            let manifest = deltaweave_core::FileManifest {
+                schema_version: deltaweave_core::MANIFEST_SCHEMA_V1,
+                size: bytes.len() as u64,
+                file_hash: hash,
+                profile: deltaweave_core::ChunkingProfile::DEFAULT,
+                chunks: vec![deltaweave_core::ChunkDescriptor {
+                    offset: 0,
+                    length: bytes.len() as u32,
+                    hash,
+                }],
+            };
+            store.chunks().put_verified(hash, bytes).unwrap();
+            let observation = store
+                .materialize(&manifest, &path, root.path())
+                .unwrap()
+                .observation;
+            let index = open_index(root.path(), state.path(), 1_000);
+            index.scan().unwrap();
+            index.set_share_metadata(b"trusted-before").unwrap();
+            let before = index.sync_records().unwrap();
+            let counter = index.replica_counter().unwrap();
+            let mut incoming = before[0].clone();
+            incoming.version.observe(replica(), u64::MAX);
+
+            let result = match route {
+                "verified" => index.adopt_verified_record(&incoming),
+                "materialized" => index.adopt_materialized_record(&incoming, &observation),
+                "verified-share" => {
+                    index.adopt_verified_record_with_share_metadata(&incoming, b"untrusted-after")
+                }
+                "materialized-share" => index.adopt_materialized_record_with_share_metadata(
+                    &incoming,
+                    &observation,
+                    b"untrusted-after",
+                ),
+                _ => unreachable!(),
+            };
+            assert!(result.is_err(), "{route} accepted a forged local counter");
+            assert_eq!(index.replica_counter().unwrap(), counter, "{route}");
+            assert_eq!(index.sync_records().unwrap(), before, "{route}");
+            assert_eq!(
+                index.share_metadata().unwrap(),
+                Some(b"trusted-before".to_vec()),
+                "{route}"
+            );
+            drop(index);
+            let reopened = open_index(root.path(), state.path(), 1_000);
+            assert_eq!(reopened.replica_counter().unwrap(), counter, "{route}");
+            assert_eq!(reopened.sync_records().unwrap(), before, "{route}");
+            assert_eq!(
+                reopened.share_metadata().unwrap(),
+                Some(b"trusted-before".to_vec()),
+                "{route}"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_authoritative_checkpoint_retains_local_history_across_restart() {
+        let root = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        fs::write(root.path().join("file.txt"), b"checkpoint content").unwrap();
+        let index = open_index(root.path(), state.path(), 1_000);
+        index.scan().unwrap();
+        let mut checkpoint = index.sync_records().unwrap().remove(0);
+        let retained_counter = index.replica_counter().unwrap() + 9;
+        checkpoint.version.observe(replica(), retained_counter);
+        index
+            .adopt_authoritative_snapshot(std::slice::from_ref(&checkpoint), b"trusted-checkpoint")
+            .unwrap();
+        assert_eq!(index.replica_counter().unwrap(), retained_counter);
+        drop(index);
+
+        let reopened = open_index(root.path(), state.path(), 1_000);
+        assert_eq!(reopened.sync_records().unwrap(), vec![checkpoint]);
+        assert_eq!(
+            reopened.share_metadata().unwrap(),
+            Some(b"trusted-checkpoint".to_vec())
+        );
+        fs::write(root.path().join("file.txt"), b"subsequent local edit").unwrap();
+        reopened.scan().unwrap();
+        assert_eq!(reopened.replica_counter().unwrap(), retained_counter + 1);
+    }
+
+    #[test]
+    fn locally_generated_direct_push_adoption_still_advances_the_counter() {
+        let root = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        let store_state = TempDir::new().unwrap();
+        let store = deltaweave_store::Store::open(store_state.path()).unwrap();
+        let bytes = b"verified direct push";
+        let hash = Hash32::digest(bytes);
+        let path = WirePath::new("direct.txt").unwrap();
+        let manifest = deltaweave_core::FileManifest {
+            schema_version: deltaweave_core::MANIFEST_SCHEMA_V1,
+            size: bytes.len() as u64,
+            file_hash: hash,
+            profile: deltaweave_core::ChunkingProfile::DEFAULT,
+            chunks: vec![deltaweave_core::ChunkDescriptor {
+                offset: 0,
+                length: bytes.len() as u32,
+                hash,
+            }],
+        };
+        store.chunks().put_verified(hash, bytes).unwrap();
+        let observation = store
+            .materialize(&manifest, &path, root.path())
+            .unwrap()
+            .observation;
+        let index = open_index(root.path(), state.path(), 1_000);
+        let counter = index.replica_counter().unwrap();
+        index.adopt_materialized_file(&path, &observation).unwrap();
+        assert_eq!(index.replica_counter().unwrap(), counter + 1);
+        assert_eq!(
+            index.get(&path).unwrap().unwrap().version.get(replica()),
+            counter + 1
+        );
     }
 
     #[test]

@@ -3,6 +3,11 @@ use super::*;
 use deltaweave_net::{RemoteSnapshot, share::ShareSession};
 
 pub(crate) trait ReconcileTransport: Sync {
+    // Endpoint-allowlisted swarm CAS access is confined to legacy relationships.
+    // Managed shares must retain their folder-scoped authorization on every pull.
+    fn legacy_session(&self) -> Option<&SyncSession> {
+        None
+    }
     fn fetch_snapshot(
         &self,
         local: &MerkleTree,
@@ -28,8 +33,9 @@ pub(crate) trait ReconcileTransport: Sync {
 }
 
 macro_rules! transport {
-    ($kind:ty) => {
+    ($kind:ty, $($legacy:item)*) => {
         impl ReconcileTransport for $kind {
+            $($legacy)*
             async fn fetch_snapshot(&self, local: &MerkleTree) -> Result<RemoteSnapshot> {
                 <$kind>::fetch_snapshot(self, local).await
             }
@@ -58,5 +64,10 @@ macro_rules! transport {
         }
     };
 }
-transport!(SyncSession);
-transport!(ShareSession);
+transport!(
+    SyncSession,
+    fn legacy_session(&self) -> Option<&SyncSession> {
+        Some(self)
+    }
+);
+transport!(ShareSession,);

@@ -5,6 +5,11 @@ repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repository_root"
 
 command -v cargo >/dev/null
+command -v npm >/dev/null
+npm --prefix web ci
+npm --prefix web test
+npm --prefix web run build
+export DELTAWEAVE_REQUIRE_WEB_ASSETS=1
 
 echo '[1/9] rustfmt'
 cargo fmt --all -- --check

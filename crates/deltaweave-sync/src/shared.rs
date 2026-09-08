@@ -135,6 +135,7 @@ impl ManagedSyncEngine {
             root,
             index,
             store,
+            swarm_sources: Vec::new(),
             profile: config.profile,
             min_free_space_bytes: config.min_free_space_bytes,
             peer: owner.to_string(),

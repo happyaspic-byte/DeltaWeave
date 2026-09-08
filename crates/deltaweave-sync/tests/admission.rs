@@ -47,6 +47,7 @@ fn sync_engine_cannot_reopen_managed_namespace_with_new_state() {
         let key = iroh::SecretKey::generate();
         let remote = iroh::SecretKey::generate();
         let result = SyncEngine::open(SyncConfig {
+            swarm_sources: Vec::new(),
             root: candidate,
             state_root: temp.path().join("alternate-state"),
             replica: ReplicaId(Hash32::digest(key.public().as_bytes())),

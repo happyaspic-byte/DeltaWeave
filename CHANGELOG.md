@@ -5,6 +5,42 @@ Versioning after its first stable release.
 
 ## [Unreleased]
 
+### Added
+
+- Restore `doctor` checks for writable, separated paths, existing identity, and
+  direct peer inputs, with actionable JSON and readable text reports.
+- Expose receiver connection and free-space admission limits through
+  `serve --max-connections` and `--min-free-space-mib`.
+
+- Add the authenticated CAS-only `deltaweave/sync/3` protocol with exact chunk
+  availability, verified local-CAS serving, bounded multi-source filling, and an
+  experimental `swarm-fill` command.
+- Add a rarest-first scheduler with bounded 1/10/100/1,000-peer overlay tests.
+- Connect `sync-once` to optional authorized V3 swarm sources: the v2 peer
+  remains state authority, V3 sources fill missing CAS hashes, and a v2 content
+  pull is the fallback when swarm filling cannot complete.
+
+### Performance
+
+- Overlap durable receiver chunk writes while preserving per-file fsync and
+  draining every submitted writer on error. A 64 MiB DirectOnly hardware run
+  improved from 4.13 s to a 2.75 s mean; two V3 sources filled the same payload
+  in 1.51 s (1.82× single-source throughput).
+- Reject unrequested or oversized V3 chunk payloads before allocation, stream
+  each fill directly into the durable CAS, and reject duplicate endpoint IDs.
+- Reuse one sync endpoint and one persistent QUIC connection per V3 source,
+  connect only when remote content is required, and pipeline two 16-chunk
+  GetChunks streams per source.
+
+### Security
+
+- Bound V3 serving to 64 connections and eight active streams, time out stalled
+  requests and network writes, cap public buffered fetches at 64 MiB, and avoid
+  closing healthy sibling streams after one malformed request.
+- Require one exact present-or-missing outcome per requested hash, retry failed
+  assignments on another source, cap durable writer tasks, and fall back to V2
+  when no V3 source can complete the fill.
+
 ## [0.4.0] - 2026-09-04
 
 ### Added

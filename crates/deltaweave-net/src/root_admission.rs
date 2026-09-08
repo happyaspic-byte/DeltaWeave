@@ -78,6 +78,27 @@ pub fn reserve_private(path: impl AsRef<Path>) -> Result<PathBuf> {
     Ok(root)
 }
 
+/// Permanently excludes one private file and public roots containing it.
+///
+/// Existing aliases resolve to the actual file before admission. Only the exact
+/// file path is reserved, so sibling public directories remain usable. Missing
+/// parents are created privately; the file itself is not created and existing
+/// parent permissions are unchanged. Use the returned path when opening the file.
+pub fn reserve_private_file(path: impl AsRef<Path>) -> Result<PathBuf> {
+    ensure!(
+        path.as_ref().file_name().is_some(),
+        "private file must have a filename"
+    );
+    let (_, file) = admit_at_with_files(
+        &registry_path()?,
+        None,
+        &[],
+        &[path.as_ref().to_path_buf()],
+        |_, private| Ok(private[0].clone()),
+    )?;
+    Ok(file)
+}
+
 fn registry_path() -> Result<PathBuf> {
     #[cfg(windows)]
     let home = std::env::var_os("USERPROFILE").context("user profile is unavailable")?;
@@ -309,6 +330,16 @@ fn admit_at<T>(
     private: &[PathBuf],
     prepare: impl FnOnce(Option<&Path>, &[PathBuf]) -> Result<T>,
 ) -> Result<(Option<RootLease>, T)> {
+    admit_at_with_files(registry, public, private, &[], prepare)
+}
+
+fn admit_at_with_files<T>(
+    registry: &Path,
+    public: Option<(&Path, RootUse)>,
+    private_directories: &[PathBuf],
+    private_files: &[PathBuf],
+    prepare: impl FnOnce(Option<&Path>, &[PathBuf]) -> Result<T>,
+) -> Result<(Option<RootLease>, T)> {
     // The registry itself is private even before the initial bootstrap mkdir.
     let proposed_registry = prospective_root(registry)?;
     if let Some((path, _)) = &public {
@@ -324,8 +355,9 @@ fn admit_at<T>(
     let public = public
         .map(|(path, kind)| Ok::<_, anyhow::Error>((prospective_root(path)?, kind)))
         .transpose()?;
-    let private: Vec<PathBuf> = private
+    let private: Vec<PathBuf> = private_directories
         .iter()
+        .chain(private_files)
         .map(|path| prospective_root(path))
         .collect::<Result<_>>()?;
     if let Some((root, kind)) = &public {
@@ -427,7 +459,16 @@ fn admit_at<T>(
     } else {
         None
     };
-    for path in &private {
+    for (index, path) in private.iter().enumerate() {
+        let directory = if index < private_directories.len() {
+            path.as_path()
+        } else {
+            ensure!(
+                !path.try_exists()? || path.is_file(),
+                "private file path is not a regular file"
+            );
+            path.parent().context("private file has no parent")?
+        };
         let mut builder = fs::DirBuilder::new();
         builder.recursive(true);
         #[cfg(unix)]
@@ -435,11 +476,17 @@ fn admit_at<T>(
             use std::os::unix::fs::DirBuilderExt;
             builder.mode(0o700);
         }
-        builder.create(path)?;
+        builder.create(directory)?;
         ensure!(
-            fs::canonicalize(path)? == *path,
+            fs::canonicalize(directory)? == directory,
             "private root changed during preparation"
         );
+        if index >= private_directories.len() && path.try_exists()? {
+            ensure!(
+                fs::canonicalize(path)? == *path && path.is_file(),
+                "private file changed during preparation"
+            );
+        }
     }
     let db = Database::create(registry.join("roots.redb"))?;
     // The writable catalog is opened only after namespace preflight succeeds.
@@ -542,7 +589,10 @@ mod tests {
         );
         drop(lease);
         assert!(acquire_at(&registry, &root, RootUse::Legacy).is_err());
-        assert!(acquire_at(&registry, &root, managed()).is_ok());
+        drop(
+            acquire_at(&registry, &root, managed())
+                .expect("same managed binding must be reacquired after lease release"),
+        );
         assert_eq!(fs::read(root.join("secret.txt")).unwrap(), b"protected");
     }
 

@@ -89,6 +89,8 @@ jobs:
           $package = Join-Path "dist" $name
           New-Item -ItemType Directory -Force -Path $package | Out-Null
           Copy-Item ".\target\x86_64-pc-windows-msvc\release\deltaweave.exe" $package
+          Copy-Item ".\scripts\start-web.cmd" $package
+          Copy-Item ".\docs\WEB_UI.md" $package
           Copy-Item ".\docs\TESTING_WINDOWS_SYNOLOGY.md" (Join-Path $package "TESTING.md")
           Copy-Item ".\docs\TESTING_LOCAL_INDEX.md" $package
           Copy-Item ".\docs\AI_PORTAINER_SETUP.md" $package

@@ -861,6 +861,7 @@ fn legacy_v1_v2_replacement_and_delete_work_across_real_filesystems() {
                     assert_eq!(fs::read(base.path().join("receiver/file")).unwrap(), bytes);
                 }
                 let engine = SyncEngine::open(SyncConfig {
+                    swarm_sources: Vec::new(),
                     root: base.path().join("sender"),
                     state_root: state.path().join("sender-state"),
                     replica: ReplicaId(Hash32::digest(key.public().as_bytes())),

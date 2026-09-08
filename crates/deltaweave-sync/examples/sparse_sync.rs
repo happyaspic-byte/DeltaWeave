@@ -552,6 +552,7 @@ async fn main() -> Result<()> {
     })
     .await?;
     let engine = SyncEngine::open(SyncConfig {
+        swarm_sources: Vec::new(),
         root: local_root.clone(),
         state_root: local_state,
         replica: replica(&client_key),

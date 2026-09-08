@@ -9,6 +9,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     process::{Child, Command as ProcessCommand, Stdio},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -19,8 +20,10 @@ use deltaweave_core::{ChunkingProfile, Hash32, ReplicaId, WirePath};
 use deltaweave_index::{IndexOptions, LocalIndex, ScanChange, WatchService};
 use deltaweave_net::{
     NetworkMode, PeerPolicy, PushOptions, Server, ServerConfig, SyncClient, TransferReceipt,
-    endpoint_addr, load_or_create_identity, push_file, start_server,
+    endpoint_addr, load_or_create_identity, push_file, root_admission, start_server,
+    swarm_fill_chunks,
 };
+use deltaweave_store::Store;
 use deltaweave_sync::{SyncConfig, SyncEngine};
 use iroh::{EndpointId, SecretKey};
 use serde::Serialize;
@@ -71,6 +74,8 @@ enum Command {
         after_help = "Example (receiver already running):\n  deltaweave push ./photo.jpg --remote-path photos/photo.jpg --peer <ENDPOINT_ID>\n\nFind the peer's endpoint ID in its serve output.\nFor a direct connection, add --direct <IP:PORT> --direct-only."
     )]
     Push(PushArgs),
+    /// Fill a private CAS from multiple authorized swarm V3 peers.
+    SwarmFill(SwarmFillArgs),
     /// Scan a folder and report changes to its local index.
     #[command(
         after_help = "Example:\n  deltaweave scan --root ./shared --include-records\n\nUse --state to choose a private index file outside the indexed folder.\nUse watch to keep the index updated as files change."
@@ -91,6 +96,8 @@ enum Command {
         after_help = "Example:\n  deltaweave manifest ./archive.zip\n\nChunk sizes are in bytes: minimum < average < maximum."
     )]
     Manifest(ManifestArgs),
+    /// Validate operational paths, identity, and direct peer inputs with actionable checks.
+    Doctor(DoctorArgs),
     /// Check transfer, sync, and recovery in a temporary workspace.
     #[command(
         after_help = "Example:\n  deltaweave self-test\n\nChecks encrypted transfer, delta reuse, bidirectional sync, and recovery.\nCreates temporary test folders automatically; no peer setup is needed."
@@ -196,6 +203,44 @@ struct ServeArgs {
     /// Disable discovery and relay services; advertise direct addresses only.
     #[arg(long, help_heading = "Peer connection")]
     direct_only: bool,
+    /// Maximum concurrently handled connections.
+    #[arg(
+        long,
+        default_value_t = 64,
+        help_heading = "Resource limits",
+        value_name = "COUNT"
+    )]
+    max_connections: usize,
+    /// Reject incoming files unless this many MiB remain free.
+    #[arg(
+        long,
+        default_value_t = 0,
+        help_heading = "Resource limits",
+        value_name = "MIB"
+    )]
+    min_free_space_mib: u64,
+}
+
+#[derive(Debug, Args)]
+struct DoctorArgs {
+    /// Synchronization or receiver root.
+    #[arg(long)]
+    root: PathBuf,
+    /// Private state directory outside `root`.
+    #[arg(long)]
+    state: PathBuf,
+    /// Persistent identity file outside `root` and `state`.
+    #[arg(long)]
+    identity: PathBuf,
+    /// Remote endpoint ID to validate.
+    #[arg(long)]
+    peer: Option<String>,
+    /// Remote direct UDP address; repeat when multiple addresses are advertised.
+    #[arg(long = "direct", value_parser = parse_usable_direct_address)]
+    direct_addresses: Vec<SocketAddr>,
+    /// Require direct peer inputs.
+    #[arg(long)]
+    direct_only: bool,
 }
 
 #[derive(Debug, Args)]
@@ -212,6 +257,7 @@ struct PushArgs {
     /// Receiver direct UDP address; repeat when multiple addresses are advertised.
     #[arg(
         long = "direct",
+        value_parser = parse_usable_direct_address,
         help_heading = "Peer connection",
         value_name = "IP:PORT"
     )]
@@ -235,6 +281,28 @@ struct PushArgs {
     direct_only: bool,
     #[command(flatten)]
     chunking: ChunkingArgs,
+}
+
+#[derive(Debug, Args)]
+struct SwarmFillArgs {
+    /// Private local CAS and metadata state directory.
+    #[arg(long, default_value = ".deltaweave/swarm-state")]
+    state: PathBuf,
+    /// Persistent client identity authorized by every source.
+    #[arg(long, default_value = ".deltaweave/identity.key")]
+    identity: PathBuf,
+    /// Source endpoint ID; repeat in the same order as `--direct`.
+    #[arg(long = "peer", required = true)]
+    peers: Vec<String>,
+    /// Direct UDP address for each source endpoint.
+    #[arg(long = "direct", required = true, value_parser = parse_usable_direct_address)]
+    direct_addresses: Vec<SocketAddr>,
+    /// Unique BLAKE3 chunk hash to fetch; repeat as needed.
+    #[arg(long = "hash", required = true)]
+    hashes: Vec<Hash32>,
+    /// Disable discovery and relay services.
+    #[arg(long)]
+    direct_only: bool,
 }
 
 #[derive(Debug, Args)]
@@ -340,6 +408,7 @@ struct SyncTargetArgs {
     /// Remote direct UDP address; repeat when multiple addresses are advertised.
     #[arg(
         long = "direct",
+        value_parser = parse_usable_direct_address,
         help_heading = "Peer connection",
         value_name = "IP:PORT"
     )]
@@ -347,6 +416,12 @@ struct SyncTargetArgs {
     /// Remote relay URL; repeat when multiple relays are advertised.
     #[arg(long = "relay", help_heading = "Peer connection", value_name = "URL")]
     relay_urls: Vec<String>,
+    /// Optional V3 swarm source endpoint ID; repeat in the same order as `--swarm-direct`.
+    #[arg(long = "swarm-peer")]
+    swarm_peers: Vec<String>,
+    /// Direct UDP address for each optional V3 swarm source.
+    #[arg(long = "swarm-direct", value_parser = parse_usable_direct_address)]
+    swarm_direct_addresses: Vec<SocketAddr>,
     /// Disable discovery and relay services; use supplied direct addresses only.
     #[arg(long, help_heading = "Peer connection")]
     direct_only: bool,
@@ -445,6 +520,8 @@ impl Command {
             Self::Manifest(_) => "manifest",
             Self::Serve(_) => "serve",
             Self::Push(_) => "push",
+            Self::SwarmFill(_) => "swarm-fill",
+            Self::Doctor(_) => "doctor",
             Self::Scan(_) => "scan",
             Self::Watch(_) => "watch",
             Self::SyncOnce(_) => "sync-once",
@@ -469,6 +546,8 @@ async fn run(cli: Cli, output: &Output) -> Result<()> {
         Command::Manifest(args) => print_manifest(args, output),
         Command::Serve(args) => serve(args, output).await,
         Command::Push(args) => push(args, output).await,
+        Command::SwarmFill(args) => swarm_fill(args, output).await,
+        Command::Doctor(args) => doctor(args, output),
         Command::Scan(args) => scan(args, output),
         Command::Watch(args) => watch(args, output).await,
         Command::SyncOnce(args) => sync_once(args, output).await,
@@ -476,6 +555,129 @@ async fn run(cli: Cli, output: &Output) -> Result<()> {
         Command::SelfTest => self_test(output).await,
         Command::FaultTest(args) => fault_test(args, output).await,
     }
+}
+
+fn parse_usable_direct_address(value: &str) -> std::result::Result<SocketAddr, String> {
+    let address = value
+        .parse::<SocketAddr>()
+        .map_err(|error| format!("invalid socket address: {error}"))?;
+    if address.port() == 0 || address.ip().is_unspecified() || address.ip().is_multicast() {
+        return Err("direct address must be a usable unicast IP with a nonzero port".to_owned());
+    }
+    Ok(address)
+}
+
+fn doctor(args: DoctorArgs, output: &Output) -> Result<()> {
+    let root_writable = writable_directory_check(&args.root);
+    let state_writable = writable_directory_check(&args.state);
+    let root = fs::canonicalize(&args.root).ok();
+    let state = fs::canonicalize(&args.state).ok();
+    let identity = canonicalize_candidate(&args.identity).ok();
+    let separated = root
+        .as_ref()
+        .zip(state.as_ref())
+        .is_some_and(|(root, state)| !root.starts_with(state) && !state.starts_with(root))
+        && identity.as_ref().is_some_and(|identity| {
+            root.as_ref()
+                .is_some_and(|root| !identity.starts_with(root))
+                && state
+                    .as_ref()
+                    .is_some_and(|state| !identity.starts_with(state))
+        });
+    let identity_result = load_existing_identity(&args.identity);
+    let peer_result = args.peer.as_ref().map_or(Ok(()), |peer| {
+        peer.parse::<EndpointId>()
+            .map(|_| ())
+            .with_context(|| format!("invalid endpoint ID {peer}"))
+    });
+    let direct_ok = !args.direct_only || !args.direct_addresses.is_empty();
+    let pass = root_writable.is_ok()
+        && state_writable.is_ok()
+        && separated
+        && identity_result.is_ok()
+        && peer_result.is_ok()
+        && direct_ok;
+    let check = |result: &Result<()>, action: &str| {
+        json!({
+            "status": if result.is_ok() { "pass" } else { "fail" },
+            "detail": result.as_ref().err().map(ToString::to_string),
+            "action": if result.is_ok() { None } else { Some(action) },
+        })
+    };
+    let separation_result = if separated {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "root, state, and identity must be separate"
+        ))
+    };
+    let direct_result = if direct_ok {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("direct-only mode has no direct address"))
+    };
+    output.print(&json!({
+        "status": if pass { "pass" } else { "fail" },
+        "paths": {
+            "root": display_path(&args.root),
+            "state": display_path(&args.state),
+            "identity": display_path(&args.identity),
+        },
+        "checks": {
+            "root_writable": check(&root_writable, "Grant write access or select a writable --root."),
+            "state_writable": check(&state_writable, "Grant write access or select a writable --state."),
+            "path_separation": check(&separation_result, "Place --state and --identity outside --root, with identity outside state."),
+            "identity": check(&identity_result, "Run deltaweave init --identity <path>, then retry."),
+            "peer": check(&peer_result, "Copy the peer endpoint_id exactly from init or serve JSON."),
+            "direct_addresses": check(&direct_result, "Add at least one --direct <IP:PORT>, or omit --direct-only."),
+        }
+    }))?;
+    ensure!(
+        pass,
+        "doctor found failed checks; follow the reported actions above"
+    );
+    Ok(())
+}
+
+fn writable_directory_check(path: &Path) -> Result<()> {
+    fs::create_dir_all(path)
+        .with_context(|| format!("cannot create directory {}", path.display()))?;
+    tempfile::Builder::new()
+        .prefix(".deltaweave-write-test-")
+        .tempfile_in(path)
+        .with_context(|| {
+            format!(
+                "cannot create an exclusive write probe in {}",
+                path.display()
+            )
+        })?;
+    Ok(())
+}
+
+fn canonicalize_candidate(path: &Path) -> Result<PathBuf> {
+    if path.exists() {
+        return fs::canonicalize(path)
+            .with_context(|| format!("cannot resolve {}", path.display()));
+    }
+    let file_name = path
+        .file_name()
+        .context("identity path must include a filename")?;
+    let parent = path
+        .parent()
+        .filter(|value| !value.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    Ok(fs::canonicalize(parent)
+        .with_context(|| format!("cannot resolve identity parent {}", parent.display()))?
+        .join(file_name))
+}
+
+fn load_existing_identity(path: &Path) -> Result<()> {
+    ensure!(
+        path.is_file(),
+        "identity file {} does not exist",
+        path.display()
+    );
+    load_or_create_identity(path).map(|_| ())
 }
 
 fn initialize(args: InitArgs, output: &Output) -> Result<()> {
@@ -519,8 +721,8 @@ async fn serve(args: ServeArgs, output: &Output) -> Result<()> {
         peer_policy,
         network_mode: network_mode(args.direct_only),
         bind_address: args.bind,
-        max_connections: 64,
-        min_free_space_bytes: 0,
+        max_connections: args.max_connections,
+        min_free_space_bytes: args.min_free_space_mib.saturating_mul(1024 * 1024),
     })
     .await?;
     if !server.wait_online(Duration::from_secs(20)).await {
@@ -615,14 +817,65 @@ async fn push(args: PushArgs, output: &Output) -> Result<()> {
     output.print(&receipt)
 }
 
+async fn swarm_fill(args: SwarmFillArgs, output: &Output) -> Result<()> {
+    ensure!(
+        args.peers.len() == args.direct_addresses.len(),
+        "swarm-fill requires one --direct for each --peer"
+    );
+    ensure!(
+        args.peers.len() <= 8,
+        "swarm-fill supports at most eight sources"
+    );
+    let sources = args
+        .peers
+        .iter()
+        .zip(args.direct_addresses)
+        .map(|(peer, direct)| endpoint_addr(peer, &[direct], &[]))
+        .collect::<Result<Vec<_>>>()?;
+    let state = root_admission::reserve_private(&args.state)?;
+    let identity_path = root_admission::reserve_private_file(&args.identity)?;
+    let identity = load_or_create_identity(identity_path)?;
+    let store = Arc::new(Store::open(state)?);
+    let started = Instant::now();
+    let receipt = swarm_fill_chunks(
+        identity.secret_key,
+        sources,
+        network_mode(args.direct_only),
+        store,
+        args.hashes,
+    )
+    .await?;
+    output.print(&json!({
+        "status": "pass",
+        "transferred_chunks": receipt.transferred_chunks,
+        "transferred_bytes": receipt.transferred_bytes,
+        "sources_used": receipt.sources_used,
+        "elapsed_ms": started.elapsed().as_millis(),
+    }))
+}
+
 fn open_sync_engine(args: SyncTargetArgs) -> Result<SyncEngine> {
     if args.direct_only && args.direct_addresses.is_empty() {
         bail!("--direct-only requires at least one --direct address");
     }
+    ensure!(
+        args.swarm_peers.len() == args.swarm_direct_addresses.len(),
+        "sync requires one --swarm-direct for each --swarm-peer"
+    );
+    ensure!(
+        args.swarm_peers.len() <= 8,
+        "sync supports at most eight swarm sources"
+    );
     ensure_identity_outside_destination(&args.identity, &args.root)?;
     let identity = load_or_create_identity(&args.identity)?;
     let profile = args.chunking.profile()?;
     let remote = endpoint_addr(&args.peer, &args.direct_addresses, &args.relay_urls)?;
+    let swarm_sources = args
+        .swarm_peers
+        .iter()
+        .zip(args.swarm_direct_addresses)
+        .map(|(peer, direct)| endpoint_addr(peer, &[direct], &[]))
+        .collect::<Result<Vec<_>>>()?;
     let replica = ReplicaId(Hash32::digest(identity.endpoint_id().as_bytes()));
     SyncEngine::open(SyncConfig {
         root: args.root,
@@ -633,6 +886,7 @@ fn open_sync_engine(args: SyncTargetArgs) -> Result<SyncEngine> {
             remote,
             network_mode: network_mode(args.direct_only),
         },
+        swarm_sources,
         profile,
         ignored_paths: Vec::new(),
     })
@@ -1546,6 +1800,7 @@ async fn exercise_sync_self_test(
             remote: server.endpoint_addr(),
             network_mode: NetworkMode::DirectOnly,
         },
+        swarm_sources: Vec::new(),
         profile: ChunkingProfile::DEFAULT,
         ignored_paths: Vec::new(),
     };
@@ -1956,6 +2211,219 @@ mod tests {
     }
 
     #[test]
+    fn parses_experimental_swarm_fill_command() {
+        let cli = Cli::try_parse_from([
+            "deltaweave",
+            "swarm-fill",
+            "--state",
+            "private/state",
+            "--identity",
+            "private/node.key",
+            "--peer",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--direct",
+            "172.30.1.21:1234",
+            "--peer",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "--direct",
+            "172.30.1.22:5678",
+            "--hash",
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "--direct-only",
+        ])
+        .expect("experimental swarm-fill command parses");
+        let Command::SwarmFill(args) = cli.command else {
+            panic!("swarm-fill command expected");
+        };
+        assert_eq!(args.peers.len(), 2);
+        assert_eq!(args.direct_addresses.len(), 2);
+        assert_eq!(args.hashes.len(), 1);
+        assert!(args.direct_only);
+    }
+
+    #[test]
+    fn swarm_fill_reserves_private_paths_before_creating_files() {
+        let temp = tempfile::tempdir().expect("isolated admission workspace");
+        let home = temp.path().join("home");
+        fs::create_dir(&home).unwrap();
+        let mut child = ProcessCommand::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::swarm_fill_private_admission_worker",
+                "--nocapture",
+            ])
+            .env("DW_CLI_SWARM_ADMISSION_TEST", temp.path())
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("isolated admission test process");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                let result = child.wait_with_output().unwrap();
+                assert!(
+                    result.status.success(),
+                    "admission regression failed:\n{}\n{}",
+                    String::from_utf8_lossy(&result.stdout),
+                    String::from_utf8_lossy(&result.stderr),
+                );
+                break;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                let _ = child.wait();
+                panic!("swarm-fill admission test exceeded 15 seconds");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[tokio::test]
+    async fn swarm_fill_private_admission_worker() {
+        use deltaweave_net::root_admission::{RootUse, acquire};
+
+        let Some(base) = std::env::var_os("DW_CLI_SWARM_ADMISSION_TEST") else {
+            return;
+        };
+        let base = PathBuf::from(base);
+        let peer = SecretKey::generate().public().to_string();
+        let output = Output::new(OutputFormat::Json, "swarm-fill");
+        let args = |state: PathBuf, identity: PathBuf| SwarmFillArgs {
+            state,
+            identity,
+            peers: vec![peer.clone()],
+            direct_addresses: vec!["127.0.0.1:9".parse().unwrap()],
+            // An empty inventory keeps this admission test entirely offline,
+            // including when the missing guard lets the command reach CAS fill.
+            hashes: Vec::new(),
+            direct_only: true,
+        };
+
+        for (name, kind) in [
+            ("legacy", RootUse::Legacy),
+            (
+                "managed",
+                RootUse::Managed {
+                    share: [1; 32],
+                    owner: [2; 32],
+                },
+            ),
+        ] {
+            let root = base.join(name).join("public");
+            let _lease = acquire(&root, kind).expect("public root admitted");
+            for reject_state in [true, false] {
+                let state = if reject_state {
+                    root.join("new-state")
+                } else {
+                    base.join(name).join("private-state")
+                };
+                let identity = if reject_state {
+                    base.join(name).join("private-identity/client.key")
+                } else {
+                    root.join("new-identity/client.key")
+                };
+                let error = swarm_fill(args(state.clone(), identity.clone()), &output)
+                    .await
+                    .expect_err("a public namespace must reject private state or identity");
+                assert!(
+                    error.to_string().contains("private state overlaps"),
+                    "unexpected error: {error:#}"
+                );
+                assert!(!identity.exists(), "rejection must not create a key");
+                assert!(!state.join("metadata.redb").exists());
+                assert!(!state.join("chunks").exists());
+                assert!(!root.join("new-state").exists());
+                assert!(!root.join("new-identity").exists());
+            }
+        }
+
+        #[cfg(unix)]
+        {
+            let root = base.join("alias/public");
+            let key = root.join("existing.key");
+            load_or_create_identity(&key).unwrap();
+            let _lease = acquire(&root, RootUse::Legacy).unwrap();
+            let alias = base.join("identity-link.key");
+            std::os::unix::fs::symlink(&key, &alias).unwrap();
+            let state = base.join("alias/private-state");
+            let error = swarm_fill(args(state.clone(), alias), &output)
+                .await
+                .expect_err("identity aliases must protect the actual key location");
+            assert!(error.to_string().contains("private state overlaps"));
+            assert!(!state.join("metadata.redb").exists());
+            assert!(!state.join("chunks").exists());
+        }
+
+        let state = base.join("invalid/private-state");
+        let identity = base.join("invalid/private-identity/client.key");
+        let mut invalid = args(state.clone(), identity.clone());
+        invalid.peers[0] = "invalid-endpoint".to_owned();
+        assert!(swarm_fill(invalid, &output).await.is_err());
+        assert!(!state.exists());
+        assert!(!identity.parent().unwrap().exists());
+
+        let state = base.join("valid/private-state");
+        let identity = base.join("valid/private-identity/client.key");
+        swarm_fill(args(state.clone(), identity.clone()), &output)
+            .await
+            .expect("safe private paths remain usable");
+        assert!(identity.is_file());
+        assert!(state.join("metadata.redb").is_file());
+        assert!(acquire(&state, RootUse::Legacy).is_err());
+        assert!(acquire(&identity, RootUse::Legacy).is_err());
+        assert!(acquire(identity.parent().unwrap(), RootUse::Legacy).is_err());
+        drop(
+            acquire(
+                identity.parent().unwrap().join("public-sibling"),
+                RootUse::Legacy,
+            )
+            .expect("private file reservation must not reserve its entire parent"),
+        );
+
+        let existing = base.join("existing/client.key");
+        let endpoint = load_or_create_identity(&existing).unwrap().endpoint_id();
+        #[cfg(unix)]
+        let original_mode = {
+            use std::os::unix::fs::PermissionsExt;
+            fs::metadata(existing.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+        };
+        swarm_fill(args(base.join("existing-state"), existing.clone()), &output)
+            .await
+            .expect("existing identities remain reusable");
+        let reloaded = load_or_create_identity(&existing).unwrap();
+        assert!(!reloaded.created);
+        assert_eq!(reloaded.endpoint_id(), endpoint);
+        assert!(acquire(&existing, RootUse::Legacy).is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(existing.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode(),
+                original_mode,
+                "reservation must not change existing parent permissions"
+            );
+        }
+
+        let missing = base.join("file-only/client.key");
+        let reserved = root_admission::reserve_private_file(&missing).unwrap();
+        assert!(!reserved.exists(), "reservation must not create the key");
+        assert!(reserved.parent().unwrap().is_dir());
+        assert!(acquire(&reserved, RootUse::Legacy).is_err());
+        assert!(
+            !reserved.exists(),
+            "rejected publication must not create the key path"
+        );
+    }
+
+    #[test]
     fn parses_one_shot_and_continuous_sync_commands() {
         let once = Cli::try_parse_from([
             "deltaweave",
@@ -1967,6 +2435,25 @@ mod tests {
         ])
         .expect("sync-once command parses");
         assert!(matches!(once.command, Command::SyncOnce(_)));
+
+        let with_swarm = Cli::try_parse_from([
+            "deltaweave",
+            "sync-once",
+            "--root",
+            "data",
+            "--peer",
+            "peer-id",
+            "--swarm-peer",
+            "swarm-peer-1",
+            "--swarm-direct",
+            "172.30.1.21:1234",
+        ])
+        .expect("sync-once command with swarm sources parses");
+        let Command::SyncOnce(args) = with_swarm.command else {
+            panic!("sync-once command expected");
+        };
+        assert_eq!(args.swarm_peers.len(), 1);
+        assert_eq!(args.swarm_direct_addresses.len(), 1);
 
         let continuous = Cli::try_parse_from([
             "deltaweave",

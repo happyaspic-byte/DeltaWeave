@@ -124,6 +124,7 @@ impl Worker {
                     .context("minimum free space byte count overflow")?;
                 SyncEngine::open_with_min_free_space(
                     SyncConfig {
+                        swarm_sources: Vec::new(),
                         root: input.root.into(),
                         state_root: input.state_path.context("state path missing")?.into(),
                         replica: ReplicaId(Hash32::digest(identity.endpoint_id().as_bytes())),
@@ -443,6 +444,7 @@ mod tests {
             pulled_bytes: 0,
             pushed_bytes: 0,
             reused_extents: 0,
+            swarm_sources_used: 0,
             conflicts: vec![
                 serde_json::from_value(serde_json::json!({
                     "path": "directory", "conflict_path": null, "winner_hash": hash,
