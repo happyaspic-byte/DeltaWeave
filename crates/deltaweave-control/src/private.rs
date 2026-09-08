@@ -10,7 +10,7 @@
 use std::{
     fs,
     io::{self, ErrorKind},
-    path::{Component, Path},
+    path::{Path, PathBuf},
 };
 
 const PRIVATE_ERROR: &str = "managed private directory security check failed";
@@ -125,13 +125,8 @@ fn create_private_leaf(path: &Path) -> io::Result<()> {
 }
 
 fn reject_reparse_components(path: &Path) -> io::Result<()> {
-    let mut current = path
-        .components()
-        .next()
-        .map(component_path)
-        .unwrap_or_default();
-
-    for component in path.components().skip(1) {
+    let mut current = PathBuf::new();
+    for component in path.components() {
         current.push(component.as_os_str());
         match fs::symlink_metadata(&current) {
             Ok(metadata) => {
@@ -144,12 +139,6 @@ fn reject_reparse_components(path: &Path) -> io::Result<()> {
         }
     }
     Ok(())
-}
-
-fn component_path(component: Component<'_>) -> std::path::PathBuf {
-    let mut path = std::path::PathBuf::new();
-    path.push(component.as_os_str());
-    path
 }
 
 #[cfg(windows)]
@@ -170,8 +159,9 @@ const fn is_reparse_point(_metadata: &fs::Metadata) -> bool {
 
 #[cfg(windows)]
 fn prepare_windows_acl(path: &Path, allow_initial_repair: bool) -> io::Result<()> {
-    let user_sid = current_user_sid()?;
-    let output = std::process::Command::new("powershell.exe")
+    let powershell =
+        trusted_windows_executable(Path::new("WindowsPowerShell\\v1.0\\powershell.exe"))?;
+    let output = std::process::Command::new(powershell)
         .args([
             "-NoLogo",
             "-NoProfile",
@@ -182,7 +172,6 @@ fn prepare_windows_acl(path: &Path, allow_initial_repair: bool) -> io::Result<()
             WINDOWS_ACL_SCRIPT,
         ])
         .env("DELTAWEAVE_PRIVATE_ACL_PATH", path)
-        .env("DELTAWEAVE_PRIVATE_USER_SID", &user_sid)
         .env(
             "DELTAWEAVE_PRIVATE_ACL_REPAIR",
             if allow_initial_repair { "1" } else { "0" },
@@ -207,40 +196,46 @@ fn prepare_windows_acl(path: &Path, allow_initial_repair: bool) -> io::Result<()
 }
 
 #[cfg(windows)]
-fn current_user_sid() -> io::Result<String> {
-    let output = std::process::Command::new("whoami.exe")
-        .args(["/user", "/fo", "csv", "/nh"])
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(|error| safe_io_error(error, PRIVATE_ERROR))?;
-    if !output.status.success() {
+fn trusted_windows_executable(relative_path: &Path) -> io::Result<PathBuf> {
+    if relative_path.is_absolute()
+        || relative_path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
         return Err(permission_error(PRIVATE_ERROR));
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let sid = text
-        .split(|character: char| !character.is_ascii_alphanumeric() && character != '-')
-        .find(|candidate| is_sid(candidate))
+    let root = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .filter(|root| root.is_absolute())
         .ok_or_else(|| permission_error(PRIVATE_ERROR))?;
-    Ok(sid.to_owned())
-}
-
-#[cfg(windows)]
-fn is_sid(value: &str) -> bool {
-    let mut pieces = value.split('-');
-    let prefix_is_valid = matches!(pieces.next(), Some("S")) && matches!(pieces.next(), Some("1"));
-    let mut has_authority = false;
-    let numeric_authorities = pieces.all(|piece| {
-        has_authority = true;
-        !piece.is_empty() && piece.bytes().all(|byte| byte.is_ascii_digit())
-    });
-    prefix_is_valid && has_authority && numeric_authorities
+    let system_dir = root.join("System32");
+    reject_reparse_components(&system_dir)?;
+    let system_metadata =
+        fs::symlink_metadata(&system_dir).map_err(|error| safe_io_error(error, PRIVATE_ERROR))?;
+    if system_metadata.file_type().is_symlink()
+        || is_reparse_point(&system_metadata)
+        || !system_metadata.is_dir()
+    {
+        return Err(permission_error(PRIVATE_ERROR));
+    }
+    let executable = system_dir.join(relative_path);
+    reject_reparse_components(&executable)?;
+    let executable_metadata =
+        fs::symlink_metadata(&executable).map_err(|error| safe_io_error(error, PRIVATE_ERROR))?;
+    if executable_metadata.file_type().is_symlink()
+        || is_reparse_point(&executable_metadata)
+        || !executable_metadata.is_file()
+    {
+        return Err(permission_error(PRIVATE_ERROR));
+    }
+    Ok(executable)
 }
 
 #[cfg(windows)]
 const WINDOWS_ACL_SCRIPT: &str = r#"
 $ErrorActionPreference = 'Stop'
 $path = $env:DELTAWEAVE_PRIVATE_ACL_PATH
-$userSid = $env:DELTAWEAVE_PRIVATE_USER_SID
+$userSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $systemSid = 'S-1-5-18'
 $repair = $env:DELTAWEAVE_PRIVATE_ACL_REPAIR -eq '1'
 
@@ -252,6 +247,8 @@ $sids = @($userSid, $systemSid) | Sort-Object -Unique
 if ($repair) {
     $acl = New-Object System.Security.AccessControl.DirectorySecurity
     $acl.SetAccessRuleProtection($true, $false)
+    $userIdentity = New-Object System.Security.Principal.SecurityIdentifier($userSid)
+    $acl.SetOwner($userIdentity)
     $rights = [System.Security.AccessControl.FileSystemRights]::FullControl
     $inheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
     $propagation = [System.Security.AccessControl.PropagationFlags]::None
@@ -406,11 +403,14 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn accepts_only_numeric_security_identifier_shape() {
-        assert!(is_sid("S-1-5-18"));
-        assert!(is_sid("S-1-5-21-123-456-789-1001"));
-        assert!(!is_sid("S-1-5-18:$(whoami)"));
-        assert!(!is_sid("Everyone"));
-        assert!(!is_sid("S-2-5-18"));
+    fn acl_script_uses_literal_paths_and_protected_allow_rules() {
+        assert!(WINDOWS_ACL_SCRIPT.contains("Get-Item -LiteralPath"));
+        assert!(WINDOWS_ACL_SCRIPT.contains("Set-Acl -LiteralPath"));
+        assert!(WINDOWS_ACL_SCRIPT.contains("SetAccessRuleProtection($true, $false)"));
+        assert!(WINDOWS_ACL_SCRIPT.contains("SetOwner($userIdentity)"));
+        assert!(WINDOWS_ACL_SCRIPT.contains("WindowsIdentity]::GetCurrent().User.Value"));
+        assert!(WINDOWS_ACL_SCRIPT.contains("ReparsePoint"));
+        assert!(!WINDOWS_ACL_SCRIPT.contains("Invoke-Expression"));
+        assert!(!WINDOWS_ACL_SCRIPT.contains("cmd.exe"));
     }
 }
