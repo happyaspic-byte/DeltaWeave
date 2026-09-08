@@ -313,6 +313,16 @@ struct PendingWorker {
     lease: Option<RootLease>,
 }
 
+struct IssueKeyRequest<'a> {
+    request_id: String,
+    share: ShareId,
+    permission: Permission,
+    expires_at: Option<u64>,
+    operation: &'a str,
+    hash: String,
+    rotate_invitation: Option<InvitationId>,
+}
+
 struct ManagedObserverState {
     last_event_at: u64,
 }
@@ -836,10 +846,10 @@ impl Manager {
                 ManagedError::new(ManagedErrorKind::InvalidPath)
             );
             std::fs::remove_file(path)?;
-            if let Some(parent) = path.parent() {
-                if let Ok(file) = File::open(parent) {
-                    let _ = file.sync_all();
-                }
+            if let Some(parent) = path.parent()
+                && let Ok(file) = File::open(parent)
+            {
+                let _ = file.sync_all();
             }
         }
         Ok(())
@@ -1588,7 +1598,7 @@ impl Manager {
 
     async fn update_managed_failure(&self, share: ShareId, error: &anyhow::Error) -> Result<()> {
         let id = share_id_string(share);
-        let summary = classify_managed_error(&error);
+        let summary = classify_managed_error(error);
         let offline = summary.code == "offline";
         self.persist(|config| {
             if let Some(record) = config
@@ -1815,31 +1825,30 @@ impl Manager {
                 .shares
                 .iter_mut()
                 .find(|record| record.share_id == id)
+                && record.status != ManagedStatus::Paused
+                && record.status != ManagedStatus::Revoked
             {
-                if record.status != ManagedStatus::Paused && record.status != ManagedStatus::Revoked
-                {
-                    record.status = if summary.code == "member_revoked" {
-                        ManagedStatus::Revoked
-                    } else if summary.code == "offline" {
-                        ManagedStatus::Offline
+                record.status = if summary.code == "member_revoked" {
+                    ManagedStatus::Revoked
+                } else if summary.code == "offline" {
+                    ManagedStatus::Offline
+                } else {
+                    ManagedStatus::Error
+                };
+                record.phase = Some(
+                    if summary.code == "member_revoked" {
+                        "revoked"
                     } else {
-                        ManagedStatus::Error
-                    };
-                    record.phase = Some(
-                        if summary.code == "member_revoked" {
-                            "revoked"
-                        } else {
-                            "error"
-                        }
-                        .into(),
-                    );
-                    record.retry_at = if summary.code == "member_revoked" {
-                        None
-                    } else {
-                        Some(managed_now().saturating_add(MANAGED_TICK_SECONDS))
-                    };
-                    record.last_error = Some(summary);
-                }
+                        "error"
+                    }
+                    .into(),
+                );
+                record.retry_at = if summary.code == "member_revoked" {
+                    None
+                } else {
+                    Some(managed_now().saturating_add(MANAGED_TICK_SECONDS))
+                };
+                record.last_error = Some(summary);
             }
             Ok(())
         })
@@ -2310,24 +2319,23 @@ impl Manager {
                 .find(|pending| pending.request_id == input.request_id)
                 .cloned()
         };
-        if let Some(result_ref) = self.request_lookup(&input.request_id, "join_share", &hash)? {
-            if pending_existing.is_none() {
-                let share =
-                    parse_share_id(result_ref.strip_prefix("share:").unwrap_or(&result_ref))?;
-                let record = self.managed_record(share)?;
-                return Ok(JoinResult {
-                    request_id: input.request_id,
-                    share_id: record.share_id,
-                    enrollment: if record.status == ManagedStatus::Revoked {
-                        EnrollmentState::Revoked
-                    } else {
-                        EnrollmentState::Enrolled
-                    },
-                    status: record.status,
-                    permission: record.permission,
-                    member_id: record.member_id,
-                });
-            }
+        if let Some(result_ref) = self.request_lookup(&input.request_id, "join_share", &hash)?
+            && pending_existing.is_none()
+        {
+            let share = parse_share_id(result_ref.strip_prefix("share:").unwrap_or(&result_ref))?;
+            let record = self.managed_record(share)?;
+            return Ok(JoinResult {
+                request_id: input.request_id,
+                share_id: record.share_id,
+                enrollment: if record.status == ManagedStatus::Revoked {
+                    EnrollmentState::Revoked
+                } else {
+                    EnrollmentState::Enrolled
+                },
+                status: record.status,
+                permission: record.permission,
+                member_id: record.member_id,
+            });
         }
         let _mutation = self.managed_mutations.lock().await;
         let pending_existing = {
@@ -2862,16 +2870,16 @@ impl Manager {
         Self::issued_key(request_id.into(), encoded)
     }
 
-    async fn issue_key_inner(
-        &self,
-        request_id: String,
-        share: ShareId,
-        permission: Permission,
-        expires_at: Option<u64>,
-        operation: &str,
-        hash: String,
-        rotate_invitation: Option<InvitationId>,
-    ) -> Result<IssuedKey> {
+    async fn issue_key_inner(&self, request: IssueKeyRequest<'_>) -> Result<IssuedKey> {
+        let IssueKeyRequest {
+            request_id,
+            share,
+            permission,
+            expires_at,
+            operation,
+            hash,
+            rotate_invitation,
+        } = request;
         Self::check_expiry(expires_at)?;
         if let Some(result_ref) = self.request_lookup(&request_id, operation, &hash)? {
             return self
@@ -2910,15 +2918,15 @@ impl Manager {
         validate_request_id(&input.request_id)?;
         let hash = request_hash("issue_key", &input)?;
         let _mutation = self.managed_mutations.lock().await;
-        self.issue_key_inner(
-            input.request_id,
-            input.share,
-            input.permission,
-            input.expires_at,
-            "issue_key",
+        self.issue_key_inner(IssueKeyRequest {
+            request_id: input.request_id,
+            share: input.share,
+            permission: input.permission,
+            expires_at: input.expires_at,
+            operation: "issue_key",
             hash,
-            None,
-        )
+            rotate_invitation: None,
+        })
         .await
     }
 
@@ -2928,15 +2936,15 @@ impl Manager {
         validate_request_id(&input.request_id)?;
         let hash = request_hash("rotate_key", &input)?;
         let _mutation = self.managed_mutations.lock().await;
-        self.issue_key_inner(
-            input.request_id,
-            input.share,
-            Permission::ReadOnly,
-            input.expires_at,
-            "rotate_key",
+        self.issue_key_inner(IssueKeyRequest {
+            request_id: input.request_id,
+            share: input.share,
+            permission: Permission::ReadOnly,
+            expires_at: input.expires_at,
+            operation: "rotate_key",
             hash,
-            Some(input.invitation),
-        )
+            rotate_invitation: Some(input.invitation),
+        })
         .await
     }
 
@@ -3083,13 +3091,17 @@ impl Manager {
             Ok(())
         })
         .await?;
-        if let Some(slot) = self
+        let slot = self
             .managed_slots
             .lock()
             .expect("managed slots mutex")
-            .remove(&id)
-        {
-            if let Some(worker) = slot.operation.lock().await.take() {
+            .remove(&id);
+        if let Some(slot) = slot {
+            let worker = {
+                let mut operation = slot.operation.lock().await;
+                operation.take()
+            };
+            if let Some(worker) = worker {
                 worker.stop().await?;
             }
         }
