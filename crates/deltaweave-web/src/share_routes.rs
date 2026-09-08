@@ -1,20 +1,22 @@
 use crate::routes::AppState;
 use axum::{
-    Json, Router,
-    extract::{Path, State, rejection::JsonRejection},
+    extract::{rejection::JsonRejection, Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
+    Json, Router,
 };
 use deltaweave_control::{
-    CreateShareInput, IssueKeyInput, JoinShareInput, PreviewKeyInput, RemoveShareInput,
-    ResumeMembershipInput, RevokeKeyInput, RevokeMemberInput, RotateKeyInput, ShareCommand,
-    ShareCommandInput, ValidateKeyInput, classify_managed_error,
+    classify_managed_error, CreateShareInput, IssueKeyInput, JoinShareInput, PreviewKeyInput,
+    RemoveShareInput, ResumeMembershipInput, RevokeKeyInput, RevokeMemberInput, RotateKeyInput,
+    ShareCommand, ShareCommandInput, ValidateKeyInput,
 };
 use deltaweave_net::share::{InvitationId, Permission, ShareId};
 use serde::Deserialize;
 use serde_json::json;
 use std::{path::PathBuf, sync::Arc};
+
+type RouteResult<T> = Result<T, Box<Response>>;
 
 #[derive(Clone, Debug, Deserialize)]
 struct CreateBody {
@@ -131,32 +133,43 @@ fn validate_key_body(request_id: &str, key: &str) -> Option<Response> {
     })
 }
 
-fn parse_id<T>(value: &str, label: &'static str, make: fn([u8; 32]) -> T) -> Result<T, Response> {
+fn parse_id<T>(value: &str, label: &'static str, make: fn([u8; 32]) -> T) -> RouteResult<T> {
     if value.len() != 64
         || value
             .chars()
             .any(|ch| !ch.is_ascii_hexdigit() || ch.is_ascii_uppercase())
     {
-        return Err(client_error(
+        return Err(Box::new(client_error(
             StatusCode::UNPROCESSABLE_ENTITY,
             "invalid_id",
             label,
             None,
-        ));
+        )));
     }
-    let bytes = hex::decode(value)
-        .map_err(|_| client_error(StatusCode::UNPROCESSABLE_ENTITY, "invalid_id", label, None))?;
-    let bytes: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| client_error(StatusCode::UNPROCESSABLE_ENTITY, "invalid_id", label, None))?;
+    let bytes = hex::decode(value).map_err(|_| {
+        Box::new(client_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_id",
+            label,
+            None,
+        ))
+    })?;
+    let bytes: [u8; 32] = bytes.try_into().map_err(|_| {
+        Box::new(client_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_id",
+            label,
+            None,
+        ))
+    })?;
     Ok(make(bytes))
 }
 
-fn share_id(value: &str) -> Result<ShareId, Response> {
+fn share_id(value: &str) -> RouteResult<ShareId> {
     parse_id(value, "공유 ID 형식이 올바르지 않습니다.", ShareId)
 }
 
-fn invitation_id(value: &str) -> Result<InvitationId, Response> {
+fn invitation_id(value: &str) -> RouteResult<InvitationId> {
     parse_id(value, "초대 ID 형식이 올바르지 않습니다.", InvitationId)
 }
 
@@ -371,7 +384,7 @@ async fn resume_membership(
     }
     let share = match share_id(&input.share_id) {
         Ok(value) => value,
-        Err(error) => return error,
+        Err(error) => return *error,
     };
     let request_id = input.request_id.clone();
     result(
@@ -417,7 +430,7 @@ async fn get_one(State(state): State<Arc<AppState>>, Path(raw_share): Path<Strin
 async fn list_keys(State(state): State<Arc<AppState>>, Path(raw_share): Path<String>) -> Response {
     let share = match share_id(&raw_share) {
         Ok(value) => value,
-        Err(error) => return error,
+        Err(error) => return *error,
     };
     result(state.manager.list_keys(share).await, None)
 }
@@ -429,7 +442,7 @@ async fn issue_key(
 ) -> Response {
     let share = match share_id(&raw_share) {
         Ok(value) => value,
-        Err(error) => return error,
+        Err(error) => return *error,
     };
     let Json(input) = match input {
         Ok(value) => value,
@@ -460,11 +473,11 @@ async fn rotate_key(
 ) -> Response {
     let share = match share_id(&raw_share) {
         Ok(value) => value,
-        Err(error) => return error,
+        Err(error) => return *error,
     };
     let invitation = match invitation_id(&raw_invitation) {
         Ok(value) => value,
-        Err(error) => return error,
+        Err(error) => return *error,
     };
     let Json(input) = match input {
         Ok(value) => value,
@@ -495,11 +508,11 @@ async fn revoke_key(
 ) -> Response {
     let share = match share_id(&raw_share) {
         Ok(value) => value,
-        Err(error) => return error,
+        Err(error) => return *error,
     };
     let invitation = match invitation_id(&raw_invitation) {
         Ok(value) => value,
-        Err(error) => return error,
+        Err(error) => return *error,
     };
     let Json(input) = match input {
         Ok(value) => value,
@@ -528,7 +541,7 @@ async fn list_members(
 ) -> Response {
     let share = match share_id(&raw_share) {
         Ok(value) => value,
-        Err(error) => return error,
+        Err(error) => return *error,
     };
     result(state.manager.list_members(share).await, None)
 }
@@ -540,7 +553,7 @@ async fn revoke_member(
 ) -> Response {
     let share = match share_id(&raw_share) {
         Ok(value) => value,
-        Err(error) => return error,
+        Err(error) => return *error,
     };
     if !valid_opaque(&member_id) {
         return client_error(
@@ -578,7 +591,7 @@ async fn remove(
 ) -> Response {
     let share = match share_id(&raw_share) {
         Ok(value) => value,
-        Err(error) => return error,
+        Err(error) => return *error,
     };
     let Json(input) = match input {
         Ok(value) => value,
@@ -608,7 +621,7 @@ async fn command(
 ) -> Response {
     let share = match share_id(&raw_share) {
         Ok(value) => value,
-        Err(error) => return error,
+        Err(error) => return *error,
     };
     let Json(input) = match input {
         Ok(value) => value,
