@@ -384,11 +384,23 @@ export default function App() {
       : undefined;
   const managedShares = state?.shares ?? [];
   const managedPending = state?.pending ?? [];
+  const hasManagedShares = managedShares.length > 0 || managedPending.length > 0;
   const managedDetailShare =
     dialog?.kind === "share-detail"
       ? managedShares.find((share) => share.share_id === dialog.share.share_id) ??
         dialog.share
       : undefined;
+  const managedBoard = (
+    <ManagedSharesBoard
+      shares={managedShares}
+      pending={managedPending}
+      api={api}
+      onCreate={() => setDialog({ kind: "share-create" })}
+      onJoin={() => setDialog({ kind: "share-join" })}
+      onDetail={(share) => setDialog({ kind: "share-detail", share })}
+      onRefresh={reload}
+    />
+  );
   return (
     <div className="app">
       <header className="masthead">
@@ -598,45 +610,34 @@ export default function App() {
             <>
               {page === "overview" && (
                 <>
-                  <Overview
-                    state={state}
-                    transport={transport}
-                    onAdd={() => setDialog({ kind: "share-create" })}
-                    onNavigate={navigate}
-                    onDetail={(id) => setDialog({ kind: "folder-detail", id })}
-                    onActivity={(activity) =>
-                      setDialog({ kind: "activity-detail", activity })
-                    }
-                    onCommand={command}
-                  />
-                  <ManagedSharesBoard
-                    shares={managedShares}
-                    pending={managedPending}
-                    api={api}
-                    onCreate={() => setDialog({ kind: "share-create" })}
-                    onJoin={() => setDialog({ kind: "share-join" })}
-                    onDetail={(share) => setDialog({ kind: "share-detail", share })}
-                    onRefresh={reload}
-                  />
+                  {hasManagedShares && managedBoard}
+                  {(!hasManagedShares || state.folders.length > 0) && (
+                    <Overview
+                      state={state}
+                      transport={transport}
+                      onAdd={() => setDialog({ kind: "share-create" })}
+                      onNavigate={navigate}
+                      onDetail={(id) => setDialog({ kind: "folder-detail", id })}
+                      onActivity={(activity) =>
+                        setDialog({ kind: "activity-detail", activity })
+                      }
+                      onCommand={command}
+                    />
+                  )}
+                  {!hasManagedShares && managedBoard}
                 </>
               )}
               {page === "folders" && (
                 <>
-                  <ManagedSharesBoard
-                    shares={managedShares}
-                    pending={managedPending}
-                    api={api}
-                    onCreate={() => setDialog({ kind: "share-create" })}
-                    onJoin={() => setDialog({ kind: "share-join" })}
-                    onDetail={(share) => setDialog({ kind: "share-detail", share })}
-                    onRefresh={reload}
-                  />
-                  <FoldersPage
-                    state={state}
-                    onAdd={() => setDialog({ kind: "share-create" })}
-                    onDetail={(id) => setDialog({ kind: "folder-detail", id })}
-                    onCommand={command}
-                  />
+                  {managedBoard}
+                  {(state.folders.length > 0 || !hasManagedShares) && (
+                    <FoldersPage
+                      state={state}
+                      onAdd={() => setDialog({ kind: "folder-form" })}
+                      onDetail={(id) => setDialog({ kind: "folder-detail", id })}
+                      onCommand={command}
+                    />
+                  )}
                 </>
               )}
               {page === "devices" && (
@@ -928,7 +929,7 @@ function Overview({
     transport === "offline"
       ? "장치 상태를 다시 확인하고 있습니다"
       : !state.folders.length
-        ? "첫 번째 폴더를 연결해 보세요"
+        ? "첫 폴더를 공유해 보세요"
         : errors
           ? `${errors}개 폴더를 확인해 주세요`
           : syncing
@@ -971,7 +972,7 @@ function Overview({
                 state.folders.length ? onNavigate("folders") : onAdd()
               }
               aria-label={
-                state.folders.length ? "폴더 관리로 이동" : "첫 폴더 연결하기"
+                state.folders.length ? "폴더 관리로 이동" : "첫 폴더 공유하기"
               }
             >
               <ArrowUpRight size={21} />
@@ -1023,7 +1024,7 @@ function Overview({
                 <Plus size={20} />
               </div>
               <button className="btn primary" onClick={onAdd}>
-                첫 폴더 연결 <ArrowRight size={16} />
+                첫 폴더 공유 <ArrowRight size={16} />
               </button>
             </div>
           )}
@@ -1085,6 +1086,7 @@ function Overview({
           onDetail={onDetail}
           onCommand={onCommand}
           onAdd={onAdd}
+          emptyActionLabel="폴더 공유"
         />
         <div className="panel-foot">
           <Info size={14} />
@@ -1397,6 +1399,7 @@ function FolderTable({
   onDetail,
   onCommand,
   onAdd,
+  emptyActionLabel = "수동 폴더 연결",
 }: {
   folders: FolderView[];
   devices: DeviceView[];
@@ -1406,6 +1409,7 @@ function FolderTable({
     c: "sync" | "pause" | "resume",
   ) => Promise<unknown>;
   onAdd?: () => void;
+  emptyActionLabel?: string;
 }) {
   if (!folders.length)
     return (
@@ -1415,13 +1419,13 @@ function FolderTable({
         }
         description={
           onAdd
-            ? "동기화할 로컬 폴더와 상대 장치를 지정하세요. 기존 상태와 identity 파일도 가져올 수 있습니다."
+            ? "폴더를 공유하거나 고급 연결에서 기존 수동 폴더를 추가하세요."
             : "검색어나 상태 필터를 바꿔 보세요."
         }
         action={
           onAdd ? (
             <button className="btn subtle small" onClick={onAdd}>
-              <Plus size={14} />첫 폴더 연결
+              <Plus size={14} />{emptyActionLabel}
             </button>
           ) : null
         }
@@ -1545,6 +1549,7 @@ function FoldersPage({
           folders={folders}
           devices={state.devices}
           onAdd={!state.folders.length ? onAdd : undefined}
+          emptyActionLabel="수동 폴더 연결"
           onDetail={onDetail}
           onCommand={onCommand}
         />

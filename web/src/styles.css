@@ -481,7 +481,9 @@ fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
   .workspace-label { font-size: 10px; letter-spacing: 1.2px; }
   .transport { font-size: 10px; gap: 6px; }
   h1 { font-size: 34px; letter-spacing: -1.5px; }
-  .page-heading { align-items: flex-start; gap: 12px; margin-bottom: 25px; }
+  .page-heading { display: block; margin-bottom: 25px; }
+  .page-heading > div:first-child { min-width: 0; }
+  .heading-actions { margin-top: 18px; flex-wrap: wrap; justify-content: flex-start; }
   .page-heading p { font-size: 12px; margin-top: 8px; max-width: 235px; }
   .heading-actions .hide-mobile { display: none; }
   .heading-actions .btn { font-size: 12px; padding: 10px 12px; min-height: 40px; }
