@@ -1,5 +1,7 @@
 use crate::model::*;
 use anyhow::{Context, Result, ensure};
+use deltaweave_core::ReplicaId;
+use iroh::EndpointAddr;
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
@@ -38,6 +40,8 @@ pub(crate) struct ManagedConfig {
     pub intents: Vec<CreateIntent>,
     #[serde(default)]
     pub requests: Vec<RequestRecord>,
+    #[serde(default)]
+    pub tombstones: Vec<String>,
 }
 
 impl Default for ManagedConfig {
@@ -48,6 +52,7 @@ impl Default for ManagedConfig {
             pending: Vec::new(),
             intents: Vec::new(),
             requests: Vec::new(),
+            tombstones: Vec::new(),
         }
     }
 }
@@ -65,7 +70,19 @@ pub(crate) struct ManagedShareRecord {
     pub root: String,
     pub state_root: String,
     pub owner: String,
+    #[serde(default)]
+    pub min_free_space_bytes: u64,
+    #[serde(default)]
+    pub owner_address: Option<EndpointAddr>,
     pub member_id: Option<String>,
+    #[serde(default)]
+    pub replica: Option<ReplicaId>,
+    #[serde(default)]
+    pub enrolled_at: Option<u64>,
+    #[serde(default)]
+    pub membership_epoch: Option<u64>,
+    #[serde(default)]
+    pub revocation_pending: bool,
     pub status: ManagedStatus,
     pub phase: Option<String>,
     pub last_sync_at: Option<u64>,
@@ -74,6 +91,10 @@ pub(crate) struct ManagedShareRecord {
     pub total_bytes: u64,
     pub transferred_bytes: u64,
     pub speed_bps: u64,
+    #[serde(default)]
+    pub active_peer_count: u32,
+    #[serde(default)]
+    pub connected_devices: Vec<ConnectedDeviceView>,
     pub last_error: Option<ErrorSummary>,
 }
 
@@ -82,12 +103,20 @@ pub(crate) struct PendingRecord {
     pub request_id: String,
     pub share_id: String,
     pub owner: String,
+    #[serde(default)]
+    pub owner_address: Option<EndpointAddr>,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub permission: Option<Permission>,
     pub root: String,
     pub state_root: String,
     pub ticket_file: String,
     pub created_at: u64,
     pub expires_at: Option<u64>,
     pub status: ManagedStatus,
+    #[serde(default)]
+    pub retry_at: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -97,6 +126,8 @@ pub(crate) struct CreateIntent {
     pub name: String,
     pub root: String,
     pub state_root: String,
+    #[serde(default)]
+    pub owner: Option<String>,
     pub created_at: u64,
 }
 

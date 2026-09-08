@@ -200,6 +200,16 @@ impl Registry {
             .config
             .clone())
     }
+    pub fn remove_share(&self, id: ShareId) -> Result<()> {
+        self.update(|catalog| {
+            ensure!(
+                catalog.shares.remove(&id).is_some(),
+                ShareError::UnknownShare
+            );
+            catalog.relationships.retain(|(_, share), _| *share != id);
+            Ok(())
+        })
+    }
     pub fn remember_replicas(
         &self,
         id: ShareId,
@@ -428,9 +438,25 @@ impl Registry {
             let key = (member.owner, member.share_id);
             if let Some(existing) = catalog.relationships.get(&key) {
                 ensure!(
-                    existing.membership.replica == member.replica,
+                    existing.membership.replica == member.replica
+                        && existing.membership.permission == member.permission
+                        && existing.membership.enrolled_at == member.enrolled_at
+                        && existing.membership.endpoint == member.endpoint
+                        && existing.membership.owner == member.owner,
                     ShareError::ReplicaClaimRejected
                 );
+                if existing.membership.revoked_at.is_none() && member.revoked_at.is_some() {
+                    ensure!(
+                        member.epoch >= existing.membership.epoch,
+                        ShareError::ReplicaClaimRejected
+                    );
+                } else {
+                    ensure!(
+                        existing.membership.epoch == member.epoch
+                            && existing.membership.revoked_at == member.revoked_at,
+                        ShareError::ReplicaClaimRejected
+                    );
+                }
             }
             catalog.relationships.insert(key, relationship);
             Ok(())
@@ -444,6 +470,12 @@ impl Registry {
             .relationships
             .remove(&(owner, share))
             .ok_or_else(|| ShareError::NotMember.into())
+    }
+    pub fn forget_relationship(&self, owner: EndpointId, share: ShareId) -> Result<()> {
+        self.update(|catalog| {
+            catalog.relationships.remove(&(owner, share));
+            Ok(())
+        })
     }
 }
 
@@ -613,6 +645,92 @@ mod tests {
                 .enroll(&ticket, winner.endpoint, Some(&retry_proof))
                 .unwrap(),
             winner
+        );
+    }
+
+    #[test]
+    fn resume_relationship_requires_exact_binding_and_only_monotonic_revoke() {
+        let temp = tempfile::tempdir().unwrap();
+        let owner = SecretKey::generate();
+        let peer = SecretKey::generate().public();
+        let share = ShareId([9; 32]);
+        let owner_registry =
+            Registry::open(&temp.path().join("owner-private"), owner.public()).unwrap();
+        owner_registry
+            .insert_share(
+                OwnedShareConfig {
+                    share_id: share,
+                    owner: owner.public(),
+                    name: "Files".into(),
+                    root: temp.path().join("root"),
+                    state_root: temp.path().join("state"),
+                    replica: ReplicaId(Hash32::digest(b"owner")),
+                    min_free_space_bytes: 0,
+                },
+                BTreeSet::new(),
+            )
+            .unwrap();
+        let ticket = ShareTicket::issue(
+            &owner,
+            share,
+            "Files".into(),
+            Permission::ReadWrite,
+            None,
+            EndpointAddr::new(owner.public()),
+            now(),
+        )
+        .unwrap();
+        owner_registry.issue(&ticket).unwrap();
+        let membership = owner_registry.enroll(&ticket, peer, None).unwrap();
+        let address = EndpointAddr::new(owner.public());
+        let registry = Registry::open(&temp.path().join("member-private"), peer).unwrap();
+        registry
+            .store_relationship(MemberRelationship {
+                membership: membership.clone(),
+                address: address.clone(),
+            })
+            .unwrap();
+
+        for mutate in [
+            |candidate: &mut Membership| candidate.permission = Permission::ReadOnly,
+            |candidate: &mut Membership| candidate.enrolled_at += 1,
+            |candidate: &mut Membership| candidate.epoch += 1,
+        ] as [fn(&mut Membership); 3]
+        {
+            let mut changed = membership.clone();
+            mutate(&mut changed);
+            assert_eq!(
+                registry
+                    .store_relationship(MemberRelationship {
+                        membership: changed,
+                        address: address.clone(),
+                    })
+                    .unwrap_err()
+                    .downcast_ref::<ShareError>(),
+                Some(&ShareError::ReplicaClaimRejected)
+            );
+        }
+
+        let mut revoked = membership.clone();
+        revoked.revoked_at = Some(now());
+        revoked.epoch += 1;
+        registry
+            .store_relationship(MemberRelationship {
+                membership: revoked.clone(),
+                address: address.clone(),
+            })
+            .unwrap();
+        let mut revived = revoked;
+        revived.revoked_at = None;
+        assert_eq!(
+            registry
+                .store_relationship(MemberRelationship {
+                    membership: revived,
+                    address,
+                })
+                .unwrap_err()
+                .downcast_ref::<ShareError>(),
+            Some(&ShareError::ReplicaClaimRejected)
         );
     }
 }

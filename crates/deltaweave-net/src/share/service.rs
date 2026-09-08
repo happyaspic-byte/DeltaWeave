@@ -151,6 +151,21 @@ impl ShareService {
         }
         self.load_config(self.registry.config(share)?).await
     }
+
+    /// Pauses and drains a managed owner runtime before deleting only its
+    /// transport catalog entry. The manager retains local files and state.
+    pub async fn unload_owned_share(&self, share: ShareId) -> Result<()> {
+        let _lifecycle = self.lifecycle.lock().await;
+        let runtime = self.runtimes.write().expect("runtime map").remove(&share);
+        if let Some(runtime) = runtime {
+            runtime.pause().await;
+        }
+        self.registry.remove_share(share)
+    }
+
+    pub fn forget_membership(&self, owner: EndpointId, share: ShareId) -> Result<()> {
+        self.registry.forget_relationship(owner, share)
+    }
     async fn load_config(&self, config: OwnedShareConfig) -> Result<OwnerShare> {
         let lease = root_admission::acquire_with_private(
             &config.root,
@@ -277,6 +292,54 @@ impl ShareService {
             _ => Err(ShareError::Protocol.into()),
         }
     }
+
+    /// Restores a durable membership after a lost enrollment response.
+    ///
+    /// This path intentionally has no ticket and never allocates a membership or
+    /// logical replica. The owner authenticates the caller from the QUIC peer ID and
+    /// returns only the currently active binding for the requested share.
+    pub async fn resume_membership(
+        &self,
+        owner: EndpointId,
+        share: ShareId,
+        address: EndpointAddr,
+    ) -> Result<Membership> {
+        ensure!(owner != self.endpoint_id(), ShareError::OwnerMismatch);
+        ensure!(address.id == owner, ShareError::OwnerMismatch);
+        let connection = self
+            .router
+            .endpoint()
+            .connect(address.clone(), ALPN_V3)
+            .await
+            .map_err(|_| ShareError::Offline)?;
+        let result = wire::exchange(
+            &connection,
+            Hello {
+                version: 3,
+                share_id: share,
+                operation: Operation::Resume,
+            },
+        )
+        .await;
+        connection.close(0u8.into(), b"membership resume complete");
+        match result? {
+            Reply::Resumed(member) => {
+                ensure!(
+                    member.owner == owner
+                        && member.share_id == share
+                        && member.endpoint == self.endpoint_id(),
+                    ShareError::OwnerMismatch
+                );
+                self.registry.store_relationship(MemberRelationship {
+                    membership: member.clone(),
+                    address,
+                })?;
+                ensure!(member.revoked_at.is_none(), ShareError::MemberRevoked);
+                Ok(member)
+            }
+            _ => Err(ShareError::Protocol.into()),
+        }
+    }
     async fn connect_ticket(&self, ticket: &ShareTicket) -> Result<Connection> {
         ensure!(
             ticket.preview().owner != self.endpoint_id(),
@@ -339,6 +402,7 @@ impl ShareService {
         for runtime in runtimes {
             runtime.pause().await;
         }
+        self.runtimes.write().expect("runtime map").clear();
         self.router.shutdown().await?;
         let _drained = self.active.write().await;
         Ok(())
@@ -481,6 +545,11 @@ impl Handler {
                     self.registry.authorize(hello.share_id, peer, false)?;
                     Ok(Reply::Accepted)
                 }
+                Operation::Resume => Ok(Reply::Resumed(self.registry.authorize(
+                    hello.share_id,
+                    peer,
+                    false,
+                )?)),
             }
         })();
         let reply = result.unwrap_or_else(|error| Reply::Error(safe_error(&error)));
