@@ -403,14 +403,85 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn acl_script_uses_literal_paths_and_protected_allow_rules() {
-        assert!(WINDOWS_ACL_SCRIPT.contains("Get-Item -LiteralPath"));
-        assert!(WINDOWS_ACL_SCRIPT.contains("Set-Acl -LiteralPath"));
-        assert!(WINDOWS_ACL_SCRIPT.contains("SetAccessRuleProtection($true, $false)"));
-        assert!(WINDOWS_ACL_SCRIPT.contains("SetOwner($userIdentity)"));
-        assert!(WINDOWS_ACL_SCRIPT.contains("WindowsIdentity]::GetCurrent().User.Value"));
-        assert!(WINDOWS_ACL_SCRIPT.contains("ReparsePoint"));
-        assert!(!WINDOWS_ACL_SCRIPT.contains("Invoke-Expression"));
-        assert!(!WINDOWS_ACL_SCRIPT.contains("cmd.exe"));
+    fn native_acl_preparation_is_idempotent_and_fails_closed() {
+        let root = test_directory();
+        let target = root.0.join("managed");
+
+        // The first call creates the leaf and validates the real DACL.  A
+        // second call exercises the existing-directory path and proves that a
+        // valid private leaf can be reopened without changing its ACL.
+        prepare_directory(&target).expect("native private directory is prepared");
+        prepare_directory(&target).expect("native preparation is idempotent");
+
+        let before = windows_acl_fingerprint(&target).expect("read private ACL");
+        add_broad_windows_acl(&target).expect("make a deliberately broad ACL");
+        let broad = windows_acl_fingerprint(&target).expect("read broad ACL");
+        assert_ne!(broad, before, "test fixture must broaden the ACL");
+
+        let error = prepare_directory(&target).expect_err("broad ACL must fail closed");
+        assert_eq!(error.kind(), ErrorKind::PermissionDenied);
+        let after = windows_acl_fingerprint(&target).expect("read ACL after rejection");
+        assert_eq!(after, broad, "rejected ACL must not be repaired implicitly");
+    }
+
+    #[cfg(windows)]
+    fn run_windows_probe(path: &Path, script: &str) -> io::Result<String> {
+        let powershell =
+            trusted_windows_executable(Path::new("WindowsPowerShell\\v1.0\\powershell.exe"))?;
+        let output = std::process::Command::new(powershell)
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                script,
+            ])
+            .env("DELTAWEAVE_PRIVATE_ACL_PATH", path)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|error| safe_io_error(error, PRIVATE_ERROR))?;
+        if !output.status.success() {
+            return Err(permission_error(PRIVATE_ERROR));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    }
+
+    #[cfg(windows)]
+    fn windows_acl_fingerprint(path: &Path) -> io::Result<String> {
+        run_windows_probe(
+            path,
+            r#"
+$ErrorActionPreference = 'Stop'
+$acl = Get-Acl -LiteralPath $env:DELTAWEAVE_PRIVATE_ACL_PATH
+$rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) |
+    ForEach-Object { '{0}|{1}|{2}|{3}|{4}|{5}' -f $_.IdentityReference.Value, $_.AccessControlType, $_.FileSystemRights, $_.InheritanceFlags, $_.PropagationFlags, $_.IsInherited } |
+    Sort-Object
+$material = @($acl.AreAccessRulesProtected, $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value) + $rules
+$bytes = [System.Text.Encoding]::UTF8.GetBytes(($material -join "`n"))
+$hash = [System.Security.Cryptography.SHA256]::Create().ComputeHash($bytes)
+[System.BitConverter]::ToString($hash).Replace('-', '')
+"#,
+        )
+    }
+
+    #[cfg(windows)]
+    fn add_broad_windows_acl(path: &Path) -> io::Result<()> {
+        run_windows_probe(
+            path,
+            r#"
+$ErrorActionPreference = 'Stop'
+$path = $env:DELTAWEAVE_PRIVATE_ACL_PATH
+$acl = Get-Acl -LiteralPath $path
+$identity = New-Object System.Security.Principal.NTAccount('Everyone')
+$rights = [System.Security.AccessControl.FileSystemRights]::ReadAndExecute
+$inheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+$rule = New-Object System.Security.AccessControl.FileSystemAccessRule($identity, $rights, $inheritance, [System.Security.AccessControl.PropagationFlags]::None, [System.Security.AccessControl.AccessControlType]::Allow)
+$acl.AddAccessRule($rule)
+Set-Acl -LiteralPath $path -AclObject $acl
+"#,
+        )
+        .map(|_| ())
     }
 }
