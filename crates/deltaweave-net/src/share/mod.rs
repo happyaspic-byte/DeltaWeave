@@ -1,10 +1,15 @@
 //! Owner-mediated, folder-scoped sharing over one persistent device endpoint.
 mod registry;
+mod roster;
 mod runtime;
 mod service;
 mod ticket;
 pub(crate) mod wire;
 pub use registry::{Invitation, MemberRelationship, Membership, OwnedShareConfig};
+pub use roster::{
+    GrantNonce, PermissionEpoch, ROSTER_HEARTBEAT_INTERVAL_SECONDS, RosterEntry, RosterHeartbeat,
+    SignedRoster, SnapshotId,
+};
 pub(crate) use runtime::Authorization;
 pub use runtime::{MutationProvenance, OwnerShare};
 pub use service::{ShareService, ShareSession};
@@ -31,6 +36,17 @@ pub enum ShareError {
     Protocol,
     OwnerMismatch,
     TransferFailed,
+    HeartbeatExpired,
+    HeartbeatReplay,
+    EpochMismatch,
+    EndpointMismatch,
+    ClockRollback,
+    RosterStale,
+    GrantExpired,
+    GrantReplay,
+    ManifestMismatch,
+    CasUnavailable,
+    RevocationPending,
 }
 impl std::fmt::Display for ShareError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -51,6 +67,17 @@ impl std::fmt::Display for ShareError {
             Self::Protocol => "invalid share protocol",
             Self::OwnerMismatch => "share owner mismatch",
             Self::TransferFailed => "share transfer failed",
+            Self::HeartbeatExpired => "share heartbeat expired",
+            Self::HeartbeatReplay => "share heartbeat replayed",
+            Self::EpochMismatch => "share permission epoch mismatch",
+            Self::EndpointMismatch => "share endpoint mismatch",
+            Self::ClockRollback => "share clock rollback",
+            Self::RosterStale => "share roster is stale",
+            Self::GrantExpired => "share grant expired",
+            Self::GrantReplay => "share grant replayed",
+            Self::ManifestMismatch => "share manifest mismatch",
+            Self::CasUnavailable => "share content unavailable",
+            Self::RevocationPending => "share revocation is pending",
         })
     }
 }
