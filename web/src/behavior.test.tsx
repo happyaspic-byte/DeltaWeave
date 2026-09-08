@@ -1,5 +1,6 @@
 import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { StrictMode, useState } from "react";
 import { expect, it, vi } from "vitest";
 import {
   CopyButton,
@@ -267,6 +268,86 @@ it("restores focus after a fallback copy so Escape still closes its dialog", asy
       Object.defineProperty(navigator, "clipboard", clipboardDescriptor);
     else Reflect.deleteProperty(navigator, "clipboard");
   }
+});
+
+it("restores the opening trigger focus after an Escape close", async () => {
+  const user = userEvent.setup();
+  function Harness() {
+    const [open, setOpen] = useState(false);
+    return (
+      <>
+        <button type="button" onClick={() => setOpen(true)}>
+          공유 열기
+        </button>
+        {open && (
+          <Modal title="공유" onClose={() => setOpen(false)}>
+            <button type="button">작업</button>
+          </Modal>
+        )}
+      </>
+    );
+  }
+
+  render(<Harness />);
+  const trigger = screen.getByRole("button", { name: "공유 열기" });
+  await user.click(trigger);
+  await user.keyboard("{Escape}");
+  await waitFor(() => expect(trigger).toHaveFocus());
+});
+
+it("keeps focus inside a StrictMode dialog after its effect probe", async () => {
+  const user = userEvent.setup();
+  function Harness() {
+    const [open, setOpen] = useState(false);
+    return (
+      <>
+        <button type="button" onClick={() => setOpen(true)}>
+          공유 열기
+        </button>
+        {open && (
+          <Modal title="공유" onClose={() => setOpen(false)}>
+            <input aria-label="공유 이름" />
+          </Modal>
+        )}
+      </>
+    );
+  }
+
+  render(
+    <StrictMode>
+      <Harness />
+    </StrictMode>,
+  );
+  await user.click(screen.getByRole("button", { name: "공유 열기" }));
+  await waitFor(() => expect(screen.getByLabelText("공유 이름")).toHaveFocus());
+});
+
+it("returns focus to a trigger inside the parent dialog after a nested close", async () => {
+  const user = userEvent.setup();
+  function Harness() {
+    const [innerOpen, setInnerOpen] = useState(false);
+    return (
+      <>
+        <Modal title="바깥 창" onClose={() => undefined}>
+          <button type="button" onClick={() => setInnerOpen(true)}>
+            안쪽 창 열기
+          </button>
+        </Modal>
+        {innerOpen && (
+          <Modal title="안쪽 창" onClose={() => setInnerOpen(false)}>
+            <button type="button">안쪽 작업</button>
+          </Modal>
+        )}
+      </>
+    );
+  }
+
+  render(<Harness />);
+  const trigger = screen.getByRole("button", { name: "안쪽 창 열기" });
+  await user.click(trigger);
+  await user.keyboard("{Escape}");
+  await waitFor(() => expect(trigger).toHaveFocus());
+  expect(screen.getByRole("dialog", { name: "바깥 창" })).toBeVisible();
 });
 
 it("recovers outside focus for Tab and Escape after an asynchronous dialog action", async () => {
