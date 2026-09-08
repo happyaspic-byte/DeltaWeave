@@ -178,6 +178,11 @@ async fn managed_routes_keep_session_host_origin_csrf_and_input_boundaries() {
         ),
         (
             "POST".into(),
+            "/api/v1/shares/pending/retry".into(),
+            json!({"request_id":"pending-retry","share_id":share.clone()}),
+        ),
+        (
+            "POST".into(),
             format!("/api/v1/shares/{share}/keys"),
             json!({"request_id":"issue","permission":"read_only"}),
         ),

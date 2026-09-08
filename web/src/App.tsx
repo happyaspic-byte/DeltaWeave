@@ -342,11 +342,12 @@ export default function App() {
     }
   }
   const browse = useCallback(
-    (path: string) =>
+    (path: string, signal?: AbortSignal) =>
       api.request<Directory>(
         path.trim()
           ? `/browse?path=${encodeURIComponent(path.trim())}`
           : "/browse",
+        { signal },
       ),
     [api],
   );
@@ -695,13 +696,7 @@ export default function App() {
             folder={dialog.folder}
             devices={state.devices}
             defaultInterval={state.settings.poll_interval_seconds}
-            browse={(path) =>
-              api.request<Directory>(
-                path.trim()
-                  ? `/browse?path=${encodeURIComponent(path)}`
-                  : "/browse",
-              )
-            }
+            browse={browse}
             onSubmit={(input) =>
               mutate(
                 dialog.folder
