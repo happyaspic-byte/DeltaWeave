@@ -142,6 +142,10 @@ impl OwnedRuntime {
             id,
         }
     }
+    /// Prevents admission before a persisted paused state is published.
+    pub(crate) fn disable(&self) {
+        self.enabled.store(false, Ordering::SeqCst);
+    }
     fn close_connections(&self, peer: Option<EndpointId>) {
         for (endpoint, connection) in self.connections.lock().expect("connection mutex").values() {
             if peer.is_none_or(|peer| *endpoint == peer) {

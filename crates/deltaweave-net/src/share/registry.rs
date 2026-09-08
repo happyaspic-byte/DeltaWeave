@@ -245,6 +245,21 @@ impl Registry {
                 entry.config.owner == ticket.body.owner && entry.config.name == ticket.body.name,
                 ShareError::InvalidTicket
             );
+            let digest = ticket.issuance_digest()?;
+            if let Some(existing) = entry.invitations.get(&ticket.body.invitation_id) {
+                // A recovered issuance intent may replay the same signed
+                // ticket.  It must be an exact replay and can never resurrect
+                // a revoked invitation or overwrite its durable role/expiry.
+                ensure!(
+                    existing.share_id == ticket.body.share_id
+                        && existing.permission == ticket.body.permission
+                        && existing.expires_at == ticket.body.expires_at
+                        && existing.digest == digest
+                        && existing.revoked_at.is_none(),
+                    ShareError::InvalidTicket
+                );
+                return Ok(());
+            }
             ensure!(entry.invitations.len() < 4096, ShareError::Busy);
             entry.invitations.insert(
                 ticket.body.invitation_id,
@@ -254,7 +269,7 @@ impl Registry {
                     permission: ticket.body.permission,
                     expires_at: ticket.body.expires_at,
                     revoked_at: None,
-                    digest: ticket.issuance_digest()?,
+                    digest,
                 },
             );
             Ok(())

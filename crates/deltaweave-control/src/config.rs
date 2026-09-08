@@ -42,6 +42,10 @@ pub(crate) struct ManagedConfig {
     pub requests: Vec<RequestRecord>,
     #[serde(default)]
     pub tombstones: Vec<String>,
+    /// Highest accepted managed wall-clock second.  A persisted future value
+    /// makes a later clock rollback fail closed instead of extending TTLs.
+    #[serde(default)]
+    pub clock_last: u64,
 }
 
 impl Default for ManagedConfig {
@@ -53,6 +57,7 @@ impl Default for ManagedConfig {
             intents: Vec::new(),
             requests: Vec::new(),
             tombstones: Vec::new(),
+            clock_last: 0,
         }
     }
 }
@@ -117,6 +122,8 @@ pub(crate) struct PendingRecord {
     pub status: ManagedStatus,
     #[serde(default)]
     pub retry_at: Option<u64>,
+    #[serde(default)]
+    pub min_free_space_bytes: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
