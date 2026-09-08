@@ -1,6 +1,6 @@
 use super::{
-    ALPN_V3, LegacyProof, MemberRelationship, Membership, OwnedShareConfig, ShareError, ShareId,
-    ShareTicket, TicketPreview,
+    ALPN_V3, GrantNonce, LegacyProof, MemberRelationship, Membership, OwnedShareConfig,
+    RosterHeartbeat, ShareError, ShareId, ShareTicket, SignedRoster, TicketPreview,
 };
 use super::{
     registry::Registry,
@@ -28,7 +28,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::{Arc, RwLock, atomic::Ordering},
+    sync::{Arc, Mutex, RwLock, atomic::Ordering},
 };
 
 /// One device-wide persistent endpoint. Clone its endpoint for all outbound shares;
@@ -58,6 +58,7 @@ impl ShareService {
         let active = Arc::new(tokio::sync::RwLock::new(()));
         let handler = Handler {
             registry: registry.clone(),
+            key: key.clone(),
             runtimes: runtimes.clone(),
             limit: Arc::new(tokio::sync::Semaphore::new(64)),
             active: active.clone(),
@@ -368,6 +369,7 @@ impl ShareService {
             _ => Err(ShareError::Protocol.into()),
         }
     }
+
     async fn connect_ticket(&self, ticket: &ShareTicket) -> Result<Connection> {
         ensure!(
             ticket.preview().owner != self.endpoint_id(),
@@ -392,6 +394,7 @@ impl ShareService {
         );
         Ok(ShareSession {
             membership: relationship.membership,
+            roster_challenge: Mutex::new(None),
             inner: SyncSession {
                 client: SyncClient {
                     secret_key: self.key.clone(),
@@ -440,12 +443,118 @@ impl ShareService {
 #[derive(Debug)]
 pub struct ShareSession {
     membership: Membership,
+    roster_challenge: Mutex<Option<GrantNonce>>,
     inner: SyncSession,
 }
 impl ShareSession {
     pub fn membership(&self) -> &Membership {
         &self.membership
     }
+
+    /// Fetches the owner-signed member roster and arms one heartbeat challenge
+    /// for the next address update. Roster addresses are transport hints only;
+    /// persisted membership remains the authorization authority.
+    pub async fn refresh_roster(&self) -> Result<SignedRoster> {
+        let result = self.control_exchange(Operation::Roster).await?;
+        let (roster, challenge) = match result {
+            Reply::Roster { roster, challenge } => (roster, challenge),
+            _ => return Err(ShareError::Protocol.into()),
+        };
+        roster.verify_for(
+            self.membership.owner,
+            self.membership.share_id,
+            super::now(),
+        )?;
+        ensure!(
+            roster
+                .member(self.membership.endpoint)
+                .is_some_and(|entry| {
+                    entry.permission == self.membership.permission
+                        && entry.member_epoch == self.membership.epoch
+                }),
+            ShareError::EpochMismatch
+        );
+        *self
+            .roster_challenge
+            .lock()
+            .expect("roster challenge mutex") = Some(challenge);
+        Ok(roster)
+    }
+
+    /// Returns the most recently issued challenge for callers that need to
+    /// schedule an explicit heartbeat.
+    #[must_use]
+    pub fn roster_challenge(&self) -> Option<GrantNonce> {
+        *self
+            .roster_challenge
+            .lock()
+            .expect("roster challenge mutex")
+    }
+
+    /// Signs the current endpoint address and submits it to the owner. The
+    /// owner authenticates both the QUIC peer identity and this signature
+    /// before updating the durable roster address.
+    pub async fn heartbeat(&self, challenge: GrantNonce) -> Result<()> {
+        let address = crate::endpoint_addr_with_local_fallback(&self.inner.endpoint);
+        let heartbeat = RosterHeartbeat::sign(
+            &self.inner.client.secret_key,
+            self.membership.owner,
+            self.membership.share_id,
+            address,
+            challenge,
+            super::now(),
+        );
+        let result = self
+            .control_exchange(Operation::Heartbeat(heartbeat))
+            .await?;
+        let roster = match result {
+            Reply::Heartbeat(roster) => roster,
+            _ => return Err(ShareError::Protocol.into()),
+        };
+        roster.verify_for(
+            self.membership.owner,
+            self.membership.share_id,
+            super::now(),
+        )?;
+        ensure!(
+            roster
+                .member(self.membership.endpoint)
+                .is_some_and(|entry| {
+                    entry.permission == self.membership.permission
+                        && entry.member_epoch == self.membership.epoch
+                }),
+            ShareError::EpochMismatch
+        );
+        let mut stored = self
+            .roster_challenge
+            .lock()
+            .expect("roster challenge mutex");
+        if stored.as_ref() == Some(&challenge) {
+            *stored = None;
+        }
+        Ok(())
+    }
+
+    async fn control_exchange(&self, operation: Operation) -> Result<Reply> {
+        let connection = self
+            .inner
+            .endpoint
+            .connect(self.inner.client.remote.clone(), ALPN_V3)
+            .await
+            .map_err(|_| ShareError::Offline)?;
+        let result = wire::exchange(
+            &connection,
+            Hello {
+                version: 3,
+                share_id: self.membership.share_id,
+                operation,
+            },
+        )
+        .await;
+        connection.close(0u8.into(), b"share control complete");
+        result
+    }
+
     pub async fn fetch_snapshot(&self, local: &MerkleTree) -> Result<crate::RemoteSnapshot> {
         self.inner.fetch_snapshot(local).await
     }
@@ -504,6 +613,7 @@ impl ShareSession {
 #[derive(Clone, Debug)]
 struct Handler {
     registry: Arc<Registry>,
+    key: SecretKey,
     runtimes: Arc<RwLock<BTreeMap<ShareId, Arc<OwnedRuntime>>>>,
     limit: Arc<tokio::sync::Semaphore>,
     active: Arc<tokio::sync::RwLock<()>>,
@@ -578,6 +688,19 @@ impl Handler {
                     peer,
                     false,
                 )?)),
+                Operation::Roster => {
+                    let (roster, challenge) =
+                        self.registry
+                            .issue_roster_challenge(&self.key, hello.share_id, peer)?;
+                    Ok(Reply::Roster { roster, challenge })
+                }
+                Operation::Heartbeat(heartbeat) => {
+                    ensure!(heartbeat.share == hello.share_id, ShareError::OwnerMismatch);
+                    Ok(Reply::Heartbeat(
+                        self.registry
+                            .accept_roster_heartbeat(&self.key, &heartbeat, peer)?,
+                    ))
+                }
             }
         })();
         let reply = result.unwrap_or_else(|error| Reply::Error(safe_error(&error)));
@@ -659,7 +782,190 @@ fn safe_error(error: &anyhow::Error) -> ShareError {
 
 #[cfg(test)]
 mod tests {
+    use super::super::Permission;
     use super::*;
+
+    async fn roster_exchange(
+        client: &ShareService,
+        owner: &ShareService,
+        share: ShareId,
+        operation: Operation,
+    ) -> Result<Reply> {
+        let connection = client
+            .router
+            .endpoint()
+            .connect(owner.endpoint_addr(), ALPN_V3)
+            .await?;
+        let result = wire::exchange(
+            &connection,
+            Hello {
+                version: 3,
+                share_id: share,
+                operation,
+            },
+        )
+        .await;
+        connection.close(0u8.into(), b"roster test complete");
+        result
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn authenticated_roster_heartbeat_updates_address_and_rejects_replay() {
+        let name = "share::service::tests::authenticated_roster_heartbeat_updates_address_and_rejects_replay";
+        if std::env::var("DW_ROSTER_CHILD").ok().as_deref() != Some(name) {
+            let profile = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture"])
+                .env("DW_ROSTER_CHILD", name)
+                .env("HOME", profile.path())
+                .env("USERPROFILE", profile.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let owner = ShareService::open(temp.path().join("owner"), NetworkMode::DirectOnly, None)
+            .await
+            .unwrap();
+        let member = ShareService::open(temp.path().join("member"), NetworkMode::DirectOnly, None)
+            .await
+            .unwrap();
+        let outsider =
+            ShareService::open(temp.path().join("outsider"), NetworkMode::DirectOnly, None)
+                .await
+                .unwrap();
+        let owner_share = owner
+            .create_owned_share(
+                "Files".into(),
+                temp.path().join("root"),
+                temp.path().join("state"),
+                None,
+                0,
+            )
+            .await
+            .unwrap();
+        let share = owner_share.config().share_id;
+        let ticket = owner_share
+            .issue_key(Permission::ReadWrite, None, owner.endpoint_addr())
+            .unwrap();
+        let membership = member.enroll(&ticket, None).await.unwrap();
+        let session = member.open_session(owner.endpoint_id(), share).unwrap();
+
+        let roster = session.refresh_roster().await.unwrap();
+        roster
+            .verify_for(owner.endpoint_id(), share, super::super::now())
+            .unwrap();
+        let entry = roster.member(member.endpoint_id()).unwrap();
+        assert_eq!(entry.permission, membership.permission);
+        assert_eq!(entry.member_epoch, membership.epoch);
+        assert_eq!(entry.heartbeat_at, 0);
+        assert_eq!(entry.heartbeat_expires_at, 0);
+        assert!(!roster.member_is_fresh(member.endpoint_id(), super::super::now()));
+        let first_challenge = session.roster_challenge().unwrap();
+        session.heartbeat(first_challenge).await.unwrap();
+
+        let stored = owner.registry.stored_roster(share).unwrap().unwrap();
+        stored
+            .verify_for(owner.endpoint_id(), share, super::super::now())
+            .unwrap();
+        let first_entry = stored.member(member.endpoint_id()).unwrap();
+        assert_eq!(first_entry.address.id, member.endpoint_id());
+        assert!(first_entry.heartbeat_at > 0);
+        assert!(first_entry.heartbeat_expires_at > first_entry.heartbeat_at);
+        assert!(stored.member_is_fresh(member.endpoint_id(), super::super::now()));
+
+        let _ = session.refresh_roster().await.unwrap();
+        let second_challenge = session.roster_challenge().unwrap();
+        let receive_floor = super::super::now();
+        let changed_address = EndpointAddr::from_parts(
+            member.endpoint_id(),
+            [iroh::TransportAddr::Ip("127.0.0.1:39999".parse().unwrap())],
+        );
+        let changed = RosterHeartbeat::sign(
+            &member.key,
+            owner.endpoint_id(),
+            share,
+            changed_address.clone(),
+            second_challenge,
+            receive_floor.saturating_sub(4),
+        );
+        let reply = roster_exchange(
+            &member,
+            &owner,
+            share,
+            Operation::Heartbeat(changed.clone()),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(reply, Reply::Heartbeat(_)));
+        let changed_stored = owner.registry.stored_roster(share).unwrap().unwrap();
+        assert!(
+            changed_stored
+                .member(member.endpoint_id())
+                .unwrap()
+                .heartbeat_at
+                >= receive_floor,
+            "owner receive time must anchor heartbeat liveness"
+        );
+        assert_eq!(
+            changed_stored.member(member.endpoint_id()).unwrap().address,
+            changed_address
+        );
+
+        let replay =
+            match roster_exchange(&member, &owner, share, Operation::Heartbeat(changed)).await {
+                Ok(_) => panic!("replayed heartbeat was accepted"),
+                Err(error) => error,
+            };
+        assert_eq!(
+            replay.downcast_ref::<ShareError>(),
+            Some(&ShareError::HeartbeatReplay)
+        );
+
+        let bad_share = ShareId([0x55; 32]);
+        let cross_share = RosterHeartbeat::sign(
+            &member.key,
+            owner.endpoint_id(),
+            bad_share,
+            member.endpoint_addr(),
+            [7; 32],
+            super::super::now(),
+        );
+        let cross_share_error = match roster_exchange(
+            &member,
+            &owner,
+            share,
+            Operation::Heartbeat(cross_share),
+        )
+        .await
+        {
+            Ok(_) => panic!("cross-share heartbeat was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            cross_share_error.downcast_ref::<ShareError>(),
+            Some(&ShareError::OwnerMismatch)
+        );
+
+        let outsider_error =
+            match roster_exchange(&outsider, &owner, share, Operation::Roster).await {
+                Ok(_) => panic!("non-member roster request was accepted"),
+                Err(error) => error,
+            };
+        assert_eq!(
+            outsider_error.downcast_ref::<ShareError>(),
+            Some(&ShareError::NotMember)
+        );
+
+        drop(session);
+        drop(owner_share);
+        outsider.shutdown().await.unwrap();
+        member.shutdown().await.unwrap();
+        owner.shutdown().await.unwrap();
+    }
+
     #[test]
     fn denied_session_does_not_join_revocation_drain_after_connections_close() {
         if std::env::var_os("DW_DENIED_DRAIN_CHILD").is_none() {

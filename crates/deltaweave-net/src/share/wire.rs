@@ -1,4 +1,7 @@
-use super::{LegacyProof, Membership, ShareError, ShareId, ShareTicket, TicketPreview};
+use super::{
+    GrantNonce, LegacyProof, Membership, RosterHeartbeat, ShareError, ShareId, ShareTicket,
+    SignedRoster, TicketPreview,
+};
 use crate::{read_frame, write_frame};
 use anyhow::{Result, ensure};
 use iroh::endpoint::{Connection, RecvStream};
@@ -22,6 +25,10 @@ pub(crate) enum Operation {
     /// Queries an existing membership without issuing a ticket or allocating a replica.
     /// Appended after the v3 variants so existing peers retain their wire ordinals.
     Resume,
+    /// Requests an owner-signed roster and one member-bound heartbeat challenge.
+    Roster,
+    /// Submits a member-signed address heartbeat for a previously issued challenge.
+    Heartbeat(RosterHeartbeat),
 }
 #[derive(Serialize, Deserialize)]
 pub(crate) enum Reply {
@@ -31,6 +38,13 @@ pub(crate) enum Reply {
     Error(ShareError),
     /// Existing authenticated membership returned by the owner.
     Resumed(Membership),
+    /// Owner-signed roster plus one-use member heartbeat challenge.
+    Roster {
+        roster: SignedRoster,
+        challenge: GrantNonce,
+    },
+    /// Owner-signed roster after accepting a member address heartbeat.
+    Heartbeat(SignedRoster),
 }
 
 pub(crate) async fn read_hello(receive: &mut RecvStream) -> Result<Hello> {
