@@ -376,6 +376,7 @@ export function ShareCreateFlow({
         min_free_space_mib: reserve,
       });
       if (requestGeneration !== generation.current) return;
+      createRequest.current.reset();
       setShare(created);
       await onComplete();
     } catch (cause) {
@@ -397,6 +398,7 @@ export function ShareCreateFlow({
     try {
       const value = await api.issueKey(share.share_id, requestId, permission);
       if (requestGeneration !== generation.current) return;
+      tracker.reset();
       setIssued(value);
       await onComplete();
     } catch (cause) {
@@ -597,6 +599,7 @@ export function ShareJoinFlow({
     try {
       const value = await api.previewShareKey(previewRequestId, clean);
       if (requestGeneration !== generation.current) return;
+      previewRequest.current.reset();
       setPreview(value);
       setDestination("");
       if (!value.signature_valid) {
@@ -610,6 +613,7 @@ export function ShareJoinFlow({
       try {
         const validatedValue = await api.validateShareKey(validateRequestId, clean);
         if (requestGeneration !== generation.current) return;
+        validateRequest.current.reset();
         setPreview(validatedValue);
         setValidated(validatedValue.issuance === "validated");
       } catch (cause) {
@@ -851,6 +855,7 @@ function ShareCommandButtons({
     try {
       await api.shareCommand(requestGeneration, value, requestId);
       if (!mounted.current) return;
+      tracker.reset();
       await onRefresh();
     } catch (cause) {
       if (mounted.current) setError(safeShareError(cause));
@@ -1011,6 +1016,7 @@ function PendingShareRow({
     try {
       await api.resumeMembership(id, item.share_id);
       if (!mounted.current) return;
+      request.current.reset();
       await onRefresh();
     } catch (cause) {
       if (mounted.current) setError(safeShareError(cause));
@@ -1114,6 +1120,7 @@ export function ShareDetailFlow({
     try {
       const value = await api.issueKey(share.share_id, id, permission);
       if (!mounted.current || requestGeneration !== generation.current) return;
+      tracker.reset();
       setIssued(value);
       await onRefresh();
     } catch (cause) {
@@ -1135,6 +1142,7 @@ export function ShareDetailFlow({
     try {
       const value = await api.rotateKey(share.share_id, invitationId, id);
       if (!mounted.current || requestGeneration !== generation.current) return;
+      tracker.reset();
       setIssued(value);
       await reload();
       if (!mounted.current || requestGeneration !== generation.current) return;
@@ -1158,6 +1166,7 @@ export function ShareDetailFlow({
     try {
       const value = await api.revokeKey(share.share_id, invitationId, id);
       if (!mounted.current || requestGeneration !== generation.current) return;
+      if (value.completion === "complete") tracker.reset();
       if (value.completion === "complete") {
         setNotice("키를 철회했습니다. 이 키로 새 가입을 시작할 수 없습니다. 이미 전달된 파일은 회수되지 않습니다.");
       } else {
@@ -1185,6 +1194,7 @@ export function ShareDetailFlow({
     try {
       const value = await api.revokeMember(share.share_id, memberId, id);
       if (!mounted.current || requestGeneration !== generation.current) return;
+      if (value.completion === "complete") tracker.reset();
       if (value.completion === "pending") {
         setNotice("신규 권한은 막혔습니다. 연결 종료 확인 중이며, 완료 전까지 철회 완료로 표시하지 않습니다.");
       } else if (value.completion === "complete") {
@@ -1325,6 +1335,7 @@ export function ShareRemoveButton({
         setError("공유 작업 종료를 기다리는 중입니다. 완료 전에는 제거로 표시하지 않습니다.");
         return;
       }
+      request.current.reset();
       await onRemoved();
     } catch (cause) {
       if (mounted.current) setError(safeShareError(cause));

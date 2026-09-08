@@ -5,6 +5,7 @@ import { Api, ApiError, OperationRequest } from "./api";
 import {
   ManagedSharesBoard,
   ShareCreateFlow,
+  ShareDetailFlow,
   ShareJoinFlow,
   MAX_EXPIRY_TIMER_MS,
   managedStatusLabels,
@@ -247,6 +248,186 @@ describe("managed share web contract", () => {
     expect(await screen.findByText("opaque-issued-key")).toBeVisible();
     expect(issue).toHaveBeenCalledWith(shareId, expect.any(String), "read_only");
     expect(listKeys).not.toHaveBeenCalled();
+  });
+
+  it("uses a fresh request id for each acknowledged key issuance", async () => {
+    const user = userEvent.setup();
+    const api = new Api();
+    const created = vi.spyOn(api, "createShare").mockResolvedValue(share);
+    const issued = vi
+      .spyOn(api, "issueKey")
+      .mockResolvedValueOnce({
+        request_id: "issue-one",
+        share_id: shareId,
+        invitation_id: invitationId,
+        permission: "read_only",
+        expires_at: null,
+        key: "opaque-issued-key-one",
+      })
+      .mockResolvedValueOnce({
+        request_id: "issue-two",
+        share_id: shareId,
+        invitation_id: invitationId,
+        permission: "read_only",
+        expires_at: null,
+        key: "opaque-issued-key-two",
+      });
+    render(
+      <ShareCreateFlow
+        api={api}
+        browse={async () => directory}
+        onClose={() => {}}
+        onComplete={async () => {}}
+      />,
+    );
+    await user.type(screen.getByLabelText("공유 이름"), "팀 문서");
+    await user.type(screen.getByPlaceholderText("폴더를 찾아 선택하세요"), "/srv/team-docs");
+    await user.click(screen.getByRole("button", { name: "폴더 공유 만들기" }));
+    await waitFor(() => expect(created).toHaveBeenCalledOnce());
+
+    const issueButton = () => screen.getByRole("button", { name: /읽기 전용 키/ });
+    await user.click(issueButton());
+    expect(await screen.findByText("opaque-issued-key-one")).toBeVisible();
+    await user.click(issueButton());
+    expect(await screen.findByText("opaque-issued-key-two")).toBeVisible();
+
+    expect(issued).toHaveBeenCalledTimes(2);
+    expect(issued.mock.calls[1][1]).not.toBe(issued.mock.calls[0][1]);
+  });
+
+  it("uses a fresh request id for each acknowledged detail key issuance", async () => {
+    const user = userEvent.setup();
+    const api = new Api();
+    vi.spyOn(api, "listKeys").mockResolvedValue([]);
+    vi.spyOn(api, "listMembers").mockResolvedValue([]);
+    const issued = vi
+      .spyOn(api, "issueKey")
+      .mockResolvedValueOnce({
+        request_id: "detail-issue-one",
+        share_id: shareId,
+        invitation_id: invitationId,
+        permission: "read_only",
+        expires_at: null,
+        key: "opaque-detail-key-one",
+      })
+      .mockResolvedValueOnce({
+        request_id: "detail-issue-two",
+        share_id: shareId,
+        invitation_id: invitationId,
+        permission: "read_only",
+        expires_at: null,
+        key: "opaque-detail-key-two",
+      });
+    render(
+      <ShareDetailFlow
+        share={share}
+        api={api}
+        onClose={() => {}}
+        onRefresh={async () => {}}
+      />,
+    );
+
+    const issueButton = () => screen.getByRole("button", { name: "읽기 전용 키 발급" });
+    await user.click(issueButton());
+    expect(await screen.findByText("opaque-detail-key-one")).toBeVisible();
+    await user.click(issueButton());
+    expect(await screen.findByText("opaque-detail-key-two")).toBeVisible();
+
+    expect(issued).toHaveBeenCalledTimes(2);
+    expect(issued.mock.calls[1][1]).not.toBe(issued.mock.calls[0][1]);
+  });
+
+  it("uses three request ids for pause, resume, and pause after acknowledgement", async () => {
+    const user = userEvent.setup();
+    const api = new Api();
+    const command = vi.spyOn(api, "shareCommand").mockResolvedValue(share);
+    const onRefresh = vi.fn(async () => {});
+    const { rerender } = render(
+      <ManagedSharesBoard
+        shares={[share]}
+        pending={[]}
+        api={api}
+        onCreate={() => {}}
+        onJoin={() => {}}
+        onDetail={() => {}}
+        onRefresh={onRefresh}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "팀 문서 일시정지" }));
+    await waitFor(() => expect(command).toHaveBeenCalledOnce());
+    rerender(
+      <ManagedSharesBoard
+        shares={[{ ...share, status: "paused", phase: "paused" }]}
+        pending={[]}
+        api={api}
+        onCreate={() => {}}
+        onJoin={() => {}}
+        onDetail={() => {}}
+        onRefresh={onRefresh}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: "팀 문서 재개" }));
+    await waitFor(() => expect(command).toHaveBeenCalledTimes(2));
+    rerender(
+      <ManagedSharesBoard
+        shares={[share]}
+        pending={[]}
+        api={api}
+        onCreate={() => {}}
+        onJoin={() => {}}
+        onDetail={() => {}}
+        onRefresh={onRefresh}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: "팀 문서 일시정지" }));
+    await waitFor(() => expect(command).toHaveBeenCalledTimes(3));
+
+    const ids = command.mock.calls.map((call) => call[2]);
+    expect(new Set(ids).size).toBe(3);
+  });
+
+  it("retries a lost command response with the same request id", async () => {
+    const user = userEvent.setup();
+    const api = new Api();
+    const command = vi
+      .spyOn(api, "shareCommand")
+      .mockRejectedValueOnce(new ApiError("timeout", 503, "offline"))
+      .mockResolvedValueOnce(share)
+      .mockResolvedValueOnce(share);
+    const { rerender } = render(
+      <ManagedSharesBoard
+        shares={[share]}
+        pending={[]}
+        api={api}
+        onCreate={() => {}}
+        onJoin={() => {}}
+        onDetail={() => {}}
+        onRefresh={async () => {}}
+      />,
+    );
+
+    const pause = () => screen.getByRole("button", { name: "팀 문서 일시정지" });
+    await user.click(pause());
+    expect(await screen.findByText("소유자에 연결할 수 없습니다. 잠시 후 다시 시도하세요.")).toBeVisible();
+    await user.click(pause());
+    await waitFor(() => expect(command).toHaveBeenCalledTimes(2));
+    expect(command.mock.calls[1][2]).toBe(command.mock.calls[0][2]);
+
+    rerender(
+      <ManagedSharesBoard
+        shares={[share]}
+        pending={[]}
+        api={api}
+        onCreate={() => {}}
+        onJoin={() => {}}
+        onDetail={() => {}}
+        onRefresh={async () => {}}
+      />,
+    );
+    await user.click(pause());
+    await waitFor(() => expect(command).toHaveBeenCalledTimes(3));
+    expect(command.mock.calls[2][2]).not.toBe(command.mock.calls[1][2]);
   });
 
   it("renders all eight managed statuses and separates registrations from live peers", () => {
