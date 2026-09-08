@@ -61,7 +61,7 @@ struct RequestBody {
     request_id: String,
 }
 
-pub(crate) fn router() -> Router<AppState> {
+pub(crate) fn router() -> Router<Arc<AppState>> {
     // Keep static paths before the share-id routes. This is also documented in
     // the contract because "preview" must never be parsed as a share ID.
     Router::new()

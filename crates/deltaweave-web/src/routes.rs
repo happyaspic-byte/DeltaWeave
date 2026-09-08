@@ -23,6 +23,7 @@ use std::{
     time::Duration,
 };
 
+#[path = "share_routes.rs"]
 mod share_routes;
 
 pub(crate) struct AppState {
