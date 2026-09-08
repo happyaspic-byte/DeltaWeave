@@ -1,6 +1,6 @@
 pub use deltaweave_net::{NetworkMode, share::{InvitationId, Permission, ShareId}};
 use serde::{Deserialize, Serialize};
-use std::{net::SocketAddr, path::PathBuf};
+use std::{fmt, net::SocketAddr, path::PathBuf};
 
 /// Options that affect only the managed, owner-mediated endpoint.
 ///
@@ -50,13 +50,13 @@ pub struct CreateShareInput {
     pub min_free_space_mib: Option<u64>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct PreviewKeyInput {
     pub request_id: String,
     pub encoded_key: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct ValidateKeyInput {
     pub request_id: String,
     pub encoded_key: String,
@@ -70,7 +70,7 @@ pub struct IssueKeyInput {
     pub expires_at: Option<u64>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct JoinShareInput {
     pub request_id: String,
     pub encoded_key: String,
@@ -184,6 +184,8 @@ pub struct ManagedShareView {
     pub last_error: Option<ErrorSummary>,
 }
 
+pub type ShareView = ManagedShareView;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ConnectedDeviceView {
     pub member_id: String,
@@ -237,7 +239,7 @@ pub enum KeyIssuance {
     Validated,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct IssuedKey {
     pub request_id: String,
     pub share_id: String,
@@ -245,6 +247,51 @@ pub struct IssuedKey {
     pub permission: Permission,
     pub expires_at: Option<u64>,
     pub key: String,
+}
+
+impl fmt::Debug for PreviewKeyInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreviewKeyInput")
+            .field("request_id", &self.request_id)
+            .field("encoded_key", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl fmt::Debug for ValidateKeyInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ValidateKeyInput")
+            .field("request_id", &self.request_id)
+            .field("encoded_key", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl fmt::Debug for JoinShareInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("JoinShareInput")
+            .field("request_id", &self.request_id)
+            .field("encoded_key", &"[REDACTED]")
+            .field("destination_root", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl fmt::Debug for IssuedKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IssuedKey")
+            .field("request_id", &self.request_id)
+            .field("share_id", &self.share_id)
+            .field("invitation_id", &self.invitation_id)
+            .field("permission", &self.permission)
+            .field("expires_at", &self.expires_at)
+            .field("key", &"[REDACTED]")
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -392,4 +439,44 @@ pub enum FolderCommand {
     Sync,
     Pause,
     Resume,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sensitive_dto_debug_redacts_credentials_and_paths() {
+        let preview = PreviewKeyInput {
+            request_id: "request-1".into(),
+            encoded_key: "dwshare3:secret-ticket".into(),
+        };
+        let validate = ValidateKeyInput {
+            request_id: "request-2".into(),
+            encoded_key: "dwshare3:secret-ticket".into(),
+        };
+        let join = JoinShareInput {
+            request_id: "request-3".into(),
+            encoded_key: "dwshare3:secret-ticket".into(),
+            destination_root: PathBuf::from("/private/destination"),
+        };
+        let issued = IssuedKey {
+            request_id: "request-4".into(),
+            share_id: "share".into(),
+            invitation_id: "invitation".into(),
+            permission: Permission::ReadOnly,
+            expires_at: None,
+            key: "dwshare3:secret-ticket".into(),
+        };
+        for debug in [
+            format!("{preview:?}"),
+            format!("{validate:?}"),
+            format!("{join:?}"),
+            format!("{issued:?}"),
+        ] {
+            assert!(!debug.contains("secret-ticket"), "{debug}");
+            assert!(!debug.contains("/private/destination"), "{debug}");
+            assert!(debug.contains("REDACTED"), "{debug}");
+        }
+    }
 }
