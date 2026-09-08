@@ -235,6 +235,17 @@ impl Registry {
             .clone())
     }
     pub fn issue(&self, ticket: &ShareTicket) -> Result<()> {
+        self.issue_with_revocation(ticket, None)
+    }
+
+    /// Commits one signed issuance and, for rotation, revokes the old
+    /// invitation in the same catalog transaction. Replaying an already
+    /// committed signed ticket is exact and never changes revocation state.
+    pub fn issue_with_revocation(
+        &self,
+        ticket: &ShareTicket,
+        revoke: Option<InvitationId>,
+    ) -> Result<()> {
         ticket.verify_at(now())?;
         self.update(|catalog| {
             let entry = catalog
@@ -258,7 +269,29 @@ impl Registry {
                         && existing.revoked_at.is_none(),
                     ShareError::InvalidTicket
                 );
+                if let Some(revoke) = revoke {
+                    ensure!(
+                        revoke != ticket.body.invitation_id,
+                        ShareError::InvalidTicket
+                    );
+                    let old = entry
+                        .invitations
+                        .get_mut(&revoke)
+                        .ok_or(ShareError::InvalidTicket)?;
+                    old.revoked_at.get_or_insert(now());
+                }
                 return Ok(());
+            }
+            if let Some(revoke) = revoke {
+                ensure!(
+                    revoke != ticket.body.invitation_id,
+                    ShareError::InvalidTicket
+                );
+                let old = entry
+                    .invitations
+                    .get_mut(&revoke)
+                    .ok_or(ShareError::InvalidTicket)?;
+                old.revoked_at.get_or_insert(now());
             }
             ensure!(entry.invitations.len() < 4096, ShareError::Busy);
             entry.invitations.insert(

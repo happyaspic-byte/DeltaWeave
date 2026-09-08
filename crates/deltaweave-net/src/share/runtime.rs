@@ -204,8 +204,9 @@ impl OwnerShare {
     pub fn config(&self) -> &OwnedShareConfig {
         &self.runtime.config
     }
-    /// Keys are display-once: the issuance database retains only their digest.
-    pub fn issue_key(
+    /// Builds a signed ticket without changing the durable invitation catalog.
+    /// Control persists this staged ticket before committing its side effect.
+    pub fn prepare_key(
         &self,
         permission: Permission,
         expires_at: Option<u64>,
@@ -224,7 +225,28 @@ impl OwnerShare {
             address,
             now(),
         )?;
-        self.runtime.registry.issue(&ticket)?;
+        Ok(ticket)
+    }
+
+    /// Commits a staged ticket, optionally rotating an older invitation in one
+    /// durable registry transaction. Exact replay is safe after a crash.
+    pub fn commit_key(&self, ticket: &ShareTicket, revoke: Option<InvitationId>) -> Result<()> {
+        if revoke.is_none() {
+            self.runtime.registry.issue(ticket)
+        } else {
+            self.runtime.registry.issue_with_revocation(ticket, revoke)
+        }
+    }
+
+    /// Keys are display-once: the issuance database retains only their digest.
+    pub fn issue_key(
+        &self,
+        permission: Permission,
+        expires_at: Option<u64>,
+        address: EndpointAddr,
+    ) -> Result<ShareTicket> {
+        let ticket = self.prepare_key(permission, expires_at, address)?;
+        self.commit_key(&ticket, None)?;
         Ok(ticket)
     }
     pub fn keys(&self) -> Result<Vec<Invitation>> {
@@ -244,8 +266,9 @@ impl OwnerShare {
             .into_iter()
             .find(|key| key.id == id)
             .ok_or(ShareError::InvalidTicket)?;
-        self.revoke_key(id)?;
-        self.issue_key(old.permission, expires_at, address)
+        let ticket = self.prepare_key(old.permission, expires_at, address)?;
+        self.commit_key(&ticket, Some(id))?;
+        Ok(ticket)
     }
     pub fn members(&self) -> Result<Vec<Membership>> {
         self.runtime.registry.members(self.config().share_id)
@@ -253,16 +276,37 @@ impl OwnerShare {
     /// Persist denial first, close QUIC, then drain the gate and every retained handler.
     /// Lock order: gate -> short registry transaction; revocation releases registry
     /// before waiting for gate. Blocking work is always awaited by retained handlers.
-    pub async fn revoke_member(&self, peer: EndpointId) -> Result<()> {
+    pub fn deny_member(&self, peer: EndpointId) -> Result<()> {
         self.runtime
             .registry
             .revoke_member(self.config().share_id, peer)?;
         self.runtime.close_connections(Some(peer));
+        Ok(())
+    }
+
+    pub fn member_drain_ready(&self, peer: EndpointId) -> bool {
+        !self
+            .runtime
+            .connections
+            .lock()
+            .expect("connection mutex")
+            .values()
+            .any(|(endpoint, _)| *endpoint == peer)
+    }
+
+    /// Waits until all already-admitted handlers for one denied member have
+    /// released their connection tracking guards.
+    pub async fn drain_member(&self, peer: EndpointId) -> Result<()> {
         {
             let _gate = self.runtime.gate.lock().await;
         }
         self.runtime.drain_connections(Some(peer)).await;
         Ok(())
+    }
+
+    pub async fn revoke_member(&self, peer: EndpointId) -> Result<()> {
+        self.deny_member(peer)?;
+        self.drain_member(peer).await
     }
     pub async fn pause(&self) {
         self.runtime.pause().await;
