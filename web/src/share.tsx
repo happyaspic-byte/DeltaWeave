@@ -428,7 +428,6 @@ export function ShareCreateFlow({
                 value={name}
                 onChange={(event) => setName(event.target.value)}
                 placeholder="예: 팀 문서"
-                autoFocus
                 required
               />
             </Field>
@@ -738,7 +737,6 @@ export function ShareJoinFlow({
               onChange={(event) => changeKey(event.target.value)}
               placeholder="공유 키 붙여넣기"
               rows={4}
-              autoFocus
               spellCheck={false}
               data-sensitive="share-key"
               disabled={busy === "join"}
