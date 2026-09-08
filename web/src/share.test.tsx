@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Api, ApiError, OperationRequest } from "./api";
@@ -6,6 +6,7 @@ import {
   ManagedSharesBoard,
   ShareCreateFlow,
   ShareDetailFlow,
+  ShareDirectoryPicker,
   ShareJoinFlow,
   MAX_EXPIRY_TIMER_MS,
   managedStatusLabels,
@@ -82,6 +83,16 @@ function configureJoinApi(
   vi.spyOn(api, "previewShareKey").mockResolvedValue(preview);
   vi.spyOn(api, "validateShareKey").mockImplementation(validate);
   vi.spyOn(api, "joinShare").mockResolvedValue(joined);
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
 }
 
 afterEach(() => vi.restoreAllMocks());
@@ -164,7 +175,7 @@ describe("managed share web contract", () => {
     await user.click(screen.getByRole("button", { name: "이 폴더 선택" }));
     expect(screen.getByRole("button", { name: "가입 대기로 저장" })).toBeEnabled();
     await user.click(screen.getByRole("button", { name: "가입 대기로 저장" }));
-    expect(await screen.findByText("가입 요청을 안전하게 저장했습니다.")).toBeVisible();
+    expect(await screen.findByText("가입 요청을 저장했습니다.")).toBeVisible();
     expect(api.joinShare).toHaveBeenCalledOnce();
   });
 
@@ -188,6 +199,179 @@ describe("managed share web contract", () => {
     expect(await screen.findByText("철회된 공유 키입니다.")).toBeVisible();
     expect(screen.getByRole("button", { name: "공유에 가입" })).toBeDisabled();
     expect(screen.queryByRole("button", { name: "찾아보기" })).not.toBeInTheDocument();
+  });
+
+  it("clears checking state when the key changes during online validation", async () => {
+    const user = userEvent.setup();
+    const api = new Api();
+    const pendingValidation = deferred<KeyPreview>();
+    configureJoinApi(api, vi.fn(() => pendingValidation.promise));
+    render(
+      <ShareJoinFlow
+        api={api}
+        browse={async () => directory}
+        onClose={() => {}}
+        onComplete={async () => {}}
+      />,
+    );
+
+    const keyInput = screen.getByLabelText("공유 키");
+    await user.type(keyInput, "opaque-test-key");
+    await user.click(screen.getByRole("button", { name: "키 확인" }));
+    await waitFor(() => expect(api.validateShareKey).toHaveBeenCalledOnce());
+
+    await user.clear(keyInput);
+    await user.type(keyInput, "replacement-key");
+    expect(screen.getByRole("button", { name: "키 확인" })).toBeEnabled();
+
+    pendingValidation.resolve(preview);
+    await act(async () => {
+      await pendingValidation.promise;
+    });
+    expect(screen.queryByText("팀 문서")).not.toBeInTheDocument();
+  });
+
+  it("clears checking state when a preview expires during validation", async () => {
+    vi.useFakeTimers();
+    try {
+      const start = new Date("2026-09-08T00:00:00Z");
+      vi.setSystemTime(start);
+      const api = new Api();
+      const expiringPreview = {
+        ...preview,
+        expires_at: Math.floor(start.getTime() / 1000) + 1,
+      };
+      const pendingValidation = deferred<KeyPreview>();
+      vi.spyOn(api, "previewShareKey").mockResolvedValue(expiringPreview);
+      vi.spyOn(api, "validateShareKey").mockReturnValue(pendingValidation.promise);
+      vi.spyOn(api, "joinShare").mockResolvedValue(joined);
+      render(
+        <ShareJoinFlow
+          api={api}
+          browse={async () => directory}
+          onClose={() => {}}
+          onComplete={async () => {}}
+        />,
+      );
+
+      const keyInput = screen.getByLabelText("공유 키");
+      fireEvent.change(keyInput, { target: { value: "opaque-test-key" } });
+      fireEvent.click(screen.getByRole("button", { name: "키 확인" }));
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(api.validateShareKey).toHaveBeenCalledOnce();
+
+      await act(async () => {
+        vi.advanceTimersByTime(1_001);
+      });
+      expect(keyInput).toHaveValue("");
+      expect(screen.getByText("공유 키가 만료되어 화면에서 지웠습니다.")).toBeVisible();
+
+      pendingValidation.resolve(expiringPreview);
+      await act(async () => {
+        await pendingValidation.promise;
+      });
+      expect(screen.queryByText("팀 문서")).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not reopen a directory after closing during a pending browse", async () => {
+    const user = userEvent.setup();
+    const pendingBrowse = deferred<Directory>();
+    const browse = vi
+      .fn<(path: string) => Promise<Directory>>()
+      .mockResolvedValueOnce({
+        path: "/srv",
+        parent: "/",
+        entries: [{ name: "child", path: "/srv/child" }],
+      })
+      .mockReturnValueOnce(pendingBrowse.promise);
+    render(
+      <ShareDirectoryPicker
+        value=""
+        onChange={() => {}}
+        browse={browse}
+        label="저장 폴더"
+        help="테스트"
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "찾아보기" }));
+    await user.click(await screen.findByRole("button", { name: /child/ }));
+    await user.click(screen.getByRole("button", { name: "폴더 탐색 닫기" }));
+    expect(screen.getByRole("button", { name: "찾아보기" })).toBeEnabled();
+
+    pendingBrowse.resolve({ path: "/srv/child", parent: "/srv", entries: [] });
+    await act(async () => {
+      await pendingBrowse.promise;
+    });
+    expect(screen.queryByRole("button", { name: "폴더 탐색 닫기" })).not.toBeInTheDocument();
+  });
+
+  it("does not reopen a directory after choosing while a browse is pending", async () => {
+    const user = userEvent.setup();
+    const pendingBrowse = deferred<Directory>();
+    const onChange = vi.fn();
+    const browse = vi
+      .fn<(path: string) => Promise<Directory>>()
+      .mockResolvedValueOnce({
+        path: "/srv",
+        parent: "/",
+        entries: [{ name: "child", path: "/srv/child" }],
+      })
+      .mockReturnValueOnce(pendingBrowse.promise);
+    render(
+      <ShareDirectoryPicker
+        value=""
+        onChange={onChange}
+        browse={browse}
+        label="저장 폴더"
+        help="테스트"
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "찾아보기" }));
+    await user.click(await screen.findByRole("button", { name: /child/ }));
+    await user.click(screen.getByRole("button", { name: "이 폴더 선택" }));
+    expect(onChange).toHaveBeenCalledWith("/srv");
+    expect(screen.getByRole("button", { name: "찾아보기" })).toBeEnabled();
+
+    pendingBrowse.resolve({ path: "/srv/child", parent: "/srv", entries: [] });
+    await act(async () => {
+      await pendingBrowse.promise;
+    });
+    expect(screen.queryByRole("button", { name: "폴더 탐색 닫기" })).not.toBeInTheDocument();
+  });
+
+  it("shows a revoked enrollment result instead of a pending success", async () => {
+    const user = userEvent.setup();
+    const api = new Api();
+    configureJoinApi(api);
+    vi.spyOn(api, "joinShare").mockResolvedValue({
+      ...joined,
+      enrollment: "revoked",
+      status: "revoked",
+    });
+    render(
+      <ShareJoinFlow
+        api={api}
+        browse={async () => directory}
+        onClose={() => {}}
+        onComplete={async () => {}}
+      />,
+    );
+    await user.type(screen.getByLabelText("공유 키"), "opaque-test-key");
+    await user.click(screen.getByRole("button", { name: "키 확인" }));
+    await user.click(screen.getByRole("button", { name: "찾아보기" }));
+    await user.click(screen.getByRole("button", { name: "이 폴더 선택" }));
+    await user.click(screen.getByRole("button", { name: "공유에 가입" }));
+
+    expect(await screen.findByText("이 공유에 가입할 수 없습니다.")).toBeVisible();
+    expect(screen.queryByText("가입 요청을 안전하게 저장했습니다.")).not.toBeInTheDocument();
   });
 
   it("retries a lost join response with the same request id", async () => {

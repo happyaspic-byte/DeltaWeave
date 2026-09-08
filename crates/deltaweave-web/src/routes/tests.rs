@@ -275,7 +275,7 @@ async fn managed_routes_keep_session_host_origin_csrf_and_input_boundaries() {
         .request(
             "POST",
             "/api/v1/shares/preview",
-            json!({"request_id":"preview-bad-key","key":"bad-key"}),
+            json!({"request_id":"preview-bad-key","key":"dwshare3:not-hex"}),
             Some(&cookie),
             Some(&csrf),
             Some("http://localhost:8390"),

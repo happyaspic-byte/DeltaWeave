@@ -223,10 +223,12 @@ export function ShareDirectoryPicker({
   }
   function closeDirectory() {
     generation.current += 1;
+    setLoading(false);
     setDirectory(null);
   }
   function chooseDirectory(path: string) {
     generation.current += 1;
+    setLoading(false);
     onChange(path);
     setDirectory(null);
   }
@@ -468,7 +470,7 @@ export function ShareCreateFlow({
             </div>
           </div>
           <div className="share-created-summary">
-            <span className="eyebrow">OWNER SHARE</span>
+            <span className="eyebrow">소유자 공유</span>
             <strong>{share.name}</strong>
             <code>{share.root}</code>
           </div>
@@ -499,7 +501,7 @@ export function ShareCreateFlow({
             <div className="issued-key-panel" data-sensitive="share-key">
               <div className="issued-key-head">
                 <div>
-                  <span className="eyebrow">DISPLAY ONCE</span>
+                  <span className="eyebrow">한 번만 표시</span>
                   <strong>{permissionLabel(issued.permission)} 키</strong>
                 </div>
                 <PermissionBadge permission={issued.permission} />
@@ -555,6 +557,7 @@ export function ShareJoinFlow({
   const [result, setResult] = useState<JoinResult | null>(null);
   const [resultName, setResultName] = useState("");
   const [busy, setBusy] = useState<"check" | "join" | null>(null);
+  const [joinSecretExpired, setJoinSecretExpired] = useState(false);
   const [error, setError] = useState("");
   const [joinError, setJoinError] = useState("");
   const previewRequest = useRef(new OperationRequest());
@@ -570,8 +573,13 @@ export function ShareJoinFlow({
   }, []);
 
   function changeKey(value: string) {
+    // A join request owns the bearer until its response arrives. The input is
+    // disabled during that mutation; keep this guard for programmatic changes.
+    if (busy === "join") return;
     generation.current += 1;
+    setBusy(null);
     setKey(value);
+    setJoinSecretExpired(false);
     setPreview(null);
     setValidated(false);
     setOfflineValidation(false);
@@ -638,10 +646,14 @@ export function ShareJoinFlow({
   }
 
   async function submitJoin() {
+    if (joinSecretExpired) {
+      setJoinError("공유 키가 만료되어 새 요청을 보낼 수 없습니다. 공유 보드에서 상태를 확인하세요.");
+      return;
+    }
     if (!preview || (!validated && !offlineValidation) || !destination.trim() || busy) {
       setJoinError(
         offlineValidation
-          ? "이 장치의 저장 폴더를 선택하세요. 가입 요청은 owner가 복구되면 처리됩니다."
+          ? "이 장치의 저장 폴더를 선택하세요. 소유자 연결이 복구되면 처리됩니다."
           : "키를 확인하고 이 장치의 저장 폴더를 선택하세요.",
       );
       return;
@@ -660,6 +672,7 @@ export function ShareJoinFlow({
       setResult(value);
       // Enrollment success/pending both clear the bearer from React state.
       setKey("");
+      setJoinSecretExpired(false);
       setPreview(null);
       setValidated(false);
       setOfflineValidation(false);
@@ -683,19 +696,29 @@ export function ShareJoinFlow({
   useEffect(() => {
     if (preview?.expires_at == null) return;
     return scheduleExpiry(preview.expires_at, () => {
+      if (busy === "join") {
+        // Do not invalidate a join already accepted by the server. Clear the
+        // bearer while allowing its authoritative response to render.
+        setKey("");
+        setJoinSecretExpired(true);
+        setJoinError("공유 키가 만료되었습니다. 가입 결과를 확인하는 중입니다.");
+        return;
+      }
       generation.current += 1;
       setKey("");
+      setJoinSecretExpired(false);
       setPreview(null);
       setValidated(false);
       setOfflineValidation(false);
       setDestination("");
+      setBusy(null);
       setJoinError("");
       setError("공유 키가 만료되어 화면에서 지웠습니다.");
       previewRequest.current.reset();
       validateRequest.current.reset();
       joinRequest.current.reset();
     });
-  }, [preview?.expires_at]);
+  }, [busy, preview?.expires_at]);
 
   return (
     <form onSubmit={join} className="share-form join-form">
@@ -718,6 +741,7 @@ export function ShareJoinFlow({
               autoFocus
               spellCheck={false}
               data-sensitive="share-key"
+              disabled={busy === "join"}
               required
             />
           </Field>
@@ -738,20 +762,20 @@ export function ShareJoinFlow({
               <div className="key-preview-head">
                 <div className="item-icon"><Key size={21} /></div>
                 <div>
-                  <span className="eyebrow">LOCAL SIGNATURE PREVIEW</span>
+                  <span className="eyebrow">서명 확인 결과</span>
                   <strong>{preview.name}</strong>
                 </div>
                 <PermissionBadge permission={preview.permission} />
               </div>
               <dl className="details-grid compact-details">
-                <div><dt>공유 ID</dt><dd className="mono key-id">{preview.share_id}</dd></div>
+                <div><dt>공유 ID</dt><dd className="mono key-id">{shortOpaqueId(preview.share_id)}</dd></div>
                 <div><dt>초대 만료</dt><dd>{formatExpiry(preview.expires_at)}</dd></div>
               </dl>
               <p className="muted">
                 {validated
                   ? "소유자 발급 기록이 확인되었습니다. 이제 이 장치의 저장 폴더를 선택하세요."
                   : offlineValidation
-                    ? "소유자 연결이 복구되면 pending 가입이 재개됩니다."
+                    ? "소유자 연결이 복구되면 가입 요청을 다시 확인할 수 있습니다."
                     : "이 정보는 서명만 확인한 결과이며 아직 가입되거나 동기화되지 않았습니다."}
               </p>
             </div>
@@ -767,7 +791,7 @@ export function ShareJoinFlow({
             />
           )}
           {joinError && <ErrorBox error={joinError} />}
-          {joinError && (
+          {joinError && !joinSecretExpired && (
             <button
               type="button"
               className="btn subtle small join-retry"
@@ -794,16 +818,28 @@ export function ShareJoinFlow({
           <div className="share-success-banner">
             {result.enrollment === "enrolled" ? <CheckCircle size={22} weight="fill" /> : <Info size={22} />}
             <div>
-              <strong>{result.enrollment === "enrolled" ? "공유에 가입했습니다." : "가입 요청을 안전하게 저장했습니다."}</strong>
+              <strong>
+                {result.enrollment === "enrolled"
+                  ? "공유에 가입했습니다."
+                  : result.enrollment === "revoked"
+                    ? "이 공유에 가입할 수 없습니다."
+                    : result.enrollment === "error"
+                      ? "가입 결과를 확인해야 합니다."
+                      : "가입 요청을 저장했습니다."}
+              </strong>
               <p>
                 {result.enrollment === "enrolled"
                   ? "소유자의 최신 상태를 확인한 뒤 초기 동기화를 시작합니다."
-                  : "소유자가 온라인으로 돌아오면 관리형 공유 보드에서 재개할 수 있습니다."}
+                  : result.enrollment === "revoked"
+                    ? "공유 권한이 철회되어 이 장치의 가입을 진행할 수 없습니다."
+                    : result.enrollment === "error"
+                      ? "공유 보드에서 상태를 확인한 뒤 다시 시도하세요."
+                      : "소유자 연결이 복구되면 공유 보드에서 가입 요청을 다시 확인할 수 있습니다."}
               </p>
             </div>
           </div>
           <div className="join-result-card">
-            <span className="eyebrow">JOIN RESULT</span>
+            <span className="eyebrow">가입 결과</span>
             <strong>{resultName || "관리형 공유"}</strong>
             <div className="join-result-meta">
               <ShareStatus status={result.status} />
@@ -812,7 +848,7 @@ export function ShareJoinFlow({
           </div>
           <div className="permission-note">
             <ShieldCheck size={15} />
-            <span>가입 요청 ID는 응답 유실 시 같은 작업을 재시도하는 데 사용되며, 키는 더 이상 보관하지 않습니다.</span>
+            <span>응답이 늦거나 끊겨도 같은 가입 요청으로 확인할 수 있으며, 키는 더 이상 보관하지 않습니다.</span>
           </div>
           <div className="form-actions">
             <span className="muted">공유 보드에서 상태와 재개 가능 여부를 확인하세요.</span>
@@ -1251,7 +1287,7 @@ export function ShareDetailFlow({
       )}
       {issued && (
         <div className="issued-key-panel" data-sensitive="share-key">
-          <div className="issued-key-head"><div><span className="eyebrow">DISPLAY ONCE</span><strong>새 {permissionLabel(issued.permission)} 키</strong></div><PermissionBadge permission={issued.permission} /></div>
+          <div className="issued-key-head"><div><span className="eyebrow">한 번만 표시</span><strong>새 {permissionLabel(issued.permission)} 키</strong></div><PermissionBadge permission={issued.permission} /></div>
           <code className="share-key-value">{issued.key}</code>
           <div className="copy-row"><CopyButton value={issued.key} label="키 복사" /><button type="button" className="btn subtle small" onClick={() => setIssued(null)}>키 숨기기</button></div>
         </div>
