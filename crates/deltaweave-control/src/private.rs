@@ -1,0 +1,416 @@
+//! Preparation and validation of the managed private namespace.
+//!
+//! The managed state directory is created before any ticket, identity, or
+//! recovery material is written.  This module deliberately has no dependency
+//! on the configurable public folder or web state paths.  On Unix the mode is
+//! checked directly.  Windows has no portable standard-library ACL API, so a
+//! fixed PowerShell/.NET `DirectorySecurity` program is used with values passed
+//! as environment variables to a shell-free `Command` invocation.
+
+use std::{
+    fs,
+    io::{self, ErrorKind},
+    path::{Component, Path},
+};
+
+const PRIVATE_ERROR: &str = "managed private directory security check failed";
+const PRIVATE_MISSING_PARENT: &str = "managed private directory parent is unavailable";
+const PRIVATE_NOT_DIRECTORY: &str = "managed private path is not a directory";
+const PRIVATE_REPARSE: &str = "managed private path must not be a symlink or reparse point";
+#[cfg(unix)]
+const PRIVATE_PERMISSIONS: &str =
+    "managed private directory permissions are too broad or insufficient";
+
+/// Creates or validates one managed private directory before secret material
+/// is written into it.
+///
+/// The caller supplies a fixed path under the control data directory.  Parents
+/// must already exist; this function never creates a path recursively because
+/// doing so would make the security boundary depend on unvalidated parents.
+pub(crate) fn prepare_directory(path: &Path) -> io::Result<()> {
+    if path.as_os_str().is_empty() {
+        return Err(permission_error(PRIVATE_ERROR));
+    }
+
+    reject_reparse_components(path)?;
+    let existed = match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            validate_directory_metadata(&metadata)?;
+            true
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => false,
+        Err(error) => return Err(safe_io_error(error, PRIVATE_ERROR)),
+    };
+
+    if !existed {
+        create_private_leaf(path).map_err(|error| {
+            if error.kind() == ErrorKind::NotFound {
+                safe_io_error(error, PRIVATE_MISSING_PARENT)
+            } else {
+                safe_io_error(error, PRIVATE_ERROR)
+            }
+        })?;
+        // A concurrent replacement must not turn the chmod/ACL operation into
+        // an operation on an attacker-selected link or reparse point.
+        reject_reparse_components(path)?;
+        let metadata =
+            fs::symlink_metadata(path).map_err(|error| safe_io_error(error, PRIVATE_ERROR))?;
+        validate_directory_kind(&metadata)?;
+    }
+
+    #[cfg(unix)]
+    {
+        let metadata =
+            fs::symlink_metadata(path).map_err(|error| safe_io_error(error, PRIVATE_ERROR))?;
+        validate_directory_metadata(&metadata)?;
+    }
+
+    #[cfg(windows)]
+    prepare_windows_acl(path, !existed)?;
+
+    Ok(())
+}
+
+fn permission_error(message: &'static str) -> io::Error {
+    io::Error::new(ErrorKind::PermissionDenied, message)
+}
+
+fn safe_io_error(error: io::Error, message: &'static str) -> io::Error {
+    io::Error::new(error.kind(), message)
+}
+
+fn validate_directory_metadata(metadata: &fs::Metadata) -> io::Result<()> {
+    validate_directory_kind(metadata)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Require exactly owner rwx for a usable private directory.  Group,
+        // other, and special bits are all rejected; an existing broad mode is
+        // never repaired implicitly.
+        let mode = metadata.permissions().mode() & 0o7777;
+        if mode != 0o700 {
+            return Err(permission_error(PRIVATE_PERMISSIONS));
+        }
+    }
+    Ok(())
+}
+
+fn validate_directory_kind(metadata: &fs::Metadata) -> io::Result<()> {
+    if metadata.file_type().is_symlink() || is_reparse_point(metadata) {
+        return Err(permission_error(PRIVATE_REPARSE));
+    }
+    if !metadata.is_dir() {
+        return Err(permission_error(PRIVATE_NOT_DIRECTORY));
+    }
+    Ok(())
+}
+
+fn create_private_leaf(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+
+        let mut builder = fs::DirBuilder::new();
+        // The mode is applied atomically with mkdir and is then checked after
+        // creation.  A restrictive umask may remove owner bits, which causes
+        // preparation to fail closed rather than widening an existing path.
+        builder.mode(0o700);
+        builder.create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir(path)
+    }
+}
+
+fn reject_reparse_components(path: &Path) -> io::Result<()> {
+    let mut current = path
+        .components()
+        .next()
+        .map(component_path)
+        .unwrap_or_default();
+
+    for component in path.components().skip(1) {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
+                    return Err(permission_error(PRIVATE_REPARSE));
+                }
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => break,
+            Err(error) => return Err(safe_io_error(error, PRIVATE_ERROR)),
+        }
+    }
+    Ok(())
+}
+
+fn component_path(component: Component<'_>) -> std::path::PathBuf {
+    let mut path = std::path::PathBuf::new();
+    path.push(component.as_os_str());
+    path
+}
+
+#[cfg(windows)]
+fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    // FILE_ATTRIBUTE_REPARSE_POINT is part of the Win32 file attribute ABI.
+    // Keeping the value local avoids adding a platform dependency to this
+    // std-only helper.
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+const fn is_reparse_point(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn prepare_windows_acl(path: &Path, allow_initial_repair: bool) -> io::Result<()> {
+    let user_sid = current_user_sid()?;
+    let output = std::process::Command::new("powershell.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            WINDOWS_ACL_SCRIPT,
+        ])
+        .env("DELTAWEAVE_PRIVATE_ACL_PATH", path)
+        .env("DELTAWEAVE_PRIVATE_USER_SID", &user_sid)
+        .env(
+            "DELTAWEAVE_PRIVATE_ACL_REPAIR",
+            if allow_initial_repair { "1" } else { "0" },
+        )
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|error| safe_io_error(error, PRIVATE_ERROR))?;
+
+    if !output.status.success() {
+        // Do not return PowerShell's path-bearing or localized output.  The
+        // caller only needs a fail-closed security result.
+        return Err(permission_error(PRIVATE_ERROR));
+    }
+
+    // Check the leaf again after the external ACL operation.  This does not
+    // replace the fixed-path ownership contract, but makes an observed
+    // reparse replacement fail before any secret write is attempted.
+    reject_reparse_components(path)?;
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| safe_io_error(error, PRIVATE_ERROR))?;
+    validate_directory_metadata(&metadata)
+}
+
+#[cfg(windows)]
+fn current_user_sid() -> io::Result<String> {
+    let output = std::process::Command::new("whoami.exe")
+        .args(["/user", "/fo", "csv", "/nh"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|error| safe_io_error(error, PRIVATE_ERROR))?;
+    if !output.status.success() {
+        return Err(permission_error(PRIVATE_ERROR));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let sid = text
+        .split(|character: char| !character.is_ascii_alphanumeric() && character != '-')
+        .find(|candidate| is_sid(candidate))
+        .ok_or_else(|| permission_error(PRIVATE_ERROR))?;
+    Ok(sid.to_owned())
+}
+
+#[cfg(windows)]
+fn is_sid(value: &str) -> bool {
+    let mut pieces = value.split('-');
+    let prefix_is_valid = matches!(pieces.next(), Some("S")) && matches!(pieces.next(), Some("1"));
+    let mut has_authority = false;
+    let numeric_authorities = pieces.all(|piece| {
+        has_authority = true;
+        !piece.is_empty() && piece.bytes().all(|byte| byte.is_ascii_digit())
+    });
+    prefix_is_valid && has_authority && numeric_authorities
+}
+
+#[cfg(windows)]
+const WINDOWS_ACL_SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+$path = $env:DELTAWEAVE_PRIVATE_ACL_PATH
+$userSid = $env:DELTAWEAVE_PRIVATE_USER_SID
+$systemSid = 'S-1-5-18'
+$repair = $env:DELTAWEAVE_PRIVATE_ACL_REPAIR -eq '1'
+
+if ([string]::IsNullOrWhiteSpace($path) -or [string]::IsNullOrWhiteSpace($userSid)) { exit 31 }
+$item = Get-Item -LiteralPath $path -Force
+if (-not $item.PSIsContainer -or (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)) { exit 32 }
+
+$sids = @($userSid, $systemSid) | Sort-Object -Unique
+if ($repair) {
+    $acl = New-Object System.Security.AccessControl.DirectorySecurity
+    $acl.SetAccessRuleProtection($true, $false)
+    $rights = [System.Security.AccessControl.FileSystemRights]::FullControl
+    $inheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+    $propagation = [System.Security.AccessControl.PropagationFlags]::None
+    $allow = [System.Security.AccessControl.AccessControlType]::Allow
+    foreach ($sid in $sids) {
+        $identity = New-Object System.Security.Principal.SecurityIdentifier($sid)
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($identity, $rights, $inheritance, $propagation, $allow)
+        $acl.AddAccessRule($rule)
+    }
+    Set-Acl -LiteralPath $path -AclObject $acl
+}
+
+$item = Get-Item -LiteralPath $path -Force
+if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { exit 33 }
+$acl = Get-Acl -LiteralPath $path
+if (-not $acl.AreAccessRulesProtected) { exit 34 }
+$owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+if ($owner -notin $sids) { exit 37 }
+$rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+if ($rules.Count -ne $sids.Count) { exit 35 }
+$rights = [System.Security.AccessControl.FileSystemRights]::FullControl
+$inheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+$propagation = [System.Security.AccessControl.PropagationFlags]::None
+$allow = [System.Security.AccessControl.AccessControlType]::Allow
+foreach ($rule in $rules) {
+    if ($rule.IsInherited -or $rule.IdentityReference.Value -notin $sids -or $rule.AccessControlType -ne $allow -or $rule.FileSystemRights -ne $rights -or $rule.InheritanceFlags -ne $inheritance -or $rule.PropagationFlags -ne $propagation) { exit 36 }
+}
+exit 0
+"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    static TEST_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDirectory(PathBuf);
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn test_directory() -> TestDirectory {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("test clock")
+            .as_nanos();
+        let base = std::env::temp_dir();
+        for attempt in 0..100 {
+            let id = TEST_ID.fetch_add(1, Ordering::Relaxed);
+            let path = base.join(format!(
+                "deltaweave-private-test-{}-{stamp}-{id}-{attempt}",
+                std::process::id()
+            ));
+            if fs::create_dir(&path).is_ok() {
+                return TestDirectory(path);
+            }
+        }
+        panic!("could not allocate a private test directory")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn creates_exactly_owner_only_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = test_directory();
+        let target = root.0.join("managed");
+        prepare_directory(&target).expect("new directory is private");
+        let mode = fs::symlink_metadata(target)
+            .expect("target metadata")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_existing_broad_directory_without_repairing_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = test_directory();
+        let target = root.0.join("managed");
+        fs::create_dir(&target).expect("target");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o750)).expect("broad mode");
+        let error = prepare_directory(&target).expect_err("broad mode must fail closed");
+        assert_eq!(error.kind(), ErrorKind::PermissionDenied);
+        assert_eq!(
+            fs::metadata(target)
+                .expect("target metadata")
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o750
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accepts_existing_exact_private_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = test_directory();
+        let target = root.0.join("managed");
+        fs::create_dir(&target).expect("target");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).expect("private mode");
+        prepare_directory(&target).expect("exact private mode remains valid");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_target_and_parent() {
+        use std::os::unix::fs::symlink;
+
+        let root = test_directory();
+        let real = root.0.join("real");
+        let target = root.0.join("target-link");
+        let parent_link = root.0.join("parent-link");
+        fs::create_dir(&real).expect("real directory");
+        symlink(&real, &target).expect("target symlink");
+        symlink(&real, &parent_link).expect("parent symlink");
+
+        assert_eq!(
+            prepare_directory(&target).expect_err("target link").kind(),
+            ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            prepare_directory(&parent_link.join("child"))
+                .expect_err("parent link")
+                .kind(),
+            ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn rejects_missing_parent_without_creating_recursive_namespace() {
+        let root = test_directory();
+        let target = root.0.join("missing").join("managed");
+        let error = prepare_directory(&target).expect_err("parent is required");
+        assert_eq!(error.kind(), ErrorKind::NotFound);
+        assert!(!root.0.join("missing").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn accepts_only_numeric_security_identifier_shape() {
+        assert!(is_sid("S-1-5-18"));
+        assert!(is_sid("S-1-5-21-123-456-789-1001"));
+        assert!(!is_sid("S-1-5-18:$(whoami)"));
+        assert!(!is_sid("Everyone"));
+        assert!(!is_sid("S-2-5-18"));
+    }
+}
