@@ -117,11 +117,28 @@ Resume의 wire reply는 기존 `Reply::Resumed(Membership)`를 사용하고, own
 권한 세대는 현재 registry가 가진 **member별** `Membership.epoch`를 그대로 사용한다.
 `share/registry.rs:31-40,402-415`에서 보듯 revoke 때 해당 member만 증가하므로,
 `ShareGrant.epoch`는 consumer/requester의 epoch로 정의하고 반드시 별도
-`provider_epoch`도 함께 서명한다. owner는 발급 때 두 endpoint에 대해
-`authorize(share, consumer, false)`와 `authorize(share, provider, false)`를 모두
-수행한다. 어느 한 쪽의 revoke/permission 변경으로 그 member epoch가 바뀌면
-해당 grant가 무효다. requester epoch만 서명하는 축약은 provider revoke를 놓치므로
-허용하지 않는다.
+`provider_epoch`도 함께 서명한다. owner는 발급 때 consumer에 대해
+`authorize(share, consumer, false)`를 수행하고, provider가 owner 자신이면 아래의
+`OwnedRuntime` 검증과 `provider_epoch=0`을 사용한다. 일반 member provider에는
+`authorize(share, provider, false)`를 수행해 현재 `Membership.epoch > 0`을 서명한다.
+어느 한 쪽의 revoke/permission 변경으로 그 member epoch가 바뀌면 해당 grant가
+무효다. requester epoch만 서명하는 축약은 provider revoke를 놓치므로 허용하지 않는다.
+
+### Owner endpoint as a supplier
+
+owner는 share의 member row가 없어도 trusted provider가 될 수 있다. 단
+`grant.provider == owner`인 경우에만 owner handler가 현재 `OwnedRuntime`의 동일
+share에 대해 `config`가 존재하고 `enabled`임을 확인하고, 예약된
+`provider_epoch=0`을 사용한다. owner의 기존 managed root lease/index/store를 그대로
+공급하며 별도 root/index/store를 다시 열지 않는다. requester는 이 경우에도 항상
+active member이고 consumer epoch가 live여야 한다. `grant.provider != owner`인 일반
+provider는 active membership과 `Membership.epoch > 0`을 모두 가져야 한다.
+
+owner provider도 일반 provider와 동일한 `share-swarm/1` grant 검증, peer identity,
+monotonic lease, writer drain gate를 통과하고 CAS hash proof만 공급한다. owner의
+metadata authority를 이유로 gate/drain을 우회하거나 legacy handler를 직접 붙이지
+않는다. owner-authenticated `share/3`는 share-swarm 실패 시 정의된 fallback으로만
+허용한다.
 
 기존 `owner_share_catalog_v3` postcard 구조는 바꾸지 않는다. lease/nonce deny,
 roster heartbeat/address 및 필요한 monotonic clock anchor는 별도의 bounded
