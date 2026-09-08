@@ -7,7 +7,7 @@
 작성 agent: `qsync_contracts` / Luna Max
 
 현재 단계: B control 구현 checkpoint. A 계약 문서는 `121d042`로 통합되었고,
-B의 현재 source/test checkpoint는 `a831019`이다. B 완료·통합·push로 표시하지 않는다.
+B의 현재 source/test checkpoint는 `976cbf8`이다. B 완료·통합·push로 표시하지 않는다.
 
 ## 작업 공간과 agent
 
@@ -17,7 +17,7 @@ B의 현재 source/test checkpoint는 `a831019`이다. B 완료·통합·push로
 | A contracts | `/home/ubuntu/project/DeltaWeave-qsync-contracts-20260908` | `feat/qsync-contracts-20260908` | `121d042` 완료 |
 | A protocol audit | 별도 agent `qsync_protocol_audit` | root 기록 예정 | `8d50a14` network 계약 완료, D/E 입력 |
 | baseline validation | `luna_protocol_plan` 재사용 | root 기록 예정 | CI 실패 원인 조사 |
-| B control | `/home/ubuntu/project/DeltaWeave-qsync-control-20260908` | `feat/qsync-control-20260908` | `a831019` checkpoint, acceptance 일부 검증, 계속 구현 |
+| B control | `/home/ubuntu/project/DeltaWeave-qsync-control-20260908` | `feat/qsync-control-20260908` | `976cbf8` checkpoint, acceptance 일부 검증, 계속 구현 |
 | C web | `/home/ubuntu/project/DeltaWeave-qsync-web-20260908` | `feat/qsync-web-20260908` | 병렬 구현 진행 |
 | validation | `/home/ubuntu/project/DeltaWeave-qsync-verification-20260908` | `test/qsync-verification-20260908` | 후속 검증 |
 
@@ -60,8 +60,9 @@ B의 현재 source/test checkpoint는 `a831019`이다. B 완료·통합·push로
 | managed owner→RW smoke | `1 passed, 0 failed, 0 ignored`, exit `0`, 2.35s; 실제 파일 수신 확인 | `b-control/managed-smoke-20260908-current.log` |
 | control focused lifecycle | isolated process별 5개 `1 passed`, exit `0`; admission fixture 오염을 숨기지 않고 격리 재실행 근거 보존 | `b-control/control-focused-20260908-current.log`, `b-control/control-focused-isolated-retry-20260908-current.log` |
 | net resume binding | exact permission/ReplicaId/epoch/revoke binding test `1 passed`, exit `0` | `b-control/net-registry-resume-20260908-current.log` |
-| managed acceptance | `managed_acceptance` 4개 독립 시나리오 `4 passed, 0 failed`, exit `0`, 61.89s; 현재 `a831019` source | `b-control/managed-acceptance-all-tmpdir-20260908-current.log` |
-| current build/lint/format | current source `cargo check` exit `0`(5.41s), strict clippy exit `0`(1.63s), `cargo fmt --all -- --check` 및 diff check exit `0` | `b-control/check-managed-acceptance-20260908-current.log`, `b-control/clippy-managed-acceptance-20260908-retry.log` |
+| managed acceptance | `managed_acceptance` 4개 독립 시나리오 `4 passed, 0 failed`, exit `0`, 61.89s; source tree는 `a831019`에서 검증 후 `976cbf8`로 resume 변형 추가 | `b-control/managed-acceptance-all-tmpdir-20260908-current.log` |
+| resume without local relationship | 성공 join 뒤 local `ShareService::forget_membership` 후 재시작, active owner membership의 member 목록/permission/ReplicaId/enrolled_at/epoch 보존 `1 passed`, exit `0`, 40.71s | `b-control/managed-pending-resume-forgot-20260908-current.log` |
+| current build/lint/format | current source `cargo check` exit `0`(5.41s), strict clippy exit `0`(1.63s), resume 변형 포함 fmt exit `0` 및 diff check exit `0` | `b-control/check-managed-acceptance-20260908-current.log`, `b-control/clippy-pending-forgot-20260908-current.log`, `b-control/fmt-pending-forgot-20260908-current.log` |
 | npm/Windows/Internet/full CI | 아직 실행하지 않음 | 후속 evidence 필요 |
 
 ## baseline 실패와 남은 문제
@@ -78,7 +79,10 @@ UID/GID 65532 self-test receiver `PermissionDenied`였다. Security run
 body 충돌, owner/RW/RO 가입 후 restart의 permission/ReplicaId/endpoint/enrolled_at/epoch
 보존, ticket 만료·철회 뒤 active membership resume 및 owner offline pending, RW 양방향
 실제 파일 전송, RO local 변경 private 보존·복구와 `Conflict`, `Revoked`, observer 0,
-pause/remove/shutdown drain을 `a831019`의 네 테스트에서 확인했다. 테스트들은 B evidence
+pause/remove/shutdown drain을 `976cbf8`의 네 테스트에서 확인했다. response-loss durable
+pending 변형은 local relationship을 별도로 잊은 뒤 owner active membership만으로 복구하고
+owner member 목록 및 binding 필드를 보존하는 exact test로 추가 확인했다. 이 결과를 실제
+패킷 손실이나 인증 HTTP 응답 유실로 해석하지 않는다. 테스트들은 B evidence
 아래 전용 `0700` TMPDIR에서 실행했으며 raw ticket은 테스트 종료 시 workspace 정리로
 남기지 않는다.
 
