@@ -5,6 +5,8 @@ use deltaweave_net::share::{Membership, ShareError, ShareSession};
 use deltaweave_store::{PathChangeState, PathObservation, PathTarget};
 use serde::{Deserialize, Serialize};
 
+const READ_ONLY_STATE_VERSION: u16 = 2;
+
 /// A retained local object. Late writes through old handles remain attached to this path.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PreservedLocalChange {
@@ -56,6 +58,26 @@ struct LegacyReadOnlyState {
     checkpoint: Vec<SyncRecord>,
     pending: Option<LegacyPending>,
 }
+/// Managed RO state as persisted between the first E3 journal checkpoint and
+/// the identity-bound v2 envelope.  It already contains `stage_root` and the
+/// ApplyStart journal, so it must be decoded separately instead of relying on
+/// postcard's positional `serde(default)` behavior.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct LegacyReadOnlyStateWithStage {
+    version: u16,
+    owner: [u8; 32],
+    share: [u8; 32],
+    checkpoint: Vec<SyncRecord>,
+    pending: Option<LegacyPendingWithStage>,
+    apply: Option<ManagedApplyJournal>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct LegacyPendingWithStage {
+    desired: Vec<SyncRecord>,
+    attempts: Vec<String>,
+    stage: Stage,
+    stage_root: Option<PathBuf>,
+}
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct LegacyPending {
     desired: Vec<SyncRecord>,
@@ -68,10 +90,14 @@ struct Pending {
     attempts: Vec<String>,
     stage: Stage,
     /// Exact managed stage root retained across an interrupted apply.  It is
-    /// informational for recovery; a retry may allocate a new unique root
-    /// after revalidation rather than reusing an unjournalled path.
+    /// recorded before provider/CAS work; a retry may allocate a new unique
+    /// root only after this one has been proven absent or safely cleaned.
     #[serde(default)]
     stage_root: Option<PathBuf>,
+    /// Filesystem identity captured before any managed provider or CAS IO.
+    /// A missing identity belongs to an older envelope and is retained
+    /// fail-closed rather than used for deletion after a same-name replace.
+    stage_identity: Option<super::ManagedStageIdentity>,
 }
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 enum Stage {
@@ -85,7 +111,7 @@ pub(crate) fn initialize(local: &ReplicaState, member: &Membership) -> Result<()
     if let Some(bytes) = local.index.share_metadata()? {
         let state = decode_state(&bytes)?;
         ensure!(
-            state.version == 1
+            state.version == READ_ONLY_STATE_VERSION
                 && state.owner == *member.owner.as_bytes()
                 && state.share == member.share_id.0,
             ShareError::StateUnavailable
@@ -95,7 +121,7 @@ pub(crate) fn initialize(local: &ReplicaState, member: &Membership) -> Result<()
         save(
             local,
             &ReadOnlyState {
-                version: 1,
+                version: READ_ONLY_STATE_VERSION,
                 owner: *member.owner.as_bytes(),
                 share: member.share_id.0,
                 checkpoint: Vec::new(),
@@ -115,29 +141,80 @@ fn load(local: &ReplicaState) -> Result<ReadOnlyState> {
 }
 
 fn decode_state(bytes: &[u8]) -> Result<ReadOnlyState> {
-    match postcard::from_bytes::<ReadOnlyState>(bytes) {
-        Ok(state) => Ok(state),
-        Err(_) => {
-            let legacy: LegacyReadOnlyState =
-                postcard::from_bytes(bytes).context(ShareError::StateUnavailable)?;
-            Ok(ReadOnlyState {
-                version: legacy.version,
-                owner: legacy.owner,
-                share: legacy.share,
-                checkpoint: legacy.checkpoint,
-                pending: legacy.pending.map(|pending| Pending {
-                    desired: pending.desired,
-                    attempts: pending.attempts,
-                    stage: pending.stage,
-                    stage_root: None,
-                }),
-                apply: None,
-            })
-        }
+    if let Ok(state) = super::decode_exact_postcard::<ReadOnlyState>(bytes)
+        && state.version == READ_ONLY_STATE_VERSION
+    {
+        return Ok(state);
     }
+    if let Ok(legacy) = super::decode_exact_postcard::<LegacyReadOnlyStateWithStage>(bytes)
+        && legacy.version == 1
+    {
+        return Ok(ReadOnlyState {
+            version: READ_ONLY_STATE_VERSION,
+            owner: legacy.owner,
+            share: legacy.share,
+            checkpoint: legacy.checkpoint,
+            pending: legacy.pending.map(|pending| Pending {
+                desired: pending.desired,
+                attempts: pending.attempts,
+                stage: pending.stage,
+                stage_root: pending.stage_root,
+                stage_identity: None,
+            }),
+            apply: legacy.apply,
+        });
+    }
+    if let Ok(legacy) = super::decode_exact_postcard::<LegacyReadOnlyState>(bytes)
+        && legacy.version == 1
+    {
+        return Ok(ReadOnlyState {
+            version: READ_ONLY_STATE_VERSION,
+            owner: legacy.owner,
+            share: legacy.share,
+            checkpoint: legacy.checkpoint,
+            pending: legacy.pending.map(|pending| Pending {
+                desired: pending.desired,
+                attempts: pending.attempts,
+                stage: pending.stage,
+                stage_root: None,
+                stage_identity: None,
+            }),
+            apply: None,
+        });
+    }
+    Err(ShareError::StateUnavailable.into())
 }
 fn save(local: &ReplicaState, state: &ReadOnlyState) -> Result<()> {
     local.index.set_share_metadata(&postcard::to_stdvec(state)?)
+}
+
+/// Removes a completed RO stage only when the persisted identity still names
+/// the exact directory created by this managed round.  A missing identity or
+/// an uncertain filesystem error keeps the Pending record as the recovery
+/// reference and fails closed; clearing the envelope first would orphan the
+/// private stage or make a same-name replacement eligible for deletion.
+fn cleanup_pending_stage(local: &ReplicaState, state: &mut ReadOnlyState) -> Result<bool> {
+    let Some(pending) = state.pending.as_mut() else {
+        return Ok(true);
+    };
+    let Some(stage_root) = pending.stage_root.clone() else {
+        return Ok(true);
+    };
+    let mut stages = super::ManagedStages::for_recovery_root_with_identity(
+        stage_root.clone(),
+        pending.stage_identity,
+        local.store.state_root(),
+    );
+    stages.cleanup_owned(local.store.state_root());
+    match fs::symlink_metadata(&stage_root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            pending.stage_root = None;
+            pending.stage_identity = None;
+            Ok(true)
+        }
+        Ok(_) => Ok(false),
+        Err(_) => Err(ShareError::StateUnavailable.into()),
+    }
 }
 
 /// Replays only an already-durable managed ApplyStart.  The caller invokes
@@ -181,14 +258,17 @@ pub(crate) fn preserved(local: &ReplicaState) -> Result<Vec<PreservedLocalChange
         .into_iter()
         .filter(|c| c.root == local.root)
     {
-        for artifact in [&change.artifact, &change.rollback_artifact] {
-            if fs::symlink_metadata(artifact).is_ok() {
-                preserved.push(PreservedLocalChange {
-                    path: change.path.clone(),
-                    operation_id: change.id.clone(),
-                    preserved_path: artifact.clone(),
-                });
-            }
+        // `artifact` is the displaced local object. `rollback_artifact` is
+        // retained incoming owner data after an unadopted rollback; exposing
+        // it here would mislabel remote bytes as a local edit/conflict. Keep
+        // that incoming object durable in Store for recovery, but report only
+        // the user's displaced artifact through the RO API.
+        if fs::symlink_metadata(&change.artifact).is_ok() {
+            preserved.push(PreservedLocalChange {
+                path: change.path.clone(),
+                operation_id: change.id.clone(),
+                preserved_path: change.artifact.clone(),
+            });
         }
     }
     Ok(preserved)
@@ -388,6 +468,7 @@ pub(crate) async fn sync(
             attempts: Vec::new(),
             stage: Stage::Prepared,
             stage_root: None,
+            stage_identity: None,
         });
         for id in orphan_ids {
             if !pending_ids.iter().any(|existing| existing == &id) {
@@ -483,8 +564,12 @@ pub(crate) async fn sync(
     if state
         .pending
         .as_ref()
-        .is_some_and(|pending| pending.attempts.is_empty() && pending.stage == Stage::Adopted)
+        .is_some_and(|pending| pending.attempts.is_empty())
     {
+        ensure!(
+            cleanup_pending_stage(local, &mut state)?,
+            ShareError::StateUnavailable
+        );
         state.pending = None;
         save(local, &state)?;
     }
@@ -550,18 +635,73 @@ pub(crate) async fn sync(
         sum.checked_add(r.size)
             .context("pending RO byte count overflow")
     })?;
-    let (mut staged, stats) = local
-        .stage_managed_files(
-            session,
-            &files,
-            &current,
-            &remote,
-            pending_bytes,
-            &authoritative,
-            false,
-            observer,
-        )
-        .await?;
+    let old_attempts = state
+        .pending
+        .as_ref()
+        .map_or_else(Vec::new, |pending| pending.attempts.clone());
+    if !changes.is_empty() {
+        state.pending = Some(Pending {
+            desired: remote.clone(),
+            attempts: old_attempts,
+            stage: Stage::Prepared,
+            stage_root: None,
+            stage_identity: None,
+        });
+        // The marker is durable before reserving any stage directory.  The
+        // stage hook below adds the exact directory identity before provider
+        // requests or CAS materialization begin.
+        save(local, &state)?;
+    }
+    let (mut staged, stats, marked_state) = {
+        // `stage_managed_files` runs inside an owned managed task. Keep the
+        // marker state in an owned cell so cancellation cannot leave a root
+        // created by this round without its durable Pending reference.
+        let state_cell = Arc::new(std::sync::Mutex::new(state.clone()));
+        let marker_cell = Arc::clone(&state_cell);
+        let index = Arc::clone(&local.index);
+        let stage_marker: Arc<super::ManagedStageMarker> = Arc::new(move |root, identity| {
+            let mut marked = marker_cell
+                .lock()
+                .map_err(|_| anyhow::anyhow!("managed RO journal lock poisoned"))?;
+            let pending = marked
+                .pending
+                .as_mut()
+                .context(ShareError::StateUnavailable)?;
+            if let Some(existing) = &pending.stage_root {
+                // The stage helper records the selected path before mkdir and
+                // upgrades that same row with the post-mkdir identity. A
+                // different path would indicate a corrupted/reused journal.
+                ensure!(existing == root, ShareError::StateUnavailable);
+                if identity.is_some() {
+                    pending.stage_identity = identity;
+                }
+            } else {
+                pending.stage_root = Some(root.to_path_buf());
+                pending.stage_identity = identity;
+            }
+            index.set_share_metadata(&postcard::to_stdvec(&*marked)?)
+        });
+        let result = local
+            .stage_managed_files(
+                session,
+                &files,
+                &current,
+                &remote,
+                pending_bytes,
+                &authoritative,
+                false,
+                observer,
+                Some(stage_marker.clone()),
+            )
+            .await?;
+        drop(stage_marker);
+        let marked_state = Arc::try_unwrap(state_cell)
+            .map_err(|_| anyhow::anyhow!("managed RO journal marker still active"))?
+            .into_inner()
+            .map_err(|_| anyhow::anyhow!("managed RO journal lock poisoned"))?;
+        (result.0, result.1, marked_state)
+    };
+    state = marked_state;
 
     // A no-op only advances the private checkpoint. Local-only edits remain
     // local index state and never become owner history.
@@ -578,14 +718,7 @@ pub(crate) async fn sync(
         });
     }
 
-    let old_attempts = state.pending.take().map_or_else(Vec::new, |p| p.attempts);
-    state.pending = Some(Pending {
-        desired: remote.clone(),
-        attempts: old_attempts,
-        stage: Stage::Prepared,
-        stage_root: staged.roots.first().cloned(),
-    });
-    save(local, &state)?;
+    ensure!(state.pending.is_some(), ShareError::StateUnavailable);
 
     // The monotonic deadline starts before Revalidate and cannot be renewed by
     // a delayed response. All public filesystem, readonly, and index writes
@@ -694,10 +827,14 @@ pub(crate) async fn sync(
         bail!(ShareError::ManifestMismatch);
     }
     finish_apply(local, session, &mut state, &permit, operation_id, true).await?;
+    staged.cleanup_owned(local.store.state_root());
+    ensure!(
+        cleanup_pending_stage(local, &mut state)?,
+        ShareError::StateUnavailable
+    );
     state.pending = None;
     state.checkpoint = remote.clone();
     save(local, &state)?;
-    staged.cleanup_owned(local.store.state_root());
     Ok(ReadOnlyReport {
         status: "pass",
         owner_root: owner_tree.root_hash(),
@@ -710,6 +847,7 @@ pub(crate) async fn sync(
 mod tests {
     use super::*;
     use deltaweave_core::{SYNC_RECORD_SCHEMA_V1, VersionVector};
+    use iroh::{SecretKey, Signature};
     fn record(bytes: &[u8], counter: u64) -> SyncRecord {
         let mut version = VersionVector::default();
         version.observe(ReplicaId(Hash32::digest(b"owner")), counter);
@@ -754,7 +892,7 @@ mod tests {
         };
         let bytes = postcard::to_stdvec(&legacy).expect("legacy fixture encoding");
         let decoded = decode_state(&bytes).expect("legacy fixture decoding");
-        assert_eq!(decoded.version, legacy.version);
+        assert_eq!(decoded.version, READ_ONLY_STATE_VERSION);
         assert_eq!(decoded.owner, legacy.owner);
         assert_eq!(decoded.share, legacy.share);
         assert_eq!(decoded.checkpoint, legacy.checkpoint);
@@ -763,6 +901,177 @@ mod tests {
         assert_eq!(pending.attempts, attempts);
         assert_eq!(pending.stage, Stage::Preserved);
         assert_eq!(pending.stage_root, None);
+        assert_eq!(pending.stage_identity, None);
         assert!(decoded.apply.is_none());
+        let mut trailing = bytes;
+        trailing.push(0xa5);
+        assert!(decode_state(&trailing).is_err());
+    }
+
+    #[test]
+    fn managed_v1_stage_root_migrates_without_dropping_pending() {
+        let desired = vec![record(b"legacy-managed", 4)];
+        let stage_root = PathBuf::from("state/.managed-stage-old");
+        let owner = SecretKey::generate();
+        let apply = ManagedApplyJournal {
+            permit: ApplyPermit {
+                version: 1,
+                owner: owner.public(),
+                share: ShareId([3; 32]),
+                consumer: SecretKey::generate().public(),
+                epoch: 1,
+                snapshot: [4; 32],
+                root_hash: Hash32::digest(b"legacy-ro-apply"),
+                issued_at: 1,
+                expires_at: 2,
+                nonce: [5; 32],
+                signature: Signature::from_bytes(&[0; 64]),
+            },
+            operation_id: [8; 16],
+            committed: true,
+        };
+        let legacy = LegacyReadOnlyStateWithStage {
+            version: 1,
+            owner: [7; 32],
+            share: [9; 32],
+            checkpoint: vec![record(b"checkpoint", 3)],
+            pending: Some(LegacyPendingWithStage {
+                desired: desired.clone(),
+                attempts: vec!["legacy-operation".to_owned()],
+                stage: Stage::Materialized,
+                stage_root: Some(stage_root.clone()),
+            }),
+            apply: Some(apply.clone()),
+        };
+        let bytes = postcard::to_stdvec(&legacy).expect("managed legacy fixture encoding");
+        let decoded = decode_state(&bytes).expect("managed legacy fixture decoding");
+        assert_eq!(decoded.version, READ_ONLY_STATE_VERSION);
+        let pending = decoded.pending.expect("managed pending retained");
+        assert_eq!(pending.desired, desired);
+        assert_eq!(pending.stage_root, Some(stage_root));
+        assert_eq!(pending.stage_identity, None);
+        assert_eq!(pending.stage, Stage::Materialized);
+        assert_eq!(decoded.apply, Some(apply));
+    }
+
+    #[test]
+    fn preserved_reports_displaced_local_only_not_unadopted_incoming() {
+        let name =
+            "read_only::tests::preserved_reports_displaced_local_only_not_unadopted_incoming";
+        if std::env::var("DW_MANAGED_PRESERVED_REPORT_CHILD")
+            .ok()
+            .as_deref()
+            != Some(name)
+        {
+            let home = tempfile::tempdir().expect("isolated home");
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture"])
+                .env("DW_MANAGED_PRESERVED_REPORT_CHILD", name)
+                .env("HOME", home.path())
+                .env("USERPROFILE", home.path())
+                .status()
+                .expect("run isolated preserved report test");
+            assert!(status.success());
+            return;
+        }
+        let temp = tempfile::tempdir().expect("preserved fixture root");
+        let root = temp.path().join("root");
+        let state_root = temp.path().join("state");
+        std::fs::create_dir_all(&root).expect("public root");
+        std::fs::create_dir_all(&state_root).expect("private root");
+        let owner = iroh::SecretKey::generate().public();
+        let share = ShareId([0x61; 32]);
+        let replica = ReplicaId(Hash32::digest(b"preserved fixture replica"));
+        deltaweave_net::root_admission::reserve_private(&state_root).expect("state reservation");
+        let lease = deltaweave_net::root_admission::acquire_with_private(
+            &root,
+            deltaweave_net::root_admission::RootUse::Managed {
+                share: share.0,
+                owner: *owner.as_bytes(),
+            },
+            std::slice::from_ref(&state_root),
+        )
+        .expect("managed lease");
+        let index = Arc::new(
+            LocalIndex::open(
+                &root,
+                state_root.join("index.redb"),
+                replica,
+                IndexOptions::default(),
+            )
+            .expect("index"),
+        );
+        let store = Arc::new(
+            Store::open_with_recovery_reserver(state_root.join("store"), |path| {
+                deltaweave_net::root_admission::reserve_private(path)
+            })
+            .expect("store"),
+        );
+        let local = ReplicaState {
+            _root_lease: Arc::new(lease),
+            root: root.clone(),
+            index,
+            store: Arc::clone(&store),
+            swarm_sources: Vec::new(),
+            profile: ChunkingProfile::DEFAULT,
+            min_free_space_bytes: 0,
+            peer: owner.to_string(),
+        };
+
+        let incoming = temp.path().join("incoming");
+        std::fs::write(&incoming, b"owner incoming").expect("incoming bytes");
+        let incoming_manifest = store
+            .ingest_file(&incoming, ChunkingProfile::DEFAULT)
+            .expect("incoming manifest");
+        let incoming_path = WirePath::new("new.txt").expect("incoming path");
+        let mut incoming_change = store
+            .prepare_path_change(
+                &root,
+                &incoming_path,
+                PathTarget::File(incoming_manifest),
+                None,
+                true,
+            )
+            .expect("incoming path change");
+        store
+            .capture_path_change(&mut incoming_change)
+            .expect("incoming capture");
+        store
+            .rollback_unadopted_path_change(&mut incoming_change)
+            .expect("incoming rollback");
+        assert_eq!(incoming_change.state, PathChangeState::RolledBack);
+        assert_eq!(
+            std::fs::read(&incoming_change.rollback_artifact).expect("retained incoming"),
+            b"owner incoming"
+        );
+
+        std::fs::write(root.join("local.txt"), b"user edit").expect("local bytes");
+        let local_source = temp.path().join("local-incoming");
+        std::fs::write(&local_source, b"owner replacement").expect("replacement bytes");
+        let local_manifest = store
+            .ingest_file(&local_source, ChunkingProfile::DEFAULT)
+            .expect("replacement manifest");
+        let local_path = WirePath::new("local.txt").expect("local path");
+        let expected = PathObservation::read(&root, &local_path).expect("local observation");
+        let mut local_change = store
+            .prepare_path_change(
+                &root,
+                &local_path,
+                PathTarget::File(local_manifest),
+                expected,
+                true,
+            )
+            .expect("local path change");
+        store
+            .capture_path_change(&mut local_change)
+            .expect("local capture");
+        let report = preserved(&local).expect("preserved report");
+        assert_eq!(report.len(), 1);
+        assert_eq!(report[0].path, local_path);
+        assert_eq!(
+            std::fs::read(&report[0].preserved_path).expect("displaced local bytes"),
+            b"user edit"
+        );
+        assert!(report.iter().all(|item| item.path != incoming_path));
     }
 }
