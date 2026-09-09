@@ -16,6 +16,7 @@ pub(crate) struct Hello {
     pub share_id: ShareId,
     pub operation: Operation,
 }
+#[allow(clippy::large_enum_variant)]
 #[derive(Serialize, Deserialize)]
 pub(crate) enum Operation {
     Validate(ShareTicket),
@@ -55,6 +56,13 @@ pub(crate) enum Operation {
     ApplyDrained(ApplyDrained),
     /// Provider asks the owner to activate an already signed grant.
     Activate(ActivateGrantRequest),
+    /// One authenticated grant endpoint acknowledges that its side has
+    /// drained.  The owner marks the grant terminal only after both the
+    /// consumer and provider have sent this acknowledgement.
+    GrantDrained {
+        nonce: GrantNonce,
+        activation_id: [u8; 16],
+    },
 }
 #[derive(Serialize, Deserialize)]
 pub(crate) enum Reply {
@@ -81,6 +89,11 @@ pub(crate) enum Reply {
     ApplyPermit(ApplyPermit),
     /// Owner-signed activation response.
     Activate(ActivateGrantReply),
+    /// A non-session apply journal transition was durably accepted.
+    ApplyAccepted,
+    /// A grant endpoint drain acknowledgement was durably recorded.  The
+    /// grant may still be Active until its other endpoint acknowledges too.
+    GrantDrained,
 }
 
 pub(crate) async fn read_hello(receive: &mut RecvStream) -> Result<Hello> {

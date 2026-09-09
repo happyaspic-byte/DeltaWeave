@@ -1,7 +1,7 @@
 use super::registry::{MAX_REPLICAS, Registry, resolver};
 use super::{
-    Invitation, InvitationId, Membership, OwnedShareConfig, Permission, ShareError, ShareId,
-    ShareTicket, now,
+    Invitation, InvitationId, Membership, OwnedShareConfig, Permission, RevocationReceipt,
+    ShareError, ShareId, ShareTicket, now,
 };
 use crate::{TransferEvent, TransferObserver, root_admission::RootLease};
 use anyhow::{Result, ensure};
@@ -279,7 +279,7 @@ impl OwnerShare {
     pub fn deny_member(&self, peer: EndpointId) -> Result<()> {
         self.runtime
             .registry
-            .revoke_member(self.config().share_id, peer)?;
+            .revoke_member_durable(self.config().share_id, peer)?;
         self.runtime.close_connections(Some(peer));
         Ok(())
     }
@@ -305,8 +305,18 @@ impl OwnerShare {
     }
 
     pub async fn revoke_member(&self, peer: EndpointId) -> Result<()> {
+        self.revoke_member_strong(peer).await.map(|_| ())
+    }
+
+    /// Revokes new admission durably, drains local handlers, and reports the
+    /// remaining remote grant/apply blockers.  A closed QUIC connection is not
+    /// treated as a remote drain acknowledgement.
+    pub async fn revoke_member_strong(&self, peer: EndpointId) -> Result<RevocationReceipt> {
         self.deny_member(peer)?;
-        self.drain_member(peer).await
+        self.drain_member(peer).await?;
+        self.runtime
+            .registry
+            .revocation_receipt(self.config().share_id, peer)
     }
     pub async fn pause(&self) {
         self.runtime.pause().await;

@@ -186,6 +186,7 @@ struct GrantSigning {
     nonce: GrantNonce,
 }
 
+#[allow(dead_code)]
 #[derive(Serialize)]
 struct ActivateSigning {
     owner: EndpointId,
@@ -307,6 +308,7 @@ fn grant_payload(grant: &ShareGrant) -> GrantSigning {
     }
 }
 
+#[allow(dead_code)]
 fn activate_payload(request: &ActivateGrantRequest) -> ActivateSigning {
     ActivateSigning {
         owner: request.owner,
@@ -460,6 +462,7 @@ impl ManifestAttestation {
             manifest.file_hash == content_hash,
             ShareError::ManifestMismatch
         );
+        ensure!(manifest.size == record.size, ShareError::ManifestMismatch);
         let attestation = Self {
             version: AUTHORITY_VERSION,
             owner: key.public(),
@@ -542,11 +545,16 @@ impl ManifestAttestation {
             self.manifest.file_hash == content_hash,
             ShareError::ManifestMismatch
         );
+        ensure!(
+            self.manifest.size == record.size,
+            ShareError::ManifestMismatch
+        );
         Ok(())
     }
 }
 
 impl ShareGrant {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn sign(
         key: &SecretKey,
         share: ShareId,
@@ -638,6 +646,7 @@ impl ActivateGrantRequest {
         self == &grant.activate_request()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn verify_signature(&self, member: EndpointId, signature: &Signature) -> Result<()> {
         ensure!(self.consumer == member, ShareError::EndpointMismatch);
         verify_signature(member, ACTIVATE_DOMAIN, &activate_payload(self), signature)
@@ -690,6 +699,7 @@ impl ActivateGrantReply {
 }
 
 impl ApplyPermit {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn sign(
         key: &SecretKey,
         share: ShareId,
@@ -731,6 +741,10 @@ impl ApplyPermit {
         ensure!(self.epoch > 0, ShareError::EpochMismatch);
         ensure!(
             max_expiry(self.issued_at, MAX_APPLY_TTL_SECONDS, self.expires_at),
+            ShareError::Protocol
+        );
+        ensure!(
+            postcard::to_stdvec(self)?.len() <= MAX_AUTHORITY_FRAME_BYTES,
             ShareError::Protocol
         );
         Ok(())
@@ -867,5 +881,27 @@ mod tests {
             ManifestAttestation::sign(&owner, &token, &record, manifest, 100).unwrap();
         attestation.verify_for(owner.public(), share, 100).unwrap();
         attestation.verify_record(&token, &record).unwrap();
+    }
+
+    #[test]
+    fn manifest_attestation_rejects_record_size_mismatch() {
+        let owner = SecretKey::generate();
+        let share = ShareId([5; 32]);
+        let (record, manifest) = fixture_record(ReplicaId(Hash32::digest(b"size-replica")));
+        let token = SnapshotToken::sign(
+            &owner,
+            share,
+            1,
+            [6; 32],
+            MerkleTree::from_records(vec![record.clone()])
+                .unwrap()
+                .root_hash(),
+            1,
+            100,
+        )
+        .unwrap();
+        let mut wrong_size = record;
+        wrong_size.size = wrong_size.size.saturating_add(1);
+        assert!(ManifestAttestation::sign(&owner, &token, &wrong_size, manifest, 100).is_err());
     }
 }

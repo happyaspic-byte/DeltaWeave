@@ -20,6 +20,10 @@ pub use runtime::{MutationProvenance, OwnerShare};
 pub use service::{ShareService, ShareSession};
 
 pub const ALPN_V3: &[u8] = b"deltaweave/share/3";
+/// Separate grant-gated data protocol.  D2 registers the endpoint and
+/// rejects unauthenticated streams; E supplies the chunk adapter after the
+/// authority contract is verified.
+pub const ALPN_SWARM_V1: &[u8] = b"deltaweave/share-swarm/1";
 pub use ticket::{InvitationId, LegacyProof, Permission, ShareId, ShareTicket, TicketPreview};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
