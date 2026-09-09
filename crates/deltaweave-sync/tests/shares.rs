@@ -452,9 +452,9 @@ fn managed_read_only_uses_owner_and_member_suppliers_for_real_chunks() {
 }
 
 #[test]
-fn managed_read_only_owner_originated_cold_cas_uses_share3_fallback() {
+fn managed_read_only_owner_originated_file_warms_owner_supplier() {
     isolated(
-        "managed_read_only_owner_originated_cold_cas_uses_share3_fallback",
+        "managed_read_only_owner_originated_file_warms_owner_supplier",
         || {
             tokio::runtime::Runtime::new().unwrap().block_on(async {
                 let temp = tempfile::tempdir().unwrap();
@@ -496,6 +496,16 @@ fn managed_read_only_owner_originated_cold_cas_uses_share3_fallback() {
                     config(base, "consumer"),
                 )
                 .unwrap();
+                let share_events = Arc::new(Mutex::new(Vec::<ShareTransferEvent>::new()));
+                let observed_share_events = Arc::clone(&share_events);
+                let share_observer = ShareTransferObserver::new(move |event| {
+                    observed_share_events
+                        .lock()
+                        .expect("share observer lock")
+                        .push(event);
+                });
+                owner.set_share_observer(Some(share_observer.clone()));
+                consumer.set_share_observer(Some(share_observer));
                 let events = Arc::new(Mutex::new(Vec::<TransferEvent>::new()));
                 let observed = Arc::clone(&events);
                 let observer = TransferObserver::new(move |event| {
@@ -504,16 +514,19 @@ fn managed_read_only_owner_originated_cold_cas_uses_share3_fallback() {
                 let report = engine.sync_read_only(Some(observer)).await.unwrap();
                 assert_eq!(report.status, "pass");
                 assert_eq!(report.pulled_bytes, payload.len() as u64);
-                // The owner scan/manifest endpoint is authoritative, while
-                // this fixture intentionally leaves the owner CAS cold.  A
-                // zero-byte swarm receipt followed by positive pulled
-                // bytes proves the authenticated share/3 CAS fallback supplied
-                // the data from the owner file.
-                assert!(
-                    events.lock().unwrap().iter().any(|event| {
-                        event.phase == "swarm_provider_verified" && event.bytes == 0
-                    })
-                );
+                // The owner manifest request ingests the file into the
+                // already-open owner CAS while holding the runtime admission.
+                // The subsequent managed swarm transfer therefore proves the
+                // normal owner-originated cold-file path without a manual CAS
+                // preseed.  share/3 remains a CAS-only fallback for missing
+                // chunks and is covered by the legacy fallback fixture.
+                assert!(share_events.lock().unwrap().iter().any(|event| {
+                    event.phase == SharePhase::Swarm
+                        && event.direction == TransferDirection::Outbound
+                        && event.peer == consumer.endpoint_id()
+                        && event.bytes > 0
+                        && event.grant.is_some()
+                }));
                 assert_eq!(
                     fs::read(base.join("consumer-root/payload.bin")).unwrap(),
                     payload

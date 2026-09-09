@@ -442,12 +442,15 @@ fn managed_stage_path(state_root: &Path, stage_name: &str) -> Result<PathBuf> {
 /// if a crash occurs after creation, the retained path is still a conservative
 /// recovery reference rather than an untracked directory.
 fn create_managed_stage_directory(path: &Path) -> Result<()> {
-    let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]
-    {
+    let builder = {
+        let mut builder = fs::DirBuilder::new();
         use std::os::unix::fs::DirBuilderExt;
         builder.mode(0o700);
-    }
+        builder
+    };
+    #[cfg(not(unix))]
+    let builder = fs::DirBuilder::new();
     builder.create(path)?;
     let metadata = fs::symlink_metadata(path)?;
     ensure!(metadata.is_dir() && !metadata.file_type().is_symlink());
