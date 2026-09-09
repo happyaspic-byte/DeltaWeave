@@ -72,7 +72,7 @@ RW keepalive의 남은 시간만 hosted job 대기에 사용하며 전체 상한
 
 2026-09-09T11:06:48Z에 source `2f44d9fbfbe1c4779bd59f78fe9cc4ff27f41cd6`에서 빌드된 기존 Linux binary(SHA-256 `621d880c447a155c193eef9a8f2c4b11afcdf994a31c9b392d5c11d07bedefe1`, 32,322,600 bytes)를 새 run-owned copy로 고정해 local owner web start와 SIGTERM 종료를 실행했다. exit code 0, 비강제 종료, Popen 핸들 해제, owned 경로 제거가 확인됐다. 이 실행은 현재 통합 source의 provenance나 managed drain ACK를 검증하지 않으므로 `managed_drain_ack=unverified`, 3-host 주장은 false로 기록했다. 상세 결과는 `f-bootstrap/local-linux-owner-shutdown-20260909.json`이다.
 
-이 live 경로의 `file_hash`는 가입 후 파일 내용과 크기를 확인하는 readiness 관측이며 공급자별 조각 payload나 CAS 기여를 측정하지 않는다. owner/RW 양쪽 CAS와 두 공급자의 실제 payload는 E2/E3 실행에서 별도 계측·판정해야 한다.
+이 live 경로의 `file_hash`는 가입 후 파일 내용과 크기를 확인하는 readiness 관측이며 공급자별 조각 payload나 CAS 기여를 측정하지 않는다. owner/RW 양쪽 CAS와 두 공급자의 실제 payload는 E2/E3 실행에서 별도 계측·판정해야 한다. 실제 계측 결과가 준비되면 [provider payload gate](QSYNC_F_PAYLOAD_2026-09-09.md)에 `--provider-evidence`와 `--require-provider-payload`를 함께 전달한다. 이 gate를 통과하기 전에는 role manifest의 provider counter를 채우지 않는다.
 
 ## 정리와 판정
 
