@@ -32,11 +32,7 @@ pub(crate) fn prepare_directory(path: &Path) -> io::Result<()> {
         return Err(permission_error(PRIVATE_ERROR));
     }
 
-    if let Err(error) = reject_reparse_components(path) {
-        #[cfg(windows)]
-        log_acl_diagnostic("pre_reparse", None);
-        return Err(error);
-    }
+    log_acl_result(reject_reparse_components(path), "pre_reparse")?;
     let existed = match fs::symlink_metadata(path) {
         Ok(metadata) => {
             validate_directory_metadata(&metadata)?;
@@ -58,18 +54,10 @@ pub(crate) fn prepare_directory(path: &Path) -> io::Result<()> {
                 safe_io_error(error, PRIVATE_ERROR)
             }
         });
-        if let Err(error) = created {
-            #[cfg(windows)]
-            log_acl_diagnostic("create", None);
-            return Err(error);
-        }
+        log_acl_result(created, "create")?;
         // A concurrent replacement must not turn the chmod/ACL operation into
         // an operation on an attacker-selected link or reparse point.
-        if let Err(error) = reject_reparse_components(path) {
-            #[cfg(windows)]
-            log_acl_diagnostic("post_create_reparse", None);
-            return Err(error);
-        }
+        log_acl_result(reject_reparse_components(path), "post_create_reparse")?;
         let metadata = match fs::symlink_metadata(path) {
             Ok(value) => value,
             Err(error) => {
@@ -78,11 +66,7 @@ pub(crate) fn prepare_directory(path: &Path) -> io::Result<()> {
                 return Err(safe_io_error(error, PRIVATE_ERROR));
             }
         };
-        if let Err(error) = validate_directory_kind(&metadata) {
-            #[cfg(windows)]
-            log_acl_diagnostic("post_create_validate", None);
-            return Err(error);
-        }
+        log_acl_result(validate_directory_kind(&metadata), "post_create_validate")?;
     }
 
     #[cfg(unix)]
@@ -104,6 +88,16 @@ fn permission_error(message: &'static str) -> io::Error {
 
 fn safe_io_error(error: io::Error, message: &'static str) -> io::Error {
     io::Error::new(error.kind(), message)
+}
+
+fn log_acl_result<T>(result: io::Result<T>, stage: &'static str) -> io::Result<T> {
+    #[cfg(windows)]
+    if result.is_err() {
+        log_acl_diagnostic(stage, None);
+    }
+    #[cfg(not(windows))]
+    let _ = stage;
+    result
 }
 
 fn validate_directory_metadata(metadata: &fs::Metadata) -> io::Result<()> {
