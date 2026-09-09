@@ -5,6 +5,7 @@ use deltaweave_net::{
     share::{Permission, ShareError, ShareId, ShareService, ShareSession},
 };
 use serde::Serialize;
+use std::{future::Future, pin::Pin};
 
 /// Credential- and path-free error fields suitable for a management API.
 #[derive(Clone, Copy, Debug, serde::Deserialize, Serialize)]
@@ -66,7 +67,14 @@ struct ManagedInner {
     session: ShareSession,
     gate: tokio::sync::Mutex<()>,
     heartbeat_task: Option<tokio::task::JoinHandle<()>>,
+    /// Owns the concrete E2 supplier guard without exposing its net-module
+    /// type through this public sync API.  Calling it closes and unregisters
+    /// the exact generation before the local root lease is released.
+    supplier_drain: Option<SupplierDrain>,
 }
+
+type SupplierDrain =
+    Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync>;
 
 impl ManagedSyncEngine {
     /// Opens or resumes a persisted enrollment using its issuing owner and assigned replica.
@@ -153,9 +161,9 @@ impl ManagedSyncEngine {
             state.join("store"),
             |path| root_admission::reserve_private(path),
         )?);
-        if member.permission == Permission::ReadWrite {
-            deltaweave_net::recover_causal_index(&store, &index, &root)?;
-        }
+        // Managed recovery is authority-gated and must happen only after a
+        // fresh owner snapshot in the role-specific sync path.  The legacy
+        // SyncEngine keeps its existing generic recovery contract.
         let local = Arc::new(ReplicaState {
             _root_lease: lease,
             root,
@@ -173,6 +181,25 @@ impl ManagedSyncEngine {
             );
             read_only::initialize(&local, member)?;
         }
+        // Register the same Arc-backed index/store/lease used by this engine.
+        // A member's roster row alone is only a discovery hint; the net
+        // handler will serve chunks only while this exact guard is live.
+        let supplier_drain = {
+            let guard = service.register_supplier_storage(
+                owner,
+                share,
+                member,
+                &local.root,
+                Arc::clone(&local._root_lease),
+                Arc::clone(&local.index),
+                Arc::clone(&local.store),
+            )?;
+            Some(Box::new(move || {
+                let drain: Pin<Box<dyn Future<Output = Result<()>> + Send>> =
+                    Box::pin(async move { guard.drain().await });
+                drain
+            }) as SupplierDrain)
+        };
         let heartbeat_task = session.start_heartbeat();
         Ok(Self {
             pending: std::sync::Mutex::new(Vec::new()),
@@ -181,6 +208,7 @@ impl ManagedSyncEngine {
                 session,
                 gate: tokio::sync::Mutex::new(()),
                 heartbeat_task: Some(heartbeat_task),
+                supplier_drain,
             }),
         })
     }
@@ -205,6 +233,10 @@ impl ManagedSyncEngine {
         tokio::spawn(async move {
             let result = async {
                 let _guard = inner.gate.lock().await;
+                // Resolve response-lost/restarted swarm intents before any
+                // new snapshot, provider, fallback, or public operation.
+                // A nonterminal owner result remains a durable blocker.
+                recover_managed_durable_state(&inner).await?;
                 // Liveness is checked on the managed session before local
                 // reconciliation. A separate supervisor repeats this work
                 // every 30 seconds, so a long transfer cannot age the roster
@@ -212,18 +244,11 @@ impl ManagedSyncEngine {
                 inner.session.ensure_roster_heartbeat().await?;
                 inner.local.observe(&observer, "scanning", None, None, 0);
                 match inner.session.membership().permission {
-                    Permission::ReadWrite => {
-                        inner.local.recover_pending()?;
-                        let scan = scan_index(inner.local.index.clone()).await?;
-                        ensure_scan_is_safe(&scan, "local")?;
-                        let records = read_records(inner.local.index.clone()).await?;
-                        let tree = MerkleTree::from_records(records.clone())?;
-                        inner
-                            .local
-                            .sync_with_session(&inner.session, records, tree, &observer)
-                            .await
-                            .map(ManagedSyncReport::ReadWrite)
-                    }
+                    Permission::ReadWrite => inner
+                        .local
+                        .sync_managed_rw(&inner.session, &observer)
+                        .await
+                        .map(ManagedSyncReport::ReadWrite),
                     Permission::ReadOnly => {
                         read_only::sync(&inner.local, &inner.session, &observer)
                             .await
@@ -250,6 +275,42 @@ impl ManagedSyncEngine {
         })
         .await
         .context("managed sync task failed")?
+    }
+
+    /// Closes only durable, already-started work for a paused, revoked, or
+    /// temporarily offline membership.  This endpoint deliberately skips
+    /// heartbeat, fresh snapshots, grants, and public filesystem work so a
+    /// lifecycle controller can make progress on an old receipt even when
+    /// normal admission is closed.  The owner-side status/cancel/drain result
+    /// and the local apply journal are both retained on an unknown response.
+    pub async fn recover_pending(&self) -> Result<()> {
+        let inner = self.inner.clone();
+        let (finished, completion) = tokio::sync::oneshot::channel();
+        {
+            let mut pending = self
+                .pending
+                .lock()
+                .map_err(|_| anyhow::anyhow!("managed lifetime lock poisoned"))?;
+            pending.retain_mut(|receiver| {
+                matches!(
+                    receiver.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                )
+            });
+            pending.push(completion);
+        }
+        tokio::spawn(async move {
+            let result = async {
+                let _guard = inner.gate.lock().await;
+                recover_managed_durable_state(&inner).await
+            }
+            .await;
+            drop(inner);
+            let _ = finished.send(());
+            result
+        })
+        .await
+        .context("managed recovery task failed")?
     }
 
     /// Runs a causal read/write round; using an RO grant fails before any work.
@@ -303,8 +364,12 @@ impl ManagedSyncEngine {
         let ManagedInner {
             session,
             heartbeat_task,
+            supplier_drain,
             ..
         } = inner;
+        if let Some(drain) = supplier_drain {
+            drain().await?;
+        }
         if let Some(task) = heartbeat_task {
             task.abort();
             let _ = task.await;
@@ -312,6 +377,38 @@ impl ManagedSyncEngine {
         session.close().await;
         Ok(())
     }
+}
+
+fn ensure_managed_swarm_recovery_complete(
+    rows: &[deltaweave_net::share::ClientIntentRow],
+) -> Result<()> {
+    for row in rows {
+        ensure!(
+            matches!(
+                row.phase,
+                deltaweave_net::share::ClientIntentPhase::Drained
+                    | deltaweave_net::share::ClientIntentPhase::Cancelled
+            ),
+            ShareError::RevocationPending
+        );
+    }
+    Ok(())
+}
+
+async fn recover_managed_durable_state(inner: &ManagedInner) -> Result<()> {
+    // Service-owned swarm intents are recovered first.  This closes the
+    // exact activation/receipt state before any local apply journal is
+    // considered complete, while still allowing both operations when the
+    // owner has paused or revoked new admission.
+    let recovered = inner.session.recover_swarm_intents(true).await?;
+    ensure_managed_swarm_recovery_complete(&recovered)?;
+    // A managed ApplyStart can also be left in the member's private index
+    // after response loss.  Recover it before roster liveness: heartbeat is
+    // an admission check and may correctly fail for a paused/revoked owner.
+    inner
+        .local
+        .recover_managed_apply_before_liveness(&inner.session)
+        .await
 }
 
 fn validate_transferred_lease(

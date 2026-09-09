@@ -20,6 +20,9 @@ deltaweave-store = { path = "../deltaweave-store" }
 serde.workspace = true
 tokio.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+winapi-util.workspace = true
+
 [dev-dependencies]
 redb.workspace = true
 tempfile.workspace = true
