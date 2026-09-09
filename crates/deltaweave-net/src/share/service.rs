@@ -3294,6 +3294,16 @@ mod tests {
             .unwrap();
         assert!(matches!(active.state, ActivationStateView::Active));
         assert!(!active.provider_drained && !active.consumer_drained);
+        let late_cancel = provider_session
+            .cancel_activation(&grant, Some(activation.reply.activation_id), [0xc3; 16])
+            .await
+            .unwrap();
+        assert!(matches!(late_cancel.state, ActivationStateView::Active));
+        assert_eq!(
+            late_cancel.activation_id,
+            Some(activation.reply.activation_id)
+        );
+        assert!(!late_cancel.provider_drained && !late_cancel.consumer_drained);
 
         let first_revoke = owner_share
             .revoke_member_strong(provider.endpoint_id())

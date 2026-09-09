@@ -10,9 +10,10 @@
 통합되었고, B 최종 source checkpoint는 `5702ab1`, D2 source checkpoint는
 `04818f2b224249b2839b20d0b18f7b6634ae0c0a`이다. D2는 authority와
 request-start monotonic activation lease 검증까지 완료했다. D3 checkpoint
-`f886ab0`은 heartbeat와 bounded endpoint-ID fallback을 포함하지만 실제
-Internet/N0·relay와 E data-plane은 완료로 표시하지 않는다. E1 source checkpoint는
-`bfe6f92`이며, durable activation 상태 조회/취소와 양쪽 drain 상태 검증만 포함한다.
+`f886ab0`은 heartbeat와 bounded endpoint-ID fallback을 포함한다. D3의 실제
+Internet/N0·relay control 검증은 `d8225bf` evidence로 완료했으며, E data-plane은
+완료로 표시하지 않는다. E1 source checkpoint는 `bfe6f92`이며, durable activation
+상태 조회/취소와 양쪽 drain 상태 검증만 포함한다.
 
 ## 작업 공간과 agent
 
@@ -25,7 +26,7 @@ Internet/N0·relay와 E data-plane은 완료로 표시하지 않는다. E1 sourc
 | B control | `/home/ubuntu/project/DeltaWeave-qsync-control-20260908` | `feat/qsync-control-20260908` | `ca63e04` persisted managed-private path recovery; prior final source `5702ab1`, Windows acceptance fixture `39ae489` |
 | C web | `/home/ubuntu/project/DeltaWeave-qsync-web-20260908` | `feat/qsync-web-20260908` | 병렬 구현 진행 |
 | validation | `/home/ubuntu/project/DeltaWeave-qsync-verification-20260908` | `test/qsync-verification-20260908` | 후속 검증 |
-| D network | `/home/ubuntu/project/DeltaWeave-qsync-network-20260908` | `feat/qsync-network-20260908` | `bfe6f92` E1 activation status/cancel checkpoint; D3 Internet/N0·relay 및 E data-plane 검증 대기 |
+| D network | `/home/ubuntu/project/DeltaWeave-qsync-network-20260908` | `feat/qsync-network-20260908` | `bfe6f92` E1 activation status/cancel checkpoint; D3 Internet/N0·relay control 완료, E data-plane 검증 대기 |
 
 ## A에서 고정한 계약
 
@@ -143,12 +144,12 @@ flow, D N0/relay/address update, E swarm grant/manifest/max-8/fallback, root saf
   단위로 정리하며 기존 root/index/CAS 파일은 보존한다.
 
 D2에서 실제 확인한 것은 위 source-level authority/control 경계와 DirectOnly isolated
-  tests, request-start activation lease 및 isolated full-net 회귀다. 아직 D 전체 완료가
-  아닌 남은 항목은 managed worker의 30초 heartbeat와 90초
-  stale refresh, owner 주소 변경/실제 offline 복귀, Internet/N0 relay payload 증거,
-  signed roster pagination, E의 실제 `share-swarm/1` verified-CAS multi-provider data
-  handler/stream limits, Windows 3-host 및 F full CI 검증이다. DirectOnly stale-address
-  refresh와 live provider discovery는 D3 의존성으로 유지한다.
+  tests, request-start activation lease 및 isolated full-net 회귀다. D3의 실제
+  Internet/N0·relay control 경계도 `d8225bf`의 owner/member 분리 identity 실험에서
+  확인했다. 아직 D/E 전체 완료가 아닌 남은 항목은 E의 실제 `share-swarm/1`
+  verified-CAS 다중 provider data handler/stream limits, signed roster pagination,
+  Windows 3-host 및 F full CI 검증이다. 해당 D3 control byte/path 관측은 E payload
+  증거로 집계하지 않는다.
 
 ## e8122ac finding 매핑
 
@@ -292,11 +293,11 @@ CI 결과와 이 후속 source 검사는 별도 근거로 집계한다.
 | E1 검사 | 결과 | 증거 |
 | --- | --- | --- |
 | registry authority status/cancel/remove | `13 passed, 0 failed`, exit `0`, outer `13` | `2026-09-09/e1/registry-e1-final2-20260909T064242Z.log`, 06:42:42Z–06:43:00Z |
-| bilateral drain + idempotent cancel service regression | `1 passed, 0 failed`, exit `0`, logical outer `1`; nested child 출력 미합산 | `2026-09-09/e1/service-bilateral-drain-e1-final2.log`, 06:48:27Z 완료 |
+| bilateral drain + idempotent cancel service regression | `1 passed, 0 failed`, exit `0`, logical outer `1`; nested child 출력 미합산; Activate 선행 후 late cancel도 Active/ID/drain flags 보존 | `2026-09-09/e1/service-bilateral-drain-e1-followup.log`, 06:57:43Z 완료 |
 | activation recovery binding after epoch change | outer `1 passed`, exit `0` | `2026-09-09/e1/service-recovery-binding-final-20260909T064351Z.log` |
 | locked net check | `cargo check --locked -p deltaweave-net --all-targets --all-features`, exit `0` | `2026-09-09/e1/net-check-e1-final2.log`, 06:48:52Z 완료; `CARGO_TARGET_DIR` 공유 캐시와 jobs `4` |
 | strict net clippy | `cargo clippy --locked -p deltaweave-net --all-targets --all-features -- -D warnings`, exit `0` | `2026-09-09/e1/net-clippy-e1-final2.log`, 06:49:14Z 완료 |
-| format | `cargo fmt --all -- --check`, exit `0` | `2026-09-09/e1/fmt-e1-final.log`, 06:47:55Z |
+| format | `cargo fmt --all -- --check`, exit `0` | `2026-09-09/e1/fmt-e1-followup.log`, 06:58:25Z; pre-follow-up check failure was formatting-only and normalized before final checks |
 
 E1은 provider/consumer durable intent와 late/lost Activate receipt의 양단 query/ACK
 복구, paused runtime의 별도 admission-open 확인, 실제 `share-swarm/1` verified-CAS
