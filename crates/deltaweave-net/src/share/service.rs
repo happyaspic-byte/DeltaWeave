@@ -1,7 +1,8 @@
 use super::authority::{
-    ActivationCancel, ActivationReceipt, ActivationStatusQuery, ApplyDrained, ApplyPermit,
-    ApplyStart, AuthoritativeSnapshot, ClientIntentPhase, ClientSide, ManifestAttestation,
-    ShareGrant, SnapshotToken, SwarmTransferReceipt, request_hash,
+    ActivationCancel, ActivationReceipt, ActivationStateView, ActivationStatusQuery, ApplyCancel,
+    ApplyDrained, ApplyPermit, ApplyReceipt, ApplyStart, ApplyStatusQuery, AuthoritativeSnapshot,
+    ClientIntentPhase, ClientIntentRow, ClientSide, ManifestAttestation, ShareGrant, SnapshotToken,
+    SwarmTransferReceipt, request_hash,
 };
 use super::roster::random_nonce;
 use super::{
@@ -37,13 +38,70 @@ use std::{
     fs,
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, RwLock, atomic::Ordering},
+    sync::{
+        Arc, Mutex, RwLock, Weak,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 const CONTROL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
 
 type SupplierMap = Arc<RwLock<BTreeMap<(EndpointId, ShareId), Arc<SupplierRegistrationGuard>>>>;
+
+/// The service-owned lifecycle coordinator for supplier registrations.  A
+/// guard keeps only a weak reference to this object, so a registration cannot
+/// keep the endpoint alive after shutdown; while the service is alive,
+/// `SupplierRegistrationGuard::drain` is a real admission close and exact map
+/// removal rather than a boolean hint.
+#[derive(Debug)]
+struct SupplierLifecycle {
+    suppliers: SupplierMap,
+}
+
+/// Service-owned registry for every accepted share-swarm operation,
+/// including outbound member fetches. A caller dropping its future therefore
+/// cannot detach a task that still owns a root/store Arc or a blocking CAS
+/// writer; shutdown closes admission and awaits the same registry.
+#[derive(Debug, Default)]
+struct SwarmTaskRegistry {
+    closed: AtomicBool,
+    tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+
+impl SwarmTaskRegistry {
+    fn close_admission(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+    }
+
+    fn register(&self, task: tokio::task::JoinHandle<()>) -> bool {
+        let mut tasks = match self.tasks.lock() {
+            Ok(tasks) => tasks,
+            Err(_) => {
+                task.abort();
+                return false;
+            }
+        };
+        if self.closed.load(Ordering::SeqCst) {
+            task.abort();
+            return false;
+        }
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(task);
+        true
+    }
+
+    async fn close_and_drain(&self) -> Result<()> {
+        self.close_admission();
+        let tasks = std::mem::take(
+            &mut *self
+                .tasks
+                .lock()
+                .map_err(|_| anyhow::anyhow!("swarm task registry is poisoned"))?,
+        );
+        crate::await_swarm_tasks(tasks).await
+    }
+}
 
 /// The provider-side activation lease returned after a signed owner reply.
 ///
@@ -101,7 +159,8 @@ pub struct ShareService {
     mode: NetworkMode,
     active: Arc<tokio::sync::RwLock<()>>,
     suppliers: SupplierMap,
-    swarm_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    supplier_lifecycle: Arc<SupplierLifecycle>,
+    swarm_tasks: Arc<SwarmTaskRegistry>,
     #[cfg(test)]
     admission_limit: Arc<tokio::sync::Semaphore>,
 }
@@ -139,7 +198,10 @@ pub struct SupplierRegistrationGuard {
     index: Arc<LocalIndex>,
     store: Arc<Store>,
     drained: Arc<std::sync::atomic::AtomicBool>,
+    inflight: Arc<AtomicUsize>,
+    inflight_notify: Arc<tokio::sync::Notify>,
     generation: Arc<()>,
+    lifecycle: Weak<SupplierLifecycle>,
 }
 impl SupplierRegistrationGuard {
     #[allow(dead_code)]
@@ -166,8 +228,16 @@ impl SupplierRegistrationGuard {
     pub(crate) fn store(&self) -> &Arc<Store> {
         &self.store
     }
-    pub async fn drain(&mut self) -> Result<()> {
+    /// Closes this supplier admission, waits for already accepted endpoint
+    /// operations, and removes exactly this registration generation.  The
+    /// operation is idempotent and remains safe if the owning service has
+    /// already shut down (in that case the weak lifecycle is gone).
+    pub async fn drain(&self) -> Result<()> {
         self.drained.store(true, Ordering::SeqCst);
+        self.wait_for_operations().await;
+        if let Some(lifecycle) = self.lifecycle.upgrade() {
+            lifecycle.unregister(self).await?;
+        }
         Ok(())
     }
 
@@ -177,6 +247,73 @@ impl SupplierRegistrationGuard {
 
     fn is_drained(&self) -> bool {
         self.drained.load(Ordering::SeqCst)
+    }
+
+    fn begin_operation(&self) -> Result<SupplierOperation> {
+        if self.is_drained() {
+            return Err(ShareError::Busy.into());
+        }
+        self.inflight.fetch_add(1, Ordering::AcqRel);
+        // Closing can race the increment.  The second check makes the
+        // admission boundary linearizable: an operation which observes the
+        // close never receives a storage lease, while one which passed both
+        // checks is included in drain's counter.
+        if self.is_drained() {
+            self.release_operation();
+            return Err(ShareError::Busy.into());
+        }
+        Ok(SupplierOperation {
+            inflight: self.inflight.clone(),
+            notify: self.inflight_notify.clone(),
+        })
+    }
+
+    fn release_operation(&self) {
+        self.inflight.fetch_sub(1, Ordering::AcqRel);
+        self.inflight_notify.notify_waiters();
+    }
+
+    async fn wait_for_operations(&self) {
+        while self.inflight.load(Ordering::Acquire) != 0 {
+            self.inflight_notify.notified().await;
+        }
+    }
+}
+
+/// A counted lease for one member-provider operation.  It is deliberately
+/// separate from the registration guard so draining can close admission and
+/// wait for actual storage users without holding the endpoint-wide control
+/// read gate (which would otherwise deadlock owner status/drain requests).
+#[derive(Debug)]
+struct SupplierOperation {
+    inflight: Arc<AtomicUsize>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl Drop for SupplierOperation {
+    fn drop(&mut self) {
+        self.inflight.fetch_sub(1, Ordering::AcqRel);
+        self.notify.notify_waiters();
+    }
+}
+
+impl SupplierLifecycle {
+    async fn unregister(&self, guard: &SupplierRegistrationGuard) -> Result<()> {
+        guard.mark_drained();
+        // The per-registration counter waits for every accepted swarm handler
+        // that actually borrowed this supplier's storage.  We intentionally
+        // do not take the endpoint-wide control gate here: owner status,
+        // cancellation, and bilateral drain requests must remain serviceable
+        // while a member provider is closing.
+        guard.wait_for_operations().await;
+        let key = (guard.owner, guard.share);
+        let mut suppliers = self.suppliers.write().expect("supplier map");
+        if let Some(existing) = suppliers.get(&key)
+            && Arc::ptr_eq(&existing.generation, &guard.generation)
+        {
+            suppliers.remove(&key);
+        }
+        Ok(())
     }
 }
 impl ShareService {
@@ -220,7 +357,10 @@ impl ShareService {
         let active = Arc::new(tokio::sync::RwLock::new(()));
         let limit = Arc::new(tokio::sync::Semaphore::new(max_connections));
         let suppliers = Arc::new(RwLock::new(BTreeMap::new()));
-        let swarm_tasks = Arc::new(Mutex::new(Vec::new()));
+        let supplier_lifecycle = Arc::new(SupplierLifecycle {
+            suppliers: suppliers.clone(),
+        });
+        let swarm_tasks = Arc::new(SwarmTaskRegistry::default());
         let swarm_streams = Arc::new(tokio::sync::Semaphore::new(
             max_connections.saturating_mul(2).max(1),
         ));
@@ -262,6 +402,7 @@ impl ShareService {
             mode,
             active,
             suppliers,
+            supplier_lifecycle,
             swarm_tasks,
             #[cfg(test)]
             admission_limit,
@@ -485,7 +626,10 @@ impl ShareService {
             index,
             store,
             drained: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            inflight: Arc::new(AtomicUsize::new(0)),
+            inflight_notify: Arc::new(tokio::sync::Notify::new()),
             generation: Arc::new(()),
+            lifecycle: Arc::downgrade(&self.supplier_lifecycle),
         };
         let key = (owner, share);
         let mut suppliers = self.suppliers.write().expect("supplier map");
@@ -506,16 +650,7 @@ impl ShareService {
         &self,
         guard: &SupplierRegistrationGuard,
     ) -> Result<()> {
-        guard.mark_drained();
-        let _active = self.active.write().await;
-        let key = (guard.owner, guard.share);
-        let mut suppliers = self.suppliers.write().expect("supplier map");
-        if let Some(existing) = suppliers.get(&key)
-            && Arc::ptr_eq(&existing.generation, &guard.generation)
-        {
-            suppliers.remove(&key);
-        }
-        Ok(())
+        self.supplier_lifecycle.unregister(guard).await
     }
     async fn load_config(&self, config: OwnedShareConfig) -> Result<OwnerShare> {
         let lease = root_admission::acquire_with_private(
@@ -747,8 +882,77 @@ impl ShareService {
             self.router.endpoint().clone(),
             self.mode,
             relationship,
+            self.active.clone(),
+            self.swarm_tasks.clone(),
         ))
     }
+
+    /// Replays all endpoint-local grant intents that belong to this device.
+    /// The registry bounds enumeration; every row is handled from its stored
+    /// signed binding and operation ID, and a nonterminal row is never
+    /// replaced with a newly issued grant. This is intended for manager
+    /// restart/pending recovery before a fresh data snapshot is requested.
+    pub async fn recover_client_intents(
+        &self,
+        local_io_drained: bool,
+    ) -> Result<Vec<ClientIntentRow>> {
+        let handler = SwarmAdmissionHandler {
+            key: self.key.clone(),
+            registry: self.registry.clone(),
+            runtimes: self.runtimes.clone(),
+            suppliers: self.suppliers.clone(),
+            endpoint: self.router.endpoint().clone(),
+            mode: self.mode,
+            active: self.active.clone(),
+            tasks: self.swarm_tasks.clone(),
+            streams: Arc::new(tokio::sync::Semaphore::new(1)),
+            inflight: Arc::new(Mutex::new(BTreeSet::new())),
+        };
+        let rows = self.registry.client_intents()?;
+        let mut recovered = Vec::new();
+        for row in rows {
+            if row.grant.provider == self.endpoint_id() && row.side == ClientSide::Provider {
+                recovered.push(
+                    handler
+                        .recover_provider_intent(&row.grant, row.operation_id, local_io_drained)
+                        .await?,
+                );
+            } else if row.grant.consumer == self.endpoint_id()
+                && row.side == ClientSide::Consumer
+                && row.grant.owner != self.endpoint_id()
+            {
+                // The durable grant keeps the trusted owner identity even if
+                // the enrollment response was lost and a later local cleanup
+                // removed the relationship row.  Re-establish the active
+                // membership through the owner's authenticated Resume path;
+                // the endpoint-only address is intentionally empty so
+                // Internet mode can resolve the owner by identity.  Offline
+                // remains an error with the exact intent row preserved.
+                let session = match self.open_session(row.grant.owner, row.grant.share) {
+                    Ok(session) => session,
+                    Err(error)
+                        if error.downcast_ref::<ShareError>() == Some(&ShareError::NotMember) =>
+                    {
+                        self.resume_membership(
+                            row.grant.owner,
+                            row.grant.share,
+                            EndpointAddr::new(row.grant.owner),
+                        )
+                        .await?;
+                        self.open_session(row.grant.owner, row.grant.share)?
+                    }
+                    Err(error) => return Err(error),
+                };
+                recovered.push(
+                    session
+                        .recover_swarm_intent(&row.grant, row.operation_id, local_io_drained)
+                        .await?,
+                );
+            }
+        }
+        Ok(recovered)
+    }
+
     /// A managed member engine must retain this lease for its entire lifetime.
     pub fn admit_member_root(
         &self,
@@ -766,6 +970,11 @@ impl ShareService {
         )
     }
     pub async fn shutdown(self) -> Result<()> {
+        // Close new swarm admission before asking the router to stop. Tasks
+        // already registered below still own their storage and are drained;
+        // a late accept races only with the closed registry and is aborted
+        // while waiting for registration, before it can start I/O.
+        self.swarm_tasks.close_admission();
         for supplier in self.suppliers.read().expect("supplier map").values() {
             supplier.mark_drained();
         }
@@ -780,13 +989,12 @@ impl ShareService {
             runtime.pause().await;
         }
         self.runtimes.write().expect("runtime map").clear();
-        self.router.shutdown().await?;
+        let router_result = self.router.shutdown().await;
         let _drained = self.active.write().await;
-        let tasks = std::mem::take(&mut *self.swarm_tasks.lock().expect("swarm task list"));
-        for task in tasks {
-            task.await.map_err(|error| anyhow::anyhow!(error))?;
-        }
+        let tasks_result = self.swarm_tasks.close_and_drain().await;
         self.suppliers.write().expect("supplier map").clear();
+        router_result?;
+        tasks_result?;
         Ok(())
     }
 }
@@ -802,6 +1010,8 @@ struct RosterCache {
 struct ShareSessionState {
     registry: Arc<Registry>,
     membership: Membership,
+    active: Arc<tokio::sync::RwLock<()>>,
+    tasks: Arc<SwarmTaskRegistry>,
     roster_challenge: Mutex<Option<GrantNonce>>,
     roster: Mutex<RosterCache>,
     roster_gate: tokio::sync::Mutex<()>,
@@ -838,6 +1048,8 @@ impl ShareSession {
         endpoint: crate::Endpoint,
         mode: NetworkMode,
         relationship: MemberRelationship,
+        active: Arc<tokio::sync::RwLock<()>>,
+        tasks: Arc<SwarmTaskRegistry>,
     ) -> Self {
         let owner = relationship.membership.owner;
         let share = relationship.membership.share_id;
@@ -846,6 +1058,8 @@ impl ShareSession {
             state: Arc::new(ShareSessionState {
                 registry,
                 membership: relationship.membership,
+                active,
+                tasks,
                 roster_challenge: Mutex::new(None),
                 roster: Mutex::new(RosterCache::default()),
                 roster_gate: tokio::sync::Mutex::new(()),
@@ -1366,6 +1580,256 @@ impl ShareSession {
         Ok(receipt)
     }
 
+    /// Replays one endpoint-local grant intent after a response loss or
+    /// process restart. The stored signed grant and operation ID are the only
+    /// inputs that identify the operation; this method never accepts a new
+    /// grant, nonce, membership, or replica as a recovery substitute.
+    ///
+    /// `local_io_drained` is supplied by the managed engine's actual writer
+    /// drain barrier. Until it is true, an Active/Restarted/Unknown intent is
+    /// kept recoverable and no terminal state is published.
+    pub async fn recover_swarm_intent(
+        &self,
+        grant: &ShareGrant,
+        operation_id: [u8; 16],
+        local_io_drained: bool,
+    ) -> Result<ClientIntentRow> {
+        Self::ensure_recovery_binding_for(&self.state.membership, grant)?;
+        ensure!(
+            grant.consumer == self.state.membership.endpoint,
+            ShareError::EndpointMismatch
+        );
+        let mut row = self
+            .state
+            .registry
+            .client_intent_exact(grant, ClientSide::Consumer, operation_id)?
+            .ok_or(ShareError::GrantReplay)?;
+        if matches!(
+            row.phase,
+            ClientIntentPhase::Drained | ClientIntentPhase::Cancelled
+        ) {
+            return Ok(row);
+        }
+
+        let deadline = Instant::now() + CONTROL_DEADLINE;
+        let mut receipt = match self
+            .activation_status_until(grant, row.activation_id, deadline)
+            .await
+        {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                // A lost owner does not prove NotMember, revoke, or terminal
+                // completion. Preserve the exact row for a later retry.
+                if !matches!(row.phase, ClientIntentPhase::Unknown) {
+                    self.state.registry.transition_client_intent(
+                        grant,
+                        ClientSide::Consumer,
+                        operation_id,
+                        ClientIntentPhase::Unknown,
+                        row.activation_id,
+                    )?;
+                }
+                return Err(error);
+            }
+        };
+
+        // A response-loss window may have assigned an activation ID at the
+        // owner even though this endpoint never saw Ready. Retain that exact
+        // ID; never mint or accept a replacement.
+        if row.activation_id.is_none() && receipt.activation_id.is_some() {
+            row = self.state.registry.transition_client_intent(
+                grant,
+                ClientSide::Consumer,
+                operation_id,
+                row.phase,
+                receipt.activation_id,
+            )?;
+        }
+
+        if matches!(
+            receipt.state,
+            ActivationStateView::Active | ActivationStateView::Restarted
+        ) {
+            // Recovery may inspect an old active lease, but it can never
+            // reopen payload admission. Quarantine a pre-restart phase before
+            // moving it to the local drain barrier.
+            if !matches!(
+                row.phase,
+                ClientIntentPhase::Unknown | ClientIntentPhase::Draining
+            ) {
+                row = self.state.registry.transition_client_intent(
+                    grant,
+                    ClientSide::Consumer,
+                    operation_id,
+                    ClientIntentPhase::Unknown,
+                    receipt.activation_id,
+                )?;
+            }
+            if !local_io_drained {
+                return Ok(row);
+            }
+            let activation_id = receipt.activation_id.ok_or(ShareError::GrantReplay)?;
+            if !matches!(row.phase, ClientIntentPhase::Draining) {
+                row = self.state.registry.transition_client_intent(
+                    grant,
+                    ClientSide::Consumer,
+                    operation_id,
+                    ClientIntentPhase::Draining,
+                    Some(activation_id),
+                )?;
+            }
+            if !receipt.consumer_drained {
+                self.grant_drained(grant, activation_id).await?;
+            }
+            receipt = self
+                .activation_status_until(grant, Some(activation_id), deadline)
+                .await?;
+        }
+
+        match receipt.state {
+            ActivationStateView::Drained => {
+                if !local_io_drained {
+                    if !matches!(row.phase, ClientIntentPhase::Unknown) {
+                        row = self.state.registry.transition_client_intent(
+                            grant,
+                            ClientSide::Consumer,
+                            operation_id,
+                            ClientIntentPhase::Unknown,
+                            receipt.activation_id,
+                        )?;
+                    }
+                    return Ok(row);
+                }
+                if matches!(
+                    row.phase,
+                    ClientIntentPhase::Prepared | ClientIntentPhase::AwaitingActivation
+                ) {
+                    row = self.state.registry.transition_client_intent(
+                        grant,
+                        ClientSide::Consumer,
+                        operation_id,
+                        ClientIntentPhase::Unknown,
+                        receipt.activation_id,
+                    )?;
+                }
+                if matches!(row.phase, ClientIntentPhase::Active) {
+                    row = self.state.registry.transition_client_intent(
+                        grant,
+                        ClientSide::Consumer,
+                        operation_id,
+                        ClientIntentPhase::Draining,
+                        receipt.activation_id,
+                    )?;
+                }
+                if !matches!(row.phase, ClientIntentPhase::Drained) {
+                    row = self.state.registry.transition_client_intent(
+                        grant,
+                        ClientSide::Consumer,
+                        operation_id,
+                        ClientIntentPhase::Drained,
+                        receipt.activation_id,
+                    )?;
+                }
+            }
+            ActivationStateView::Denied | ActivationStateView::Expired => {
+                if !local_io_drained {
+                    if !matches!(row.phase, ClientIntentPhase::Unknown) {
+                        row = self.state.registry.transition_client_intent(
+                            grant,
+                            ClientSide::Consumer,
+                            operation_id,
+                            ClientIntentPhase::Unknown,
+                            receipt.activation_id,
+                        )?;
+                    }
+                    return Ok(row);
+                }
+                if matches!(
+                    row.phase,
+                    ClientIntentPhase::Active | ClientIntentPhase::Draining
+                ) {
+                    row = self.state.registry.transition_client_intent(
+                        grant,
+                        ClientSide::Consumer,
+                        operation_id,
+                        ClientIntentPhase::Unknown,
+                        receipt.activation_id,
+                    )?;
+                }
+                if !matches!(row.phase, ClientIntentPhase::Cancelled) {
+                    row = self.state.registry.transition_client_intent(
+                        grant,
+                        ClientSide::Consumer,
+                        operation_id,
+                        ClientIntentPhase::Cancelled,
+                        receipt.activation_id,
+                    )?;
+                }
+            }
+            ActivationStateView::Issued => {
+                // Issued means no owner activation won yet. Cancellation is
+                // the only terminal transition and is an atomic owner-side
+                // race against a late Activate.
+                let cancelled = self
+                    .cancel_activation(grant, receipt.activation_id, operation_id)
+                    .await?;
+                if matches!(
+                    cancelled.state,
+                    ActivationStateView::Denied | ActivationStateView::Expired
+                ) && local_io_drained
+                {
+                    if !matches!(row.phase, ClientIntentPhase::Cancelled) {
+                        row = self.state.registry.transition_client_intent(
+                            grant,
+                            ClientSide::Consumer,
+                            operation_id,
+                            ClientIntentPhase::Cancelled,
+                            cancelled.activation_id,
+                        )?;
+                    }
+                } else if !matches!(row.phase, ClientIntentPhase::Unknown) {
+                    row = self.state.registry.transition_client_intent(
+                        grant,
+                        ClientSide::Consumer,
+                        operation_id,
+                        ClientIntentPhase::Unknown,
+                        cancelled.activation_id,
+                    )?;
+                }
+            }
+            // The Active/Restarted cases are handled above. Keeping an
+            // explicit arm makes the state machine fail closed if that
+            // handling ever returns without a terminal query.
+            ActivationStateView::Active | ActivationStateView::Restarted => {}
+        }
+        Ok(row)
+    }
+
+    /// Replays every bounded consumer intent belonging to this authenticated
+    /// membership. Rows for other shares/endpoints are ignored; no caller
+    /// supplied role or membership is inferred from the journal.
+    pub async fn recover_swarm_intents(
+        &self,
+        local_io_drained: bool,
+    ) -> Result<Vec<ClientIntentRow>> {
+        let rows = self.state.registry.client_intents()?;
+        let mut recovered = Vec::new();
+        for row in rows {
+            if row.side != ClientSide::Consumer
+                || row.grant.owner != self.state.membership.owner
+                || row.grant.share != self.state.membership.share_id
+                || row.grant.consumer != self.state.membership.endpoint
+            {
+                continue;
+            }
+            recovered.push(
+                self.recover_swarm_intent(&row.grant, row.operation_id, local_io_drained)
+                    .await?,
+            );
+        }
+        Ok(recovered)
+    }
+
     /// Sends one authenticated endpoint drain acknowledgement for an active
     /// grant.  The owner retains the grant as Active until its other endpoint
     /// sends the same activation-bound acknowledgement.
@@ -1387,6 +1851,64 @@ impl ShareSession {
             .await?;
         ensure!(matches!(result, Reply::GrantDrained), ShareError::Protocol);
         Ok(())
+    }
+
+    /// Completes the endpoint-local journal only after the owner has returned
+    /// the exact terminal grant state.  A successful local drain acknowledgement
+    /// by itself is deliberately insufficient: the peer may still have a
+    /// writer, reader, or buffered stream in flight.  Transport loss leaves
+    /// the row in `Draining` for bounded restart recovery.
+    async fn finalize_consumer_intent_after_drain(
+        &self,
+        grant: &ShareGrant,
+        operation_id: [u8; 16],
+        activation_id: [u8; 16],
+        deadline: Instant,
+    ) -> Result<bool> {
+        let receipt = match self
+            .activation_status_until(grant, Some(activation_id), deadline)
+            .await
+        {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                // A response lost after the local ACK is a recoverable
+                // lifecycle state. The verified bytes are useful, but the
+                // caller receives an explicit pending marker and recovery
+                // retains the Draining row. Non-transport/state failures are
+                // surfaced instead of being presented as success.
+                if matches!(
+                    error.downcast_ref::<ShareError>(),
+                    Some(
+                        ShareError::Offline
+                            | ShareError::HeartbeatExpired
+                            | ShareError::RosterStale
+                    )
+                ) {
+                    return Ok(false);
+                }
+                return Err(error);
+            }
+        };
+        let phase = match receipt.state {
+            ActivationStateView::Drained => Some(ClientIntentPhase::Drained),
+            ActivationStateView::Denied | ActivationStateView::Expired => {
+                Some(ClientIntentPhase::Cancelled)
+            }
+            ActivationStateView::Issued
+            | ActivationStateView::Active
+            | ActivationStateView::Restarted => None,
+        };
+        if let Some(phase) = phase {
+            self.state.registry.transition_client_intent(
+                grant,
+                ClientSide::Consumer,
+                operation_id,
+                phase,
+                Some(activation_id),
+            )?;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     /// Revalidates the owner root and obtains a short-lived apply permit.
@@ -1468,6 +1990,86 @@ impl ShareSession {
         Ok(())
     }
 
+    /// Reads the owner's durable apply journal for response-loss recovery.
+    /// A status response never renews the permit and does not authorize a new
+    /// public write.
+    pub async fn apply_status(
+        &self,
+        permit: &ApplyPermit,
+        operation_id: Option<[u8; 16]>,
+    ) -> Result<ApplyReceipt> {
+        permit.verify_signature_for(
+            self.state.membership.owner,
+            self.state.membership.share_id,
+            self.state.membership.endpoint,
+        )?;
+        let result = self
+            .control_exchange(Operation::ApplyStatus(ApplyStatusQuery::for_permit(
+                permit,
+                operation_id,
+            )))
+            .await?;
+        let receipt = match result {
+            Reply::ApplyReceipt(receipt) => receipt,
+            _ => return Err(ShareError::Protocol.into()),
+        };
+        ensure!(
+            receipt.owner == permit.owner
+                && receipt.share == permit.share
+                && receipt.consumer == permit.consumer
+                && receipt.permit_nonce == permit.nonce,
+            ShareError::GrantReplay
+        );
+        if let Some(operation_id) = operation_id {
+            // A response can be lost before the owner records ApplyStart.
+            // In that Prepared state the durable row intentionally has no
+            // operation id yet; the permit binding is the exact recovery key
+            // and the caller must use cancel_apply before any new write. Once
+            // the row has started, however, an operation id is mandatory and
+            // must match byte-for-byte.
+            ensure!(
+                receipt.operation_id == Some(operation_id)
+                    || (matches!(receipt.state, super::ApplyStateView::Prepared)
+                        && receipt.operation_id.is_none()),
+                ShareError::GrantReplay
+            );
+        }
+        Ok(receipt)
+    }
+
+    /// Cancels an exact Prepared apply at the owner. A Started/Restarted row
+    /// is returned unchanged so callers can wait for the actual local writer
+    /// drain and then resend the same committed ApplyDrained acknowledgement.
+    pub async fn cancel_apply(
+        &self,
+        permit: &ApplyPermit,
+        operation_id: [u8; 16],
+    ) -> Result<ApplyReceipt> {
+        permit.verify_signature_for(
+            self.state.membership.owner,
+            self.state.membership.share_id,
+            self.state.membership.endpoint,
+        )?;
+        let result = self
+            .control_exchange(Operation::ApplyCancel(ApplyCancel::for_permit(
+                permit,
+                operation_id,
+            )))
+            .await?;
+        let receipt = match result {
+            Reply::ApplyReceipt(receipt) => receipt,
+            _ => return Err(ShareError::Protocol.into()),
+        };
+        ensure!(
+            receipt.owner == permit.owner
+                && receipt.share == permit.share
+                && receipt.consumer == permit.consumer
+                && receipt.permit_nonce == permit.nonce,
+            ShareError::GrantReplay
+        );
+        Ok(receipt)
+    }
+
     /// Fetches one owner-authorized chunk subset from a member or owner
     /// provider over the separate share-swarm/1 ALPN. The consumer intent is
     /// durable before the provider is contacted; a cancelled caller therefore
@@ -1485,27 +2087,56 @@ impl ShareSession {
         hashes: &[Hash32],
         operation_id: [u8; 16],
     ) -> Result<SwarmTransferReceipt> {
-        let result = self
-            .fetch_swarm_chunks_inner(
-                store,
-                grant,
-                snapshot,
-                record,
-                manifest,
-                hashes,
-                operation_id,
-            )
-            .await;
-        if result.is_err() {
-            let _ = self.state.registry.transition_client_intent(
-                grant,
-                ClientSide::Consumer,
-                operation_id,
-                ClientIntentPhase::Unknown,
-                None,
-            );
+        // The public future is only a result handle. The actual managed
+        // operation is owned by the service task registry, so aborting this
+        // caller cannot detach a blocking CAS writer or release the endpoint
+        // admission/root while the operation is still mutating state.
+        let state = self.state.clone();
+        let tasks = state.tasks.clone();
+        let grant = grant.clone();
+        let snapshot = snapshot.clone();
+        let record = record.clone();
+        let manifest = manifest.clone();
+        let hashes = hashes.to_vec();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            // Registration is the ownership hand-off. No endpoint, root, or
+            // CAS work begins until the task is in the service registry.
+            if start_rx.await.is_err() {
+                return;
+            }
+            let _active = state.active.clone().read_owned().await;
+            let session = ShareSession { state };
+            let result = session
+                .fetch_swarm_chunks_inner(
+                    store,
+                    &grant,
+                    &snapshot,
+                    &record,
+                    &manifest,
+                    &hashes,
+                    operation_id,
+                )
+                .await;
+            if result.is_err() {
+                let _ = session.state.registry.transition_client_intent(
+                    &grant,
+                    ClientSide::Consumer,
+                    operation_id,
+                    ClientIntentPhase::Unknown,
+                    None,
+                );
+            }
+            let _ = result_tx.send(result);
+        });
+        if !tasks.register(task) {
+            return Err(ShareError::Busy.into());
         }
-        result
+        let _ = start_tx.send(());
+        result_rx
+            .await
+            .map_err(|_| anyhow::Error::new(ShareError::StateUnavailable))?
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1747,7 +2378,7 @@ impl ShareSession {
             transferred_bytes = transferred_bytes.saturating_add(length as u64);
         }
         let finished = read_swarm_frame::<wire::SwarmResponse>(&mut receive, deadline).await?;
-        let transfer = match finished {
+        let mut transfer = match finished {
             wire::SwarmResponse::Finished(transfer) => transfer,
             wire::SwarmResponse::Error(error) => return Err(error.into()),
             _ => return Err(ShareError::Protocol.into()),
@@ -1778,13 +2409,10 @@ impl ShareSession {
             Some(activation_id),
         )?;
         self.grant_drained(grant, activation_id).await?;
-        self.state.registry.transition_client_intent(
-            grant,
-            ClientSide::Consumer,
-            operation_id,
-            ClientIntentPhase::Drained,
-            Some(activation_id),
-        )?;
+        let drain_confirmed = self
+            .finalize_consumer_intent_after_drain(grant, operation_id, activation_id, deadline)
+            .await?;
+        transfer.drain_pending = !drain_confirmed;
         connection.close(0u8.into(), b"share swarm receive complete");
         Ok(transfer)
     }
@@ -1877,6 +2505,13 @@ impl SwarmProviderSource {
             Self::Member(guard) => guard.store.clone(),
         }
     }
+
+    fn begin_operation(&self) -> Result<Option<SupplierOperation>> {
+        match self {
+            Self::Owner(_) => Ok(None),
+            Self::Member(guard) => guard.begin_operation().map(Some),
+        }
+    }
 }
 
 /// Removes an operation nonce when the stream task finishes.  The durable
@@ -1913,7 +2548,7 @@ struct SwarmAdmissionHandler {
     endpoint: crate::Endpoint,
     mode: NetworkMode,
     active: Arc<tokio::sync::RwLock<()>>,
-    tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    tasks: Arc<SwarmTaskRegistry>,
     streams: Arc<tokio::sync::Semaphore>,
     inflight: Arc<Mutex<BTreeSet<GrantNonce>>>,
 }
@@ -1928,7 +2563,15 @@ impl ProtocolHandler for SwarmAdmissionHandler {
         let handler = self.clone();
         let tasks = self.tasks.clone();
         let task_connection = connection.clone();
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
+            // Keep the task before its first connection operation until the
+            // service-owned registry has accepted its JoinHandle. If the
+            // endpoint is already closing, aborting this waiting task cannot
+            // detach a started CAS writer or stream.
+            if start_rx.await.is_err() {
+                return;
+            }
             let _stream_permit = stream_permit;
             let _active = active;
             let result = handler.run(task_connection.clone()).await;
@@ -1936,12 +2579,10 @@ impl ProtocolHandler for SwarmAdmissionHandler {
                 task_connection.close(0u8.into(), b"share swarm operation failed");
             }
         });
-        if let Ok(mut task_list) = tasks.lock() {
-            task_list.retain(|task| !task.is_finished());
-            task_list.push(task);
-        } else {
-            task.abort();
+        if !tasks.register(task) {
             connection.close(0u8.into(), b"share swarm unavailable");
+        } else {
+            let _ = start_tx.send(());
         }
         Ok(())
     }
@@ -2058,6 +2699,11 @@ impl SwarmAdmissionHandler {
             &hashes,
             remote_consumer,
         )?;
+        // Hold a counted registration lease across validation, inventory,
+        // payload reads, stream finish, and the provider drain/status exchange.
+        // SupplierRegistrationGuard::drain waits on this exact operation
+        // rather than taking the endpoint-wide control gate.
+        let _supplier_operation = source.begin_operation()?;
         let _inflight = InflightNonce::acquire(self.inflight.clone(), grant.nonce)?;
         let intent =
             self.registry
@@ -2204,6 +2850,10 @@ impl SwarmAdmissionHandler {
                 transferred_bytes,
                 missing_chunks: u16::try_from(missing.len()).unwrap_or(u16::MAX),
                 verified: missing.is_empty(),
+                // The provider cannot claim bilateral completion before the
+                // consumer's authenticated GrantDrained arrives. The
+                // consumer rewrites its local result after the owner query.
+                drain_pending: true,
             }),
             activation_deadline,
         )
@@ -2220,13 +2870,33 @@ impl SwarmAdmissionHandler {
             .map_err(|_| anyhow::Error::new(ShareError::TransferFailed))?;
         ensure!(stopped.is_none(), ShareError::TransferFailed);
         self.ack_provider_drain(&grant, activation_id).await?;
-        self.registry.transition_client_intent(
-            &grant,
-            ClientSide::Provider,
-            operation_id,
-            ClientIntentPhase::Drained,
-            Some(activation_id),
-        )?;
+        // The local stream is drained, but the provider intent remains
+        // recoverable until the owner confirms both endpoint acknowledgements.
+        // A lost status response therefore leaves `Draining` durable instead
+        // of falsely publishing completion.
+        if let Ok(receipt) = self
+            .provider_activation_status(&grant, Some(activation_id), activation_deadline)
+            .await
+        {
+            let phase = match receipt.state {
+                ActivationStateView::Drained => Some(ClientIntentPhase::Drained),
+                ActivationStateView::Denied | ActivationStateView::Expired => {
+                    Some(ClientIntentPhase::Cancelled)
+                }
+                ActivationStateView::Issued
+                | ActivationStateView::Active
+                | ActivationStateView::Restarted => None,
+            };
+            if let Some(phase) = phase {
+                self.registry.transition_client_intent(
+                    &grant,
+                    ClientSide::Provider,
+                    operation_id,
+                    phase,
+                    Some(activation_id),
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -2377,6 +3047,8 @@ impl SwarmAdmissionHandler {
                 self.endpoint.clone(),
                 self.mode,
                 relationship,
+                self.active.clone(),
+                self.tasks.clone(),
             );
             let lease = session.activate_grant(grant).await?;
             let activation_id = lease.reply.activation_id;
@@ -2450,6 +3122,8 @@ impl SwarmAdmissionHandler {
                 self.endpoint.clone(),
                 self.mode,
                 relationship,
+                self.active.clone(),
+                self.tasks.clone(),
             );
             session
                 .activation_status_until(grant, Some(activation_id), deadline)
@@ -2476,9 +3150,268 @@ impl SwarmAdmissionHandler {
                 self.endpoint.clone(),
                 self.mode,
                 relationship,
+                self.active.clone(),
+                self.tasks.clone(),
             );
             session.grant_drained(grant, activation_id).await
         }
+    }
+
+    async fn cancel_provider_activation(
+        &self,
+        grant: &ShareGrant,
+        activation_id: Option<[u8; 16]>,
+        operation_id: [u8; 16],
+    ) -> Result<ActivationReceipt> {
+        if grant.owner == self.key.public() {
+            return self.registry.cancel_activation(
+                &ActivationCancel::for_grant(grant, activation_id, operation_id),
+                self.key.public(),
+            );
+        }
+        let relationship = self.registry.relationship(grant.owner, grant.share)?;
+        let session = ShareSession::from_relationship(
+            self.registry.clone(),
+            self.key.clone(),
+            self.endpoint.clone(),
+            self.mode,
+            relationship,
+            self.active.clone(),
+            self.tasks.clone(),
+        );
+        session
+            .cancel_activation(grant, activation_id, operation_id)
+            .await
+    }
+
+    /// Recovers one provider-side intent without ever resuming the old
+    /// payload stream. It mirrors the consumer recovery rules but sends the
+    /// provider half of the bilateral drain acknowledgement.
+    async fn recover_provider_intent(
+        &self,
+        grant: &ShareGrant,
+        operation_id: [u8; 16],
+        local_io_drained: bool,
+    ) -> Result<ClientIntentRow> {
+        ensure!(
+            grant.provider == self.key.public(),
+            ShareError::EndpointMismatch
+        );
+        let mut row = self
+            .registry
+            .client_intent_exact(grant, ClientSide::Provider, operation_id)?
+            .ok_or(ShareError::GrantReplay)?;
+        if matches!(
+            row.phase,
+            ClientIntentPhase::Drained | ClientIntentPhase::Cancelled
+        ) {
+            return Ok(row);
+        }
+        let deadline = Instant::now() + CONTROL_DEADLINE;
+        let mut receipt = match self
+            .provider_activation_status(grant, row.activation_id, deadline)
+            .await
+        {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                if !matches!(row.phase, ClientIntentPhase::Unknown) {
+                    self.registry.transition_client_intent(
+                        grant,
+                        ClientSide::Provider,
+                        operation_id,
+                        ClientIntentPhase::Unknown,
+                        row.activation_id,
+                    )?;
+                }
+                return Err(error);
+            }
+        };
+
+        if row.activation_id.is_none() && receipt.activation_id.is_some() {
+            row = self.registry.transition_client_intent(
+                grant,
+                ClientSide::Provider,
+                operation_id,
+                row.phase,
+                receipt.activation_id,
+            )?;
+        }
+
+        if matches!(
+            receipt.state,
+            ActivationStateView::Active | ActivationStateView::Restarted
+        ) {
+            if !matches!(
+                row.phase,
+                ClientIntentPhase::Unknown | ClientIntentPhase::Draining
+            ) {
+                row = self.registry.transition_client_intent(
+                    grant,
+                    ClientSide::Provider,
+                    operation_id,
+                    ClientIntentPhase::Unknown,
+                    receipt.activation_id,
+                )?;
+            }
+            if !local_io_drained {
+                return Ok(row);
+            }
+            let activation_id = receipt.activation_id.ok_or(ShareError::GrantReplay)?;
+            if !matches!(row.phase, ClientIntentPhase::Draining) {
+                row = self.registry.transition_client_intent(
+                    grant,
+                    ClientSide::Provider,
+                    operation_id,
+                    ClientIntentPhase::Draining,
+                    Some(activation_id),
+                )?;
+            }
+            if !receipt.provider_drained {
+                self.ack_provider_drain(grant, activation_id).await?;
+            }
+            receipt = self
+                .provider_activation_status(grant, Some(activation_id), deadline)
+                .await?;
+        }
+
+        match receipt.state {
+            ActivationStateView::Drained => {
+                if !local_io_drained {
+                    if !matches!(row.phase, ClientIntentPhase::Unknown) {
+                        row = self.registry.transition_client_intent(
+                            grant,
+                            ClientSide::Provider,
+                            operation_id,
+                            ClientIntentPhase::Unknown,
+                            receipt.activation_id,
+                        )?;
+                    }
+                    return Ok(row);
+                }
+                if matches!(
+                    row.phase,
+                    ClientIntentPhase::Prepared | ClientIntentPhase::AwaitingActivation
+                ) {
+                    row = self.registry.transition_client_intent(
+                        grant,
+                        ClientSide::Provider,
+                        operation_id,
+                        ClientIntentPhase::Unknown,
+                        receipt.activation_id,
+                    )?;
+                }
+                if matches!(row.phase, ClientIntentPhase::Active) {
+                    row = self.registry.transition_client_intent(
+                        grant,
+                        ClientSide::Provider,
+                        operation_id,
+                        ClientIntentPhase::Draining,
+                        receipt.activation_id,
+                    )?;
+                }
+                if !matches!(row.phase, ClientIntentPhase::Drained) {
+                    row = self.registry.transition_client_intent(
+                        grant,
+                        ClientSide::Provider,
+                        operation_id,
+                        ClientIntentPhase::Drained,
+                        receipt.activation_id,
+                    )?;
+                }
+            }
+            ActivationStateView::Denied | ActivationStateView::Expired => {
+                if !local_io_drained {
+                    if !matches!(row.phase, ClientIntentPhase::Unknown) {
+                        row = self.registry.transition_client_intent(
+                            grant,
+                            ClientSide::Provider,
+                            operation_id,
+                            ClientIntentPhase::Unknown,
+                            receipt.activation_id,
+                        )?;
+                    }
+                    return Ok(row);
+                }
+                if matches!(
+                    row.phase,
+                    ClientIntentPhase::Active | ClientIntentPhase::Draining
+                ) {
+                    row = self.registry.transition_client_intent(
+                        grant,
+                        ClientSide::Provider,
+                        operation_id,
+                        ClientIntentPhase::Unknown,
+                        receipt.activation_id,
+                    )?;
+                }
+                if !matches!(row.phase, ClientIntentPhase::Cancelled) {
+                    row = self.registry.transition_client_intent(
+                        grant,
+                        ClientSide::Provider,
+                        operation_id,
+                        ClientIntentPhase::Cancelled,
+                        receipt.activation_id,
+                    )?;
+                }
+            }
+            ActivationStateView::Issued => {
+                let cancelled = self
+                    .cancel_provider_activation(grant, receipt.activation_id, operation_id)
+                    .await?;
+                if matches!(
+                    cancelled.state,
+                    ActivationStateView::Denied | ActivationStateView::Expired
+                ) && local_io_drained
+                {
+                    if !matches!(row.phase, ClientIntentPhase::Cancelled) {
+                        row = self.registry.transition_client_intent(
+                            grant,
+                            ClientSide::Provider,
+                            operation_id,
+                            ClientIntentPhase::Cancelled,
+                            cancelled.activation_id,
+                        )?;
+                    }
+                } else if !matches!(row.phase, ClientIntentPhase::Unknown) {
+                    row = self.registry.transition_client_intent(
+                        grant,
+                        ClientSide::Provider,
+                        operation_id,
+                        ClientIntentPhase::Unknown,
+                        cancelled.activation_id,
+                    )?;
+                }
+            }
+            ActivationStateView::Active | ActivationStateView::Restarted => {}
+        }
+        Ok(row)
+    }
+
+    async fn provider_activation_status(
+        &self,
+        grant: &ShareGrant,
+        activation_id: Option<[u8; 16]>,
+        deadline: Instant,
+    ) -> Result<ActivationReceipt> {
+        if grant.owner == self.key.public() {
+            return self.registry.activation_receipt(
+                &ActivationStatusQuery::for_grant(grant, activation_id),
+                self.key.public(),
+            );
+        }
+        let relationship = self.registry.relationship(grant.owner, grant.share)?;
+        let session = ShareSession::from_relationship(
+            self.registry.clone(),
+            self.key.clone(),
+            self.endpoint.clone(),
+            self.mode,
+            relationship,
+            self.active.clone(),
+            self.tasks.clone(),
+        );
+        session
+            .activation_status_until(grant, activation_id, deadline)
+            .await
     }
 }
 
@@ -2564,7 +3497,9 @@ impl Handler {
             | Operation::Activate(_)
             | Operation::GrantDrained { .. }
             | Operation::ActivationStatus(_)
-            | Operation::ActivationCancel(_)) => {
+            | Operation::ActivationCancel(_)
+            | Operation::ApplyStatus(_)
+            | Operation::ApplyCancel(_)) => {
                 self.run_authority(&runtime, peer, hello.share_id, authority, operation_started)
                     .await
             }
@@ -2736,6 +3671,8 @@ impl Handler {
                 | Operation::GrantDrained { .. }
                 | Operation::ActivationStatus(_)
                 | Operation::ActivationCancel(_)
+                | Operation::ApplyStatus(_)
+                | Operation::ApplyCancel(_)
         ) {
             ensure!(runtime.enabled.load(Ordering::SeqCst), ShareError::Busy);
         }
@@ -2874,6 +3811,18 @@ impl Handler {
                 let mut receipt = self.registry.cancel_activation(&cancel, peer)?;
                 receipt.admission_open = runtime.enabled.load(Ordering::SeqCst);
                 Ok(Reply::ActivationReceipt(receipt))
+            }
+            Operation::ApplyStatus(query) => {
+                ensure!(query.share == share, ShareError::OwnerMismatch);
+                let mut receipt = self.registry.apply_status(&query, peer)?;
+                receipt.admission_open = runtime.enabled.load(Ordering::SeqCst);
+                Ok(Reply::ApplyReceipt(receipt))
+            }
+            Operation::ApplyCancel(cancel) => {
+                ensure!(cancel.share == share, ShareError::OwnerMismatch);
+                let mut receipt = self.registry.cancel_apply(&cancel, peer)?;
+                receipt.admission_open = runtime.enabled.load(Ordering::SeqCst);
+                Ok(Reply::ApplyReceipt(receipt))
             }
             _ => Err(ShareError::Protocol.into()),
         }
@@ -3848,6 +4797,8 @@ mod tests {
             state: Arc::new(ShareSessionState {
                 registry: provider.registry.clone(),
                 membership: provider_membership_for_session,
+                active: provider.active.clone(),
+                tasks: provider.swarm_tasks.clone(),
                 roster_challenge: Mutex::new(None),
                 roster: Mutex::new(RosterCache::default()),
                 roster_gate: tokio::sync::Mutex::new(()),
@@ -4273,11 +5224,38 @@ mod tests {
         }
         let permit = session.revalidate(&snapshot.token).await.unwrap();
         let operation_id = [0x71; 16];
+        let prepared = session
+            .apply_status(&permit, Some(operation_id))
+            .await
+            .unwrap();
+        assert!(matches!(
+            prepared.state,
+            super::super::ApplyStateView::Prepared
+        ));
+        assert_eq!(prepared.operation_id, None);
         session.apply_start(&permit, operation_id).await.unwrap();
+        let started = session
+            .apply_status(&permit, Some(operation_id))
+            .await
+            .unwrap();
+        assert!(matches!(
+            started.state,
+            super::super::ApplyStateView::Started
+        ));
+        assert_eq!(started.operation_id, Some(operation_id));
         session
             .apply_drained(&permit, operation_id, true)
             .await
             .unwrap();
+        let drained = session
+            .apply_status(&permit, Some(operation_id))
+            .await
+            .unwrap();
+        assert!(matches!(
+            drained.state,
+            super::super::ApplyStateView::Drained
+        ));
+        assert!(drained.committed);
         assert!(matches!(
             owner_share
                 .revoke_member_strong(member.endpoint_id())
@@ -4586,10 +5564,14 @@ mod tests {
             super::super::RevocationReceipt::Complete { .. }
         ));
 
-        provider
-            .unregister_supplier_storage(&provider_guard)
-            .await
-            .unwrap();
+        provider_guard.drain().await.unwrap();
+        assert!(
+            !provider
+                .suppliers
+                .read()
+                .expect("supplier map")
+                .contains_key(&(owner.endpoint_id(), share))
+        );
 
         consumer_session.close().await;
         provider_session.close().await;
