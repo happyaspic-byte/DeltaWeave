@@ -356,56 +356,94 @@ pub fn merge_snapshots(
 
     for path in all_paths {
         match (left.records.get(&path), right.records.get(&path)) {
-            (Some(left), None) => {
-                merged.insert(path, left.clone());
+            (Some(left_record), None) => {
+                merged.insert(path, left_record.clone());
                 stats.selected_left += 1;
             }
-            (None, Some(right)) => {
-                merged.insert(path, right.clone());
+            (None, Some(right_record)) => {
+                merged.insert(path, right_record.clone());
                 stats.selected_right += 1;
             }
-            (Some(left), Some(right)) => match left.version.relation(&right.version) {
-                CausalRelation::Before => {
-                    merged.insert(path, right.clone());
-                    stats.selected_right += 1;
+            (Some(left_record), Some(right_record)) => {
+                match left_record.version.relation(&right_record.version) {
+                    CausalRelation::Before => {
+                        if requires_namespace_conflict(
+                            right_record,
+                            left_record,
+                            right,
+                            left,
+                            &path,
+                        ) {
+                            resolve_conflict(
+                                left_record,
+                                right_record,
+                                ConflictReason::ConcurrentEdit,
+                                &mut occupied,
+                                &mut merged,
+                                &mut conflicts,
+                                &mut stats,
+                            )?;
+                        } else {
+                            merged.insert(path, right_record.clone());
+                            stats.selected_right += 1;
+                        }
+                    }
+                    CausalRelation::After => {
+                        if requires_namespace_conflict(
+                            left_record,
+                            right_record,
+                            left,
+                            right,
+                            &path,
+                        ) {
+                            resolve_conflict(
+                                left_record,
+                                right_record,
+                                ConflictReason::ConcurrentEdit,
+                                &mut occupied,
+                                &mut merged,
+                                &mut conflicts,
+                                &mut stats,
+                            )?;
+                        } else {
+                            merged.insert(path, left_record.clone());
+                            stats.selected_left += 1;
+                        }
+                    }
+                    CausalRelation::Equal if left_record.same_state(right_record) => {
+                        merged.insert(path, left_record.clone());
+                        stats.equal += 1;
+                    }
+                    CausalRelation::Concurrent if left_record.same_state(right_record) => {
+                        let mut record = left_record.clone();
+                        record.version.merge(&right_record.version);
+                        merged.insert(path, record);
+                        stats.equal += 1;
+                    }
+                    CausalRelation::Equal => {
+                        resolve_conflict(
+                            left_record,
+                            right_record,
+                            ConflictReason::EqualClockDivergence,
+                            &mut occupied,
+                            &mut merged,
+                            &mut conflicts,
+                            &mut stats,
+                        )?;
+                    }
+                    CausalRelation::Concurrent => {
+                        resolve_conflict(
+                            left_record,
+                            right_record,
+                            ConflictReason::ConcurrentEdit,
+                            &mut occupied,
+                            &mut merged,
+                            &mut conflicts,
+                            &mut stats,
+                        )?;
+                    }
                 }
-                CausalRelation::After => {
-                    merged.insert(path, left.clone());
-                    stats.selected_left += 1;
-                }
-                CausalRelation::Equal if left.same_state(right) => {
-                    merged.insert(path, left.clone());
-                    stats.equal += 1;
-                }
-                CausalRelation::Concurrent if left.same_state(right) => {
-                    let mut record = left.clone();
-                    record.version.merge(&right.version);
-                    merged.insert(path, record);
-                    stats.equal += 1;
-                }
-                CausalRelation::Equal => {
-                    resolve_conflict(
-                        left,
-                        right,
-                        ConflictReason::EqualClockDivergence,
-                        &mut occupied,
-                        &mut merged,
-                        &mut conflicts,
-                        &mut stats,
-                    )?;
-                }
-                CausalRelation::Concurrent => {
-                    resolve_conflict(
-                        left,
-                        right,
-                        ConflictReason::ConcurrentEdit,
-                        &mut occupied,
-                        &mut merged,
-                        &mut conflicts,
-                        &mut stats,
-                    )?;
-                }
-            },
+            }
             (None, None) => unreachable!("path came from at least one snapshot"),
         }
     }
@@ -416,6 +454,83 @@ pub fn merge_snapshots(
         conflicts,
         stats,
     })
+}
+
+fn requires_namespace_conflict(
+    winner: &SyncRecord,
+    other: &SyncRecord,
+    winner_tree: &MerkleTree,
+    other_tree: &MerkleTree,
+    path: &WirePath,
+) -> bool {
+    // A descendant created on the directory side is structural evidence that the
+    // ancestor's causal ordering is incomplete: selecting a file or tombstone
+    // here would leave an unmaterializable live child below it.
+    !is_live_directory(winner)
+        && is_live_directory(other)
+        && has_live_descendant_after_path_merge(winner_tree, other_tree, path)
+}
+
+fn is_live_directory(record: &SyncRecord) -> bool {
+    !record.tombstone && record.kind == SyncEntryKind::Directory
+}
+
+fn has_live_descendant_after_path_merge(
+    left: &MerkleTree,
+    right: &MerkleTree,
+    path: &WirePath,
+) -> bool {
+    let prefix = format!("{}/", path.as_str());
+    for (candidate, left_record) in left
+        .records
+        .range::<str, _>((Included(prefix.as_str()), Unbounded))
+        .take_while(|(candidate, _)| candidate.as_str().starts_with(&prefix))
+    {
+        if path_merge_retains_live_data(Some(left_record), right.records.get(candidate)) {
+            return true;
+        }
+    }
+    for (candidate, right_record) in right
+        .records
+        .range::<str, _>((Included(prefix.as_str()), Unbounded))
+        .take_while(|(candidate, _)| candidate.as_str().starts_with(&prefix))
+    {
+        if !left.records.contains_key(candidate)
+            && path_merge_retains_live_data(None, Some(right_record))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn path_merge_retains_live_data(left: Option<&SyncRecord>, right: Option<&SyncRecord>) -> bool {
+    let (left, right) = match (left, right) {
+        (Some(left), Some(right)) => (left, right),
+        (Some(left), None) => return !left.tombstone,
+        (None, Some(right)) => return !right.tombstone,
+        (None, None) => return false,
+    };
+    match left.version.relation(&right.version) {
+        CausalRelation::Before => !right.tombstone,
+        CausalRelation::After => !left.tombstone,
+        CausalRelation::Equal | CausalRelation::Concurrent if left.same_state(right) => {
+            !left.tombstone
+        }
+        CausalRelation::Equal | CausalRelation::Concurrent => {
+            let left_directory = is_live_directory(left);
+            let right_directory = is_live_directory(right);
+            let (winner, loser) = match (left_directory, right_directory) {
+                (true, false) => (left, right),
+                (false, true) => (right, left),
+                _ if state_hash(left) >= state_hash(right) => (left, right),
+                _ => (right, left),
+            };
+            // A live loser can still be retained at a deterministic conflict path
+            // when the canonical child winner is a tombstone.
+            !winner.tombstone || should_preserve_loser(winner, loser)
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -432,9 +547,10 @@ fn resolve_conflict(
     let right_hash = right.logical_hash();
     let left_state_hash = state_hash(left);
     let right_state_hash = state_hash(right);
-    // A live directory wins a concurrent namespace-kind conflict. This keeps descendants
-    // materializable while the losing live file is retained as a sibling conflict copy. Causal
-    // directory-to-file transitions still take the normal Before/After path above.
+    // A live directory wins a namespace-kind conflict. This keeps descendants materializable
+    // while the losing live file is retained as a sibling conflict copy. Causally ordered
+    // directory-to-file transitions still use this policy when a live descendant proves that
+    // the ancestor clocks do not describe the complete structural change.
     let left_directory = !left.tombstone && left.kind == SyncEntryKind::Directory;
     let right_directory = !right.tombstone && right.kind == SyncEntryKind::Directory;
     let (winner, loser, winner_hash, loser_hash) = match (left_directory, right_directory) {
@@ -1074,6 +1190,251 @@ mod tests {
         assert!(forward.records.iter().any(|record| {
             &record.path == conflict_path
                 && record.content_hash == Some(Hash32::digest(b"file bytes"))
+        }));
+    }
+
+    #[test]
+    fn causal_file_replacement_with_unseen_descendant_uses_directory_policy() {
+        let alpha = replica(b"alpha");
+        let beta = replica(b"beta");
+        let owner_replacement = file("tree", alpha, 2, b"owner bytes");
+        let member_directory = directory("tree", alpha, 1);
+        let member_child = file("tree/new.txt", beta, 1, b"member bytes");
+        let left =
+            MerkleTree::from_records([owner_replacement.clone()]).expect("owner snapshot is valid");
+        let right = MerkleTree::from_records([member_directory, member_child.clone()])
+            .expect("member snapshot is valid");
+
+        let merged = merge_snapshots(&left, &right).expect("merge succeeds");
+        let reverse = merge_snapshots(&right, &left).expect("reverse merge succeeds");
+        assert_eq!(merged.records, reverse.records);
+        assert_eq!(merged.conflicts, reverse.conflicts);
+        assert_eq!(merged.stats.selected_left, reverse.stats.selected_right);
+        assert_eq!(merged.stats.selected_right, reverse.stats.selected_left);
+        let ancestor = merged
+            .records
+            .iter()
+            .find(|record| record.path.as_str() == "tree")
+            .expect("merged ancestor exists");
+        assert_eq!(ancestor.kind, SyncEntryKind::Directory);
+        assert!(!ancestor.tombstone);
+        assert!(merged.records.iter().any(|record| {
+            record.path == member_child.path
+                && record.content_hash == member_child.content_hash
+                && !record.tombstone
+        }));
+        let conflict_path = merged.conflicts[0]
+            .conflict_path
+            .as_ref()
+            .expect("owner bytes are preserved");
+        assert!(!conflict_path.as_str().starts_with("tree/"));
+        assert!(merged.records.iter().any(|record| {
+            &record.path == conflict_path
+                && record.content_hash == owner_replacement.content_hash
+                && !record.tombstone
+        }));
+        let canonical = merged.tree().expect("merged namespace is valid");
+        let repeated = merge_snapshots(&canonical, &canonical).expect("merge is idempotent");
+        assert_eq!(repeated.records, merged.records);
+        assert!(repeated.conflicts.is_empty());
+        assert_eq!(canonical.len(), 3);
+    }
+
+    #[test]
+    fn causal_directory_delete_with_unseen_descendant_preserves_member_bytes() {
+        let alpha = replica(b"alpha");
+        let beta = replica(b"beta");
+        let owner_deletion = tombstone(directory("tree", alpha, 1), alpha);
+        let member_directory = directory("tree", alpha, 1);
+        let member_child = file("tree/new.txt", beta, 1, b"member bytes");
+        let left = MerkleTree::from_records([owner_deletion]).expect("owner snapshot is valid");
+        let right = MerkleTree::from_records([member_directory, member_child.clone()])
+            .expect("member snapshot is valid");
+
+        let merged = merge_snapshots(&left, &right).expect("merge succeeds");
+        let reverse = merge_snapshots(&right, &left).expect("reverse merge succeeds");
+        assert_eq!(merged.records, reverse.records);
+        assert_eq!(merged.conflicts, reverse.conflicts);
+        assert_eq!(merged.stats.selected_left, reverse.stats.selected_right);
+        assert_eq!(merged.stats.selected_right, reverse.stats.selected_left);
+        let ancestor = merged
+            .records
+            .iter()
+            .find(|record| record.path.as_str() == "tree")
+            .expect("merged ancestor exists");
+        assert_eq!(ancestor.kind, SyncEntryKind::Directory);
+        assert!(!ancestor.tombstone);
+        assert!(merged.records.iter().any(|record| {
+            record.path == member_child.path
+                && record.content_hash == member_child.content_hash
+                && !record.tombstone
+        }));
+        assert_eq!(merged.stats.conflicts, 1);
+        assert!(merged.conflicts[0].conflict_path.is_none());
+        assert_eq!(merged.tree().expect("merged namespace is valid").len(), 2);
+    }
+
+    #[test]
+    fn causally_deleted_known_descendant_keeps_parent_deleted() {
+        let alpha = replica(b"alpha");
+        let owner_deletion = tombstone(directory("tree", alpha, 1), alpha);
+        let known_deletion = tombstone(file("tree/known.txt", alpha, 1, b"known bytes"), alpha);
+        let member_directory = directory("tree", alpha, 1);
+        let member_known = file("tree/known.txt", alpha, 1, b"known bytes");
+        let left = MerkleTree::from_records([owner_deletion, known_deletion.clone()])
+            .expect("owner snapshot is valid");
+        let right = MerkleTree::from_records([member_directory, member_known])
+            .expect("member snapshot is valid");
+
+        let merged = merge_snapshots(&left, &right).expect("merge succeeds");
+        let ancestor = merged
+            .records
+            .iter()
+            .find(|record| record.path.as_str() == "tree")
+            .expect("ancestor remains represented");
+        assert!(ancestor.tombstone);
+        let known = merged
+            .records
+            .iter()
+            .find(|record| record.path == known_deletion.path)
+            .expect("known descendant remains represented");
+        assert!(known.tombstone);
+        assert!(
+            !merged
+                .records
+                .iter()
+                .any(|record| { record.path == known_deletion.path && !record.tombstone })
+        );
+        assert_eq!(merged.stats.conflicts, 0);
+        assert_eq!(merged.tree().expect("merged namespace is valid").len(), 2);
+    }
+
+    #[test]
+    fn causally_deleted_known_children_keep_file_replacement_authoritative() {
+        let alpha = replica(b"alpha");
+        let owner_replacement = file("tree", alpha, 2, b"owner bytes");
+        let known_deletion = tombstone(file("tree/known.txt", alpha, 1, b"known bytes"), alpha);
+        let member_directory = directory("tree", alpha, 1);
+        let member_known = file("tree/known.txt", alpha, 1, b"known bytes");
+        let left = MerkleTree::from_records([owner_replacement.clone(), known_deletion.clone()])
+            .expect("owner snapshot is valid");
+        let right = MerkleTree::from_records([member_directory, member_known])
+            .expect("member snapshot is valid");
+
+        let merged = merge_snapshots(&left, &right).expect("merge succeeds");
+        let ancestor = merged
+            .records
+            .iter()
+            .find(|record| record.path.as_str() == "tree")
+            .expect("ancestor remains represented");
+        assert_eq!(ancestor.kind, SyncEntryKind::File);
+        assert!(!ancestor.tombstone);
+        let known = merged
+            .records
+            .iter()
+            .find(|record| record.path == known_deletion.path)
+            .expect("known descendant remains represented");
+        assert!(known.tombstone);
+        assert_eq!(merged.stats.conflicts, 0);
+        assert_eq!(merged.tree().expect("merged namespace is valid").len(), 2);
+    }
+
+    #[test]
+    fn concurrent_child_conflict_also_requires_a_materializable_parent() {
+        let alpha = replica(b"alpha");
+        let beta = replica(b"beta");
+        let owner_replacement = file("tree", alpha, 2, b"owner bytes");
+        let owner_known_deletion =
+            tombstone(file("tree/known.txt", alpha, 1, b"known bytes"), alpha);
+        let member_directory = directory("tree", alpha, 1);
+        let member_known = file("tree/known.txt", beta, 1, b"member bytes");
+        let left = MerkleTree::from_records([owner_replacement, owner_known_deletion])
+            .expect("owner snapshot is valid");
+        let right = MerkleTree::from_records([member_directory, member_known])
+            .expect("member snapshot is valid");
+
+        let merged = merge_snapshots(&left, &right).expect("merge succeeds");
+        let ancestor = merged
+            .records
+            .iter()
+            .find(|record| record.path.as_str() == "tree")
+            .expect("ancestor remains represented");
+        assert_eq!(ancestor.kind, SyncEntryKind::Directory);
+        assert!(!ancestor.tombstone);
+        assert!(merged.stats.conflicts >= 1);
+        assert_eq!(merged.tree().expect("merged namespace is valid").len(), 3);
+    }
+
+    #[test]
+    fn structural_conflict_keeps_multiple_ancestor_levels_materializable() {
+        let alpha = replica(b"alpha");
+        let beta = replica(b"beta");
+        let owner_replacement = file("a", alpha, 2, b"owner bytes");
+        let left =
+            MerkleTree::from_records([owner_replacement.clone()]).expect("owner snapshot is valid");
+        let right = MerkleTree::from_records([
+            directory("a", alpha, 1),
+            directory("a/b", alpha, 1),
+            file("a/b/c.txt", beta, 1, b"member bytes"),
+        ])
+        .expect("member snapshot is valid");
+
+        let merged = merge_snapshots(&left, &right).expect("merge succeeds");
+        assert!(merged.records.iter().any(|record| {
+            record.path.as_str() == "a"
+                && record.kind == SyncEntryKind::Directory
+                && !record.tombstone
+        }));
+        assert!(merged.records.iter().any(|record| {
+            record.path.as_str() == "a/b"
+                && record.kind == SyncEntryKind::Directory
+                && !record.tombstone
+        }));
+        assert!(merged.records.iter().any(|record| {
+            record.path.as_str() == "a/b/c.txt"
+                && record.content_hash == Some(Hash32::digest(b"member bytes"))
+                && !record.tombstone
+        }));
+        assert!(merged.records.iter().any(|record| {
+            record.content_hash == owner_replacement.content_hash
+                && record.path.as_str() != "a"
+                && !record.tombstone
+        }));
+        assert_eq!(merged.tree().expect("merged namespace is valid").len(), 4);
+    }
+
+    #[test]
+    fn structural_conflict_path_collision_is_deterministic_and_preserves_both_files() {
+        let alpha = replica(b"alpha");
+        let beta = replica(b"beta");
+        let owner_replacement = file("tree", alpha, 2, b"owner bytes");
+        let token = owner_replacement.logical_hash().to_hex();
+        let colliding_path = build_conflict_path(&owner_replacement.path, &token[..12], None)
+            .expect("fixture conflict path is portable");
+        let colliding_file = file(colliding_path.as_str(), beta, 3, b"existing bytes");
+        let left =
+            MerkleTree::from_records([owner_replacement.clone()]).expect("owner snapshot is valid");
+        let right = MerkleTree::from_records([
+            directory("tree", alpha, 1),
+            file("tree/new.txt", beta, 1, b"member bytes"),
+            colliding_file.clone(),
+        ])
+        .expect("member snapshot is valid");
+
+        let forward = merge_snapshots(&left, &right).expect("merge succeeds");
+        let reverse = merge_snapshots(&right, &left).expect("reverse merge succeeds");
+        assert_eq!(forward.records, reverse.records);
+        assert_eq!(forward.conflicts, reverse.conflicts);
+        let conflict_path = forward.conflicts[0]
+            .conflict_path
+            .as_ref()
+            .expect("owner bytes are preserved");
+        assert_ne!(conflict_path, &colliding_path);
+        assert!(forward.records.iter().any(|record| {
+            record.path == colliding_path && record.content_hash == colliding_file.content_hash
+        }));
+        assert!(forward.records.iter().any(|record| {
+            &record.path == conflict_path && record.content_hash == owner_replacement.content_hash
         }));
     }
 
