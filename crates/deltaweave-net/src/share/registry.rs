@@ -1,8 +1,8 @@
 use super::authority::{
     ActivationBinding, ActivationCancel, ActivationReceipt, ActivationStateView,
     ActivationStatusQuery, ApplyDrained, ApplyPermit, ApplyStart, AuthoritativeSnapshot,
-    ManifestAttestation, RevocationReceipt, ShareGrant, SnapshotToken, request_hash,
-    validate_hash_subset,
+    ClientIntentPhase, ClientIntentRow, ClientSide, ManifestAttestation, RevocationReceipt,
+    ShareGrant, SnapshotToken, request_hash, validate_hash_subset,
 };
 use super::roster::{
     MAX_ROSTER_ENTRIES, MAX_ROSTER_FRAME_BYTES, ROSTER_STALE_AFTER_SECONDS, ROSTER_TTL_SECONDS,
@@ -38,6 +38,11 @@ const GRANTS: TableDefinition<&str, &[u8]> = TableDefinition::new("share-swarm-g
 const GRANT_DRAINS: TableDefinition<&str, &[u8]> =
     TableDefinition::new("share-swarm-grant-drain-v1");
 const APPLIES: TableDefinition<&str, &[u8]> = TableDefinition::new("share-swarm-apply-v1");
+/// Endpoint-local grant operation intent. This is separate from the owner
+/// GrantRow so a member provider can persist its send guard without creating
+/// a second owner authority journal.
+const CLIENT_INTENTS: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("share-swarm-client-intent-v1");
 /// Durable high-water mark for authority timestamps.  This table is separate
 /// from the legacy catalog so a managed clock quarantine never prevents
 /// opening manual shares.
@@ -47,6 +52,7 @@ pub(crate) const MAX_REPLICAS: usize = 4096;
 const MAX_AUTHORITY_ROWS: usize = 4096;
 const MAX_AUTHORITY_BYTES: usize = 16 * 1024 * 1024;
 const AUTHORITY_RETENTION_SECONDS: u64 = 60 * 60;
+const CLIENT_INTENT_RETENTION_SECONDS: u64 = 60 * 60;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OwnedShareConfig {
@@ -183,6 +189,9 @@ struct ClockAnchor {
 pub(crate) struct Registry {
     db: Database,
     serial: Mutex<()>,
+    /// One process-generation identifier shared by every endpoint-local
+    /// client intent written through this registry.
+    boot_id: [u8; 16],
     /// Live monotonic activation deadlines.  Durable rows retain the wall
     /// value for audit/display; this map prevents a late response from
     /// extending a process-local 15 second lease.
@@ -200,6 +209,7 @@ impl Registry {
         crate::root_admission::private_directory(path)?;
         let db = Database::create(path.join("shares.redb"))?;
         let tx = db.begin_write()?;
+        let boot_id;
         {
             let mut table = tx.open_table(CATALOG)?;
             if table.get(0)?.is_none() {
@@ -239,6 +249,7 @@ impl Registry {
             anchor.boot.copy_from_slice(&bytes[..16]);
             let encoded = postcard::to_stdvec(&anchor)?;
             clock_table.insert(0, encoded.as_slice())?;
+            boot_id = anchor.boot;
         }
         {
             // Existing Active/Started rows are unsafe to reactivate after a
@@ -283,6 +294,38 @@ impl Registry {
                 }
             }
         }
+        {
+            // Endpoint-local payload intents belong to the process generation
+            // that admitted them.  A restart cannot prove that an old stream
+            // or lease drained, so quarantine every nonterminal row as
+            // Unknown before publishing the reopened registry.  Recovery may
+            // query/cancel that exact binding, but no old nonce is reopened
+            // for payload admission.
+            let rows = {
+                let table = tx.open_table(CLIENT_INTENTS)?;
+                let mut rows = Vec::new();
+                for item in table.iter()? {
+                    let (key, value) = item?;
+                    let row: ClientIntentRow = postcard::from_bytes(value.value())?;
+                    rows.push((key.value().to_owned(), row));
+                }
+                rows
+            };
+            let mut table = tx.open_table(CLIENT_INTENTS)?;
+            for (key, mut row) in rows {
+                if row.boot_id != boot_id
+                    && !matches!(
+                        row.phase,
+                        ClientIntentPhase::Drained | ClientIntentPhase::Cancelled
+                    )
+                {
+                    row.phase = ClientIntentPhase::Unknown;
+                    row.boot_id = boot_id;
+                    let bytes = postcard::to_stdvec(&row)?;
+                    table.insert(key.as_str(), bytes.as_slice())?;
+                }
+            }
+        }
         // Opening all tables is also an additive migration marker.  No rows
         // are removed here; cleanup is explicit and bounded below.
         tx.open_table(ROSTERS)?;
@@ -293,6 +336,7 @@ impl Registry {
         let registry = Self {
             db,
             serial: Mutex::new(()),
+            boot_id,
             activation_deadlines: Mutex::new(BTreeMap::new()),
         };
         let catalog = registry.read()?;
@@ -1320,6 +1364,200 @@ impl Registry {
         Ok(())
     }
 
+    fn read_client_intents(&self) -> Result<Vec<(String, ClientIntentRow)>> {
+        let read = self.db.begin_read()?;
+        let table = match read.open_table(CLIENT_INTENTS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut rows = Vec::new();
+        for item in table.iter()? {
+            let (key, value) = item?;
+            ensure!(
+                value.value().len() <= super::authority::MAX_AUTHORITY_FRAME_BYTES,
+                ShareError::StateUnavailable
+            );
+            rows.push((key.value().to_owned(), postcard::from_bytes(value.value())?));
+        }
+        Ok(rows)
+    }
+
+    fn read_client_intent(&self, key: &str) -> Result<Option<ClientIntentRow>> {
+        let read = self.db.begin_read()?;
+        let table = match read.open_table(CLIENT_INTENTS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let Some(value) = table.get(key)? else {
+            return Ok(None);
+        };
+        ensure!(
+            value.value().len() <= super::authority::MAX_AUTHORITY_FRAME_BYTES,
+            ShareError::StateUnavailable
+        );
+        Ok(Some(postcard::from_bytes(value.value())?))
+    }
+
+    fn write_client_intent(&self, key: &str, row: &ClientIntentRow) -> Result<()> {
+        let bytes = postcard::to_stdvec(row)?;
+        ensure!(
+            bytes.len() <= super::authority::MAX_AUTHORITY_FRAME_BYTES,
+            ShareError::StateUnavailable
+        );
+        let tx = self.db.begin_write()?;
+        tx.open_table(CLIENT_INTENTS)?
+            .insert(key, bytes.as_slice())?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn gc_client_intents(&self, wall: u64) -> Result<()> {
+        let remove: Vec<_> = self
+            .read_client_intents()?
+            .into_iter()
+            .filter(|(_, row)| {
+                matches!(
+                    row.phase,
+                    ClientIntentPhase::Drained | ClientIntentPhase::Cancelled
+                ) && row
+                    .started_at_wall
+                    .saturating_add(CLIENT_INTENT_RETENTION_SECONDS)
+                    <= wall
+            })
+            .map(|(key, _)| key)
+            .collect();
+        if remove.is_empty() {
+            return Ok(());
+        }
+        let tx = self.db.begin_write()?;
+        let mut table = tx.open_table(CLIENT_INTENTS)?;
+        for key in remove {
+            table.remove(key.as_str())?;
+        }
+        drop(table);
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Persists the endpoint-local guard before a share-swarm request is
+    /// opened. Exact grant replay is idempotent for the same operation ID;
+    /// another operation cannot claim the same nonce in parallel.
+    pub(crate) fn prepare_client_intent(
+        &self,
+        grant: &ShareGrant,
+        side: ClientSide,
+        operation_id: [u8; 16],
+    ) -> Result<ClientIntentRow> {
+        let _serial = self
+            .serial
+            .lock()
+            .map_err(|_| ShareError::StateUnavailable)?;
+        let wall = now();
+        grant.verify_for(grant.owner, grant.share, wall)?;
+        self.gc_client_intents(wall)?;
+        let key = grant_key(grant.nonce);
+        if let Some(existing) = self.read_client_intent(&key)? {
+            ensure!(
+                existing.grant == *grant
+                    && existing.binding == ActivationBinding::from_grant(grant),
+                ShareError::GrantReplay
+            );
+            ensure!(existing.side == side, ShareError::GrantReplay);
+            if existing.operation_id == operation_id {
+                return Ok(existing);
+            }
+            return Err(ShareError::Busy.into());
+        }
+        let row = ClientIntentRow {
+            grant: grant.clone(),
+            binding: ActivationBinding::from_grant(grant),
+            side,
+            activation_id: None,
+            operation_id,
+            phase: ClientIntentPhase::Prepared,
+            boot_id: self.boot_id,
+            started_at_wall: wall,
+        };
+        let intents = self.read_client_intents()?;
+        let row_bytes = postcard::to_stdvec(&row)?.len();
+        let total_bytes = intents.iter().try_fold(row_bytes, |total, (_, intent)| {
+            Ok::<_, postcard::Error>(total.saturating_add(postcard::to_stdvec(intent)?.len()))
+        })?;
+        ensure!(
+            intents.len() < MAX_AUTHORITY_ROWS && total_bytes <= MAX_AUTHORITY_BYTES,
+            ShareError::Busy
+        );
+        self.write_client_intent(&key, &row)?;
+        Ok(row)
+    }
+
+    /// Advances one endpoint intent monotonically. A repeated exact phase is
+    /// idempotent; terminal phases cannot be reopened by a retry.
+    pub(crate) fn transition_client_intent(
+        &self,
+        grant: &ShareGrant,
+        side: ClientSide,
+        operation_id: [u8; 16],
+        phase: ClientIntentPhase,
+        activation_id: Option<[u8; 16]>,
+    ) -> Result<ClientIntentRow> {
+        let _serial = self
+            .serial
+            .lock()
+            .map_err(|_| ShareError::StateUnavailable)?;
+        let key = grant_key(grant.nonce);
+        let mut row = self
+            .read_client_intent(&key)?
+            .ok_or(ShareError::GrantReplay)?;
+        ensure!(
+            row.grant == *grant
+                && row.binding == ActivationBinding::from_grant(grant)
+                && row.side == side
+                && row.operation_id == operation_id,
+            ShareError::GrantReplay
+        );
+        if let Some(id) = activation_id {
+            if let Some(existing) = row.activation_id {
+                ensure!(existing == id, ShareError::GrantReplay);
+            } else {
+                row.activation_id = Some(id);
+            }
+        }
+        let valid = match (row.phase, phase) {
+            (current, next) if current == next => true,
+            (ClientIntentPhase::Prepared, ClientIntentPhase::AwaitingActivation)
+            | (ClientIntentPhase::Prepared, ClientIntentPhase::Unknown)
+            | (ClientIntentPhase::Prepared, ClientIntentPhase::Cancelled)
+            | (ClientIntentPhase::AwaitingActivation, ClientIntentPhase::Active)
+            | (ClientIntentPhase::AwaitingActivation, ClientIntentPhase::Unknown)
+            | (ClientIntentPhase::AwaitingActivation, ClientIntentPhase::Draining)
+            | (ClientIntentPhase::AwaitingActivation, ClientIntentPhase::Cancelled)
+            | (ClientIntentPhase::Active, ClientIntentPhase::Draining)
+            | (ClientIntentPhase::Active, ClientIntentPhase::Unknown)
+            | (ClientIntentPhase::Active, ClientIntentPhase::Drained)
+            | (ClientIntentPhase::Draining, ClientIntentPhase::Drained)
+            | (ClientIntentPhase::Draining, ClientIntentPhase::Unknown)
+            // An Unknown operation may only be terminalized by a recovery
+            // control path. It must never restart payload admission with the
+            // old nonce after a crash or a cancelled stream.
+            | (ClientIntentPhase::Unknown, ClientIntentPhase::Cancelled) => true,
+            (ClientIntentPhase::Drained, ClientIntentPhase::Drained)
+            | (ClientIntentPhase::Cancelled, ClientIntentPhase::Cancelled) => true,
+            _ => false,
+        };
+        ensure!(valid, ShareError::GrantReplay);
+        row.phase = phase;
+        self.write_client_intent(&key, &row)?;
+        Ok(row)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn client_intent(&self, grant: &ShareGrant) -> Result<Option<ClientIntentRow>> {
+        self.read_client_intent(&grant_key(grant.nonce))
+    }
+
     /// Persists one complete owner snapshot in the separate swarm namespace.
     /// The catalog postcard remains untouched; the signed token is the only
     /// authority a later manifest or grant request may reference.
@@ -1974,6 +2212,7 @@ impl Registry {
             revoked: row.revoked,
             provider_drained: drain.provider_drained,
             consumer_drained: drain.consumer_drained,
+            admission_open: true,
         }
     }
 
@@ -2655,6 +2894,86 @@ mod tests {
         registry.issue(&ticket).unwrap();
         registry.enroll(&ticket, peer, None).unwrap();
         (temp, owner, share, peer, registry)
+    }
+
+    #[test]
+    fn client_intent_replay_is_exact_and_restarts_as_unknown() {
+        let (temp, owner, share, peer, registry) = authority_fixture();
+        let grant = ShareGrant::sign(
+            &owner,
+            share,
+            peer,
+            owner.public(),
+            1,
+            0,
+            [0xc1; 32],
+            Hash32::digest(b"intent-manifest"),
+            Hash32::digest(b"intent-request"),
+            [0xc2; 32],
+            now(),
+        )
+        .unwrap();
+        let operation_id = [0xc3; 16];
+        let prepared = registry
+            .prepare_client_intent(&grant, ClientSide::Consumer, operation_id)
+            .unwrap();
+        assert!(matches!(prepared.phase, ClientIntentPhase::Prepared));
+        let replay = registry
+            .prepare_client_intent(&grant, ClientSide::Consumer, operation_id)
+            .unwrap();
+        assert_eq!(replay, prepared);
+        assert_eq!(
+            registry
+                .prepare_client_intent(&grant, ClientSide::Consumer, [0xc4; 16])
+                .unwrap_err()
+                .downcast_ref::<ShareError>(),
+            Some(&ShareError::Busy)
+        );
+        registry
+            .transition_client_intent(
+                &grant,
+                ClientSide::Consumer,
+                operation_id,
+                ClientIntentPhase::AwaitingActivation,
+                None,
+            )
+            .unwrap();
+        let before_restart = registry.client_intent(&grant).unwrap().unwrap();
+        assert!(matches!(
+            before_restart.phase,
+            ClientIntentPhase::AwaitingActivation
+        ));
+        let private = temp.path().join("private");
+        drop(registry);
+
+        let reopened = Registry::open(&private, owner.public()).unwrap();
+        let after_restart = reopened.client_intent(&grant).unwrap().unwrap();
+        assert!(matches!(after_restart.phase, ClientIntentPhase::Unknown));
+        assert_eq!(after_restart.binding, before_restart.binding);
+        assert_eq!(after_restart.operation_id, operation_id);
+        assert_ne!(after_restart.boot_id, before_restart.boot_id);
+        assert_eq!(
+            reopened
+                .transition_client_intent(
+                    &grant,
+                    ClientSide::Consumer,
+                    operation_id,
+                    ClientIntentPhase::AwaitingActivation,
+                    None,
+                )
+                .unwrap_err()
+                .downcast_ref::<ShareError>(),
+            Some(&ShareError::GrantReplay)
+        );
+        reopened
+            .transition_client_intent(
+                &grant,
+                ClientSide::Consumer,
+                operation_id,
+                ClientIntentPhase::Cancelled,
+                None,
+            )
+            .unwrap();
     }
 
     #[test]
