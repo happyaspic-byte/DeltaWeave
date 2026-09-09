@@ -13,8 +13,8 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     str::FromStr,
-    sync::Arc,
-    time::Duration,
+    sync::{Arc, RwLock},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -27,6 +27,7 @@ use deltaweave_index::{IndexOptions, LocalIndex};
 use deltaweave_reconcile::{MerkleNodeSummary, MerkleTree};
 use deltaweave_store::{Store, VerifiedChunk};
 use deltaweave_swarm::{PeerAvailability, SchedulerLimits, schedule_chunks};
+use futures_lite::StreamExt;
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayUrl, SecretKey, TransportAddr, Watcher,
     endpoint::{Connection, RecvStream, SendStream, presets},
@@ -163,6 +164,82 @@ pub enum NetworkMode {
     Internet,
     /// Do not contact discovery or relay services; direct addresses are required.
     DirectOnly,
+}
+
+/// The address source used for an authenticated outbound connection.
+///
+/// This intentionally records only provenance.  It never exposes an endpoint
+/// address, relay URL, or identity in management telemetry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LookupProvenance {
+    /// The persisted address hint connected successfully.
+    PersistedAddress,
+    /// The endpoint-id-only address was handed to N0 for rediscovery.
+    EndpointId,
+}
+
+/// Address lookup implementation that produced a discovered endpoint address.
+///
+/// These values are the stable iroh provenance labels.  The application records
+/// the label only; it never exposes the discovered address or endpoint ID in
+/// management telemetry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AddressLookupSource {
+    /// Number 0's pkarr service.
+    Pkarr,
+    /// Number 0's DNS service.
+    Dns,
+    /// A configured lookup service with another provenance label.
+    Other,
+}
+
+/// Secret-free result of one bounded N0 address lookup.
+///
+/// A lookup is considered useful only when at least one item has the requested
+/// endpoint ID and contains an address.  `complete` distinguishes a stream that
+/// ended normally from one where the bounded observation stopped after a valid
+/// result; a valid result remains usable in the latter case.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct N0LookupObservation {
+    /// Whether a result with the requested endpoint ID and a usable address
+    /// was observed.
+    pub matched_endpoint: bool,
+    /// Whether all configured lookup streams ended before the bound.
+    pub complete: bool,
+    /// Whether the bounded observation stopped before all streams ended.
+    pub timed_out: bool,
+    /// Provenance of the first item observed from N0.
+    pub first_source: Option<AddressLookupSource>,
+    /// Number of matching or non-matching items labelled `pkarr`.
+    pub pkarr_results: usize,
+    /// Number of matching or non-matching items labelled `dns`.
+    pub dns_results: usize,
+    /// Number of items from another configured lookup service.
+    pub other_results: usize,
+    /// Number of service or aggregate lookup errors observed.
+    pub error_results: usize,
+}
+
+/// Kind of the path selected for an authenticated connection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SelectedPathKind {
+    Ip,
+    Relay,
+    Other,
+}
+
+/// Secret-free transport observation for the D3 Internet/N0 experiment.
+///
+/// Byte counters are transport totals at the time the observation is taken;
+/// callers must sample before and after a payload operation to derive a
+/// delta.  No address or endpoint identifier is included.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransportObservation {
+    pub provenance: LookupProvenance,
+    pub selected_path: Option<SelectedPathKind>,
+    pub path_count: usize,
+    pub tx_bytes: u64,
+    pub rx_bytes: u64,
 }
 
 /// Result of loading a persistent iroh identity.
@@ -660,6 +737,10 @@ pub struct SyncSession {
     client: SyncClient,
     endpoint: Endpoint,
     share: Option<share::ShareId>,
+    remote: Arc<RwLock<EndpointAddr>>,
+    fallback_endpoint: Option<EndpointId>,
+    observation: Arc<RwLock<Option<TransportObservation>>>,
+    n0_lookup: Arc<RwLock<Option<N0LookupObservation>>>,
 }
 
 impl fmt::Debug for SyncSession {
@@ -743,6 +824,10 @@ impl SyncClient {
             client: self.clone(),
             endpoint,
             share: None,
+            remote: Arc::new(RwLock::new(self.remote.clone())),
+            fallback_endpoint: None,
+            observation: Arc::new(RwLock::new(None)),
+            n0_lookup: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -756,7 +841,7 @@ impl SyncClient {
 
     async fn fetch_snapshot_connected(
         &self,
-        connection: OperationConnection,
+        connection: &OperationConnection,
         local: &MerkleTree,
     ) -> Result<RemoteSnapshot> {
         let (mut send, mut receive) = connection
@@ -891,17 +976,19 @@ impl SyncClient {
         );
 
         let session = self.open_session().await?;
+        let connection = session.connect().await?;
         let outcome = session
             .client
-            .push_record_connected(session.connect().await?, &source, record, manifest)
+            .push_record_connected(&connection, &source, record, manifest)
             .await;
+        session.refresh_transport_observation(&connection);
         session.close().await;
         outcome
     }
 
     async fn push_record_connected(
         &self,
-        connection: OperationConnection,
+        connection: &OperationConnection,
         source_path: &Path,
         record: SyncRecord,
         manifest: FileManifest,
@@ -962,7 +1049,7 @@ impl SyncClient {
 
     async fn pull_manifest_connected(
         &self,
-        connection: OperationConnection,
+        connection: &OperationConnection,
         expected: SyncRecord,
     ) -> Result<PullManifestReceipt> {
         let (mut send, mut receive) = connection
@@ -1073,7 +1160,7 @@ impl SyncClient {
 
     async fn pull_record_connected(
         &self,
-        connection: OperationConnection,
+        connection: &OperationConnection,
         expected: SyncRecord,
         store: Arc<Store>,
         destination_root: PathBuf,
@@ -1199,7 +1286,7 @@ impl SyncClient {
 
     async fn apply_metadata_connected(
         &self,
-        connection: OperationConnection,
+        connection: &OperationConnection,
         record: SyncRecord,
     ) -> Result<SyncApplyReceipt> {
         record.validate()?;
@@ -1253,18 +1340,245 @@ impl Drop for OperationConnection {
 }
 
 impl SyncSession {
+    fn remote_addr(&self) -> EndpointAddr {
+        self.remote
+            .read()
+            .expect("sync session remote lock")
+            .clone()
+    }
+
+    pub(crate) fn remote_address(&self) -> EndpointAddr {
+        self.remote_addr()
+    }
+
+    fn record_transport_observation(&self, connection: &Connection, provenance: LookupProvenance) {
+        let paths = connection.paths();
+        let selected_path = paths.iter().find(|path| path.is_selected()).map(|path| {
+            if path.is_relay() {
+                SelectedPathKind::Relay
+            } else if path.is_ip() {
+                SelectedPathKind::Ip
+            } else {
+                SelectedPathKind::Other
+            }
+        });
+        let stats = connection.stats();
+        let observation = TransportObservation {
+            provenance,
+            selected_path,
+            path_count: paths.len(),
+            tx_bytes: stats.udp_tx.bytes,
+            rx_bytes: stats.udp_rx.bytes,
+        };
+        *self
+            .observation
+            .write()
+            .expect("sync session observation lock") = Some(observation);
+    }
+
+    pub(crate) fn transport_observation(&self) -> Option<TransportObservation> {
+        *self
+            .observation
+            .read()
+            .expect("sync session observation lock")
+    }
+
+    pub(crate) fn refresh_transport_observation(&self, connection: &Connection) {
+        let provenance = self
+            .transport_observation()
+            .map_or(LookupProvenance::PersistedAddress, |value| value.provenance);
+        self.record_transport_observation(connection, provenance);
+    }
+
+    /// Returns the latest bounded N0 address-lookup observation.
+    pub(crate) fn n0_lookup_observation(&self) -> Option<N0LookupObservation> {
+        *self
+            .n0_lookup
+            .read()
+            .expect("sync session lookup observation lock")
+    }
+
+    async fn resolve_n0(
+        &self,
+        endpoint_id: EndpointId,
+        deadline: Instant,
+    ) -> Result<(N0LookupObservation, EndpointAddr)> {
+        ensure!(
+            self.client.network_mode == NetworkMode::Internet,
+            share::ShareError::Offline
+        );
+        let services = self
+            .endpoint
+            .address_lookup()
+            .map_err(|_| anyhow::Error::new(share::ShareError::Offline))?;
+        let mut stream = services.resolve(endpoint_id);
+        let mut observation = N0LookupObservation::default();
+        let mut discovered = None;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                observation.timed_out = true;
+                break;
+            }
+            let next = match tokio::time::timeout(remaining, stream.next()).await {
+                Ok(item) => item,
+                Err(_) => {
+                    observation.timed_out = true;
+                    break;
+                }
+            };
+            let Some(item) = next else {
+                observation.complete = true;
+                break;
+            };
+            match item {
+                Ok(Ok(item)) => {
+                    let source = match item.provenance() {
+                        "pkarr" => AddressLookupSource::Pkarr,
+                        "dns" => AddressLookupSource::Dns,
+                        _ => AddressLookupSource::Other,
+                    };
+                    if observation.first_source.is_none() {
+                        observation.first_source = Some(source);
+                    }
+                    match source {
+                        AddressLookupSource::Pkarr => {
+                            observation.pkarr_results = observation.pkarr_results.saturating_add(1)
+                        }
+                        AddressLookupSource::Dns => {
+                            observation.dns_results = observation.dns_results.saturating_add(1)
+                        }
+                        AddressLookupSource::Other => {
+                            observation.other_results = observation.other_results.saturating_add(1)
+                        }
+                    }
+                    if item.endpoint_id() == endpoint_id
+                        && item.endpoint_info().addrs().next().is_some()
+                    {
+                        observation.matched_endpoint = true;
+                        discovered = Some(item.to_endpoint_addr());
+                        // A valid result is sufficient to attempt the
+                        // authenticated connection. Do not let another slow
+                        // lookup service consume the caller's remaining
+                        // activation/control deadline.
+                        break;
+                    }
+                }
+                Ok(Err(_)) | Err(_) => {
+                    observation.error_results = observation.error_results.saturating_add(1);
+                }
+            }
+        }
+        let Some(discovered) = discovered else {
+            return Err(share::ShareError::Offline.into());
+        };
+        ensure!(
+            observation.matched_endpoint && discovered.id == endpoint_id,
+            share::ShareError::OwnerMismatch
+        );
+        *self
+            .n0_lookup
+            .write()
+            .expect("sync session lookup observation lock") = Some(observation);
+        Ok((observation, discovered))
+    }
+
+    async fn connect_raw_until(&self, alpn: &[u8], deadline: Instant) -> Result<Connection> {
+        let configured = self.remote_addr();
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        ensure!(!remaining.is_zero(), share::ShareError::Offline);
+        // An endpoint-id fallback needs time for lookup and a second
+        // authenticated dial.  Keep one monotonic caller deadline for the
+        // whole operation, but reserve two thirds of it when a fallback is
+        // available so a stale address cannot consume the entire budget.
+        let primary_budget = if self.fallback_endpoint.is_some() {
+            let slice = remaining / 3;
+            if slice.is_zero() { remaining } else { slice }
+        } else {
+            remaining
+        };
+        let primary = tokio::time::timeout(
+            primary_budget,
+            self.endpoint.connect(configured.clone(), alpn),
+        )
+        .await;
+        let (connection, provenance) = match primary {
+            Ok(Ok(connection)) => (connection, LookupProvenance::PersistedAddress),
+            Ok(Err(_)) | Err(_) => {
+                let Some(endpoint_id) = self.fallback_endpoint else {
+                    return Err(share::ShareError::Offline.into());
+                };
+                let lookup_deadline = {
+                    let lookup_bound = Instant::now() + Duration::from_secs(45);
+                    if deadline < lookup_bound {
+                        deadline
+                    } else {
+                        lookup_bound
+                    }
+                };
+                let (_, discovered) = self.resolve_n0(endpoint_id, lookup_deadline).await?;
+                if discovered == configured {
+                    return Err(share::ShareError::Offline.into());
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                ensure!(!remaining.is_zero(), share::ShareError::Offline);
+                let connection = tokio::time::timeout(
+                    remaining,
+                    self.endpoint.connect(discovered.clone(), alpn),
+                )
+                .await
+                .map_err(|_| share::ShareError::Offline)?
+                .map_err(|_| share::ShareError::Offline)?;
+                *self.remote.write().expect("sync session remote lock") = discovered;
+                (connection, LookupProvenance::EndpointId)
+            }
+        };
+        ensure!(
+            connection.remote_id() == configured.id,
+            share::ShareError::OwnerMismatch
+        );
+        if provenance == LookupProvenance::PersistedAddress {
+            // iroh may perform its own endpoint-id lookup after a persisted
+            // direct hint fails. Capture the authenticated transport actually
+            // used so resume callers do not write the stale hint back to the
+            // relationship catalog. This remains an address hint only; the
+            // peer identity check above is the authority.
+            if let Some(transport) = connection
+                .paths()
+                .iter()
+                .find(|path| path.is_selected())
+                .map(|path| path.remote_addr().clone())
+            {
+                let observed = EndpointAddr::from_parts(configured.id, [transport]);
+                if observed != configured {
+                    *self.remote.write().expect("sync session remote lock") = observed;
+                }
+            }
+        }
+        self.record_transport_observation(&connection, provenance);
+        Ok(connection)
+    }
+
+    async fn connect_raw(&self, alpn: &[u8]) -> Result<Connection> {
+        self.connect_raw_until(alpn, Instant::now() + Duration::from_secs(15))
+            .await
+    }
+
+    pub(crate) async fn connect_control(&self) -> Result<Connection> {
+        self.connect_raw(share::ALPN_V3).await
+    }
+
+    pub(crate) async fn connect_control_until(&self, deadline: Instant) -> Result<Connection> {
+        self.connect_raw_until(share::ALPN_V3, deadline).await
+    }
+
     async fn connect(&self) -> Result<OperationConnection> {
         let alpn = if self.share.is_some() {
             share::ALPN_V3
         } else {
             ALPN_V2
         };
-        let connection = OperationConnection(
-            self.endpoint
-                .connect(self.client.remote.clone(), alpn)
-                .await
-                .map_err(|_| share::ShareError::Offline)?,
-        );
+        let connection = OperationConnection(self.connect_raw(alpn).await?);
         if let Some(share_id) = self.share {
             share::wire::open_session(&connection, share_id).await?;
         }
@@ -1272,9 +1586,13 @@ impl SyncSession {
     }
     /// Reconstructs the remote snapshot through this reusable endpoint.
     pub async fn fetch_snapshot(&self, local: &MerkleTree) -> Result<RemoteSnapshot> {
-        self.client
-            .fetch_snapshot_connected(self.connect().await?, local)
-            .await
+        let connection = self.connect().await?;
+        let result = self
+            .client
+            .fetch_snapshot_connected(&connection, local)
+            .await;
+        self.refresh_transport_observation(&connection);
+        result
     }
 
     /// Pushes one exact live-file record through this reusable endpoint.
@@ -1300,9 +1618,13 @@ impl SyncSession {
             record.size == manifest.size && record.content_hash == Some(manifest.file_hash),
             "source content does not match causal record"
         );
-        self.client
-            .push_record_connected(self.connect().await?, &source, record, manifest)
-            .await
+        let connection = self.connect().await?;
+        let result = self
+            .client
+            .push_record_connected(&connection, &source, record, manifest)
+            .await;
+        self.refresh_transport_observation(&connection);
+        result
     }
 
     /// Retrieves one exact live-file manifest through this reusable endpoint.
@@ -1312,9 +1634,13 @@ impl SyncSession {
             !record.tombstone && record.kind == SyncEntryKind::File,
             "pull_manifest requires a live file record"
         );
-        self.client
-            .pull_manifest_connected(self.connect().await?, record)
-            .await
+        let connection = self.connect().await?;
+        let result = self
+            .client
+            .pull_manifest_connected(&connection, record)
+            .await;
+        self.refresh_transport_observation(&connection);
+        result
     }
 
     /// Pulls one exact live-file record through this reusable endpoint.
@@ -1356,23 +1682,31 @@ impl SyncSession {
             !record.tombstone && record.kind == SyncEntryKind::File,
             "pull_record requires a live file record"
         );
-        self.client
+        let connection = self.connect().await?;
+        let result = self
+            .client
             .pull_record_connected(
-                self.connect().await?,
+                &connection,
                 record,
                 store,
                 destination_root,
                 min_free_space_bytes,
                 pending_destination_bytes,
             )
-            .await
+            .await;
+        self.refresh_transport_observation(&connection);
+        result
     }
 
     /// Applies a directory or tombstone record through this reusable endpoint.
     pub async fn apply_metadata(&self, record: SyncRecord) -> Result<SyncApplyReceipt> {
-        self.client
-            .apply_metadata_connected(self.connect().await?, record)
-            .await
+        let connection = self.connect().await?;
+        let result = self
+            .client
+            .apply_metadata_connected(&connection, record)
+            .await;
+        self.refresh_transport_observation(&connection);
+        result
     }
 
     /// Opens persistent V3 connections to authorized swarm sources using this session endpoint.
@@ -4478,9 +4812,45 @@ mod tests {
     use std::{collections::HashSet, fs, io};
 
     use deltaweave_core::{SYNC_RECORD_SCHEMA_V1, VersionVector};
+    use futures_lite::StreamExt;
+    use iroh::address_lookup::{
+        AddressLookup, EndpointData, EndpointInfo, Error as LookupError, Item,
+    };
     use tempfile::TempDir;
 
     use super::*;
+
+    #[derive(Debug, Clone)]
+    struct DelayedAddressLookup {
+        endpoint: EndpointAddr,
+        delay: Duration,
+    }
+
+    impl AddressLookup for DelayedAddressLookup {
+        fn publish(&self, _data: &EndpointData) {}
+
+        fn resolve(
+            &self,
+            endpoint_id: EndpointId,
+        ) -> Option<futures_lite::stream::Boxed<Result<Item, LookupError>>> {
+            if endpoint_id != self.endpoint.id {
+                return None;
+            }
+            let endpoint = self.endpoint.clone();
+            let delay = self.delay;
+            Some(
+                futures_lite::stream::once_future(async move {
+                    tokio::time::sleep(delay).await;
+                    Ok(Item::new(
+                        EndpointInfo::from(endpoint),
+                        "delayed-test",
+                        None,
+                    ))
+                })
+                .boxed(),
+            )
+        }
+    }
 
     fn regular_files_below(path: &Path) -> usize {
         let Ok(entries) = fs::read_dir(path) else {
@@ -4514,6 +4884,73 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn endpoint_id_fallback_reserves_budget_for_delayed_lookup() {
+        let server = Endpoint::builder(presets::Minimal)
+            .alpns(vec![ALPN_V3.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        let server_address = EndpointAddr::from_parts(
+            server.id(),
+            [TransportAddr::Ip(SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                server.bound_sockets()[0].port(),
+            ))],
+        );
+        let server_task = tokio::spawn({
+            let server = server.clone();
+            async move {
+                let incoming = server.accept().await.unwrap();
+                let connection = incoming.await.unwrap();
+                connection.closed().await;
+            }
+        });
+
+        let client = Endpoint::builder(presets::Minimal)
+            .alpns(vec![ALPN_V3.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        client.address_lookup().unwrap().add(DelayedAddressLookup {
+            endpoint: server_address.clone(),
+            delay: Duration::from_millis(1_200),
+        });
+        let stale = EndpointAddr::from_parts(
+            server.id(),
+            [TransportAddr::Ip("192.0.2.1:9".parse().unwrap())],
+        );
+        let session = SyncSession {
+            client: SyncClient {
+                secret_key: SecretKey::generate(),
+                remote: stale.clone(),
+                network_mode: NetworkMode::Internet,
+            },
+            endpoint: client.clone(),
+            share: None,
+            remote: Arc::new(RwLock::new(stale)),
+            fallback_endpoint: Some(server.id()),
+            observation: Arc::new(RwLock::new(None)),
+            n0_lookup: Arc::new(RwLock::new(None)),
+        };
+        let started = Instant::now();
+        let connection = session
+            .connect_raw_until(ALPN_V3, started + Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_eq!(connection.remote_id(), server.id());
+        assert_eq!(
+            session.transport_observation().unwrap().provenance,
+            LookupProvenance::EndpointId
+        );
+        assert!(session.n0_lookup_observation().unwrap().matched_endpoint);
+        connection.close(0u8.into(), b"delayed fallback complete");
+        client.close().await;
+        server.close().await;
+        server_task.await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

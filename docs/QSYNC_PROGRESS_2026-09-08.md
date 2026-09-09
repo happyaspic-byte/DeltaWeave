@@ -6,11 +6,12 @@
 
 작성 agent: `qsync_contracts` / Luna Max
 
-현재 단계: D2 network authority checkpoint. A 계약 문서는 `121d042`로
+현재 단계: D3 network lifecycle checkpoint. A 계약 문서는 `121d042`로
 통합되었고, B 최종 source checkpoint는 `5702ab1`, D2 source checkpoint는
 `04818f2b224249b2839b20d0b18f7b6634ae0c0a`이다. D2는 authority와
-request-start monotonic activation lease 검증까지 완료했으며
-D3 heartbeat/N0와 E data-plane은 완료로 표시하지 않는다.
+request-start monotonic activation lease 검증까지 완료했다. D3 checkpoint
+`f886ab0`은 heartbeat와 bounded endpoint-ID fallback을 포함하지만 실제
+Internet/N0·relay와 E data-plane은 완료로 표시하지 않는다.
 
 ## 작업 공간과 agent
 
@@ -23,7 +24,7 @@ D3 heartbeat/N0와 E data-plane은 완료로 표시하지 않는다.
 | B control | `/home/ubuntu/project/DeltaWeave-qsync-control-20260908` | `feat/qsync-control-20260908` | `ca63e04` persisted managed-private path recovery; prior final source `5702ab1`, Windows acceptance fixture `39ae489` |
 | C web | `/home/ubuntu/project/DeltaWeave-qsync-web-20260908` | `feat/qsync-web-20260908` | 병렬 구현 진행 |
 | validation | `/home/ubuntu/project/DeltaWeave-qsync-verification-20260908` | `test/qsync-verification-20260908` | 후속 검증 |
-| D network | `/home/ubuntu/project/DeltaWeave-qsync-network-20260908` | `feat/qsync-network-20260908` | `04818f2` D2 authority/registry/handler와 request-start activation lease checkpoint, isolated full-net 통과; D3 대기 |
+| D network | `/home/ubuntu/project/DeltaWeave-qsync-network-20260908` | `feat/qsync-network-20260908` | `f886ab0` D3 heartbeat/address fallback checkpoint; root merge 및 실제 Internet/N0·relay 검증 대기 |
 
 ## A에서 고정한 계약
 
@@ -193,3 +194,42 @@ root가 확인한다. Container image artifact는 운영 배포 증거와 구분
    B/C 영향 범위를 갱신한 뒤 후속 implementation을 재개한다.
 4. final integration, 3기기/Windows/Internet/full CI 검증, release 판단과 goal complete
    판정은 root가 담당한다.
+
+## D3 network lifecycle checkpoint (`f886ab0`)
+
+- `SyncSession`의 endpoint-ID fallback은 하나의 monotonic caller deadline을
+  connect, bounded N0 lookup, 재연결에 전달한다. fallback이 있는 경우 stale
+  persisted address에 전체 시간을 소비하지 않도록 primary dial에 일부 예산만
+  배정하며, lookup 결과는 endpoint ID와 실제 주소가 일치하는 첫 usable item에서
+  멈춘다. 남은 시간이 없으면 owner에 `Activate`를 전송하지 않는다.
+- `ShareService::resume_membership`은 Internet 모드에서 저장된 주소가 stale해도
+  동일 device endpoint의 endpoint-ID lookup을 시도하고, 인증된 연결의 실제 주소
+  hint를 relationship에 저장한다. peer identity, owner/share, permission, epoch은
+  계속 authenticated response와 기존 binding으로 검증한다.
+- managed `ShareSession`은 기존 ShareService endpoint와 transport를 공유한다.
+  별도 endpoint/index/store를 열지 않으며, data synchronization gate와 독립된
+  heartbeat supervisor가 30초 cadence로 roster challenge/heartbeat를 시도한다.
+  heartbeat/control 연결은 취소 시 Drop-close되고 engine shutdown에서 task를
+  abort·await한 뒤 session을 해제한다. heartbeat 실패도 managed observer의
+  terminal `error`로 전달된다.
+- `TransportObservation`과 `N0LookupObservation`은 주소, endpoint ID, key를
+  포함하지 않는 관측값이다. transport byte/path 값은 payload 전후 샘플을 위한
+  hook일 뿐이며 이번 checkpoint에서 실제 relay payload 증거로 사용하지 않는다.
+
+| D3 검사 | 결과 | 증거 |
+| --- | --- | --- |
+| net 전체 isolated suite | `121 passed, 0 failed`, exit `0`; outer `106` unit + `2` admission + `13` shares, child 출력 중복 제외 | `2026-09-09/d3/d3-full-net-isolated-rerun-20260909T051428Z.log`; 05:14:28Z–05:14:55Z, workspace-private HOME/USERPROFILE/TMPDIR, preserved rustup/cargo homes |
+| sync heartbeat/lease focused | `2 passed, 0 failed`, exit `0`; outer `2` | `2026-09-09/d3/d3-sync-focused-20260909T051525Z.log`; 05:15:25Z–05:15:51Z |
+| activation deadline and resume fallback | 각 outer `1 passed`, exit `0` | `d3-activation-deadline-rerun2-20260909T050211Z.log`, `d3-resume-lookup-rerun-20260909T050550Z.log`; resume의 `MemoryLookup`는 합성 lookup fixture이며 실제 pkarr/dns/N0 증거가 아님 |
+| managed heartbeat observer error | outer `1 passed`, exit `0` | `d3-heartbeat-observer-error-20260909T050732Z.log`; owner offline 시 sync 경로에서 observer `error` 확인 |
+| share focused tests | `27 passed, 0 failed`, exit `0` | `d3-share-focused-rerun-20260909T050953Z.log` 및 outer-count correction log |
+| format/diff | `git diff --check`, `cargo fmt --all -- --check` exit `0` | `d3-quality-20260909T051622Z.log`; 05:16:22Z–05:16:24Z |
+| compile/lint | locked all-target check와 strict `clippy -D warnings` exit `0` | `d3-check-all-targets-20260909T051022Z.log`, `d3-clippy-strict-rerun-20260909T051134Z.log`; 해당 로그는 `52c29fe` HEAD에 동일한 D3 dirty tree를 대상으로 실행했고 그 tree를 변경 없이 `f886ab0`에 commit했다 |
+
+이번 checkpoint의 isolated resume 검사는 owner endpoint ID를 반환하는 합성
+`MemoryLookup`로 stale 주소 경로를 검증한 것이다. 실제 Internet에서의 pkarr/dns
+provenance, owner 주소 변경·offline/back 재검색, N0 relay-only path event 및 전송
+전후 byte delta는 별도 D3 실험으로 남아 있다. `share-swarm/1`의 verified-CAS
+다중 provider payload, durable late activation receipt/ACK와 provider/consumer 양쪽
+drain, Windows 3-host 및 F release 검증은 E/F 순차 범위다. 현재 source checkpoint는
+실제 payload 또는 세 기기 검증을 완료했다고 주장하지 않는다.
