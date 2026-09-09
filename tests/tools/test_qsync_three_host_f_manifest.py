@@ -99,6 +99,16 @@ class QsyncRoleManifestTests(unittest.TestCase):
             self.assertEqual(staged.read_bytes(), content)
             self.assertEqual(staged.stat().st_mode & 0o777, 0o700)
 
+    def test_rw_runner_stages_private_copy_and_owns_evidence_directory_creation(self) -> None:
+        runner = (ROOT / "scripts" / "qsync_three_host_winrm_keepalive.py").read_text(encoding="utf-8")
+        workflow = (ROOT / ".github" / "workflows" / "qsync-three-host-bootstrap.yml").read_text(encoding="utf-8")
+        self.assertIn("tempfile.mkdtemp(prefix=\"qsync-f-rw-\"", runner)
+        self.assertIn("bootstrap.stage_role_binary", runner)
+        self.assertIn("run_owned_copy_removed", runner)
+        self.assertIn("keepalive_observed(remote, args.keepalive_seconds)", runner)
+        self.assertNotRegex(workflow, r"mkdir[^\n]*qsync-f-rw-evidence")
+        self.assertNotRegex(workflow, r"mkdir[^\n]*qsync-f-evidence")
+
     def test_evidence_bundle_removes_partial_publication_on_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary) / "evidence"
@@ -123,15 +133,36 @@ class QsyncRoleManifestTests(unittest.TestCase):
         ]
         phases[0].update(hash=expected_binary, size=123)
         phases[7].update(hash=expected_file, size=256)
+        phases[8].update(hash=expected_file, size=256)
         phases[-1]["signal"] = "ctrl_c"
         remote = BOOTSTRAP.RemoteRun(
             phases=phases,
+            diagnostic_stages=list(BOOTSTRAP.REMOTE_REOPEN_TRACE_STAGES),
+            diagnostic_counts={"reopen_checks": 63},
             graceful_signal=True,
             transport_cleanup_completed=True,
             status_code=0,
         )
         self.assertTrue(BOOTSTRAP.remote_contract_is_complete(remote, expected_binary, 123, expected_file, 256))
+        self.assertFalse(
+            BOOTSTRAP.remote_contract_is_complete(
+                remote, expected_binary, 123, expected_file, 256, require_keepalive=True
+            )
+        )
+        remote.diagnostic_stages.extend(BOOTSTRAP.REMOTE_KEEPALIVE_TRACE_STAGES)
+        remote.diagnostic_counts.update({"keepalive_enter": 300, "keepalive_done": 300})
+        self.assertTrue(
+            BOOTSTRAP.remote_contract_is_complete(
+                remote, expected_binary, 123, expected_file, 256, require_keepalive=True
+            )
+        )
         self.assertFalse(BOOTSTRAP.remote_contract_is_complete(remote, expected_binary, 123, expected_binary, 123))
+        remote.phases[8]["size"] = 255
+        self.assertFalse(BOOTSTRAP.remote_contract_is_complete(remote, expected_binary, 123, expected_file, 256))
+        remote.phases[8]["size"] = 256
+        remote.diagnostic_counts["reopen_checks"] = 31
+        self.assertFalse(BOOTSTRAP.remote_contract_is_complete(remote, expected_binary, 123, expected_file, 256))
+        remote.diagnostic_counts["reopen_checks"] = 63
         remote.transport_error_class = "timeout"
         self.assertFalse(BOOTSTRAP.remote_contract_is_complete(remote, expected_binary, 123, expected_file, 256))
         remote.phases.pop(2)
@@ -353,6 +384,9 @@ class QsyncRoleManifestTests(unittest.TestCase):
         self.assertNotIn("BeginErrorReadLine", script)
         self.assertIn("CopyToAsync([IO.Stream]::Null)", script)
         self.assertIn("ProcessStreamTasks", script)
+        self.assertIn("$Method -eq 'Post' -and $PSBoundParameters.ContainsKey('Body')", script)
+        self.assertIn("'keepalive_enter', 'keepalive_done'", script)
+        self.assertIn("expected_permission", script)
         self.assertIn("console_test_extra_trusted", script)
         self.assertIn("LastStopErrorClass", script)
 
@@ -444,6 +478,7 @@ class QsyncRoleManifestTests(unittest.TestCase):
                 "destination_root": r"C:\DeltaWeave-QSync-F-opaque\member-files",
                 "expected_file_hash": "c" * 64,
                 "expected_file_name": "fixture-a.bin",
+                "expected_permission": "read_write",
             },
         )
         lengths = BOOTSTRAP._winrm_command_lengths(wrapper)
@@ -481,6 +516,7 @@ class QsyncRoleManifestTests(unittest.TestCase):
             "destination_root": r"C:\DeltaWeave-QSync-F-opaque\member-files",
             "expected_file_hash": "c" * 64,
             "expected_file_name": "fixture-a.bin",
+            "expected_permission": "read_write",
         }
         wrapper = BOOTSTRAP._winrm_wrapper(script, config)
         encoded_match = re.search(r"-ConfigB64 '([A-Za-z0-9+/=]+)'$", wrapper)

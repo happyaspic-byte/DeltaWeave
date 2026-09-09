@@ -177,5 +177,10 @@ jobs:
       execute_ro: ${{ inputs.qsync_three_host_execute }}
     secrets:
       QSYNC_F_RO_SHARE_KEY: ${{ secrets.QSYNC_F_RO_SHARE_KEY }}
+      QSYNC_F_RW_SHARE_KEY: ${{ secrets.QSYNC_F_RW_SHARE_KEY }}
+      QSYNC_F_OWNER_API_URL: ${{ secrets.QSYNC_F_OWNER_API_URL }}
+      QSYNC_F_ARTIFACT_PUBLIC_HOST: ${{ secrets.QSYNC_F_ARTIFACT_PUBLIC_HOST }}
+      QSYNC_F_WINRM_HOST: ${{ secrets.QSYNC_F_WINRM_HOST }}
+      QSYNC_F_WINRM_DESTINATION: ${{ secrets.QSYNC_F_WINRM_DESTINATION }}
       QSYNC_F_WINRM_USERNAME: ${{ secrets.QSYNC_F_WINRM_USERNAME }}
       QSYNC_F_WINRM_PASSWORD: ${{ secrets.QSYNC_F_WINRM_PASSWORD }}

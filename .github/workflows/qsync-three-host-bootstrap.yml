@@ -20,12 +20,27 @@ on:
         required: false
         default: false
         type: boolean
+      keepalive_seconds:
+        description: 'Bounded RW provider window shared with the hosted RO role'
+        required: false
+        default: 300
+        type: number
     secrets:
       QSYNC_F_RO_SHARE_KEY:
         required: false
       QSYNC_F_WINRM_USERNAME:
         required: false
       QSYNC_F_WINRM_PASSWORD:
+        required: false
+      QSYNC_F_WINRM_HOST:
+        required: false
+      QSYNC_F_WINRM_DESTINATION:
+        required: false
+      QSYNC_F_OWNER_API_URL:
+        required: false
+      QSYNC_F_ARTIFACT_PUBLIC_HOST:
+        required: false
+      QSYNC_F_RW_SHARE_KEY:
         required: false
   workflow_dispatch:
     inputs:
@@ -46,6 +61,11 @@ on:
         required: false
         default: false
         type: boolean
+      keepalive_seconds:
+        description: 'Bounded RW provider window shared with the hosted RO role'
+        required: false
+        default: 300
+        type: number
 
 permissions:
   contents: read
@@ -107,7 +127,7 @@ jobs:
       - name: Build Linux role binary
         env:
           DELTAWEAVE_REQUIRE_WEB_ASSETS: '1'
-        run: cargo build --locked --release -p deltaweave
+        run: cargo build --locked --all-features --release -p deltaweave
       - name: Create role-specific manifest
         id: role-manifest
         env:
@@ -127,6 +147,60 @@ jobs:
           path: |
             target/release/deltaweave
             f-role-manifest.json
+          if-no-files-found: error
+          retention-days: 7
+
+  windows-rw-provider:
+    name: F approved Windows RW provider keepalive
+    if: ${{ inputs.execute_ro }}
+    needs: provenance-and-linux-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout selected source
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Download passing Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: qsync-native-windows-${{ inputs.native_artifact_run_id }}
+          path: native-artifact
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.native_artifact_run_id }}
+      - name: Install WinRM runner dependency
+        run: python3 -m pip install --disable-pip-version-check --no-input pywinrm==0.5.0
+      - name: Run concurrent Windows RW provider
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          EXPECTED_HASH: ${{ inputs.expected_file_hash }}
+          KEEPALIVE_SECONDS: ${{ inputs.keepalive_seconds }}
+          QSYNC_F_OWNER_API_URL: ${{ secrets.QSYNC_F_OWNER_API_URL }}
+          QSYNC_F_ARTIFACT_PUBLIC_HOST: ${{ secrets.QSYNC_F_ARTIFACT_PUBLIC_HOST }}
+          QSYNC_F_WINRM_HOST: ${{ secrets.QSYNC_F_WINRM_HOST }}
+          QSYNC_F_WINRM_USERNAME: ${{ secrets.QSYNC_F_WINRM_USERNAME }}
+          QSYNC_F_WINRM_PASSWORD: ${{ secrets.QSYNC_F_WINRM_PASSWORD }}
+          QSYNC_F_WINRM_DESTINATION: ${{ secrets.QSYNC_F_WINRM_DESTINATION }}
+          QSYNC_F_RW_SHARE_KEY: ${{ secrets.QSYNC_F_RW_SHARE_KEY }}
+        run: |
+          test "$KEEPALIVE_SECONDS" -ge 1
+          test "$KEEPALIVE_SECONDS" -le 900
+          python3 scripts/qsync_three_host_winrm_keepalive.py \
+            --source-sha "$SOURCE_SHA" \
+            --native-manifest "$PWD/native-artifact/native-verification-manifest.json" \
+            --windows-binary "$PWD/native-artifact/deltaweave.exe" \
+            --expected-file-hash "$EXPECTED_HASH" \
+            --evidence-dir "$RUNNER_TEMP/qsync-f-rw-evidence" \
+            --keepalive-seconds "$KEEPALIVE_SECONDS"
+      - name: Upload safe RW evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qsync-f-rw-evidence-${{ github.run_id }}
+          path: ${{ runner.temp }}/qsync-f-rw-evidence
           if-no-files-found: error
           retention-days: 7
 
@@ -164,7 +238,6 @@ jobs:
           EXPECTED_HASH: ${{ inputs.expected_file_hash }}
           QSYNC_F_RO_SHARE_KEY: ${{ secrets.QSYNC_F_RO_SHARE_KEY }}
         run: |
-          mkdir -p "$RUNNER_TEMP/qsync-f-evidence"
           python3 scripts/qsync_three_host_role.py \
             --source-sha "$SOURCE_SHA" \
             --manifest "$PWD/f-linux/f-role-manifest.json" \
@@ -181,3 +254,39 @@ jobs:
           path: ${{ runner.temp }}/qsync-f-evidence
           if-no-files-found: error
           retention-days: 7
+
+  concurrent-role-gate:
+    name: F concurrent RW/RO evidence gate
+    if: ${{ always() && inputs.execute_ro }}
+    needs: [windows-rw-provider, hosted-ro-consumer]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout selected source
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Download RW evidence
+        if: always()
+        uses: actions/download-artifact@v4
+        with:
+          name: qsync-f-rw-evidence-${{ github.run_id }}
+          path: rw-evidence
+      - name: Download RO evidence
+        if: always()
+        uses: actions/download-artifact@v4
+        with:
+          name: qsync-f-ro-evidence-${{ github.run_id }}
+          path: ro-evidence
+      - name: Verify concurrent role contract
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          KEEPALIVE_SECONDS: ${{ inputs.keepalive_seconds }}
+        run: |
+          python3 scripts/qsync_three_host_coordination.py \
+            --source-sha "$SOURCE_SHA" \
+            --keepalive-seconds "$KEEPALIVE_SECONDS" \
+            --rw-evidence "$PWD/rw-evidence/rw-keepalive.json" \
+            --ro-evidence "$PWD/ro-evidence/f-ro-result.json"

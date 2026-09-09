@@ -938,6 +938,17 @@ REMOTE_REQUIRED_PHASES = (
     "member_reopen_membership",
     "cleanup",
 )
+REMOTE_REOPEN_TRACE_STAGES = (
+    "reopen_login_enter",
+    "reopen_login_done",
+    "reopen_membership_enter",
+    "reopen_membership_done",
+    "reopen_checks",
+)
+REMOTE_KEEPALIVE_TRACE_STAGES = (
+    "keepalive_enter",
+    "keepalive_done",
+)
 REMOTE_TRACE_STAGES = {
     "config_ok",
     "binary_done",
@@ -976,6 +987,11 @@ REMOTE_TRACE_STAGES = {
     "owner_attach_enter",
     "owner_stop_enter",
     "member_reopen_enter",
+    "reopen_login_enter",
+    "reopen_login_done",
+    "reopen_membership_enter",
+    "reopen_membership_done",
+    "reopen_checks",
     "artifact_download_enter",
     "artifact_download_done",
     "artifact_hash_done",
@@ -1007,6 +1023,8 @@ def remote_contract_is_complete(
     expected_binary_size: int,
     expected_file_hash: str,
     expected_file_size: int | None = None,
+    *,
+    require_keepalive: bool = False,
 ) -> bool:
     """Require one complete transcript with independent binary/file bindings."""
 
@@ -1023,6 +1041,19 @@ def remote_contract_is_complete(
         return False
     if any(item.get("ok") is not True for item in remote.phases):
         return False
+    # The reopen phase is backed by a real HTTP login, an exact membership
+    # lookup, and a file re-read.  A phase-only transcript could otherwise
+    # claim success after observing just a non-null response.  Require each
+    # bounded diagnostic stage exactly once and the all-checks bitmask: 1 is
+    # login, 2 is HTTP 200, 4 is the same share, 8 is the file hash, 16 is a
+    # member role, and 32 is the expected permission.
+    required_trace_stages = REMOTE_REOPEN_TRACE_STAGES + (
+        REMOTE_KEEPALIVE_TRACE_STAGES if require_keepalive else ()
+    )
+    if any(remote.diagnostic_stages.count(stage) != 1 for stage in required_trace_stages):
+        return False
+    if remote.diagnostic_counts.get("reopen_checks") != 63:
+        return False
     binary = remote.phases[0]
     if binary.get("hash") != expected_binary_hash or binary.get("size") != expected_binary_size:
         return False
@@ -1030,6 +1061,11 @@ def remote_contract_is_complete(
     if file_hash.get("hash") != expected_file_hash or not isinstance(file_hash.get("size"), int) or file_hash["size"] <= 0:
         return False
     if expected_file_size is not None and file_hash.get("size") != expected_file_size:
+        return False
+    reopened = remote.phases[8]
+    if reopened.get("hash") != expected_file_hash or not isinstance(reopened.get("size"), int) or reopened["size"] <= 0:
+        return False
+    if expected_file_size is not None and reopened.get("size") != expected_file_size:
         return False
     cleanup = remote.phases[-1]
     return cleanup.get("signal") == "ctrl_c" and cleanup.get("forced") is not True
@@ -1121,7 +1157,7 @@ def parse_remote_output(stdout: bytes | str, expected_hash: str, expected_size: 
         if not match or match.group(1) not in REMOTE_PHASES:
             continue
         phase, ok, hash_value, size_value, forced, signal, error_class = match.groups()
-        if error_class not in ERROR_CLASSES:
+        if error_class is not None and error_class not in ERROR_CLASSES:
             error_class = "unexpected"
         if hash_value and phase == "file_hash":
             result.file_hash = hash_value
@@ -1247,7 +1283,12 @@ def _winrm_command_lengths(command: str) -> dict[str, int]:
     }
 
 
-def _run_winrm_powershell(session: Any, command: str) -> WinRMResult:
+def _run_winrm_powershell(
+    session: Any,
+    command: str,
+    *,
+    command_deadline_seconds: int = WINRM_COMMAND_DEADLINE_SECONDS,
+) -> WinRMResult:
     """Run PowerShell through WinRS with bounded output polling.
 
     ``Protocol.get_command_output`` intentionally retries operation timeouts
@@ -1335,7 +1376,9 @@ def _run_winrm_powershell(session: Any, command: str) -> WinRMResult:
         if category == "timeout":
             command_timed_out = True
 
-    deadline = time.monotonic() + WINRM_COMMAND_DEADLINE_SECONDS
+    if not isinstance(command_deadline_seconds, int) or command_deadline_seconds < WINRM_COMMAND_DEADLINE_SECONDS:
+        fail("config_invalid")
+    deadline = time.monotonic() + command_deadline_seconds
 
     def before_command_rpc() -> bool:
         nonlocal command_timed_out, transport_error_class
@@ -1473,11 +1516,14 @@ def run_winrm_member(
     public_host: str,
     artifact_size: int,
     vault: SecretVault,
+    keepalive_seconds: int = 0,
 ) -> RemoteRun:
     """Run the approved Windows role over encrypted WinRM without a fake local pass."""
 
     if not isinstance(artifact_size, int) or artifact_size <= 0:
         fail("manifest_invalid")
+    if not isinstance(keepalive_seconds, int) or not 0 <= keepalive_seconds <= 900:
+        fail("config_invalid")
     if not all((spec.winrm_host_env, spec.winrm_username_env, spec.winrm_password_env)):
         fail("config_invalid")
     host_raw = os.environ.get(spec.winrm_host_env or "")
@@ -1507,6 +1553,8 @@ def run_winrm_member(
             "destination_root": destination,
             "expected_file_hash": expected_file_hash,
             "expected_file_name": "fixture-a.bin",
+            "expected_permission": "read_write",
+            "keepalive_seconds": str(keepalive_seconds),
         }
         wrapper = _winrm_wrapper(script, remote_config)
         try:
@@ -1520,7 +1568,11 @@ def run_winrm_member(
                 operation_timeout_sec=45,
                 read_timeout_sec=60,
             )
-            result = _run_winrm_powershell(session, wrapper)
+            result = _run_winrm_powershell(
+                session,
+                wrapper,
+                command_deadline_seconds=WINRM_COMMAND_DEADLINE_SECONDS + keepalive_seconds,
+            )
         except ImportError:
             # This is a controller precondition; no remote shell was created.
             return RemoteRun(

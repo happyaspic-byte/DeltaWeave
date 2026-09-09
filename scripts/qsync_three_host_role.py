@@ -236,7 +236,16 @@ def _run(argv: list[str] | None = None) -> int:
         reopened_client: bootstrap.ApiClient = reopened_login.value
         membership = reopened_client._call("GET", f"/api/v1/shares/{share_id}")
         reopened_hash = bootstrap.file_sha256(target) if target.is_file() else ""
-        reopen_ok = membership[0] == 200 and reopened_hash == expected_hash
+        membership_value = membership[1] if isinstance(membership, tuple) and len(membership) == 2 else None
+        membership_ok = (
+            membership[0] == 200
+            and isinstance(membership_value, dict)
+            and membership_value.get("share_id") == share_id
+            and membership_value.get("role") == "member"
+            and membership_value.get("permission") == "read_only"
+        )
+        reopened_size = target.stat().st_size if target.is_file() else None
+        reopen_ok = membership_ok and reopened_hash == expected_hash and reopened_size == checked.value["size_bytes"]
         recorder.add(
             phase="member_reopen_membership",
             role="ro_consumer",

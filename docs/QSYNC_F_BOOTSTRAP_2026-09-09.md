@@ -196,3 +196,49 @@ retry9의 transport/phase 기록은 최종 binary/fixture 독립 gate 보정 전
 회귀 결과는 commit `df0ba52a058c97523ea119aa5f6296656fe44dd7`에서 다시 확인했고,
 정확한 source hash와 명령 시각은 `f-bootstrap/winrm-bounded-contract-final/`
 검증 ledger에 보존했다.
+
+## 현재 bounded/reopen 및 동시 역할 checkpoint
+
+위의 retry9와 28개 회귀 기록은 과거 checkpoint다. 현재 도구는 reopen HTTP 응답과
+membership의 `share_id`, `role`, `permission`, 재조회 파일의 hash·크기를 함께
+확인하고, `reopen_checks=63` 및 각 reopen trace의 정확히 한 번의 관측을 요구한다.
+성공 phase에 오류 필드가 없으면 parser는 `error_class=none`으로 기록한다. RW
+runner도 원본 Windows binary를 바로 전송하지 않고 run-owned 0700 복사본을 해시
+검증한 뒤 사용한다. 정상적으로 원격 정리가 확인된 경우에만 그 복사본을 지우며,
+timeout·forced·불명확한 상태에서는 `run_owned_copy_removed=false`와 상태 보존을
+기록한다. coordination gate는 이 조건을 만족하지 않으면 pass를 만들지 않는다.
+
+2026-09-09의 retry10은 source `2f44d9fbfbe1c4779bd59f78fe9cc4ff27f41cd6`, Windows
+artifact SHA `186b9e177d8b3a8246ceb994d00402b827fb8481b26642edf4ce62983988453a`,
+크기 `33488896` bytes를 사용했다. owner/member preview·validate·join과 최초
+fixture hash `8b666f88f7b033f647f9b5ae66d668b7bb88376630dbecfb0fba757f4f84334c`,
+`262144` bytes는 통과했지만 reopen membership의 HTTP status가 0이고 checks가
+9로 끝나 전체 결과는 `pending`이었다. 별도 read-only process probe는
+`authenticated=true`, `deltaweave_process_count=0`, `web_ready=false`였다.
+bodyless GET 수정 뒤의 retry11은 reopen 전에 test-owned console에 분류할 수 없는
+추가 process가 남아 `console_control_failed`로 안전하게 중단됐다. 전체 결과는
+`pending`, transport cleanup은 true, 별도 probe는 동일하게 orphan 0이었다. 따라서
+retry10/11 어느 것도 graceful reopen pass나 3-host pass를 증명하지 않는다.
+
+`qsync_three_host_winrm_keepalive.py`와 reusable workflow는 `provenance-and-linux-build`
+뒤에 Windows RW와 hosted Ubuntu RO를 병렬로 시작하고, RW의 1~900초 bounded
+keepalive trace와 두 role의 독립 binary hash를 coordination gate에서 확인한다.
+Linux/Windows executable hash는 달라도 되며 각 role의 `source_sha`, `workflow_sha`,
+`target`, hash, 크기를 따로 검증한다. workflow는 evidence 디렉터리를 runner에
+미리 만들지 않고 각 driver가 0700으로 단독 생성하게 한다. owner API URL, RW/RO
+share key, WinRM 값은 workflow secret에서 driver의 메모리로만 주입되며 hosted RO에
+owner 관리자 credential을 전달하지 않는다. 현재 workflow에는 동적 owner 생성이나
+새 secret 발급·삭제가 없으므로 외부 owner, artifact host, 승인 Windows 접근값이
+제공되지 않으면 역할은 `blocked`/`pending`이다. 이는 실행 가능한 경로를 제공하지만
+이 환경에서 3 host, bilateral drain ACK, E share-swarm provider payload의 성공을
+주장하지 않는다.
+
+현재 로컬 검증은 `py_compile` exit 0, `python3 -m unittest discover -s tests/tools
+-p 'test_qsync_three_host*.py' -v` 32 tests exit 0, 세 workflow YAML parse exit 0,
+`git diff --check` exit 0이다. `actionlint`는 이 실행 환경에 설치되어 있지 않아
+사용하지 못했다. CI의 caller는 reusable workflow에 job-level `contents:read`와
+`actions:read`만 전달하도록 수정됐고, Linux/Windows web test는 `npm --prefix web
+test -- --run`, CLI self-test는 `cargo run --locked --all-features -p deltaweave --
+self-test`를 사용한다. 이 수정으로 시작한 run `34324974244`는 source
+`860b03f2ed151754551f781e6c12947425256bce`에서 진행 중이며, 결과가 나올 때까지
+full F 판정으로 집계하지 않는다.

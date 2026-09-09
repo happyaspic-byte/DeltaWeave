@@ -37,6 +37,9 @@ function Emit-Diagnostic {
         'owner_issue_enter', 'owner_issue_done', 'console_release_enter',
         'console_release_done', 'member_web_start_enter', 'member_stop_enter',
         'owner_attach_enter', 'owner_stop_enter', 'member_reopen_enter',
+        'reopen_login_enter', 'reopen_login_done', 'reopen_membership_enter',
+        'reopen_membership_done', 'reopen_checks',
+        'keepalive_enter', 'keepalive_done',
         'artifact_download_enter', 'artifact_download_done', 'artifact_hash_done',
         'ctrlc_sent', 'exit_wait_enter', 'exit_observed', 'streams_drained',
         'console_released', 'stop_ctrlc_failed', 'stop_exit_timeout',
@@ -107,7 +110,7 @@ function Decode-Config {
 
 function Assert-Config {
     param($Value)
-    $required = @('artifact_url', 'artifact_sha256', 'artifact_size', 'owner_base_uri', 'share_key', 'destination_root', 'expected_file_hash', 'expected_file_name')
+    $required = @('artifact_url', 'artifact_sha256', 'artifact_size', 'owner_base_uri', 'share_key', 'destination_root', 'expected_file_hash', 'expected_file_name', 'expected_permission')
     foreach ($name in $required) {
         $item = [string]$Value.$name
         if ([string]::IsNullOrWhiteSpace($item)) { throw 'config' }
@@ -117,6 +120,9 @@ function Assert-Config {
     if ([string]$Value.expected_file_hash -notmatch '^[0-9a-f]{64}$') { throw 'config' }
     if ([string]$Value.destination_root -notmatch '^[A-Za-z]:\\[^\x00\r\n]+$') { throw 'config' }
     if ([string]$Value.expected_file_name -notmatch '^[A-Za-z0-9._-]{1,128}$') { throw 'config' }
+    if ([string]$Value.expected_permission -notmatch '^(read_only|read_write)$') { throw 'config' }
+    if ($null -eq $Value.keepalive_seconds) { $Value | Add-Member -NotePropertyName keepalive_seconds -NotePropertyValue 0 }
+    if ([string]$Value.keepalive_seconds -notmatch '^[0-9]{1,3}$' -or [int]$Value.keepalive_seconds -gt 900) { throw 'config' }
     if ([string]$Value.owner_base_uri -notmatch '^https?://[^\s/]+(?::[0-9]{1,5})?$') { throw 'config' }
     if ([string]$Value.artifact_url -notmatch '^https?://[^\s/]+(?::[0-9]{1,5})?/qsync-f-[A-Za-z0-9_-]+$') { throw 'config' }
 }
@@ -639,7 +645,12 @@ function Invoke-JsonApi {
             Headers = $headers
             TimeoutSec = 90
         }
-        if ($null -ne $Body) {
+        # PowerShell binds the optional Body parameter to its empty default
+        # even when a GET caller omits it.  Sending that default as a GET body
+        # can fail before the request reaches the managed membership route.
+        # Only mutation requests may carry the JSON body supplied by the
+        # caller; the reopen membership GET is deliberately bodyless.
+        if ($Method -eq 'Post' -and $PSBoundParameters.ContainsKey('Body') -and $null -ne $Body) {
             $params['ContentType'] = 'application/json'
             $params['Body'] = $Body
         }
@@ -749,6 +760,16 @@ try {
     Emit-Phase 'file_hash' $fileOk $fileHash $fileSize
     if (-not $fileOk) { throw 'file_hash' }
 
+    $keepAliveSeconds = [int]$config.keepalive_seconds
+    if ($keepAliveSeconds -gt 0) {
+        Emit-Diagnostic 'keepalive_enter' -Count $keepAliveSeconds
+        $keepAliveDeadline = [Diagnostics.Stopwatch]::GetTimestamp() + [int64]($keepAliveSeconds * [Diagnostics.Stopwatch]::Frequency)
+        while ([Diagnostics.Stopwatch]::GetTimestamp() -lt $keepAliveDeadline) {
+            Start-Sleep -Milliseconds 250
+        }
+        Emit-Diagnostic 'keepalive_done' -Count $keepAliveSeconds
+    }
+
     Emit-Diagnostic 'shutdown_enter'
     $stopped = Stop-WebProcess $script:MemberProcess
     if ($stopped) { $script:MemberProcess = $null }
@@ -759,13 +780,25 @@ try {
     $restartedProcess = Start-WebProcess $artifact $data $memberPort $profile
     if ($null -ne $restartedProcess) { $script:MemberProcess = $restartedProcess }
     $reopened = $null -ne $script:MemberProcess
+    Emit-Diagnostic 'reopen_login_enter'
     $reopenClient = if ($reopened) { New-ApiClient "http://127.0.0.1:$memberPort" $data } else { $null }
+    Emit-Diagnostic 'reopen_login_done' -Count $(if ($null -ne $reopenClient) { $script:LastApiStatus } else { 0 })
+    Emit-Diagnostic 'reopen_membership_enter'
     $membership = if ($null -ne $reopenClient) { Invoke-JsonApi $reopenClient Get "/api/v1/shares/$shareId" } else { $null }
+    Emit-Diagnostic 'reopen_membership_done' -Count $script:LastApiStatus
     $afterHash = ''
     if (Test-Path -LiteralPath $target -PathType Leaf) {
         try { $afterHash = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash.ToLowerInvariant() } catch { }
     }
-    $reopenOk = $reopened -and $null -ne $reopenClient -and $null -ne $membership -and $afterHash -eq [string]$config.expected_file_hash
+    $reopenLoginOk = $reopened -and $null -ne $reopenClient
+    $membershipStatusOk = $script:LastApiStatus -eq 200
+    $membershipShareOk = $membershipStatusOk -and $null -ne $membership -and [string]$membership.share_id -eq $shareId
+    $membershipRoleOk = $membershipShareOk -and [string]$membership.role -eq 'member'
+    $membershipPermissionOk = $membershipRoleOk -and [string]$membership.permission -eq [string]$config.expected_permission
+    $fileHashOk = $afterHash -eq [string]$config.expected_file_hash
+    $reopenChecks = [int]$reopenLoginOk + (2 * [int]$membershipStatusOk) + (4 * [int]$membershipShareOk) + (8 * [int]$fileHashOk) + (16 * [int]$membershipRoleOk) + (32 * [int]$membershipPermissionOk)
+    Emit-Diagnostic 'reopen_checks' -Count $reopenChecks
+    $reopenOk = $reopenLoginOk -and $membershipPermissionOk -and $fileHashOk
     $afterSize = if ($reopenOk) { (Get-Item -LiteralPath $target).Length } else { -1 }
     Emit-Phase 'member_reopen_membership' $reopenOk $afterHash $afterSize
     if (-not $reopenOk) { throw 'reopen' }
