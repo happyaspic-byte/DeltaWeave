@@ -19,6 +19,7 @@ import sys
 import tempfile
 import time
 import uuid
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -55,8 +56,17 @@ def load_artifact(source_sha: str, manifest_path: Path, binary: Path) -> dict[st
     raw_artifacts = manifest.get("artifacts")
     if isinstance(raw_artifacts, dict):
         artifact = raw_artifacts.get("ro_consumer") or raw_artifacts.get("default")
+    else:
+        artifact = {
+            **bootstrap.json_object(artifact, "manifest_invalid"),
+            "source_sha": artifact.get("source_sha", manifest.get("source_sha")),
+            "workflow_sha": artifact.get("workflow_sha", manifest.get("workflow_sha")),
+            "target": artifact.get("target", manifest.get("target")),
+        }
     artifact = bootstrap.json_object(artifact, "manifest_invalid")
-    if artifact.get("source_sha", source_sha) != source_sha or artifact.get("workflow_sha", source_sha) != source_sha:
+    if artifact.get("source_sha") != source_sha or artifact.get("workflow_sha") != source_sha:
+        bootstrap.fail("source_mismatch")
+    if artifact.get("target") != "linux":
         bootstrap.fail("source_mismatch")
     expected_hash = bootstrap.require_sha256(artifact.get("sha256"), "manifest_invalid")
     expected_size = artifact.get("size_bytes")
@@ -66,7 +76,13 @@ def load_artifact(source_sha: str, manifest_path: Path, binary: Path) -> dict[st
     actual_hash = bootstrap.file_sha256(binary)
     if actual_hash != expected_hash or binary.stat().st_size != expected_size:
         bootstrap.fail("binary_hash_mismatch")
-    return {"source_sha": source_sha, "sha256": expected_hash, "size_bytes": expected_size}
+    return {
+        "source_sha": source_sha,
+        "workflow_sha": source_sha,
+        "target": "linux",
+        "sha256": expected_hash,
+        "size_bytes": expected_size,
+    }
 
 
 def _run(argv: list[str] | None = None) -> int:
@@ -123,11 +139,12 @@ def _run(argv: list[str] | None = None) -> int:
             "binary_verification",
             "ro_consumer",
             "ro.provenance.binary",
-            lambda: bootstrap.verify_role_binary(spec, info),
+            lambda: bootstrap.stage_role_binary(spec, info, run_root),
         )
         if binary_result.status != "pass":
             return 1
-        binary_hashes["ro_consumer"] = binary_result.value
+        spec = replace(spec, binary=binary_result.value)
+        binary_hashes["ro_consumer"] = info["sha256"]
         self_test = recorder.run(
             "self_test",
             "ro_consumer",
@@ -299,7 +316,7 @@ def _run(argv: list[str] | None = None) -> int:
                 "status": final_status,
                 "source_sha": args.source_sha,
                 "binary_sha256": binary_hashes,
-                "topology": ["hosted-ubuntu-ro"],
+                "topology": [{"role": "ro_consumer", "label": "hosted-ubuntu-ro", "runner": "local"}],
                 "providers": [
                     {"role": "owner-provider", "epoch": 0, "verified_chunks": 0, "verified_bytes": 0},
                     {"role": "rw-provider", "epoch": None, "verified_chunks": 0, "verified_bytes": 0},
@@ -311,8 +328,7 @@ def _run(argv: list[str] | None = None) -> int:
                 "raw_output_retained": False,
             }
             try:
-                evidence.write_json("f-ro-result.json", manifest)
-                evidence.write_jsonl("f-ro-phase-events.jsonl", recorder.phases)
+                evidence.write_bundle("f-ro-result.json", manifest, "f-ro-phase-events.jsonl", recorder.phases)
             except Exception:
                 vault.clear()
                 raise bootstrap.HarnessError("unexpected", "failed", 1)

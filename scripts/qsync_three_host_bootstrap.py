@@ -31,7 +31,7 @@ import urllib.error
 import urllib.request
 import uuid
 import zlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, NoReturn
@@ -48,6 +48,7 @@ ROLE_LABELS = {
     "ro_consumer": "hosted-ubuntu-ro",
 }
 RUNNERS = {"local", "prestarted", "winrm", "github_hosted"}
+FIXTURE_A_SIZE_BYTES = 256 * 1024
 SAFE_CHILD_ENV_KEYS = {
     "PATH",
     "LANG",
@@ -112,6 +113,8 @@ ERROR_CLASSES = {
     "remote_failure",
     "timeout",
     "cleanup_incomplete",
+    "console_control_failed",
+    "process_exited",
     "unexpected",
 }
 PHASE_STATUSES = {"pass", "failed", "blocked", "unrun", "pending"}
@@ -121,7 +124,7 @@ class HarnessError(Exception):
     """An error with a fixed, safe classification and no display message."""
 
     def __init__(self, error_class: str, status: str = "failed", exit_code: int = 1):
-        if error_class not in ERROR_CLASSES:
+        if error_class is not None and error_class not in ERROR_CLASSES:
             error_class = "unexpected"
         if status not in PHASE_STATUSES:
             status = "failed"
@@ -300,7 +303,10 @@ class SecretVault:
 
 def reject_secret_config(value: Any, key: str = "") -> None:
     lowered = key.lower()
-    if any(word in lowered for word in ("password", "credential", "bearer", "secret", "token")) and not lowered.endswith("_env"):
+    if (
+        any(word in lowered for word in ("password", "credential", "bearer", "secret", "token"))
+        or lowered.endswith("_key")
+    ) and not lowered.endswith("_env"):
         if value not in (None, "", False, 0, []):
             fail("config_invalid")
     if isinstance(value, Mapping):
@@ -482,7 +488,24 @@ class PhaseRecorder:
         started = utc_now()
         try:
             value = action()
-            outcome = value if isinstance(value, Outcome) else Outcome("pass", value=value)
+            if isinstance(value, Outcome):
+                outcome = value
+            elif isinstance(getattr(value, "transport_error_class", None), str):
+                # A WinRS transport can return a partial, sanitized transcript
+                # after setup/output failure.  Keep that value for the final
+                # evidence instead of turning it into an exception with no
+                # observable phase boundary.
+                pending = bool(getattr(value, "command_timed_out", False)) or not bool(
+                    getattr(value, "transport_cleanup_completed", False)
+                )
+                outcome = Outcome(
+                    "pending" if pending else "failed",
+                    str(value.transport_error_class),
+                    2 if pending else 1,
+                    value,
+                )
+            else:
+                outcome = Outcome("pass", value=value)
         except HarnessError as error:
             outcome = Outcome(error.status, error.error_class, error.exit_code)
         except TimeoutError:
@@ -574,6 +597,61 @@ class SafeEvidence:
                 handle.write(json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n")
         target.chmod(0o600)
 
+    def write_bundle(
+        self,
+        manifest_name: str,
+        manifest: Mapping[str, Any],
+        events_name: str,
+        events: Iterable[Mapping[str, Any]],
+    ) -> None:
+        """Publish the pass manifest only after its event ledger is durable."""
+
+        if not re.fullmatch(r"[a-z0-9_-]+\.json", manifest_name):
+            raise ValueError("unsafe evidence filename")
+        if not re.fullmatch(r"[a-z0-9_-]+\.jsonl", events_name):
+            raise ValueError("unsafe evidence filename")
+        event_values = list(events)
+        self._check(manifest)
+        for event in event_values:
+            self._check(event)
+        manifest_target = self.directory / manifest_name
+        events_target = self.directory / events_name
+        if manifest_target.exists() or events_target.exists():
+            raise ValueError("evidence already exists")
+        payloads = {
+            manifest_target: (json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode(
+                "utf-8"
+            ),
+            events_target: b"".join(
+                (json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+                for event in event_values
+            ),
+        }
+        temporary: list[Path] = []
+        published: list[Path] = []
+        try:
+            for target, encoded in payloads.items():
+                tmp = self.directory / ("." + target.name + ".tmp")
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                temporary.append(tmp)
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(encoded)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            # Keep the manifest as the final publication point. If this fails,
+            # remove the event ledger and leave no success-looking manifest.
+            os.replace(temporary[1], events_target)
+            published.append(events_target)
+            os.replace(temporary[0], manifest_target)
+            published.append(manifest_target)
+        except Exception:
+            for path in (*temporary, *published):
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+            raise
+
 
 def verify_manifest(config: HarnessConfig) -> dict[str, Any]:
     manifest = load_json_file(config.artifact_manifest)
@@ -587,6 +665,12 @@ def verify_manifest(config: HarnessConfig) -> dict[str, Any]:
         # descriptor.  A full three-host run should provide role-specific
         # descriptors; this fallback is retained for validate-only callers.
         raw_artifact = json_object(manifest.get("artifact"), "manifest_invalid")
+        raw_artifact = {
+            **raw_artifact,
+            "source_sha": raw_artifact.get("source_sha", manifest.get("source_sha")),
+            "workflow_sha": raw_artifact.get("workflow_sha", manifest.get("workflow_sha")),
+            "target": raw_artifact.get("target", manifest.get("target")),
+        }
         raw_artifacts = {"default": raw_artifact}
     if not isinstance(raw_artifacts, dict) or not raw_artifacts:
         fail("manifest_invalid")
@@ -598,14 +682,25 @@ def verify_manifest(config: HarnessConfig) -> dict[str, Any]:
         expected_size = raw_artifact.get("size_bytes")
         if not isinstance(expected_size, int) or expected_size <= 0:
             fail("manifest_invalid")
-        if raw_artifact.get("source_sha", config.source_sha) != config.source_sha:
+        artifact_source = raw_artifact.get("source_sha")
+        artifact_workflow = raw_artifact.get("workflow_sha")
+        artifact_target = raw_artifact.get("target")
+        if not isinstance(artifact_source, str) or not SOURCE_SHA_RE.fullmatch(artifact_source):
+            fail("manifest_invalid")
+        if not isinstance(artifact_workflow, str) or not SOURCE_SHA_RE.fullmatch(artifact_workflow):
+            fail("manifest_invalid")
+        if not isinstance(artifact_target, str) or not artifact_target:
+            fail("manifest_invalid")
+        if artifact_source != config.source_sha:
             fail("source_mismatch")
-        if raw_artifact.get("workflow_sha", config.source_sha) != config.source_sha:
+        if artifact_workflow != config.source_sha:
             fail("source_mismatch")
         artifacts[role] = {
             "sha256": expected_hash,
             "size_bytes": expected_size,
-            "target": raw_artifact.get("target"),
+            "source_sha": artifact_source,
+            "workflow_sha": artifact_workflow,
+            "target": artifact_target,
         }
     return {"source_sha": config.source_sha, "artifacts": artifacts}
 
@@ -613,7 +708,7 @@ def verify_manifest(config: HarnessConfig) -> dict[str, Any]:
 def verify_role_binary(spec: RoleSpec, artifact: Mapping[str, Any]) -> str:
     assert spec.binary is not None
     expected_target = "windows" if spec.runner == "winrm" else "linux" if spec.runner == "local" else None
-    if expected_target is not None and artifact.get("target") not in (None, expected_target):
+    if expected_target is not None and artifact.get("target") != expected_target:
         fail("source_mismatch")
     if not spec.binary.is_file():
         fail("binary_missing")
@@ -623,6 +718,63 @@ def verify_role_binary(spec: RoleSpec, artifact: Mapping[str, Any]) -> str:
     if spec.binary_sha256 != artifact["sha256"] or spec.binary.stat().st_size != artifact["size_bytes"]:
         fail("source_mismatch")
     return actual
+
+
+def stage_role_binary(spec: RoleSpec, artifact: Mapping[str, Any], run_root: Path) -> Path:
+    """Copy and verify one role binary before any child process can use it."""
+
+    assert spec.binary is not None
+    expected_target = "windows" if spec.runner == "winrm" else "linux" if spec.runner == "local" else None
+    if expected_target is not None and artifact.get("target") != expected_target:
+        fail("source_mismatch")
+    expected_hash = require_sha256(artifact.get("sha256"), "manifest_invalid")
+    expected_size = artifact.get("size_bytes")
+    if not isinstance(expected_size, int) or expected_size <= 0:
+        fail("manifest_invalid")
+    if spec.binary_sha256 != expected_hash:
+        fail("source_mismatch")
+    if not run_root.is_dir() or run_root.is_symlink():
+        fail("path_invalid")
+    destination = run_root / (spec.name + "-binary")
+    if destination.exists() or destination.is_symlink():
+        fail("path_invalid")
+    digest = hashlib.sha256()
+    copied = 0
+    source_handle = None
+    destination_fd: int | None = None
+    try:
+        source_handle = spec.binary.open("rb")
+        destination_fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o700)
+        with os.fdopen(destination_fd, "wb", closefd=True) as target_handle:
+            destination_fd = None
+            while True:
+                chunk = source_handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                target_handle.write(chunk)
+                digest.update(chunk)
+                copied += len(chunk)
+            target_handle.flush()
+            os.fsync(target_handle.fileno())
+        os.chmod(destination, 0o700)
+    except (OSError, UnicodeError):
+        if destination_fd is not None:
+            os.close(destination_fd)
+        try:
+            destination.unlink()
+        except OSError:
+            pass
+        fail("binary_missing")
+    finally:
+        if source_handle is not None:
+            source_handle.close()
+    if copied != expected_size or digest.hexdigest() != expected_hash:
+        try:
+            destination.unlink()
+        except OSError:
+            pass
+        fail("binary_hash_mismatch")
+    return destination
 
 
 def run_self_test(spec: RoleSpec, profile_root: Path | None = None) -> Outcome:
@@ -756,7 +908,11 @@ REMOTE_LINE_RE = re.compile(
     r"(?:\|hash=([0-9a-f]{64}))?"
     r"(?:\|size=([0-9]+))?"
     r"(?:\|forced=(true|false))?"
+    r"(?:\|signal=(ctrl_c|none))?"
     r"(?:\|error_class=([a-z0-9_]+))?$"
+)
+REMOTE_TRACE_RE = re.compile(
+    r"^FTRACE\|stage=([a-z_]+)(?:\|count=([0-9]{1,4}))?(?:\|elapsed_ms=([0-9]{1,12}))?$"
 )
 REMOTE_PHASES = {
     "binary_verification",
@@ -770,23 +926,143 @@ REMOTE_PHASES = {
     "member_reopen_membership",
     "cleanup",
 }
+REMOTE_REQUIRED_PHASES = (
+    "binary_verification",
+    "self_test",
+    "member_web_start",
+    "member_login",
+    "local_preview",
+    "online_validate",
+    "member_join",
+    "file_hash",
+    "member_reopen_membership",
+    "cleanup",
+)
+REMOTE_TRACE_STAGES = {
+    "config_ok",
+    "binary_done",
+    "self_test_done",
+    "web_start_enter",
+    "console_prepare",
+    "console_detached",
+    "console_allocated",
+    "console_handler_installed",
+    "console_verified",
+    "web_process_started",
+    "console_ready",
+    "pipes_ready",
+    "web_http_ready",
+    "web_start_return",
+    "member_login_enter",
+    "member_login_done",
+    "preview_enter",
+    "validate_enter",
+    "join_enter",
+    "file_hash_enter",
+    "shutdown_enter",
+    "reopen_enter",
+    "cleanup_enter",
+    "owner_web_ready",
+    "owner_login_enter",
+    "owner_login_done",
+    "owner_create_enter",
+    "owner_create_done",
+    "owner_issue_enter",
+    "owner_issue_done",
+    "console_release_enter",
+    "console_release_done",
+    "member_web_start_enter",
+    "member_stop_enter",
+    "owner_attach_enter",
+    "owner_stop_enter",
+    "member_reopen_enter",
+    "artifact_download_enter",
+    "artifact_download_done",
+    "artifact_hash_done",
+    "ctrlc_sent",
+    "exit_wait_enter",
+    "exit_observed",
+    "streams_drained",
+    "console_released",
+    "stop_ctrlc_failed",
+    "stop_exit_timeout",
+    "stop_stream_timeout",
+    "stop_release_failed",
+    "stop_done",
+    "console_test_enter",
+    "console_test_not_owned",
+    "console_test_missing",
+    "console_test_exited",
+    "console_test_ready",
+    "console_test_mismatch",
+    "console_test_extra_trusted",
+    "console_test_extra_unknown",
+    "console_test_error",
+}
+
+
+def remote_contract_is_complete(
+    remote: RemoteRun,
+    expected_binary_hash: str,
+    expected_binary_size: int,
+    expected_file_hash: str,
+    expected_file_size: int | None = None,
+) -> bool:
+    """Require one complete transcript with independent binary/file bindings."""
+
+    if (
+        remote.status_code != 0
+        or remote.command_timed_out
+        or not remote.transport_cleanup_completed
+        or remote.transport_error_class not in (None, "")
+        or remote.forced_termination
+        or not remote.graceful_signal
+    ):
+        return False
+    if [item.get("phase") for item in remote.phases] != list(REMOTE_REQUIRED_PHASES):
+        return False
+    if any(item.get("ok") is not True for item in remote.phases):
+        return False
+    binary = remote.phases[0]
+    if binary.get("hash") != expected_binary_hash or binary.get("size") != expected_binary_size:
+        return False
+    file_hash = remote.phases[7]
+    if file_hash.get("hash") != expected_file_hash or not isinstance(file_hash.get("size"), int) or file_hash["size"] <= 0:
+        return False
+    if expected_file_size is not None and file_hash.get("size") != expected_file_size:
+        return False
+    cleanup = remote.phases[-1]
+    return cleanup.get("signal") == "ctrl_c" and cleanup.get("forced") is not True
 
 # pywinrm's Session.run_ps builds a `powershell -encodedcommand ...` command
 # and sends it through the Windows command shell.  The command shell has an
 # approximately 8 KiB command-line limit.  The direct WinRS path below keeps
-# the same UTF-16LE/Base64 PowerShell payload but sets WINRS_SKIP_CMD_SHELL so
-# cmd.exe is not involved.  The upper bound is a fail-closed guard for the
-# WinRS argument itself; it is never reported with payload contents.
+# a short PowerShell stdin command and sets WINRS_SKIP_CMD_SHELL so cmd.exe is
+# not involved.  The payload is sent in bounded stdin chunks; its upper bound
+# is a fail-closed guard and is never reported with payload contents.
 WINRM_CMD_SHELL_LIMIT_BYTES = 8191
 WINRM_MAX_ENCODED_COMMAND_BYTES = 512 * 1024
 WINRM_DIRECT_COMMAND_LIMIT_BYTES = 32767
-WINRM_POWER_SHELL_ARGUMENTS = (
+WINRM_MAX_STDIN_PAYLOAD_BYTES = 512 * 1024
+WINRM_STDIN_CHUNK_BYTES = 4096
+# A receive request may legitimately return a WSMan operation-timeout while a
+# long-running PowerShell role is still working.  Poll those responses with a
+# short bounded operation timeout, but put a hard ceiling on the whole remote
+# command so a lost child cannot hold the controller indefinitely.
+WINRM_RECEIVE_OPERATION_TIMEOUT_SECONDS = 10
+WINRM_RECEIVE_READ_TIMEOUT_SECONDS = 15
+WINRM_COMMAND_DEADLINE_SECONDS = 180
+WINRM_CLEANUP_OPERATION_TIMEOUT_SECONDS = 5
+WINRM_CLEANUP_READ_TIMEOUT_SECONDS = 8
+WINRM_CLEANUP_DEADLINE_SECONDS = 15
+WINRM_POWER_SHELL_STDIN_ARGUMENTS = (
     "-NoLogo",
     "-NoProfile",
     "-NonInteractive",
     "-ExecutionPolicy",
     "Bypass",
-    "-EncodedCommand",
+    "-Command",
+    "-",
 )
 
 
@@ -797,6 +1073,15 @@ class RemoteRun:
     file_size: int | None = None
     binary_size: int | None = None
     forced_termination: bool = False
+    graceful_signal: bool = False
+    command_timed_out: bool = False
+    transport_cleanup_completed: bool = False
+    receive_poll_count: int = 0
+    diagnostic_stages: list[str] = field(default_factory=list)
+    diagnostic_counts: dict[str, int] = field(default_factory=dict)
+    diagnostic_elapsed_ms: dict[str, int] = field(default_factory=dict)
+    transport_error_class: str | None = None
+    output_bytes: int = 0
     status_code: int = 1
 
 
@@ -805,6 +1090,11 @@ class WinRMResult:
     std_out: bytes
     std_err: bytes
     status_code: int
+    command_timed_out: bool = False
+    transport_cleanup_completed: bool = False
+    receive_poll_count: int = 0
+    error_class: str | None = None
+    output_bytes: int = 0
 
 
 def parse_remote_output(stdout: bytes | str, expected_hash: str, expected_size: int | None = None) -> RemoteRun:
@@ -818,10 +1108,19 @@ def parse_remote_output(stdout: bytes | str, expected_hash: str, expected_size: 
         fail("api_response_invalid")
     result = RemoteRun()
     for line in text.splitlines():
+        trace = REMOTE_TRACE_RE.fullmatch(line.strip())
+        if trace and trace.group(1) in REMOTE_TRACE_STAGES:
+            stage = trace.group(1)
+            result.diagnostic_stages.append(stage)
+            if trace.group(2) is not None:
+                result.diagnostic_counts.setdefault(stage, int(trace.group(2)))
+            if trace.group(3) is not None:
+                result.diagnostic_elapsed_ms.setdefault(stage, int(trace.group(3)))
+            continue
         match = REMOTE_LINE_RE.fullmatch(line.strip())
         if not match or match.group(1) not in REMOTE_PHASES:
             continue
-        phase, ok, hash_value, size_value, forced, error_class = match.groups()
+        phase, ok, hash_value, size_value, forced, signal, error_class = match.groups()
         if error_class not in ERROR_CLASSES:
             error_class = "unexpected"
         if hash_value and phase == "file_hash":
@@ -838,6 +1137,8 @@ def parse_remote_output(stdout: bytes | str, expected_hash: str, expected_size: 
             error_class = "binary_hash_mismatch"
         if forced == "true":
             result.forced_termination = True
+        if phase == "cleanup" and signal == "ctrl_c" and ok == "true":
+            result.graceful_signal = True
         result.phases.append(
             {
                 "phase": phase,
@@ -845,10 +1146,42 @@ def parse_remote_output(stdout: bytes | str, expected_hash: str, expected_size: 
                 "hash": hash_value,
                 "size": int(size_value) if size_value is not None else None,
                 "forced": forced == "true",
+                "signal": signal,
                 "error_class": error_class or ("none" if ok == "true" else "unexpected"),
             }
         )
     return result
+
+
+def add_remote_timeout_phase(remote: RemoteRun) -> None:
+    """Mark the first unobserved required phase after a bounded timeout.
+
+    The remote script writes a phase only after that phase has reached a
+    definitive result.  If WinRS stops returning before the next line, the
+    controller records a synthetic fixed-class timeout entry so the evidence
+    identifies the boundary without copying remote exception text.
+    """
+
+    if not remote.command_timed_out:
+        return
+    if remote.phases and remote.phases[-1].get("ok") is False:
+        return
+    observed = [item.get("phase") for item in remote.phases]
+    next_phase = next((phase for phase in REMOTE_REQUIRED_PHASES if phase not in observed), None)
+    if next_phase is None:
+        return
+    remote.phases.append(
+        {
+            "phase": next_phase,
+            "ok": False,
+            "hash": None,
+            "size": None,
+            "forced": False,
+            "signal": None,
+            "error_class": "timeout",
+            "synthetic": True,
+        }
+    )
 
 
 def record_remote_output(recorder: PhaseRecorder, role: str, remote: RemoteRun) -> None:
@@ -904,56 +1237,229 @@ def _winrm_command_lengths(command: str) -> dict[str, int]:
 
     encoded = _winrm_encoded_command(command)
     legacy_command = "powershell -encodedcommand " + encoded
-    direct_command = "powershell.exe " + " ".join((*WINRM_POWER_SHELL_ARGUMENTS, encoded))
+    direct_command = "powershell.exe " + " ".join(WINRM_POWER_SHELL_STDIN_ARGUMENTS)
     return {
         "wrapper_bytes": len(command.encode("utf-8")),
         "encoded_command_bytes": len(encoded.encode("ascii")),
         "legacy_run_ps_command_bytes": len(legacy_command.encode("ascii")),
         "direct_skip_cmd_shell_command_bytes": len(direct_command.encode("ascii")),
+        "direct_stdin_payload_bytes": len(command.encode("utf-8")),
     }
 
 
 def _run_winrm_powershell(session: Any, command: str) -> WinRMResult:
-    """Run PowerShell through WinRS directly, bypassing cmd.exe."""
+    """Run PowerShell through WinRS with bounded output polling.
+
+    ``Protocol.get_command_output`` intentionally retries operation timeouts
+    forever.  That is useful for a human-triggered long command, but it can
+    leave a verification controller waiting after the remote role has lost its
+    owner or child process.  The public ``get_command_output_raw`` API gives us
+    one Receive response at a time, so retain its bytes in memory and enforce
+    an overall monotonic deadline here.
+    """
 
     protocol = getattr(session, "protocol", None)
     if protocol is None:
         fail("external_unavailable", "blocked")
-    encoded = _winrm_encoded_command(command)
-    direct_command = "powershell.exe " + " ".join((*WINRM_POWER_SHELL_ARGUMENTS, encoded))
+    try:
+        payload = command.encode("ascii")
+    except UnicodeEncodeError:
+        fail("config_invalid")
+    if not payload or len(payload) > WINRM_MAX_STDIN_PAYLOAD_BYTES:
+        fail("api_response_invalid")
+    direct_command = "powershell.exe " + " ".join(WINRM_POWER_SHELL_STDIN_ARGUMENTS)
     if len(direct_command.encode("ascii")) > WINRM_DIRECT_COMMAND_LIMIT_BYTES:
         fail("api_response_invalid")
+    raw_output = getattr(protocol, "get_command_output_raw", None)
+    if not callable(raw_output):
+        # Do not silently fall back to the unbounded compatibility wrapper.
+        fail("external_unavailable", "blocked")
+
     shell_id: Any = None
     command_id: Any = None
     cleanup_failed = False
+    command_timed_out = False
+    receive_poll_count = 0
+    std_out_parts: list[bytes] = []
+    std_err_parts: list[bytes] = []
+    status_code = -1
+    transport_error_class: str | None = None
+    old_operation_timeout = getattr(protocol, "operation_timeout_sec", None)
+    old_read_timeout = getattr(protocol, "read_timeout_sec", None)
+    transport = getattr(protocol, "transport", None)
+    old_transport_read_timeout = getattr(transport, "read_timeout_sec", None)
+
+    def set_receive_timeouts() -> None:
+        # Protocol fields are mutable in the supported pywinrm API.  Keep the
+        # fallback assignments conditional so small fake protocols remain
+        # usable in unit tests without making assumptions about their shape.
+        if hasattr(protocol, "operation_timeout_sec"):
+            protocol.operation_timeout_sec = WINRM_RECEIVE_OPERATION_TIMEOUT_SECONDS
+        if hasattr(protocol, "read_timeout_sec"):
+            protocol.read_timeout_sec = WINRM_RECEIVE_READ_TIMEOUT_SECONDS
+        if transport is not None and hasattr(transport, "read_timeout_sec"):
+            transport.read_timeout_sec = WINRM_RECEIVE_READ_TIMEOUT_SECONDS
+
+    def restore_timeouts() -> None:
+        if old_operation_timeout is not None and hasattr(protocol, "operation_timeout_sec"):
+            protocol.operation_timeout_sec = old_operation_timeout
+        if old_read_timeout is not None and hasattr(protocol, "read_timeout_sec"):
+            protocol.read_timeout_sec = old_read_timeout
+        if transport is not None and old_transport_read_timeout is not None:
+            transport.read_timeout_sec = old_transport_read_timeout
+
+    def is_operation_timeout(error: Exception) -> bool:
+        # Import lazily: the harness's local validation suite does not require
+        # pywinrm, while the approved WinRM runner does provide it.
+        try:
+            from winrm.exceptions import WinRMOperationTimeoutError  # type: ignore[import-not-found]
+
+            if isinstance(error, WinRMOperationTimeoutError):
+                return True
+        except ImportError:
+            pass
+        return type(error).__name__ == "WinRMOperationTimeoutError"
+
+    def classify_transport_error(error: Exception) -> str:
+        if is_operation_timeout(error) or isinstance(error, TimeoutError):
+            return "timeout"
+        if isinstance(error, (ConnectionError, OSError)):
+            return "external_unavailable"
+        return "remote_failure"
+
+    def mark_transport_error(error: Exception) -> None:
+        nonlocal command_timed_out, transport_error_class
+        category = classify_transport_error(error)
+        if transport_error_class is None:
+            transport_error_class = category
+        if category == "timeout":
+            command_timed_out = True
+
+    deadline = time.monotonic() + WINRM_COMMAND_DEADLINE_SECONDS
+
+    def before_command_rpc() -> bool:
+        nonlocal command_timed_out, transport_error_class
+        if time.monotonic() >= deadline:
+            command_timed_out = True
+            transport_error_class = transport_error_class or "timeout"
+            return False
+        return True
+
+    def command_rpc(call: Callable[[], Any]) -> tuple[bool, Any]:
+        """Run setup/input RPCs only while the one command deadline remains."""
+
+        if not before_command_rpc():
+            return False, None
+        try:
+            return True, call()
+        except Exception as error:
+            mark_transport_error(error)
+            return False, None
+
     try:
-        shell_id = protocol.open_shell()
-        command_id = protocol.run_command(
-            shell_id,
-            "powershell.exe",
-            (*WINRM_POWER_SHELL_ARGUMENTS, encoded),
-            console_mode_stdin=False,
-            skip_cmd_shell=True,
-        )
-        std_out, std_err, status_code = protocol.get_command_output(shell_id, command_id)
-    except HarnessError:
-        raise
-    except Exception:
-        fail("external_unavailable", "blocked")
+        set_receive_timeouts()
+        opened, shell_id = command_rpc(protocol.open_shell)
+        if opened:
+            started, command_id = command_rpc(
+                lambda: protocol.run_command(
+                    shell_id,
+                    "powershell.exe",
+                    WINRM_POWER_SHELL_STDIN_ARGUMENTS,
+                    console_mode_stdin=True,
+                    skip_cmd_shell=True,
+                )
+            )
+        else:
+            started = False
+        if started:
+            input_complete = True
+            for offset in range(0, len(payload), WINRM_STDIN_CHUNK_BYTES):
+                sent, _ = command_rpc(
+                    lambda offset=offset: protocol.send_command_input(
+                        shell_id,
+                        command_id,
+                        payload[offset : offset + WINRM_STDIN_CHUNK_BYTES],
+                        end=False,
+                    )
+                )
+                if not sent:
+                    input_complete = False
+                    break
+            if input_complete:
+                input_complete, _ = command_rpc(
+                    lambda: protocol.send_command_input(shell_id, command_id, b"", end=True)
+                )
+            if input_complete:
+                command_done = False
+                while not command_done:
+                    if not before_command_rpc():
+                        break
+                    try:
+                        std_out, std_err, status_code, command_done = raw_output(shell_id, command_id)
+                        receive_poll_count += 1
+                        if std_out:
+                            std_out_parts.append(bytes(std_out))
+                        if std_err:
+                            std_err_parts.append(bytes(std_err))
+                        if sum(map(len, std_out_parts)) + sum(map(len, std_err_parts)) > WINRM_MAX_STDIN_PAYLOAD_BYTES:
+                            transport_error_class = transport_error_class or "api_response_invalid"
+                            break
+                    except Exception as error:
+                        if not is_operation_timeout(error):
+                            mark_transport_error(error)
+                            status_code = -1
+                            break
+                        receive_poll_count += 1
+                        # An operation-timeout is expected while the command
+                        # is running.  The next loop iteration checks the
+                        # hard deadline before issuing another Receive.
+                        if not before_command_rpc():
+                            break
+        if command_timed_out or transport_error_class in {"timeout", "api_response_invalid"}:
+            status_code = -1
     finally:
-        if shell_id is not None and command_id is not None:
+        # Cleanup gets a separate short transport budget.  Reusing the command
+        # deadline here would either issue an unbounded request after expiry or
+        # silently skip handle cleanup and lose the orphan-state distinction.
+        if hasattr(protocol, "operation_timeout_sec"):
+            protocol.operation_timeout_sec = WINRM_CLEANUP_OPERATION_TIMEOUT_SECONDS
+        if hasattr(protocol, "read_timeout_sec"):
+            protocol.read_timeout_sec = WINRM_CLEANUP_READ_TIMEOUT_SECONDS
+        if transport is not None and hasattr(transport, "read_timeout_sec"):
+            transport.read_timeout_sec = WINRM_CLEANUP_READ_TIMEOUT_SECONDS
+        cleanup_deadline = time.monotonic() + WINRM_CLEANUP_DEADLINE_SECONDS
+
+        def cleanup_rpc(call: Callable[[], Any]) -> bool:
+            if time.monotonic() >= cleanup_deadline:
+                return False
             try:
-                protocol.cleanup_command(shell_id, command_id)
+                call()
+                return True
             except Exception:
+                return False
+
+        if shell_id is not None and command_id is not None:
+            if not cleanup_rpc(lambda: protocol.cleanup_command(shell_id, command_id)):
                 cleanup_failed = True
         if shell_id is not None:
-            try:
-                protocol.close_shell(shell_id)
-            except Exception:
+            if not cleanup_rpc(lambda: protocol.close_shell(shell_id)):
                 cleanup_failed = True
+        try:
+            restore_timeouts()
+        except Exception:
+            cleanup_failed = True
     if cleanup_failed:
-        fail("external_unavailable", "blocked")
-    return WinRMResult(bytes(std_out), bytes(std_err), int(status_code))
+        transport_error_class = transport_error_class or "cleanup_incomplete"
+    return WinRMResult(
+        b"".join(std_out_parts),
+        b"".join(std_err_parts),
+        int(status_code),
+        command_timed_out=command_timed_out,
+        transport_cleanup_completed=not cleanup_failed,
+        receive_poll_count=receive_poll_count,
+        error_class=transport_error_class,
+        output_bytes=sum(map(len, std_out_parts)) + sum(map(len, std_err_parts)),
+    )
 
 
 def run_winrm_member(
@@ -1016,19 +1522,33 @@ def run_winrm_member(
             )
             result = _run_winrm_powershell(session, wrapper)
         except ImportError:
-            fail("external_unavailable", "blocked")
+            # This is a controller precondition; no remote shell was created.
+            return RemoteRun(
+                status_code=-1,
+                transport_cleanup_completed=True,
+                transport_error_class="external_unavailable",
+            )
         except Exception:
-            fail("external_unavailable", "blocked")
+            # Preserve a fixed transport category.  In particular, do not turn
+            # an exception after shell setup into a blocked result with no
+            # partial transcript; _run_winrm_powershell handles those cases.
+            return RemoteRun(
+                status_code=-1,
+                transport_cleanup_completed=True,
+                transport_error_class="external_unavailable",
+            )
         remote = parse_remote_output(result.std_out, artifact_hash, artifact_size)
         remote.status_code = int(result.status_code)
-        if remote.status_code != 0 and not remote.phases:
-            fail("external_unavailable", "blocked")
+        remote.command_timed_out = result.command_timed_out
+        remote.transport_cleanup_completed = result.transport_cleanup_completed
+        remote.receive_poll_count = result.receive_poll_count
+        remote.transport_error_class = result.error_class
+        remote.output_bytes = result.output_bytes
+        add_remote_timeout_phase(remote)
         if not server.served:
-            fail("external_unavailable", "blocked")
+            remote.transport_error_class = remote.transport_error_class or "external_unavailable"
         if server.transfer_error:
-            fail("external_unavailable", "blocked")
-        if remote.file_hash and remote.file_hash != "" and remote.file_hash != "0" * 64:
-            return remote
+            remote.transport_error_class = remote.transport_error_class or "external_unavailable"
         return remote
     finally:
         server.stop()
@@ -1209,15 +1729,21 @@ class LocalWebProcess:
         self.prepare()
         port = free_tcp_port()
         try:
+            arguments = [
+                str(self.spec.binary),
+                "web",
+                "--bind",
+                f"{self.spec.bind_host}:{port}",
+                "--data-dir",
+                str(self.data_dir),
+            ]
+            if self.spec.bind_host in {"0.0.0.0", "::"}:
+                public_host = os.environ.get("QSYNC_F_PUBLIC_HOST")
+                if not public_host:
+                    fail("config_invalid")
+                arguments.extend(("--allow-host", validate_host(public_host)))
             self.process = subprocess.Popen(
-                [
-                    str(self.spec.binary),
-                    "web",
-                    "--bind",
-                    f"{self.spec.bind_host}:{port}",
-                    "--data-dir",
-                    str(self.data_dir),
-                ],
+                arguments,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -1290,7 +1816,7 @@ def make_fixture(owner: LocalWebProcess) -> tuple[Path, dict[str, str]]:
     owner.prepare()
     fixture_a = owner.root / "fixture-a.bin"
     fixture_b = owner.root / "fixture-b.bin"
-    fixture_a.write_bytes(bytes((index * 17) % 251 for index in range(256 * 1024)))
+    fixture_a.write_bytes(bytes((index * 17) % 251 for index in range(FIXTURE_A_SIZE_BYTES)))
     fixture_b.write_bytes(bytes((index * 29 + 7) % 251 for index in range(192 * 1024)))
     return owner.root, {
         "fixture_a": file_sha256(fixture_a),
@@ -1363,6 +1889,7 @@ def run_harness(config: HarnessConfig, evidence_dir: Path, execute_external: boo
     run_root: Path | None = None
     evidence: SafeEvidence | None = None
     binary_hashes: dict[str, str] = {}
+    staged_specs: dict[str, RoleSpec] = {}
     providers = [
         {"role": "owner-provider", "epoch": 0, "verified_chunks": 0, "verified_bytes": 0},
         {"role": "rw-provider", "epoch": None, "verified_chunks": 0, "verified_bytes": 0},
@@ -1370,6 +1897,16 @@ def run_harness(config: HarnessConfig, evidence_dir: Path, execute_external: boo
     file_hash_verified: dict[str, dict[str, Any]] = {}
     remote_binary: dict[str, dict[str, Any]] = {}
     remote_forced_termination: dict[str, bool] = {}
+    remote_graceful_signal: dict[str, bool] = {}
+    remote_command_timed_out: dict[str, bool] = {}
+    remote_transport_cleanup: dict[str, bool] = {}
+    remote_receive_poll_count: dict[str, int] = {}
+    remote_transport_error: dict[str, str] = {}
+    remote_output_bytes: dict[str, int] = {}
+    remote_diagnostic_stages: dict[str, list[str]] = {}
+    remote_diagnostic_counts: dict[str, dict[str, int]] = {}
+    remote_diagnostic_elapsed_ms: dict[str, dict[str, int]] = {}
+    remote_contract_valid: dict[str, bool] = {}
     status = "failed"
     cleanup_state = {
         "owned_processes_stopped": False,
@@ -1419,10 +1956,11 @@ def run_harness(config: HarnessConfig, evidence_dir: Path, execute_external: boo
                 "binary_verification",
                 role,
                 f"provenance.binary.{role}",
-                lambda spec=spec, role_artifact=role_artifact: verify_role_binary(spec, role_artifact),
+                lambda spec=spec, role_artifact=role_artifact: stage_role_binary(spec, role_artifact, run_root),
             )
             if outcome.status == "pass":
-                binary_hashes[role] = outcome.value
+                staged_specs[role] = replace(spec, binary=outcome.value)
+                binary_hashes[role] = role_artifact["sha256"]
             elif spec.runner == "local":
                 status = "failed"
                 return 1
@@ -1433,7 +1971,9 @@ def run_harness(config: HarnessConfig, evidence_dir: Path, execute_external: boo
                 "self_test",
                 role,
                 f"host.self_test.{role}",
-                lambda spec=spec: run_self_test(spec, run_root / (spec.name + "-self-test-profile")),
+                lambda spec=staged_specs.get(role, spec): run_self_test(
+                    spec, run_root / (spec.name + "-self-test-profile")
+                ),
             )
             if self_test.status == "failed":
                 status = "failed"
@@ -1453,7 +1993,7 @@ def run_harness(config: HarnessConfig, evidence_dir: Path, execute_external: boo
             )
             status = "blocked"
             return 2
-        owner_spec = config.roles["owner"]
+        owner_spec = staged_specs.get("owner", config.roles["owner"])
         if owner_spec.runner == "local":
             owner_process = LocalWebProcess(owner_spec, run_root, "owner", vault)
             processes.append(owner_process)
@@ -1495,7 +2035,7 @@ def run_harness(config: HarnessConfig, evidence_dir: Path, execute_external: boo
             return 1
         issued = issue_outcome.value
         for role, permission in (("rw_provider", "read_write"), ("ro_consumer", "read_only")):
-            spec = config.roles[role]
+            spec = staged_specs.get(role, config.roles[role])
             if spec.runner == "github_hosted":
                 # Hosted RO is a separate reusable-workflow role driver.  The
                 # controller must not substitute a prestarted client or claim
@@ -1547,12 +2087,30 @@ def run_harness(config: HarnessConfig, evidence_dir: Path, execute_external: boo
                         vault,
                     ),
                 )
-                if remote_outcome.status != "pass":
+                remote_value = remote_outcome.value
+                remote: RemoteRun | None = remote_value if isinstance(remote_value, RemoteRun) else None
+                if remote is None:
                     status = remote_outcome.status
-                    return 2 if status == "blocked" else 1
-                remote: RemoteRun = remote_outcome.value
+                    return 2 if status in {"blocked", "pending"} else 1
                 record_remote_output(recorder, role, remote)
                 remote_forced_termination[role] = remote.forced_termination
+                remote_graceful_signal[role] = remote.graceful_signal
+                remote_command_timed_out[role] = remote.command_timed_out
+                remote_transport_cleanup[role] = remote.transport_cleanup_completed
+                remote_receive_poll_count[role] = remote.receive_poll_count
+                if remote.transport_error_class:
+                    remote_transport_error[role] = remote.transport_error_class
+                remote_output_bytes[role] = remote.output_bytes
+                remote_diagnostic_stages[role] = remote.diagnostic_stages
+                remote_diagnostic_counts[role] = remote.diagnostic_counts
+                remote_diagnostic_elapsed_ms[role] = remote.diagnostic_elapsed_ms
+                remote_contract_valid[role] = remote_contract_is_complete(
+                    remote,
+                    rw_artifact["sha256"],
+                    rw_artifact["size_bytes"],
+                    expected,
+                    FIXTURE_A_SIZE_BYTES,
+                )
                 binary_observed = any(
                     item["phase"] == "binary_verification" and item["ok"] and item["hash"] == rw_artifact["sha256"]
                     for item in remote.phases
@@ -1570,13 +2128,26 @@ def run_harness(config: HarnessConfig, evidence_dir: Path, execute_external: boo
                         "size_bytes": remote.file_size,
                         "observed": True,
                     }
+                if remote_outcome.status != "pass":
+                    status = remote_outcome.status
+                    return 2 if status in {"blocked", "pending"} else 1
                 if remote.forced_termination:
                     # A forced/unknown remote stop leaves the remote namespace
                     # for inspection; it cannot be reported as a completed
                     # role even when the file hash was correct.
                     status = "pending"
                     return 2
-                if remote.status_code != 0 or not remote.phases or any(not item["ok"] for item in remote.phases):
+                if remote.command_timed_out or not remote.transport_cleanup_completed:
+                    # A bounded controller timeout or incomplete WinRS cleanup
+                    # does not prove that the remote process and namespace are
+                    # gone.  Preserve the run for inspection and keep the
+                    # result pending rather than claiming a clean stop.
+                    status = "pending"
+                    return 2
+                if not remote.graceful_signal:
+                    status = "pending"
+                    return 2
+                if not remote_contract_valid[role]:
                     cleanup_pending = any(
                         item["phase"] == "cleanup" and item["error_class"] == "cleanup_incomplete"
                         for item in remote.phases
@@ -1733,7 +2304,20 @@ def run_harness(config: HarnessConfig, evidence_dir: Path, execute_external: boo
                 "source_sha": config.source_sha,
                 "binary_sha256": binary_hashes,
                 "remote_binary": remote_binary,
-                "topology": [ROLE_LABELS[role] for role in ROLE_NAMES],
+                "remote_graceful_signal": remote_graceful_signal,
+                "remote_command_timed_out": remote_command_timed_out,
+                "remote_transport_cleanup": remote_transport_cleanup,
+                "remote_receive_poll_count": remote_receive_poll_count,
+                "remote_transport_error": remote_transport_error,
+                "remote_output_bytes": remote_output_bytes,
+                "remote_diagnostic_stages": remote_diagnostic_stages,
+                "remote_diagnostic_counts": remote_diagnostic_counts,
+                "remote_diagnostic_elapsed_ms": remote_diagnostic_elapsed_ms,
+                "remote_contract_valid": remote_contract_valid,
+                "topology": [
+                    {"role": role, "label": ROLE_LABELS[role], "runner": config.roles[role].runner}
+                    for role in ROLE_NAMES
+                ],
                 "providers": providers,
                 "file_hash_verified": file_hash_verified,
                 "phases": recorder.phases,
@@ -1742,8 +2326,7 @@ def run_harness(config: HarnessConfig, evidence_dir: Path, execute_external: boo
                 "raw_output_retained": False,
             }
             try:
-                evidence.write_json("f-run-manifest.json", manifest)
-                evidence.write_jsonl("f-phase-events.jsonl", recorder.phases)
+                evidence.write_bundle("f-run-manifest.json", manifest, "f-phase-events.jsonl", recorder.phases)
             except Exception:
                 # Evidence is part of the gate.  A redaction or persistence
                 # failure must override an otherwise passing/blocked result.
@@ -1765,10 +2348,22 @@ def validate_artifact(source_sha: str, manifest_path: Path, binary: Path, role: 
             print("QSYNC_F_VALIDATE|ok=false|error_class=manifest_invalid")
             return 1
         artifact = raw_artifacts.get(role)
+    elif isinstance(artifact, dict):
+        artifact = {
+            **artifact,
+            "source_sha": artifact.get("source_sha", manifest.get("source_sha")),
+            "workflow_sha": artifact.get("workflow_sha", manifest.get("workflow_sha")),
+            "target": artifact.get("target", manifest.get("target")),
+        }
     if not isinstance(artifact, dict) or not SHA256_RE.fullmatch(str(artifact.get("sha256", ""))):
         print("QSYNC_F_VALIDATE|ok=false|error_class=manifest_invalid")
         return 1
-    if artifact.get("source_sha", source_sha) != source_sha or artifact.get("workflow_sha", source_sha) != source_sha:
+    if (
+        artifact.get("source_sha") != source_sha
+        or artifact.get("workflow_sha") != source_sha
+        or not isinstance(artifact.get("target"), str)
+        or not artifact.get("target")
+    ):
         print("QSYNC_F_VALIDATE|ok=false|error_class=source_mismatch")
         return 1
     if not binary.is_file():

@@ -65,16 +65,17 @@ CLI argument는 로그·evidence·artifact에 쓰지 않는다. GitHub reusable 
 
 WinRM은 `Session.run_ps`를 사용하지 않는다. pywinrm의 해당 편의 메서드는
 `powershell -encodedcommand ...`를 Windows command shell로 보내므로, wrapper의
-UTF-16LE/Base64 payload를 메모리에서 만들고 `Protocol.run_command`에
+UTF-16LE/Base64 길이는 메모리에서 측정하되, 실제 payload는 `powershell -Command -`의
+stdin으로 4,096-byte 조각씩 보낸다. `Protocol.run_command`에는
 `skip_cmd_shell=True`를 지정해 `powershell.exe`를 직접 실행한다. `open_shell`,
-`get_command_output`, `cleanup_command`, `close_shell`을 모두 같은 호출에서 정리하며,
-정리 실패나 encoded argument·직접 process command의 한계를 넘는 입력은 고정 오류로
-실패시킨다. encoded payload는 512 KiB, 전체 직접 command는 Windows의 32,767-byte
-한계로 제한한다. 길이 검사는 payload를 기록하지 않고 숫자만 산출한다. 비밀 없는 대표
-config에서 wrapper는 6,374 bytes,
-encoded payload는 17,000 bytes, 기존 run_ps command는 17,027 bytes,
-직접 WinRS command는 17,090 bytes였고 command-shell 8,191-byte 경계를 넘었으므로
-이 경로가 필수임을 확인했다.
+`send_command_input`, `get_command_output`, `cleanup_command`, `close_shell`을 모두
+같은 호출에서 정리하며, 정리 실패나 512 KiB를 넘는 stdin payload는 고정 오류로
+실패시킨다. 직접 command는 Windows의 32,767-byte 한계도 검사한다. 길이 검사는
+payload를 기록하지 않고 숫자만 산출한다. 비밀 없는 대표 config에서 wrapper/stdin은
+8,258 bytes, legacy UTF-16LE/Base64 payload는 22,024 bytes, 기존 run_ps command는
+22,051 bytes, 직접 WinRS command는 84 bytes였고 command-shell 8,191-byte 경계를
+넘는 payload를 4,096-byte 조각으로 전송하는 fake Protocol 및 승인 서버 hello에서
+이 경계를 확인했다.
 
 wrapper의 `ConfigB64`는 gzip으로 압축한 UTF-8 JSON을 Base64로 감싼 형식이며,
 Windows `Decode-Config`도 같은 순서로 Base64 해제 후 gzip 해제를 수행한다. 승인된
@@ -100,6 +101,14 @@ workflow의 `execute_ro`가 명시적으로 true일 때만 secret을 읽는다. 
 response가 없는 phase는 `failed`/`pending`/`blocked`로 남기며 passing manifest로
 바꾸지 않는다.
 
+Windows helper는 앱을 test-owned dedicated console에 붙이고, console process list가
+helper와 해당 child만 포함하는지 확인한 뒤 `CTRL_C_EVENT`를 보낸다. helper 자신의
+handler는 신호를 소비하고 child만 앱 신호 경로를 처리하게 한다. child가 실제로
+신호를 받은 뒤 exit code 0으로 종료하고 cleanup phase가 `signal=ctrl_c`를 내보내야
+Windows role의 graceful signal을 통과시킨다. 이는 앱의 정상 종료·재시작 경계를
+검증하는 것이며, 양 끝점의 managed revoke/pause drain acknowledgement나
+share-swarm 공급자 drain을 대신하지 않는다.
+
 `providers[].verified_chunks`와 `verified_bytes`는 실제
 `deltaweave/share-swarm/1` provider payload 관측값이다. 이 bootstrap의 파일 hash
 성공은 `file_hash_verified[role]`의 SHA-256과 `size_bytes`로만 기록한다. 따라서 현재
@@ -111,10 +120,11 @@ member discovery, relay session/payload와 `share-swarm/1` payload hook가 실�
 정상 종료와 강제 종료는 `forced_termination_used`로 구분한다. graceful drain을
 확인하지 못한 상태에서 complete/cleanup 성공을 주장하지 않는다. run 소유 namespace만
 삭제하고, 종료·drain이 확인되지 않으면 state를 보존하고 cleanup을 pending으로
-기록한다. 현재 이 subset에는 managed pause/revoke drain ACK adapter가 없으므로
-프로세스가 정상 종료해도 `graceful_drain_proven=unverified`로 남기고 소유 state를
-보존한다. pre-existing 보호 상태는 실제 before/after 비교가 없으면
-`unverified`로 남는다.
+기록한다. Linux local process와 bilateral managed pause/revoke drain ACK adapter가
+없는 경로는 `graceful_drain_proven=unverified`로 남긴다. Windows의
+`graceful_signal=ctrl_c`는 별도로 앱 신호와 exit code를 입증하지만 원격 writer/reader
+drain 완료를 의미하지 않는다. pre-existing 보호 상태는 실제 before/after 비교가
+없으면 `unverified`로 남는다.
 
 ## 검증 범위
 
@@ -145,3 +155,44 @@ GitHub reusable workflow dispatch, 새 encrypted secret 생성, 외부 3-host �
 N0/relay, `share-swarm/1` 다중 provider payload, Edge/CDP와 full F acceptance matrix는
 다음 source checkpoint에서 실행한다. 이 문서와 local checks는 실행 경로와 fail-closed
 계약을 검증할 뿐 해당 미실행 항목의 성공을 뜻하지 않는다.
+
+## Bounded WinRM과 Windows 로컬 종료 재검증
+
+`_run_winrm_powershell`은 `get_command_output_raw`의 단일 Receive 응답만 사용한다.
+open/run/stdin/Receive 각 호출 전에 monotonic 전체 deadline을 확인하고, Receive
+operation timeout은 제한된 횟수로 부분 stdout/stderr 바이트와 마지막 고정 phase를
+메모리에 유지한다. cleanup command/close shell은 별도 짧은 deadline에서 시도하고,
+실패·불명확한 child 상태는 `pending`과 상태 보존으로 기록한다. 원격 출력은 고정
+`FTRACE`/`FROLE` parser를 통과한 phase, count, elapsed, error class만 evidence에
+남긴다. PowerShell helper의 stdout/stderr는 .NET `CopyToAsync(Stream.Null)`로
+배수하며 callback scriptblock을 사용하지 않는다.
+
+원격 complete 판정은 binary artifact의 SHA/크기와 destination fixture의 SHA/크기를
+서로 다른 입력으로 비교한다. transport error class가 남거나 cleanup이 불완전하면
+모든 phase가 보였어도 complete가 될 수 없다.
+
+새 test-owned console 실행(retry9, 2026-09-09T07:03:33Z~07:06:38Z)은 source
+`2f44d9fbfbe1c4779bd59f78fe9cc4ff27f41cd6`, Windows artifact
+`186b9e177d8b3a8246ceb994d00402b827fb8481b26642edf4ce62983988453a`/33,488,896
+bytes, generated script SHA
+`e72532d74ebcda2b746d0079f01ff72f5de754d0fa01529bb87162d87e9c5ac2`를 사용했다.
+owner create/key issue, member preview/validate/join, 실제 fixture SHA
+`8b666f88f7b033f647f9b5ae66d668b7bb88376630dbecfb0fba757f4f84334c`/262,144 bytes,
+첫 member와 owner의 `console_test_ready(count=2)`, Ctrl+C, exit 관측, stream drain,
+console release는 통과했다. 재시작 console에서는 추가 1개가 고정 경로·부모 관계상
+test-owned 시스템 PowerShell로 분류된 뒤 count=2로 회복했다. 이는 ACL helper가
+실패 원인이라는 확정 증거가 아니다.
+
+재시작 후 membership 조회와 최종 cleanup은 bounded 전체 timeout으로 완료되지 않아
+결과는 `pending`이다. transport cleanup은 true였고 별도 격리 orphan 확인은
+`matched=0, remaining=0`이었다. 따라서 동일 identity 재오픈·정상 cleanup pass,
+3-host F, bilateral drain ACK, E `share-swarm/1` provider payload를 주장하지 않는다.
+retry8은 pywinrm 없는 system Python으로 원격 실행 전 실패한 실행기 오류이며 별도
+failed evidence로 보존했다. retry9 상세 고정 evidence는
+`f-bootstrap/windows-local-graceful-2f-retry9/` 아래에 있다.
+
+retry9의 transport/phase 기록은 최종 binary/fixture 독립 gate 보정 전 생성된 실행
+기록이므로, 현재 checkpoint의 complete 결과로 재해석하지 않는다. 현재 gate와 28개
+회귀 결과는 commit `df0ba52a058c97523ea119aa5f6296656fe44dd7`에서 다시 확인했고,
+정확한 source hash와 명령 시각은 `f-bootstrap/winrm-bounded-contract-final/`
+검증 ledger에 보존했다.
