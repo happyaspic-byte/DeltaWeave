@@ -151,7 +151,7 @@ drain ACK adapter가 없어 smoke namespace는 보존하고 `drain_ack=unverifie
 다음은 이 checkpoint에서 실행하는 로컬 비밀 없는 검사다.
 
 ```text
-python3 -m py_compile scripts/qsync_three_host_bootstrap.py scripts/qsync_three_host_coordination.py scripts/qsync_three_host_role.py scripts/qsync_three_host_winrm_keepalive.py tests/tools/test_qsync_three_host_coordination.py tests/tools/test_qsync_three_host_f_manifest.py
+python3 -m py_compile scripts/qsync_three_host_bootstrap.py scripts/qsync_three_host_coordination.py scripts/qsync_three_host_role.py scripts/qsync_three_host_winrm_keepalive.py tests/tools/test_qsync_three_host_bootstrap.py tests/tools/test_qsync_three_host_coordination.py tests/tools/test_qsync_three_host_f_manifest.py
 python3 -m unittest discover -s tests/tools -p 'test_qsync_three_host*.py' -v
 ```
 
@@ -241,7 +241,10 @@ evidence로 남긴다. controller는 workflow run을 찾을 때 head/source SHA�
 RO의 `run_id`, RW의 `run_id`, source SHA, fixture hash·크기, 실제
 keepalive 구간이 같은 실행을 가리키는지 확인한다. Linux/Windows executable hash는 달라도
 되며 각 role의 `source_sha`, `workflow_sha`, `target`, hash, 크기를 따로 검증한다.
-keepalive 구간이 RO join 및 파일 검증 phase와 실제로 겹치지 않으면 실패한다. workflow는
+WinRM remote trace의 elapsed 값은 요청한 keepalive 지속시간만 검증하고 controller 시각에
+더하지 않는다. controller가 고정 trace를 실제로 받은 시각을 별도 기록해 keepalive가
+RO join 및 파일 검증 phase와 실제로 겹치는지 확인하며, 이 수신 구간이 없거나 겹치지 않으면
+실패한다. workflow는
 evidence 디렉터리를 runner에 미리 만들지 않고 각 driver가 0700으로 단독 생성하게 한다.
 hosted runner에는 RO key만 per-run 별칭으로 주입하고 owner API, RW key, WinRM credential은
 주입하지 않는다. controller, RO key, owner endpoint 중 하나라도 준비되지 않으면 역할은
@@ -249,7 +252,7 @@ hosted runner에는 RO key만 per-run 별칭으로 주입하고 owner API, RW ke
 bilateral drain ACK, E share-swarm provider payload의 성공을 주장하지 않는다.
 
 현재 로컬 검증은 `py_compile` exit 0, `python3 -m unittest discover -s tests/tools
--p 'test_qsync_three_host*.py' -v` 36 tests exit 0, 두 workflow YAML parse exit 0,
+-p 'test_qsync_three_host*.py' -v` 39 tests exit 0, 두 workflow YAML parse exit 0,
 `git diff --check` exit 0이다. `actionlint`는 이 실행 환경에 설치되어 있지 않아
 사용하지 못했다. CI의 caller는 reusable workflow에 job-level `contents:read`와
 `actions:read`만 전달하도록 수정됐고, Linux/Windows web test는 `npm --prefix web

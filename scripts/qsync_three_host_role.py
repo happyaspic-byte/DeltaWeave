@@ -89,8 +89,8 @@ def load_artifact(source_sha: str, manifest_path: Path, binary: Path) -> dict[st
 def phase_window(phases: list[dict[str, Any]], phase_name: str) -> tuple[str | None, str | None]:
     for phase in phases:
         if phase.get("phase") == phase_name and phase.get("status") == "pass":
-            started = phase.get("started")
-            finished = phase.get("finished")
+            started = phase.get("started_utc")
+            finished = phase.get("finished_utc")
             if isinstance(started, str) and isinstance(finished, str):
                 return started, finished
     return None, None
@@ -99,7 +99,7 @@ def phase_window(phases: list[dict[str, Any]], phase_name: str) -> tuple[str | N
 def _run(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     vault = bootstrap.SecretVault()
-    run_started_utc = bootstrap.utc_now()
+    run_started_utc = bootstrap.utc_now_precise()
     run_id = ""
     recorder = bootstrap.PhaseRecorder()
     process: bootstrap.LocalWebProcess | None = None
@@ -235,8 +235,8 @@ def _run(argv: list[str] | None = None) -> int:
                 role="ro_consumer",
                 command_id="ro.reopen.precondition",
                 status="failed",
-                started=bootstrap.utc_now(),
-                finished=bootstrap.utc_now(),
+                started=bootstrap.utc_now_precise(),
+                finished=bootstrap.utc_now_precise(),
                 elapsed_ms=0,
                 error_class="cleanup_incomplete",
             )
@@ -265,8 +265,8 @@ def _run(argv: list[str] | None = None) -> int:
             role="ro_consumer",
             command_id="ro.managed.reopen.membership",
             status="pass" if reopen_ok else "failed",
-            started=bootstrap.utc_now(),
-            finished=bootstrap.utc_now(),
+            started=bootstrap.utc_now_precise(),
+            finished=bootstrap.utc_now_precise(),
             elapsed_ms=0,
             error_class="none" if reopen_ok else "hash_mismatch",
         )
@@ -281,7 +281,7 @@ def _run(argv: list[str] | None = None) -> int:
         result_code = 1
         return result_code
     finally:
-        run_finished_utc = bootstrap.utc_now()
+        run_finished_utc = bootstrap.utc_now_precise()
         if process is not None:
             started_once = process.started_once
             try:
@@ -319,8 +319,8 @@ def _run(argv: list[str] | None = None) -> int:
                 role="controller",
                 command_id="ro.cleanup.run_owned_only",
                 status=cleanup_status,
-                started=bootstrap.utc_now(),
-                finished=bootstrap.utc_now(),
+                started=bootstrap.utc_now_precise(),
+                finished=bootstrap.utc_now_precise(),
                 elapsed_ms=0,
                 error_class="none" if cleanup_status == "pass" else "cleanup_incomplete",
             )

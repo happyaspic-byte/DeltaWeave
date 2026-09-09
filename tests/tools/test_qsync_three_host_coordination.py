@@ -36,6 +36,8 @@ def valid_results() -> tuple[dict[str, object], dict[str, object]]:
         "keepalive_observed": True,
         "keepalive_trace_enter_elapsed_ms": 1000,
         "keepalive_trace_done_elapsed_ms": 301000,
+        "keepalive_enter_observed_utc": "2026-09-09T08:00:01.100000Z",
+        "keepalive_done_observed_utc": "2026-09-09T08:05:01.100000Z",
         "expected_file_hash": FILE_HASH,
         "expected_file_size_bytes": FIXTURE_SIZE,
         "remote_contract_valid": True,
@@ -48,10 +50,10 @@ def valid_results() -> tuple[dict[str, object], dict[str, object]]:
         "run_id": RUN_ID,
         "run_started_utc": "2026-09-09T08:02:00Z",
         "run_finished_utc": "2026-09-09T08:05:00Z",
-        "join_started_utc": "2026-09-09T08:03:00Z",
-        "join_finished_utc": "2026-09-09T08:04:00Z",
-        "file_hash_started_utc": "2026-09-09T08:04:00Z",
-        "file_hash_finished_utc": "2026-09-09T08:05:00Z",
+        "join_started_utc": "2026-09-09T08:03:00.100000Z",
+        "join_finished_utc": "2026-09-09T08:04:00.100000Z",
+        "file_hash_started_utc": "2026-09-09T08:04:00.200000Z",
+        "file_hash_finished_utc": "2026-09-09T08:05:00.200000Z",
         "source_sha": SOURCE,
         "binary_sha256": {"ro_consumer": LINUX_HASH},
         "file_hash_verified": {"ro_consumer": {"sha256": FILE_HASH, "size_bytes": FIXTURE_SIZE}},
@@ -116,6 +118,11 @@ class CoordinationTests(unittest.TestCase):
         rw, ro = valid_results()
         ro["join_started_utc"] = "2026-09-09T08:11:00Z"
         ro["join_finished_utc"] = "2026-09-09T08:12:00Z"
+        result, output = self.invoke(rw, ro)
+        self.assertEqual(result, 1)
+        self.assertIn("time_window_missing", output)
+        rw, ro = valid_results()
+        rw["keepalive_enter_observed_utc"] = None
         result, output = self.invoke(rw, ro)
         self.assertEqual(result, 1)
         self.assertIn("time_window_missing", output)

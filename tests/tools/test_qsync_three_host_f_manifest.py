@@ -22,6 +22,13 @@ assert SPEC is not None and SPEC.loader is not None
 BOOTSTRAP = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = BOOTSTRAP
 SPEC.loader.exec_module(BOOTSTRAP)
+sys.modules.setdefault("qsync_three_host_bootstrap", BOOTSTRAP)
+ROLE_SPEC = importlib.util.spec_from_file_location(
+    "qsync_three_host_role_manifest_test", ROOT / "scripts" / "qsync_three_host_role.py"
+)
+assert ROLE_SPEC is not None and ROLE_SPEC.loader is not None
+ROLE = importlib.util.module_from_spec(ROLE_SPEC)
+ROLE_SPEC.loader.exec_module(ROLE)
 
 
 def digest(path: Path) -> str:
@@ -29,6 +36,20 @@ def digest(path: Path) -> str:
 
 
 class QsyncRoleManifestTests(unittest.TestCase):
+    def test_role_phase_window_reads_durable_recorder_timestamps(self) -> None:
+        phases = [
+            {
+                "phase": "member_join",
+                "status": "pass",
+                "started_utc": "2026-09-09T08:00:00.100000Z",
+                "finished_utc": "2026-09-09T08:00:00.200000Z",
+            }
+        ]
+        self.assertEqual(
+            ROLE.phase_window(phases, "member_join"),
+            ("2026-09-09T08:00:00.100000Z", "2026-09-09T08:00:00.200000Z"),
+        )
+
     def test_config_rejects_raw_share_key(self) -> None:
         with self.assertRaises(BOOTSTRAP.HarnessError) as error:
             BOOTSTRAP.reject_secret_config({"share_key": "raw-secret"})
@@ -530,6 +551,47 @@ class QsyncRoleManifestTests(unittest.TestCase):
             [BOOTSTRAP.WINRM_STDIN_CHUNK_BYTES, BOOTSTRAP.WINRM_STDIN_CHUNK_BYTES, 3, 0],
         )
         self.assertTrue(large_inputs[-1][1][3]["end"])
+
+    def test_winrm_receive_records_controller_keepalive_observation_times(self) -> None:
+        class SplitTraceProtocol:
+            def __init__(self) -> None:
+                self.polls = 0
+
+            def open_shell(self) -> str:
+                return "shell"
+
+            def run_command(self, *_args: object, **_kwargs: object) -> str:
+                return "command"
+
+            def send_command_input(self, *_args: object, **_kwargs: object) -> None:
+                return None
+
+            def get_command_output_raw(self, *_args: object) -> tuple[bytes, bytes, int, bool]:
+                self.polls += 1
+                if self.polls == 1:
+                    return b"FTRACE|stage=keepalive_enter|count=300|elapsed_ms=10", b"", 0, False
+                return b"\nFTRACE|stage=keepalive_done|count=300|elapsed_ms=300010\n", b"", 0, True
+
+            def cleanup_command(self, *_args: object) -> None:
+                return None
+
+            def close_shell(self, *_args: object) -> None:
+                return None
+
+        with mock.patch.object(
+            BOOTSTRAP,
+            "utc_now_precise",
+            side_effect=["2026-09-09T08:00:00.100000Z", "2026-09-09T08:05:00.100000Z"],
+        ):
+            result = BOOTSTRAP._run_winrm_powershell(
+                type("Session", (), {"protocol": SplitTraceProtocol()})(), "Write-Output FTRACE"
+            )
+        self.assertEqual(result.status_code, 0)
+        self.assertRegex(result.diagnostic_observed_utc["keepalive_enter"], r"^2026-\d{2}-\d{2}T")
+        self.assertRegex(result.diagnostic_observed_utc["keepalive_done"], r"^2026-\d{2}-\d{2}T")
+        self.assertLess(
+            result.diagnostic_observed_utc["keepalive_enter"], result.diagnostic_observed_utc["keepalive_done"]
+        )
 
     def test_winrm_command_length_measurement_is_numeric_and_bounded(self) -> None:
         script = (ROOT / "scripts" / "qsync_three_host_winrm_member.ps1").read_text(encoding="utf-8")

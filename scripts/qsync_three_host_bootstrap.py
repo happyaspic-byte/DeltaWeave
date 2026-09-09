@@ -143,6 +143,12 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def utc_now_precise() -> str:
+    """Return a UTC timestamp precise enough to order short API phases."""
+
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
 def json_object(value: Any, error_class: str = "api_response_invalid") -> dict[str, Any]:
     if not isinstance(value, dict):
         fail(error_class)
@@ -492,7 +498,7 @@ class PhaseRecorder:
         action: Callable[[], Any],
     ) -> Outcome:
         started_at = time.monotonic()
-        started = utc_now()
+        started = utc_now_precise()
         try:
             value = action()
             if isinstance(value, Outcome):
@@ -519,7 +525,7 @@ class PhaseRecorder:
             outcome = Outcome("failed", "timeout", 124)
         except Exception:
             outcome = Outcome("failed", "unexpected", 1)
-        finished = utc_now()
+        finished = utc_now_precise()
         self.add(
             phase=phase,
             role=role,
@@ -1128,6 +1134,7 @@ class RemoteRun:
     diagnostic_stages: list[str] = field(default_factory=list)
     diagnostic_counts: dict[str, int] = field(default_factory=dict)
     diagnostic_elapsed_ms: dict[str, int] = field(default_factory=dict)
+    diagnostic_observed_utc: dict[str, str] = field(default_factory=dict)
     transport_error_class: str | None = None
     output_bytes: int = 0
     status_code: int = 1
@@ -1143,6 +1150,7 @@ class WinRMResult:
     receive_poll_count: int = 0
     error_class: str | None = None
     output_bytes: int = 0
+    diagnostic_observed_utc: dict[str, str] = field(default_factory=dict)
 
 
 def parse_remote_output(stdout: bytes | str, expected_hash: str, expected_size: int | None = None) -> RemoteRun:
@@ -1242,8 +1250,8 @@ def record_remote_output(recorder: PhaseRecorder, role: str, remote: RemoteRun) 
             role=role,
             command_id=f"remote.{role}.{phase}.{index}",
             status="pass" if ok else "failed",
-            started=utc_now(),
-            finished=utc_now(),
+            started=utc_now_precise(),
+            finished=utc_now_precise(),
             elapsed_ms=0,
             exit_code=0 if ok else 1,
             error_class=error_class,
@@ -1335,6 +1343,8 @@ def _run_winrm_powershell(
     receive_poll_count = 0
     std_out_parts: list[bytes] = []
     std_err_parts: list[bytes] = []
+    trace_scan_buffer = b""
+    diagnostic_observed_utc: dict[str, str] = {}
     status_code = -1
     transport_error_class: str | None = None
     old_operation_timeout = getattr(protocol, "operation_timeout_sec", None)
@@ -1411,6 +1421,34 @@ def _run_winrm_powershell(
             mark_transport_error(error)
             return False, None
 
+    def observe_trace_bytes(chunk: bytes, *, flush: bool = False) -> None:
+        """Capture controller receive times for the fixed keepalive traces."""
+
+        nonlocal trace_scan_buffer
+        if chunk:
+            trace_scan_buffer += chunk
+            if len(trace_scan_buffer) > 8192:
+                trace_scan_buffer = trace_scan_buffer[-8192:]
+        while b"\n" in trace_scan_buffer:
+            line, trace_scan_buffer = trace_scan_buffer.split(b"\n", 1)
+            try:
+                decoded = line.strip().decode("ascii")
+            except UnicodeDecodeError:
+                continue
+            trace = REMOTE_TRACE_RE.fullmatch(decoded)
+            if trace and trace.group(1) in REMOTE_KEEPALIVE_TRACE_STAGES:
+                diagnostic_observed_utc.setdefault(trace.group(1), utc_now_precise())
+        if flush and trace_scan_buffer:
+            try:
+                decoded = trace_scan_buffer.strip().decode("ascii")
+            except UnicodeDecodeError:
+                trace_scan_buffer = b""
+                return
+            trace_scan_buffer = b""
+            trace = REMOTE_TRACE_RE.fullmatch(decoded)
+            if trace and trace.group(1) in REMOTE_KEEPALIVE_TRACE_STAGES:
+                diagnostic_observed_utc.setdefault(trace.group(1), utc_now_precise())
+
     try:
         set_receive_timeouts()
         opened, shell_id = command_rpc(protocol.open_shell)
@@ -1453,7 +1491,9 @@ def _run_winrm_powershell(
                         std_out, std_err, status_code, command_done = raw_output(shell_id, command_id)
                         receive_poll_count += 1
                         if std_out:
-                            std_out_parts.append(bytes(std_out))
+                            stdout_bytes = bytes(std_out)
+                            std_out_parts.append(stdout_bytes)
+                            observe_trace_bytes(stdout_bytes)
                         if std_err:
                             std_err_parts.append(bytes(std_err))
                         if sum(map(len, std_out_parts)) + sum(map(len, std_err_parts)) > WINRM_MAX_STDIN_PAYLOAD_BYTES:
@@ -1470,6 +1510,7 @@ def _run_winrm_powershell(
                         # hard deadline before issuing another Receive.
                         if not before_command_rpc():
                             break
+        observe_trace_bytes(b"", flush=True)
         if command_timed_out or transport_error_class in {"timeout", "api_response_invalid"}:
             status_code = -1
     finally:
@@ -1514,6 +1555,7 @@ def _run_winrm_powershell(
         receive_poll_count=receive_poll_count,
         error_class=transport_error_class,
         output_bytes=sum(map(len, std_out_parts)) + sum(map(len, std_err_parts)),
+        diagnostic_observed_utc=diagnostic_observed_utc,
     )
 
 
@@ -1608,6 +1650,7 @@ def run_winrm_member(
         remote.receive_poll_count = result.receive_poll_count
         remote.transport_error_class = result.error_class
         remote.output_bytes = result.output_bytes
+        remote.diagnostic_observed_utc = result.diagnostic_observed_utc
         add_remote_timeout_phase(remote)
         if not server.served:
             remote.transport_error_class = remote.transport_error_class or "external_unavailable"

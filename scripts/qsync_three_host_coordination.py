@@ -14,14 +14,16 @@ import argparse
 import json
 import re
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 SOURCE_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 RUN_ID_RE = re.compile(r"^[0-9]{1,20}$")
-UTC_SECONDS_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
+UTC_TIMESTAMP_RE = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?Z$"
+)
 
 
 class CoordinationError(Exception):
@@ -60,43 +62,40 @@ def require_run_id(value: Any) -> str:
     return value
 
 
-def parse_utc_seconds(value: Any) -> datetime:
-    if not isinstance(value, str) or not UTC_SECONDS_RE.fullmatch(value):
+def parse_utc_timestamp(value: Any) -> datetime:
+    if not isinstance(value, str) or not UTC_TIMESTAMP_RE.fullmatch(value):
         raise CoordinationError("time_window_missing")
     try:
-        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         raise CoordinationError("time_window_missing") from None
 
 
-def interval(result: dict[str, Any], start_key: str, finish_key: str) -> tuple[datetime, datetime]:
-    started = parse_utc_seconds(result.get(start_key))
-    finished = parse_utc_seconds(result.get(finish_key))
+def interval_values(start_value: Any, finish_value: Any) -> tuple[datetime, datetime]:
+    started = parse_utc_timestamp(start_value)
+    finished = parse_utc_timestamp(finish_value)
     if finished <= started:
         raise CoordinationError("time_window_missing")
     return started, finished
+
+
+def interval(result: dict[str, Any], start_key: str, finish_key: str) -> tuple[datetime, datetime]:
+    return interval_values(result.get(start_key), result.get(finish_key))
 
 
 def intervals_overlap(left: tuple[datetime, datetime], right: tuple[datetime, datetime]) -> bool:
     return max(left[0], right[0]) < min(left[1], right[1])
 
 
-def elapsed_window(
-    remote_window: tuple[datetime, datetime], enter_elapsed_ms: Any, done_elapsed_ms: Any, keepalive_seconds: int
-) -> tuple[datetime, datetime]:
+def validate_keepalive_trace(enter_elapsed_ms: Any, done_elapsed_ms: Any, keepalive_seconds: int) -> None:
     if (
-        not isinstance(enter_elapsed_ms, int)
+        type(enter_elapsed_ms) is not int
         or enter_elapsed_ms < 0
-        or not isinstance(done_elapsed_ms, int)
+        or type(done_elapsed_ms) is not int
         or done_elapsed_ms < enter_elapsed_ms
         or done_elapsed_ms - enter_elapsed_ms < keepalive_seconds * 1000
     ):
         raise CoordinationError("keepalive_missing")
-    started = remote_window[0] + timedelta(milliseconds=enter_elapsed_ms)
-    finished = remote_window[0] + timedelta(milliseconds=done_elapsed_ms)
-    if started < remote_window[0] or finished > remote_window[1]:
-        raise CoordinationError("time_window_missing")
-    return started, finished
 
 
 def verify(run_id: str, source_sha: str, keepalive_seconds: int, rw: dict[str, Any], ro: dict[str, Any]) -> None:
@@ -141,12 +140,20 @@ def verify(run_id: str, source_sha: str, keepalive_seconds: int, rw: dict[str, A
     rw_window = interval(rw, "remote_command_started_utc", "remote_command_finished_utc")
     ro_window = interval(ro, "join_started_utc", "join_finished_utc")
     ro_file_window = interval(ro, "file_hash_started_utc", "file_hash_finished_utc")
-    keepalive_window = elapsed_window(
-        rw_window,
+    validate_keepalive_trace(
         rw.get("keepalive_trace_enter_elapsed_ms"),
         rw.get("keepalive_trace_done_elapsed_ms"),
         keepalive_seconds,
     )
+    # Remote elapsed values prove the requested keepalive duration but use a
+    # different clock origin.  Use controller receive timestamps for the
+    # cross-role overlap check instead of adding remote elapsed time to the
+    # controller's command-start timestamp.
+    keepalive_window = interval_values(
+        rw.get("keepalive_enter_observed_utc"), rw.get("keepalive_done_observed_utc")
+    )
+    if keepalive_window[0] < rw_window[0] or keepalive_window[1] > rw_window[1]:
+        raise CoordinationError("time_window_missing")
     if not intervals_overlap(keepalive_window, ro_window) or not intervals_overlap(keepalive_window, ro_file_window):
         raise CoordinationError("time_window_missing")
     if rw.get("managed_bilateral_drain_ack") != "unverified":

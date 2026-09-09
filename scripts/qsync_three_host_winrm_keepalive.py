@@ -111,6 +111,12 @@ def write_result(
         "keepalive_trace_done_elapsed_ms": (
             remote.diagnostic_elapsed_ms.get("keepalive_done") if remote is not None else None
         ),
+        "keepalive_enter_observed_utc": (
+            remote.diagnostic_observed_utc.get("keepalive_enter") if remote is not None else None
+        ),
+        "keepalive_done_observed_utc": (
+            remote.diagnostic_observed_utc.get("keepalive_done") if remote is not None else None
+        ),
         "expected_file_hash": expected_file_hash,
         "expected_file_size_bytes": bootstrap.FIXTURE_A_SIZE_BYTES,
         "remote_status_code": remote.status_code if remote is not None else None,
@@ -147,7 +153,7 @@ def write_result(
 
 def run(args: argparse.Namespace) -> int:
     vault = bootstrap.SecretVault()
-    run_started_utc = bootstrap.utc_now()
+    run_started_utc = bootstrap.utc_now_precise()
     run_id = ""
     evidence: bootstrap.SafeEvidence | None = None
     artifact: dict[str, Any] | None = None
@@ -202,7 +208,7 @@ def run(args: argparse.Namespace) -> int:
         share_key = vault.hold(share_key_raw)
         public_host = bootstrap.validate_host(public_host_raw)
         destination = bootstrap.fresh_winrm_destination(spec)
-        remote_command_started_utc = bootstrap.utc_now()
+        remote_command_started_utc = bootstrap.utc_now_precise()
         remote = bootstrap.run_winrm_member(
             spec,
             staged_binary,
@@ -216,7 +222,7 @@ def run(args: argparse.Namespace) -> int:
             vault,
             keepalive_seconds=args.keepalive_seconds,
         )
-        remote_command_finished_utc = bootstrap.utc_now()
+        remote_command_finished_utc = bootstrap.utc_now_precise()
         if keepalive_observed(remote, args.keepalive_seconds) and bootstrap.remote_contract_is_complete(
             remote,
             artifact["sha256"],
@@ -243,7 +249,7 @@ def run(args: argparse.Namespace) -> int:
         error_class = "unexpected"
         result_code = 1
     finally:
-        run_finished_utc = bootstrap.utc_now()
+        run_finished_utc = bootstrap.utc_now_precise()
         if run_root is not None:
             can_remove = remote is None or (
                 remote.transport_cleanup_completed
