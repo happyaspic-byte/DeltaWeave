@@ -48,7 +48,7 @@ struct ReadOnlyState {
 /// sufficient compatibility guarantee for an existing `pending` value.  Keep
 /// this decoder local and convert the old value without rewriting it until a
 /// subsequent successful state save.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct LegacyReadOnlyState {
     version: u16,
     owner: [u8; 32],
@@ -56,7 +56,7 @@ struct LegacyReadOnlyState {
     checkpoint: Vec<SyncRecord>,
     pending: Option<LegacyPending>,
 }
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct LegacyPending {
     desired: Vec<SyncRecord>,
     attempts: Vec<String>,
@@ -735,5 +735,34 @@ mod tests {
         tombstone.tombstone = true;
         validate_checkpoint(&checkpoint, &[tombstone.clone()]).unwrap();
         assert!(validate_checkpoint(&[tombstone], &[]).is_err());
+    }
+
+    #[test]
+    fn legacy_v1_pending_some_decodes_without_loss() {
+        let desired = vec![record(b"legacy", 4)];
+        let attempts = vec!["legacy-operation".to_owned()];
+        let legacy = LegacyReadOnlyState {
+            version: 1,
+            owner: [7; 32],
+            share: [9; 32],
+            checkpoint: vec![record(b"checkpoint", 3)],
+            pending: Some(LegacyPending {
+                desired: desired.clone(),
+                attempts: attempts.clone(),
+                stage: Stage::Preserved,
+            }),
+        };
+        let bytes = postcard::to_stdvec(&legacy).expect("legacy fixture encoding");
+        let decoded = decode_state(&bytes).expect("legacy fixture decoding");
+        assert_eq!(decoded.version, legacy.version);
+        assert_eq!(decoded.owner, legacy.owner);
+        assert_eq!(decoded.share, legacy.share);
+        assert_eq!(decoded.checkpoint, legacy.checkpoint);
+        let pending = decoded.pending.expect("legacy pending retained");
+        assert_eq!(pending.desired, desired);
+        assert_eq!(pending.attempts, attempts);
+        assert_eq!(pending.stage, Stage::Preserved);
+        assert_eq!(pending.stage_root, None);
+        assert!(decoded.apply.is_none());
     }
 }

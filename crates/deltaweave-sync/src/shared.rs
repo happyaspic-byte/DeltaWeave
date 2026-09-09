@@ -7,6 +7,12 @@ use deltaweave_net::{
 use serde::Serialize;
 use std::{future::Future, pin::Pin};
 
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
+
+#[cfg(windows)]
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+
 /// Credential- and path-free error fields suitable for a management API.
 #[derive(Clone, Copy, Debug, serde::Deserialize, Serialize)]
 #[serde(tag = "kind", content = "share_error", rename_all = "snake_case")]
@@ -555,23 +561,13 @@ fn validate_existing_managed_directory(path: &Path) -> Result<()> {
                 );
                 #[cfg(windows)]
                 ensure!(
-                    !managed_path_is_reparse_point(&current)?,
+                    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
                     ShareError::StateUnavailable
                 );
             }
         }
     }
     Ok(())
-}
-
-#[cfg(windows)]
-fn managed_path_is_reparse_point(path: &Path) -> Result<bool> {
-    let handle = winapi_util::Handle::from_path_any(path)
-        .map_err(|_| anyhow::Error::new(ShareError::StateUnavailable))?;
-    let information = winapi_util::file::information(&handle)
-        .map_err(|_| anyhow::Error::new(ShareError::StateUnavailable))?;
-    const FILE_ATTRIBUTE_REPARSE_POINT: u64 = 0x0400;
-    Ok(information.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
 }
 
 #[cfg(test)]
