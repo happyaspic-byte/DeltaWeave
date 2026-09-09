@@ -2525,6 +2525,23 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn managed_causal_authorization_rejects_missing_and_cross_share_permits() {
+        let name = "tests::managed_causal_authorization_rejects_missing_and_cross_share_permits";
+        if std::env::var("DW_MANAGED_CAUSAL_AUTH_CHILD")
+            .ok()
+            .as_deref()
+            != Some(name)
+        {
+            let home = tempfile::tempdir().expect("isolated home");
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture"])
+                .env("DW_MANAGED_CAUSAL_AUTH_CHILD", name)
+                .env("HOME", home.path())
+                .env("USERPROFILE", home.path())
+                .status()
+                .expect("run isolated authorization test");
+            assert!(status.success());
+            return;
+        }
         let base = TempDir::new().expect("share test root can be created");
         let owner = ShareService::open(
             base.path().join("owner-device"),
