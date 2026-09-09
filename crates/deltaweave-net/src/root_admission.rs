@@ -878,7 +878,10 @@ mod tests {
         let registry = temp.path().join("registry");
         let root = temp.path().join("public");
         let state = temp.path().join("private/state");
-        let expected_root = fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+        // Build the oracle from the known existing parent and the fixture's
+        // missing suffix.  Calling prospective_root here would duplicate the
+        // implementation under test and could make the assertion vacuous.
+        let expected_root = fs::canonicalize(temp.path()).unwrap().join("public");
         let expected_kind = managed();
         let lease = admit_at(
             &registry,
@@ -1092,7 +1095,12 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let registry = temp.path().join("registry");
         let target = temp.path().join("private/nested/leaf");
-        let expected_target = fs::canonicalize(&target).unwrap_or_else(|_| target.clone());
+        // Canonicalize only the known existing parent, then append the known
+        // missing suffix.  This is independent of prospective_root and also
+        // matches Windows' extended canonical representation.
+        let expected_target = fs::canonicalize(temp.path())
+            .unwrap()
+            .join("private/nested/leaf");
         let (_, returned) = admit_at_with_creation(
             &registry,
             None,

@@ -43,7 +43,7 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       - name: Tests
-        run: cargo test --locked --workspace --all-targets --all-features
+        run: cargo test --locked --workspace --all-targets --all-features --no-fail-fast
       - name: CLI self-test
         run: cargo run --locked -p deltaweave -- self-test
       - name: Documentation
@@ -112,7 +112,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-      - run: cargo test --locked --workspace --all-targets --all-features
+      - run: cargo test --locked --workspace --all-targets --all-features --no-fail-fast
       - run: cargo run --locked -p deltaweave -- self-test
 
   qsync-private-acl-probe:

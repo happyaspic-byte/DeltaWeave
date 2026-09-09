@@ -452,6 +452,43 @@ fn invalid_staged_key_file_is_removed_before_new_ticket_is_generated() {
                     })
                     .await
                     .unwrap();
+                // Exercise the product-created response namespace rather than
+                // creating it with an unvalidated recursive mkdir. The staged
+                // file below must pass the same private ACL preparation as a
+                // real key issuance on Windows.
+                let preparation_root = temp.path().join("response-preparation-files");
+                std::fs::create_dir_all(&preparation_root).unwrap();
+                let preparation = manager
+                    .create_share(CreateShareInput {
+                        request_id: "invalid-intent-preparation-share".into(),
+                        name: "Preparation".into(),
+                        root: preparation_root,
+                        min_free_space_mib: Some(0),
+                    })
+                    .await
+                    .unwrap();
+                let preparation_id = ShareId(
+                    hex::decode(&preparation.share_id)
+                        .unwrap()
+                        .try_into()
+                        .unwrap(),
+                );
+                manager
+                    .issue_key(IssueKeyInput {
+                        request_id: "invalid-intent-preparation-key".into(),
+                        share: preparation_id,
+                        permission: Permission::ReadWrite,
+                        expires_at: None,
+                    })
+                    .await
+                    .unwrap();
+                manager
+                    .remove_share(RemoveShareInput {
+                        request_id: "invalid-intent-preparation-remove".into(),
+                        share: preparation_id,
+                    })
+                    .await
+                    .unwrap();
                 manager.shutdown().await.unwrap();
 
                 let request = IssueKeyInput {
@@ -469,7 +506,6 @@ fn invalid_staged_key_file_is_removed_before_new_ticket_is_generated() {
                 let response_file = data_dir
                     .join("managed/responses")
                     .join(format!("{request_hash}.ticket"));
-                std::fs::create_dir_all(response_file.parent().unwrap()).unwrap();
                 std::fs::write(&response_file, b"corrupt staged ticket").unwrap();
                 #[cfg(unix)]
                 {
