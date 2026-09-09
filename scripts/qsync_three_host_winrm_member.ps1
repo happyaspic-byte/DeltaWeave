@@ -346,16 +346,17 @@ function Send-OwnedCtrlC {
             return [QsyncOwnedConsole]::GenerateConsoleCtrlEvent(0, 0)
         } catch { return $false }
     }
-    # A short-lived, test-owned system PowerShell ACL helper may remain on the
-    # console after the child is ready.  Wait only for that verified class to
-    # disappear; an unknown process is never broadcast to.
-    if (-not $script:LastConsoleExtraTrusted) { return $false }
+    # A short-lived helper, or a process that cannot be classified during a
+    # transient process-list race, may remain on the console after the child
+    # is ready.  Resample for a short fixed budget.  An unknown process is
+    # never included in a broadcast; only Test-OwnedConsoleProcess returning
+    # true permits the signal.
     for ($attempt = 0; $attempt -lt 20; $attempt++) {
         Start-Sleep -Milliseconds 50
+        if ($Process.HasExited) { return $false }
         if (Test-OwnedConsoleProcess $Process) {
             try { return [QsyncOwnedConsole]::GenerateConsoleCtrlEvent(0, 0) } catch { return $false }
         }
-        if (-not $script:LastConsoleExtraTrusted) { return $false }
     }
     return $false
 }

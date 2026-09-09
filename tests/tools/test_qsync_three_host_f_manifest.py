@@ -389,6 +389,9 @@ class QsyncRoleManifestTests(unittest.TestCase):
         self.assertIn("expected_permission", script)
         self.assertIn("console_test_extra_trusted", script)
         self.assertIn("LastStopErrorClass", script)
+        self.assertIn("for ($attempt = 0; $attempt -lt 20; $attempt++)", script)
+        self.assertIn("if ($Process.HasExited) { return $false }", script)
+        self.assertIn("if (Test-OwnedConsoleProcess $Process)", script)
 
     def test_winrm_direct_protocol_bypasses_command_shell_and_closes_handles(self) -> None:
         class FakeProtocol:
