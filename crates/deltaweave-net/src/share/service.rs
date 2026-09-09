@@ -23,7 +23,6 @@ use crate::{
     write_frame,
 };
 use anyhow::{Result, ensure};
-use deltaweave_cdc::manifest_from_path;
 use deltaweave_core::{ChunkingProfile, Hash32, ReplicaId, SyncRecord};
 use deltaweave_index::{IndexOptions, LocalIndex};
 use deltaweave_reconcile::MerkleTree;
@@ -46,6 +45,7 @@ use std::{
 };
 
 const CONTROL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+const CLOSE_CONFIRM_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);
 const MAX_SWARM_OPERATION_KEYS: usize = 4096;
 
 fn query_event_id(sequence: &AtomicU64, share: ShareId, peer: EndpointId, tag: &[u8]) -> [u8; 16] {
@@ -693,6 +693,89 @@ mod swarm_task_registry_tests {
                 .try_close_completed_operation(key)
                 .expect("marked operation query")
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forced_connection_close_confirms_before_current_boot_drain_marker() {
+        let server = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .alpns(vec![b"deltaweave/test-drain".to_vec()])
+            .clear_ip_transports()
+            .bind_addr(
+                "127.0.0.1:0"
+                    .parse::<std::net::SocketAddr>()
+                    .expect("loopback address"),
+            )
+            .expect("bind address")
+            .bind()
+            .await
+            .expect("test server endpoint");
+        let socket = server
+            .bound_sockets()
+            .into_iter()
+            .find(|socket| socket.is_ipv4())
+            .expect("test server IPv4 socket");
+        let server_address =
+            iroh::EndpointAddr::from_parts(server.id(), [iroh::TransportAddr::Ip(socket)]);
+        let server_task = tokio::spawn({
+            let server = server.clone();
+            async move {
+                for _ in 0..2 {
+                    let incoming = server.accept().await.expect("incoming test connection");
+                    let connection = incoming.await.expect("test handshake");
+                    connection.closed().await;
+                }
+            }
+        });
+        let client = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .bind()
+            .await
+            .expect("test client endpoint");
+        let connection = client
+            .connect(server_address.clone(), b"deltaweave/test-drain")
+            .await
+            .expect("test connection");
+
+        let registry = Arc::new(SwarmTaskRegistry::default());
+        let key = ([0xa6; 32], [0xa7; 16]);
+        let unmarked = registry.begin_operation(key).expect("operation admission");
+        connection.close(0u8.into(), b"forced close test");
+        drop(unmarked);
+        assert!(
+            !registry
+                .try_close_completed_operation(key)
+                .expect("unmarked operation query"),
+            "calling close alone must not create a current-boot drain marker"
+        );
+
+        let connection = client
+            .connect(server_address, b"deltaweave/test-drain")
+            .await
+            .expect("second test connection");
+        assert!(
+            connection.close_reason().is_none(),
+            "the second connection must begin open"
+        );
+        let mut marked = registry.begin_operation(key).expect("operation retry");
+        assert!(
+            Handler::wait_closed_bounded_until(&connection, Duration::ZERO).await,
+            "timeout path must close and observe the owned connection's terminal state"
+        );
+        assert!(
+            connection.close_reason().is_some(),
+            "close confirmation must observe a terminal reason"
+        );
+        SwarmTaskRegistry::mark_operation_drained(&mut marked, true);
+        drop(marked);
+        assert!(
+            registry
+                .try_close_completed_operation(key)
+                .expect("confirmed operation query"),
+            "only the observed close may create the exact current-boot proof"
+        );
+
+        client.close().await;
+        server.close().await;
+        server_task.await.expect("server close observer");
     }
 }
 
@@ -5068,20 +5151,25 @@ impl Handler {
     }
 
     async fn wait_closed_bounded(connection: &Connection) -> bool {
-        if tokio::time::timeout(CONTROL_DEADLINE, connection.closed())
+        Self::wait_closed_bounded_until(connection, CONTROL_DEADLINE).await
+    }
+
+    /// Waits for the transport to report its terminal state, including after
+    /// a bounded timeout. Calling `Connection::close` only requests an abort;
+    /// it is not itself a local drain proof. The second wait observes the
+    /// owned connection's close notification before a caller may mark the
+    /// exact operation as locally complete.
+    async fn wait_closed_bounded_until(connection: &Connection, deadline: Duration) -> bool {
+        if tokio::time::timeout(deadline, connection.closed())
             .await
-            .is_err()
+            .is_ok()
         {
-            // A retained Connection clone can keep the QUIC transport alive
-            // after the admission task releases its permit. Explicitly close
-            // on the bounded-wait path so the peer and any clone observe the
-            // admission boundary; relying on the final handle's implicit
-            // close would make this guarantee depend on hidden ownership.
-            connection.close(0u8.into(), b"share control deadline");
-            false
-        } else {
-            true
+            return connection.close_reason().is_some();
         }
+        connection.close(0u8.into(), b"share control deadline");
+        tokio::time::timeout(CLOSE_CONFIRM_DEADLINE, connection.closed())
+            .await
+            .is_ok_and(|_| connection.close_reason().is_some())
     }
 
     /// Handles the owner-authoritative v1 swarm control records.  Each branch
@@ -5156,11 +5244,33 @@ impl Handler {
                     record.kind == deltaweave_core::SyncEntryKind::File,
                     ShareError::ManifestMismatch
                 );
-                let path = runtime.config.root.join(record.path.as_str());
+                // The owner is also a first-class swarm supplier. Build the
+                // manifest and ingest every verified missing chunk while the
+                // exact owner runtime gate and admission lease are held. A
+                // manifest-only response otherwise leaves a cold owner CAS,
+                // making a later RO sync depend on an accidental RW warm-up.
+                let path = owner_source_path(runtime, share, &record)?;
+                let store = runtime.store.clone();
+                let admission = crate::DiskAdmission::new(
+                    runtime.store.state_root().to_path_buf(),
+                    runtime.config.root.clone(),
+                    runtime.config.min_free_space_bytes,
+                    0,
+                );
                 let manifest = tokio::task::spawn_blocking(move || {
-                    manifest_from_path(path, ChunkingProfile::DEFAULT)
+                    store.ingest_file_with_admission(path, ChunkingProfile::DEFAULT, |bytes| {
+                        admission.check_state(bytes)
+                    })
                 })
                 .await??;
+                ensure!(
+                    manifest.size == record.size
+                        && record
+                            .content_hash
+                            .is_some_and(|content_hash| manifest.file_hash == content_hash),
+                    ShareError::ManifestMismatch
+                );
+                manifest.validate()?;
                 let attestation = ManifestAttestation::sign(
                     &self.key,
                     &snapshot,
@@ -5263,6 +5373,48 @@ impl Handler {
         }
     }
 }
+
+/// Resolves one owner-authoritative record only through the already-admitted
+/// managed runtime. The source must remain beneath the canonical public root,
+/// and the runtime's Store/index/private reservation must all refer to the
+/// same binding before a manifest request can populate the owner CAS.
+fn owner_source_path(
+    runtime: &OwnedRuntime,
+    share: ShareId,
+    record: &SyncRecord,
+) -> Result<PathBuf> {
+    let root = fs::canonicalize(&runtime.config.root)?;
+    let state_root = fs::canonicalize(runtime.store.state_root())?;
+    ensure!(
+        runtime.lease.root() == root.as_path()
+            && fs::canonicalize(runtime.index.root())? == root
+            && fs::canonicalize(&runtime.config.state_root)? == state_root
+            && runtime
+                .lease
+                .private_roots()
+                .iter()
+                .any(|private| private == &state_root),
+        ShareError::StateUnavailable
+    );
+    ensure!(
+        matches!(
+            runtime.lease.kind(),
+            RootUse::Managed {
+                share: admitted_share,
+                owner: admitted_owner
+            } if admitted_share == &share.0 && admitted_owner == runtime.config.owner.as_bytes()
+        ),
+        ShareError::OwnerMismatch
+    );
+    let path = runtime.config.root.join(record.path.as_str());
+    let canonical_path = fs::canonicalize(path)?;
+    ensure!(
+        canonical_path.starts_with(&root) && canonical_path.is_file(),
+        ShareError::ManifestMismatch
+    );
+    Ok(canonical_path)
+}
+
 fn safe_error(error: &anyhow::Error) -> ShareError {
     ShareError::classify(error)
 }
@@ -6626,21 +6778,14 @@ mod tests {
             .iter()
             .map(|chunk| chunk.hash)
             .collect();
-        // `create_owned_share` indexes the source tree but does not silently
-        // populate the CAS.  Seed the owner CAS through the already-open
-        // runtime so this vertical provider test exercises a real verified
-        // payload transfer rather than treating every chunk as a scheduler
-        // fallback candidate.
-        let source_bytes = fs::read(root.join(record.path.as_str())).unwrap();
+        // Manifest authority must make the owner a real verified supplier.
+        // This assertion deliberately runs before issuing the owner grant, so
+        // the provider path cannot be made green by manually warming the CAS.
         for descriptor in &manifest.manifest.chunks {
-            let begin = usize::try_from(descriptor.offset).unwrap();
-            let end = begin + usize::try_from(descriptor.length).unwrap();
-            owner_share
-                .runtime
-                .store
-                .chunks()
-                .put_verified(descriptor.hash, &source_bytes[begin..end])
-                .unwrap();
+            assert!(
+                owner_share.runtime.store.chunks().contains(descriptor.hash),
+                "authoritative manifest must ingest owner chunks"
+            );
         }
         let grant = session
             .request_swarm_grant(owner.endpoint_id(), &snapshot.token, &manifest, &hashes)
