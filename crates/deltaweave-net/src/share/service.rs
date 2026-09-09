@@ -31,6 +31,8 @@ use std::{
     sync::{Arc, Mutex, RwLock, atomic::Ordering},
 };
 
+const CONTROL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// One device-wide persistent endpoint. Clone its endpoint for all outbound shares;
 /// legacy per-folder identities remain separate and are never rebound here.
 #[derive(Debug)]
@@ -266,15 +268,16 @@ impl ShareService {
     pub async fn validate_ticket(&self, ticket: &ShareTicket) -> Result<TicketPreview> {
         ticket.verify_at(super::now())?;
         let connection = self.connect_ticket(ticket).await?;
-        let result = wire::exchange(
-            &connection,
-            Hello {
-                version: 3,
-                share_id: ticket.preview().share_id,
-                operation: Operation::Validate(ticket.clone()),
-            },
-        )
-        .await;
+        let result = self
+            .exchange_bounded(
+                &connection,
+                Hello {
+                    version: 3,
+                    share_id: ticket.preview().share_id,
+                    operation: Operation::Validate(ticket.clone()),
+                },
+            )
+            .await;
         connection.close(0u8.into(), b"validation complete");
         match result? {
             Reply::Validated(preview) => {
@@ -291,18 +294,19 @@ impl ShareService {
     ) -> Result<Membership> {
         ticket.verify_at(super::now())?;
         let connection = self.connect_ticket(ticket).await?;
-        let result = wire::exchange(
-            &connection,
-            Hello {
-                version: 3,
-                share_id: ticket.preview().share_id,
-                operation: Operation::Enroll {
-                    ticket: ticket.clone(),
-                    proof: proof.map(Box::new),
+        let result = self
+            .exchange_bounded(
+                &connection,
+                Hello {
+                    version: 3,
+                    share_id: ticket.preview().share_id,
+                    operation: Operation::Enroll {
+                        ticket: ticket.clone(),
+                        proof: proof.map(Box::new),
+                    },
                 },
-            },
-        )
-        .await;
+            )
+            .await;
         connection.close(0u8.into(), b"enrollment complete");
         match result? {
             Reply::Enrolled(member) => {
@@ -335,21 +339,17 @@ impl ShareService {
     ) -> Result<Membership> {
         ensure!(owner != self.endpoint_id(), ShareError::OwnerMismatch);
         ensure!(address.id == owner, ShareError::OwnerMismatch);
-        let connection = self
-            .router
-            .endpoint()
-            .connect(address.clone(), ALPN_V3)
-            .await
-            .map_err(|_| ShareError::Offline)?;
-        let result = wire::exchange(
-            &connection,
-            Hello {
-                version: 3,
-                share_id: share,
-                operation: Operation::Resume,
-            },
-        )
-        .await;
+        let connection = self.connect_address(address.clone()).await?;
+        let result = self
+            .exchange_bounded(
+                &connection,
+                Hello {
+                    version: 3,
+                    share_id: share,
+                    operation: Operation::Resume,
+                },
+            )
+            .await;
         connection.close(0u8.into(), b"membership resume complete");
         match result? {
             Reply::Resumed(member) => {
@@ -375,12 +375,23 @@ impl ShareService {
             ticket.preview().owner != self.endpoint_id(),
             ShareError::OwnerMismatch
         );
-        Ok(self
-            .router
-            .endpoint()
-            .connect(ticket.address(), ALPN_V3)
+        self.connect_address(ticket.address()).await
+    }
+
+    async fn connect_address(&self, address: EndpointAddr) -> Result<Connection> {
+        tokio::time::timeout(
+            CONTROL_DEADLINE,
+            self.router.endpoint().connect(address, ALPN_V3),
+        )
+        .await
+        .map_err(|_| anyhow::Error::new(ShareError::Offline))?
+        .map_err(|_| ShareError::Offline.into())
+    }
+
+    async fn exchange_bounded(&self, connection: &Connection, hello: Hello) -> Result<Reply> {
+        tokio::time::timeout(CONTROL_DEADLINE, wire::exchange(connection, hello))
             .await
-            .map_err(|_| ShareError::Offline)?)
+            .map_err(|_| anyhow::Error::new(ShareError::Offline))?
     }
     /// Opens an issuer-pinned session from persisted enrollment. No caller-supplied
     /// role is accepted, and the existing endpoint is cloned, never rebound.
