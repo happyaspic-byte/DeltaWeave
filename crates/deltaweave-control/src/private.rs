@@ -307,6 +307,10 @@ fn log_acl_script_diagnostic(stage: &'static str, exit_code: Option<i32>, stdout
         "method_invocation",
         "runtime",
         "cmdlet_invocation",
+        "action_preference_stop",
+        "write_error",
+        "provider_invocation",
+        "privilege_not_held",
         "directory_not_found",
         "file_not_found",
         "not_supported",
@@ -392,10 +396,12 @@ function Exit-WithDiagnostic([string]$stage, [int]$code, $errorRecord) {
         $exception = $null
         try {
             $exception = $errorRecord.Exception
-            $exceptionName = $exception.GetType().Name
-            if ($exception.InnerException -and @('MethodInvocationException', 'RuntimeException', 'CmdletInvocationException') -contains $exceptionName) {
-                $exception = $exception.InnerException
+            for ($depth = 0; $depth -lt 4 -and $null -ne $exception; $depth++) {
                 $exceptionName = $exception.GetType().Name
+                if (@('UnauthorizedAccessException', 'SecurityException', 'ArgumentException', 'ArgumentNullException', 'IOException', 'Win32Exception', 'PlatformNotSupportedException', 'InvalidOperationException', 'MethodInvocationException', 'RuntimeException', 'CmdletInvocationException', 'ActionPreferenceStopException', 'WriteErrorException', 'CmdletProviderInvocationException', 'ProviderInvocationException', 'PrivilegeNotHeldException', 'DirectoryNotFoundException', 'FileNotFoundException', 'NotSupportedException') -contains $exceptionName) {
+                    break
+                }
+                $exception = $exception.InnerException
             }
         } catch {
             $exceptionName = ''
@@ -411,6 +417,10 @@ function Exit-WithDiagnostic([string]$stage, [int]$code, $errorRecord) {
         elseif ($exceptionName -eq 'MethodInvocationException') { $class = 'method_invocation' }
         elseif ($exceptionName -eq 'RuntimeException') { $class = 'runtime' }
         elseif ($exceptionName -eq 'CmdletInvocationException') { $class = 'cmdlet_invocation' }
+        elseif ($exceptionName -eq 'ActionPreferenceStopException') { $class = 'action_preference_stop' }
+        elseif ($exceptionName -eq 'WriteErrorException') { $class = 'write_error' }
+        elseif ($exceptionName -eq 'CmdletProviderInvocationException' -or $exceptionName -eq 'ProviderInvocationException') { $class = 'provider_invocation' }
+        elseif ($exceptionName -eq 'PrivilegeNotHeldException') { $class = 'privilege_not_held' }
         elseif ($exceptionName -eq 'DirectoryNotFoundException') { $class = 'directory_not_found' }
         elseif ($exceptionName -eq 'FileNotFoundException') { $class = 'file_not_found' }
         elseif ($exceptionName -eq 'NotSupportedException') { $class = 'not_supported' }
@@ -442,7 +452,12 @@ if ($repair) {
         try { $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($identity, $rights, $inheritance, $propagation, $allow) } catch { Exit-WithDiagnostic 'access_rule' 41 $_ }
         try { $acl.AddAccessRule($rule) } catch { Exit-WithDiagnostic 'add_access_rule' 41 $_ }
     }
-    try { Set-Acl -LiteralPath $path -AclObject $acl } catch { Exit-WithDiagnostic 'set_acl' 41 $_ }
+    try {
+        # Set-Acl may request SACL sections that require SeSecurityPrivilege.
+        # Directory.SetAccessControl applies the prepared DACL without that
+        # provider-level audit request.
+        [System.IO.Directory]::SetAccessControl($path, $acl)
+    } catch { Exit-WithDiagnostic 'set_acl' 41 $_ }
 }
 
 try { $item = Get-Item -LiteralPath $path -Force } catch { Exit-WithDiagnostic 'post_get_item' 42 $_ }
@@ -666,7 +681,7 @@ $rights = [System.Security.AccessControl.FileSystemRights]::ReadAndExecute
 $inheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
 $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($identity, $rights, $inheritance, [System.Security.AccessControl.PropagationFlags]::None, [System.Security.AccessControl.AccessControlType]::Allow)
 $acl.AddAccessRule($rule)
-Set-Acl -LiteralPath $path -AclObject $acl
+[System.IO.Directory]::SetAccessControl($path, $acl)
 "#,
         )
         .map(|_| ())
