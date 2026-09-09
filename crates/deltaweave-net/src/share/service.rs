@@ -1,6 +1,7 @@
 use super::authority::{
-    ApplyDrained, ApplyPermit, ApplyStart, AuthoritativeSnapshot, ManifestAttestation, ShareGrant,
-    SnapshotToken, request_hash,
+    ActivationCancel, ActivationReceipt, ActivationStatusQuery, ApplyDrained, ApplyPermit,
+    ApplyStart, AuthoritativeSnapshot, ManifestAttestation, ShareGrant, SnapshotToken,
+    request_hash,
 };
 use super::roster::random_nonce;
 use super::{
@@ -371,11 +372,18 @@ impl ShareService {
     /// transport catalog entry. The manager retains local files and state.
     pub async fn unload_owned_share(&self, share: ShareId) -> Result<()> {
         let _lifecycle = self.lifecycle.lock().await;
-        let runtime = self.runtimes.write().expect("runtime map").remove(&share);
+        let runtime = self
+            .runtimes
+            .read()
+            .expect("runtime map")
+            .get(&share)
+            .cloned();
         if let Some(runtime) = runtime {
             runtime.pause().await;
         }
-        self.registry.remove_share(share)
+        self.registry.remove_share(share)?;
+        self.runtimes.write().expect("runtime map").remove(&share);
+        Ok(())
     }
 
     pub fn forget_membership(&self, owner: EndpointId, share: ShareId) -> Result<()> {
@@ -1119,15 +1127,10 @@ impl ShareSession {
         request_started: Instant,
         deadline: Instant,
     ) -> Result<ActivationLease> {
+        Self::ensure_activation_binding_for(&self.state.membership, grant)?;
         ensure!(
             grant.provider == self.state.membership.endpoint,
             ShareError::EndpointMismatch
-        );
-        ensure!(
-            grant.share == self.state.membership.share_id
-                && grant.owner == self.state.membership.owner
-                && grant.provider_epoch == self.state.membership.epoch,
-            ShareError::EpochMismatch
         );
         let result = self
             .control_exchange_until(Operation::Activate(grant.activate_request()), deadline)
@@ -1147,6 +1150,86 @@ impl ShareSession {
         );
         ensure!(reply.nonce == grant.nonce, ShareError::GrantReplay);
         ActivationLease::from_reply_at(reply, request_started, Instant::now())
+    }
+
+    fn ensure_recovery_binding_for(membership: &Membership, grant: &ShareGrant) -> Result<()> {
+        ensure!(
+            grant.owner == membership.owner && grant.share == membership.share_id,
+            ShareError::OwnerMismatch
+        );
+        let endpoint = membership.endpoint;
+        ensure!(
+            grant.consumer == endpoint || grant.provider == endpoint,
+            ShareError::EndpointMismatch
+        );
+        Ok(())
+    }
+
+    fn ensure_activation_binding_for(membership: &Membership, grant: &ShareGrant) -> Result<()> {
+        Self::ensure_recovery_binding_for(membership, grant)?;
+        let endpoint = membership.endpoint;
+        if grant.consumer == endpoint {
+            ensure!(grant.epoch == membership.epoch, ShareError::EpochMismatch);
+        } else {
+            ensure!(
+                grant.provider_epoch == membership.epoch,
+                ShareError::EpochMismatch
+            );
+        }
+        Ok(())
+    }
+
+    /// Queries the owner for the exact durable activation state.  A receipt
+    /// never refreshes the local monotonic lease or admits payload work by
+    /// itself.
+    pub async fn activation_status(
+        &self,
+        grant: &ShareGrant,
+        activation_id: Option<[u8; 16]>,
+    ) -> Result<ActivationReceipt> {
+        // Status recovery intentionally accepts the exact old binding after a
+        // membership epoch advances.  This is a read/cancel path, not a new
+        // data admission; current-epoch checks remain in activation and data
+        // permit paths.
+        Self::ensure_recovery_binding_for(&self.state.membership, grant)?;
+        let result = self
+            .control_exchange(Operation::ActivationStatus(
+                ActivationStatusQuery::for_grant(grant, activation_id),
+            ))
+            .await?;
+        let receipt = match result {
+            Reply::ActivationReceipt(receipt) => receipt,
+            _ => return Err(ShareError::Protocol.into()),
+        };
+        receipt.verify_for(grant, activation_id)?;
+        Ok(receipt)
+    }
+
+    /// Requests an idempotent owner-side cancellation for an exact activation
+    /// attempt.  An already Active/Restarted grant returns its drain blocker;
+    /// it is never converted to Denied by a late cancellation.
+    pub async fn cancel_activation(
+        &self,
+        grant: &ShareGrant,
+        activation_id: Option<[u8; 16]>,
+        operation_id: [u8; 16],
+    ) -> Result<ActivationReceipt> {
+        // Cancellation has the same recovery exception as status: an old
+        // activation must remain queryable after revoke/epoch advancement.
+        Self::ensure_recovery_binding_for(&self.state.membership, grant)?;
+        let result = self
+            .control_exchange(Operation::ActivationCancel(ActivationCancel::for_grant(
+                grant,
+                activation_id,
+                operation_id,
+            )))
+            .await?;
+        let receipt = match result {
+            Reply::ActivationReceipt(receipt) => receipt,
+            _ => return Err(ShareError::Protocol.into()),
+        };
+        receipt.verify_for(grant, activation_id)?;
+        Ok(receipt)
     }
 
     /// Sends one authenticated endpoint drain acknowledgement for an active
@@ -1390,7 +1473,9 @@ impl Handler {
             | Operation::ApplyStart(_)
             | Operation::ApplyDrained(_)
             | Operation::Activate(_)
-            | Operation::GrantDrained { .. }) => {
+            | Operation::GrantDrained { .. }
+            | Operation::ActivationStatus(_)
+            | Operation::ActivationCancel(_)) => {
                 self.run_authority(&runtime, peer, hello.share_id, authority, operation_started)
                     .await
             }
@@ -1558,7 +1643,10 @@ impl Handler {
         // blocker merely because the runtime was disabled first.
         if !matches!(
             operation,
-            Operation::ApplyDrained(_) | Operation::GrantDrained { .. }
+            Operation::ApplyDrained(_)
+                | Operation::GrantDrained { .. }
+                | Operation::ActivationStatus(_)
+                | Operation::ActivationCancel(_)
         ) {
             ensure!(runtime.enabled.load(Ordering::SeqCst), ShareError::Busy);
         }
@@ -1686,6 +1774,18 @@ impl Handler {
                 )?;
                 Ok(Reply::Activate(reply))
             }
+            Operation::ActivationStatus(query) => {
+                ensure!(query.binding.share == share, ShareError::OwnerMismatch);
+                Ok(Reply::ActivationReceipt(
+                    self.registry.activation_receipt(&query, peer)?,
+                ))
+            }
+            Operation::ActivationCancel(cancel) => {
+                ensure!(cancel.binding.share == share, ShareError::OwnerMismatch);
+                Ok(Reply::ActivationReceipt(
+                    self.registry.cancel_activation(&cancel, peer)?,
+                ))
+            }
             _ => Err(ShareError::Protocol.into()),
         }
     }
@@ -1696,7 +1796,7 @@ fn safe_error(error: &anyhow::Error) -> ShareError {
 
 #[cfg(test)]
 mod tests {
-    use super::super::Permission;
+    use super::super::{ActivationStateView, Permission, now};
     use super::*;
     use futures_lite::StreamExt;
     use iroh::address_lookup::{
@@ -3037,6 +3137,48 @@ mod tests {
         owner.shutdown().await.unwrap();
     }
 
+    #[test]
+    fn activation_recovery_binding_survives_permission_epoch_change() {
+        let owner = SecretKey::generate();
+        let member = SecretKey::generate();
+        let share = ShareId([0xb1; 32]);
+        let membership = Membership {
+            share_id: share,
+            owner: owner.public(),
+            endpoint: member.public(),
+            permission: Permission::ReadWrite,
+            replica: ReplicaId(Hash32::digest(b"recovery-replica")),
+            enrolled_at: 1,
+            revoked_at: Some(2),
+            epoch: 2,
+        };
+        let grant = ShareGrant::sign(
+            &owner,
+            share,
+            member.public(),
+            owner.public(),
+            1,
+            0,
+            [0xb2; 32],
+            Hash32::digest(b"recovery-manifest"),
+            Hash32::digest(b"recovery-request"),
+            [0xb3; 32],
+            now(),
+        )
+        .unwrap();
+
+        // A revoked/advanced local membership can still query or cancel the
+        // old activation binding for drain recovery, while a new data
+        // activation remains rejected by the current epoch gate.
+        assert!(ShareSession::ensure_recovery_binding_for(&membership, &grant).is_ok());
+        assert_eq!(
+            ShareSession::ensure_activation_binding_for(&membership, &grant)
+                .unwrap_err()
+                .downcast_ref::<ShareError>(),
+            Some(&ShareError::EpochMismatch)
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn read_only_provider_grant_activation_requires_bilateral_drain() {
         let name =
@@ -3131,7 +3273,27 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(grant.provider_epoch, provider_membership.epoch);
+        let pending_grant = consumer_session
+            .request_swarm_grant(provider.endpoint_id(), &snapshot.token, &manifest, &hashes)
+            .await
+            .unwrap();
+        let denied = provider_session
+            .cancel_activation(&pending_grant, None, [0xc1; 16])
+            .await
+            .unwrap();
+        assert!(matches!(denied.state, ActivationStateView::Denied));
+        let denied_retry = provider_session
+            .cancel_activation(&pending_grant, None, [0xc2; 16])
+            .await
+            .unwrap();
+        assert!(matches!(denied_retry.state, ActivationStateView::Denied));
         let activation = provider_session.activate_grant(&grant).await.unwrap();
+        let active = provider_session
+            .activation_status(&grant, Some(activation.reply.activation_id))
+            .await
+            .unwrap();
+        assert!(matches!(active.state, ActivationStateView::Active));
+        assert!(!active.provider_drained && !active.consumer_drained);
 
         let first_revoke = owner_share
             .revoke_member_strong(provider.endpoint_id())
@@ -3149,6 +3311,12 @@ mod tests {
             .grant_drained(&grant, activation.reply.activation_id)
             .await
             .unwrap();
+        let one_sided = consumer_session
+            .activation_status(&grant, Some(activation.reply.activation_id))
+            .await
+            .unwrap();
+        assert!(matches!(one_sided.state, ActivationStateView::Active));
+        assert!(!one_sided.provider_drained && one_sided.consumer_drained);
         assert!(matches!(
             owner
                 .registry
@@ -3160,6 +3328,12 @@ mod tests {
             .grant_drained(&grant, activation.reply.activation_id)
             .await
             .unwrap();
+        let drained = provider_session
+            .activation_status(&grant, Some(activation.reply.activation_id))
+            .await
+            .unwrap();
+        assert!(matches!(drained.state, ActivationStateView::Drained));
+        assert!(drained.provider_drained && drained.consumer_drained);
         assert!(matches!(
             owner_share
                 .revoke_member_strong(provider.endpoint_id())

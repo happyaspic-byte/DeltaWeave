@@ -7,8 +7,10 @@ mod service;
 mod ticket;
 pub(crate) mod wire;
 pub use authority::{
-    ActivateGrantReply, ActivateGrantRequest, ApplyDrained, ApplyPermit, ApplyStart,
-    AuthoritativeSnapshot, ManifestAttestation, RevocationReceipt, ShareGrant, SnapshotToken,
+    ActivateGrantReply, ActivateGrantRequest, ActivationBinding, ActivationCancel,
+    ActivationReceipt, ActivationStateView, ActivationStatusQuery, ApplyDrained, ApplyPermit,
+    ApplyStart, AuthoritativeSnapshot, ManifestAttestation, RevocationReceipt, ShareGrant,
+    SnapshotToken,
 };
 pub use registry::{Invitation, MemberRelationship, Membership, OwnedShareConfig};
 pub use roster::{

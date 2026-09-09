@@ -101,6 +101,123 @@ pub struct ActivateGrantReply {
     pub signature: Signature,
 }
 
+/// The immutable owner binding for one activation attempt.  It deliberately
+/// contains the signed grant fields that identify the request, but no bearer
+/// key or private endpoint state.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ActivationBinding {
+    pub owner: EndpointId,
+    pub share: ShareId,
+    pub consumer: EndpointId,
+    pub provider: EndpointId,
+    pub epoch: PermissionEpoch,
+    pub provider_epoch: PermissionEpoch,
+    pub manifest: Hash32,
+    pub request_hash: Hash32,
+    pub nonce: GrantNonce,
+}
+
+impl ActivationBinding {
+    pub fn from_grant(grant: &ShareGrant) -> Self {
+        Self {
+            owner: grant.owner,
+            share: grant.share,
+            consumer: grant.consumer,
+            provider: grant.provider,
+            epoch: grant.epoch,
+            provider_epoch: grant.provider_epoch,
+            manifest: grant.manifest,
+            request_hash: grant.request_hash,
+            nonce: grant.nonce,
+        }
+    }
+}
+
+/// Queries the owner for the durable state of one exact activation nonce.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ActivationStatusQuery {
+    pub binding: ActivationBinding,
+    pub activation_id: Option<[u8; 16]>,
+}
+
+impl ActivationStatusQuery {
+    pub fn for_grant(grant: &ShareGrant, activation_id: Option<[u8; 16]>) -> Self {
+        Self {
+            binding: ActivationBinding::from_grant(grant),
+            activation_id,
+        }
+    }
+}
+
+/// Cancels an exact issued activation.  The operation ID belongs to the
+/// caller's durable intent journal; owner-side cancellation is idempotent for
+/// the immutable grant binding and never turns an Active grant into Denied.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ActivationCancel {
+    pub binding: ActivationBinding,
+    pub activation_id: Option<[u8; 16]>,
+    pub operation_id: [u8; 16],
+}
+
+impl ActivationCancel {
+    pub fn for_grant(
+        grant: &ShareGrant,
+        activation_id: Option<[u8; 16]>,
+        operation_id: [u8; 16],
+    ) -> Self {
+        Self {
+            binding: ActivationBinding::from_grant(grant),
+            activation_id,
+            operation_id,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivationStateView {
+    Issued,
+    Active,
+    Restarted,
+    Drained,
+    Denied,
+    Expired,
+}
+
+/// Owner-authenticated, durable activation state.  The receipt attests only
+/// the owner's grant and drain journal; it does not claim that a peer fsynced
+/// its local intent or that payload bytes were transferred.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ActivationReceipt {
+    pub binding: ActivationBinding,
+    pub state: ActivationStateView,
+    pub activation_id: Option<[u8; 16]>,
+    pub activation_deadline: Option<u64>,
+    pub revoked: bool,
+    pub provider_drained: bool,
+    pub consumer_drained: bool,
+}
+
+impl ActivationReceipt {
+    pub fn verify_for(
+        &self,
+        grant: &ShareGrant,
+        requested_activation_id: Option<[u8; 16]>,
+    ) -> Result<()> {
+        ensure!(
+            self.binding == ActivationBinding::from_grant(grant),
+            ShareError::GrantReplay
+        );
+        if let Some(requested) = requested_activation_id {
+            ensure!(
+                self.activation_id == Some(requested),
+                ShareError::GrantReplay
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ApplyPermit {
     pub version: u8,

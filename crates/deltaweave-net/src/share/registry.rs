@@ -1,6 +1,8 @@
 use super::authority::{
-    ApplyDrained, ApplyPermit, ApplyStart, AuthoritativeSnapshot, ManifestAttestation,
-    RevocationReceipt, ShareGrant, SnapshotToken, request_hash, validate_hash_subset,
+    ActivationBinding, ActivationCancel, ActivationReceipt, ActivationStateView,
+    ActivationStatusQuery, ApplyDrained, ApplyPermit, ApplyStart, AuthoritativeSnapshot,
+    ManifestAttestation, RevocationReceipt, ShareGrant, SnapshotToken, request_hash,
+    validate_hash_subset,
 };
 use super::roster::{
     MAX_ROSTER_ENTRIES, MAX_ROSTER_FRAME_BYTES, ROSTER_STALE_AFTER_SECONDS, ROSTER_TTL_SECONDS,
@@ -399,12 +401,35 @@ impl Registry {
             .serial
             .lock()
             .map_err(|_| ShareError::StateUnavailable)?;
+        // A share cannot be forgotten while an authority row still describes
+        // a possible remote writer.  Keeping these rows is what lets a later
+        // status/drain recovery distinguish Pending from a completed remove;
+        // deleting them would manufacture a false terminal result.
+        let has_nonterminal_authority =
+            self.read_grant_rows()?.into_iter().any(|(_, row)| {
+                matches!(
+                    row.state,
+                    GrantState::Issued | GrantState::Active | GrantState::Restarted
+                ) && row.grant.share == id
+            }) || self.read_apply_rows()?.into_iter().any(|(_, row)| {
+                matches!(
+                    row.state,
+                    ApplyState::Prepared | ApplyState::Started | ApplyState::Restarted
+                ) && row.permit.share == id
+            });
+        ensure!(!has_nonterminal_authority, ShareError::RevocationPending);
         let mut catalog = self.read()?;
         ensure!(
             catalog.shares.remove(&id).is_some(),
             ShareError::UnknownShare
         );
-        catalog.relationships.retain(|(_, share), _| *share != id);
+        // Relationships are keyed by the remote owner and share.  Removing a
+        // locally owned share must not erase a foreign owner's relationship
+        // that happens to reuse the same ShareId.
+        let local_owner = catalog.owner;
+        catalog
+            .relationships
+            .retain(|(owner, share), _| *share != id || *owner != local_owner);
         let catalog_bytes = postcard::to_stdvec(&catalog)?;
         ensure!(
             catalog_bytes.len() <= 16 * 1024 * 1024,
@@ -1895,6 +1920,169 @@ impl Registry {
         }
     }
 
+    /// Reads one grant and its two-sided drain state from the same redb read
+    /// transaction.  A missing drain row is the conservative pre-migration
+    /// value: neither endpoint has acknowledged a drain.
+    fn read_grant_with_drain(&self, key: &str) -> Result<Option<(GrantRow, GrantDrainState)>> {
+        let read = self.db.begin_read()?;
+        let row = {
+            let table = match read.open_table(GRANTS) {
+                Ok(table) => table,
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
+            let Some(value) = table.get(key)? else {
+                return Ok(None);
+            };
+            ensure!(
+                value.value().len() <= super::authority::MAX_AUTHORITY_FRAME_BYTES,
+                ShareError::StateUnavailable
+            );
+            postcard::from_bytes::<GrantRow>(value.value())?
+        };
+        let drain = {
+            let table = match read.open_table(GRANT_DRAINS) {
+                Ok(table) => table,
+                Err(redb::TableError::TableDoesNotExist(_)) => {
+                    return Ok(Some((row, GrantDrainState::default())));
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let Some(value) = table.get(key)? else {
+                return Ok(Some((row, GrantDrainState::default())));
+            };
+            ensure!(value.value().len() <= 1024, ShareError::StateUnavailable);
+            postcard::from_bytes::<GrantDrainState>(value.value())?
+        };
+        Ok(Some((row, drain)))
+    }
+
+    fn activation_receipt_from_row(row: &GrantRow, drain: GrantDrainState) -> ActivationReceipt {
+        let state = match row.state {
+            GrantState::Issued => ActivationStateView::Issued,
+            GrantState::Active => ActivationStateView::Active,
+            GrantState::Restarted => ActivationStateView::Restarted,
+            GrantState::Drained => ActivationStateView::Drained,
+            GrantState::Denied => ActivationStateView::Denied,
+            GrantState::Expired => ActivationStateView::Expired,
+        };
+        ActivationReceipt {
+            binding: ActivationBinding::from_grant(&row.grant),
+            state,
+            activation_id: row.activation_id,
+            activation_deadline: row.activation_deadline,
+            revoked: row.revoked,
+            provider_drained: drain.provider_drained,
+            consumer_drained: drain.consumer_drained,
+        }
+    }
+
+    fn validate_activation_query(
+        row: &GrantRow,
+        binding: &ActivationBinding,
+        activation_id: Option<[u8; 16]>,
+        authenticated_peer: EndpointId,
+    ) -> Result<()> {
+        ensure!(
+            ActivationBinding::from_grant(&row.grant) == *binding,
+            ShareError::GrantReplay
+        );
+        ensure!(
+            row.grant.consumer == authenticated_peer || row.grant.provider == authenticated_peer,
+            ShareError::EndpointMismatch
+        );
+        if let Some(activation_id) = activation_id {
+            ensure!(
+                row.activation_id == Some(activation_id),
+                ShareError::GrantReplay
+            );
+        }
+        Ok(())
+    }
+
+    /// Returns an authenticated owner receipt without changing the live
+    /// monotonic lease or treating a wall-clock expiry as a drain proof.
+    pub(crate) fn activation_receipt(
+        &self,
+        query: &ActivationStatusQuery,
+        authenticated_peer: EndpointId,
+    ) -> Result<ActivationReceipt> {
+        let _serial = self
+            .serial
+            .lock()
+            .map_err(|_| ShareError::StateUnavailable)?;
+        let catalog = self.read()?;
+        ensure!(
+            query.binding.owner == catalog.owner,
+            ShareError::OwnerMismatch
+        );
+        let key = grant_key(query.binding.nonce);
+        let (row, drain) = self
+            .read_grant_with_drain(&key)?
+            .ok_or(ShareError::GrantReplay)?;
+        ensure!(row.grant.owner == catalog.owner, ShareError::OwnerMismatch);
+        Self::validate_activation_query(
+            &row,
+            &query.binding,
+            query.activation_id,
+            authenticated_peer,
+        )?;
+        Ok(Self::activation_receipt_from_row(&row, drain))
+    }
+
+    /// Atomically wins the race against an unactivated grant by writing its
+    /// existing row as Denied (or Expired when its bounded wall lifetime has
+    /// elapsed).  If activation already won, this is an idempotent read of the
+    /// Active/Restarted drain blocker and never rewrites it as Denied.
+    pub(crate) fn cancel_activation(
+        &self,
+        cancel: &ActivationCancel,
+        authenticated_peer: EndpointId,
+    ) -> Result<ActivationReceipt> {
+        let _serial = self
+            .serial
+            .lock()
+            .map_err(|_| ShareError::StateUnavailable)?;
+        let wall = now();
+        self.observe_authority_clock(wall)?;
+        let catalog = self.read()?;
+        ensure!(
+            cancel.binding.owner == catalog.owner,
+            ShareError::OwnerMismatch
+        );
+        let key = grant_key(cancel.binding.nonce);
+        let (mut row, drain) = self
+            .read_grant_with_drain(&key)?
+            .ok_or(ShareError::GrantReplay)?;
+        Self::validate_activation_query(
+            &row,
+            &cancel.binding,
+            cancel.activation_id,
+            authenticated_peer,
+        )?;
+        match row.state {
+            GrantState::Issued => {
+                row.state = if row.grant.expires_at <= wall {
+                    GrantState::Expired
+                } else {
+                    GrantState::Denied
+                };
+                row.activation_deadline = None;
+                self.write_grant_and_drain(&key, &row, &drain)?;
+                self.activation_deadlines
+                    .lock()
+                    .map_err(|_| ShareError::StateUnavailable)?
+                    .remove(&cancel.binding.nonce);
+            }
+            GrantState::Active
+            | GrantState::Restarted
+            | GrantState::Drained
+            | GrantState::Denied
+            | GrantState::Expired => {}
+        }
+        Ok(Self::activation_receipt_from_row(&row, drain))
+    }
+
     #[allow(dead_code)]
     pub(crate) fn activate_grant(
         &self,
@@ -2467,6 +2655,194 @@ mod tests {
         registry.issue(&ticket).unwrap();
         registry.enroll(&ticket, peer, None).unwrap();
         (temp, owner, share, peer, registry)
+    }
+
+    #[test]
+    fn activation_status_and_cancel_are_exact_and_idempotent() {
+        let (_temp, owner, share, peer, registry) = authority_fixture();
+        let nonce = [0xa1; 32];
+        let grant = ShareGrant::sign(
+            &owner,
+            share,
+            peer,
+            owner.public(),
+            1,
+            0,
+            [0xa2; 32],
+            Hash32::digest(b"activation-manifest"),
+            Hash32::digest(b"activation-request"),
+            nonce,
+            now(),
+        )
+        .unwrap();
+        registry
+            .write_grant(
+                &grant_key(nonce),
+                &GrantRow {
+                    grant: grant.clone(),
+                    state: GrantState::Issued,
+                    activation_id: None,
+                    activation_deadline: None,
+                    revoked: false,
+                },
+            )
+            .unwrap();
+
+        let issued = registry
+            .activation_receipt(&ActivationStatusQuery::for_grant(&grant, None), peer)
+            .unwrap();
+        assert!(matches!(issued.state, ActivationStateView::Issued));
+        assert_eq!(issued.binding, ActivationBinding::from_grant(&grant));
+        assert!(!issued.revoked);
+        assert!(!issued.provider_drained && !issued.consumer_drained);
+
+        let cancel = ActivationCancel::for_grant(&grant, None, [0xa3; 16]);
+        let denied = registry.cancel_activation(&cancel, peer).unwrap();
+        assert!(matches!(denied.state, ActivationStateView::Denied));
+        assert!(denied.activation_id.is_none());
+
+        // A retry with a new local operation ID observes the same durable
+        // denial and cannot issue or activate another invitation.
+        let retry = registry
+            .cancel_activation(&ActivationCancel::for_grant(&grant, None, [0xa4; 16]), peer)
+            .unwrap();
+        assert!(matches!(retry.state, ActivationStateView::Denied));
+        assert_eq!(retry.binding, denied.binding);
+        let late = registry
+            .activate_grant(&owner, &grant.activate_request(), owner.public())
+            .unwrap_err();
+        assert_eq!(
+            late.downcast_ref::<ShareError>(),
+            Some(&ShareError::MemberRevoked)
+        );
+
+        let mut wrong = ActivationStatusQuery::for_grant(&grant, None);
+        wrong.binding.request_hash = Hash32::digest(b"different-request");
+        assert_eq!(
+            registry
+                .activation_receipt(&wrong, peer)
+                .unwrap_err()
+                .downcast_ref(),
+            Some(&ShareError::GrantReplay)
+        );
+    }
+
+    #[test]
+    fn activation_status_does_not_synthesize_expiry_before_durable_cancel() {
+        let (_temp, owner, share, peer, registry) = authority_fixture();
+        let nonce = [0xa9; 32];
+        let mut grant = ShareGrant::sign(
+            &owner,
+            share,
+            peer,
+            owner.public(),
+            1,
+            0,
+            [0xaa; 32],
+            Hash32::digest(b"expired-manifest"),
+            Hash32::digest(b"expired-request"),
+            nonce,
+            now(),
+        )
+        .unwrap();
+        // This row is trusted durable authority in the registry fixture. Its
+        // signed shape is otherwise unchanged; the expired wall value is
+        // deliberately used to exercise the cleanup ordering.
+        grant.expires_at = now().saturating_sub(1);
+        registry
+            .write_grant(
+                &grant_key(nonce),
+                &GrantRow {
+                    grant: grant.clone(),
+                    state: GrantState::Issued,
+                    activation_id: None,
+                    activation_deadline: None,
+                    revoked: false,
+                },
+            )
+            .unwrap();
+
+        let before_cancel = registry
+            .activation_receipt(&ActivationStatusQuery::for_grant(&grant, None), peer)
+            .unwrap();
+        assert!(matches!(before_cancel.state, ActivationStateView::Issued));
+        let expired = registry
+            .cancel_activation(&ActivationCancel::for_grant(&grant, None, [0xab; 16]), peer)
+            .unwrap();
+        assert!(matches!(expired.state, ActivationStateView::Expired));
+        let after_cancel = registry
+            .activation_receipt(&ActivationStatusQuery::for_grant(&grant, None), peer)
+            .unwrap();
+        assert!(matches!(after_cancel.state, ActivationStateView::Expired));
+    }
+
+    #[test]
+    fn remove_share_preserves_nonterminal_activation_for_drain_recovery() {
+        let (_temp, owner, share, peer, registry) = authority_fixture();
+        let foreign_owner = SecretKey::generate().public();
+        registry
+            .store_relationship(MemberRelationship {
+                membership: Membership {
+                    share_id: share,
+                    owner: foreign_owner,
+                    endpoint: owner.public(),
+                    permission: Permission::ReadOnly,
+                    replica: ReplicaId(Hash32::digest(b"foreign-replica")),
+                    enrolled_at: now(),
+                    revoked_at: None,
+                    epoch: 1,
+                },
+                address: EndpointAddr::new(foreign_owner),
+            })
+            .unwrap();
+        let nonce = [0xa5; 32];
+        let grant = ShareGrant::sign(
+            &owner,
+            share,
+            peer,
+            owner.public(),
+            1,
+            0,
+            [0xa6; 32],
+            Hash32::digest(b"remove-manifest"),
+            Hash32::digest(b"remove-request"),
+            nonce,
+            now(),
+        )
+        .unwrap();
+        registry
+            .write_grant(
+                &grant_key(nonce),
+                &GrantRow {
+                    grant,
+                    state: GrantState::Issued,
+                    activation_id: None,
+                    activation_deadline: None,
+                    revoked: false,
+                },
+            )
+            .unwrap();
+
+        let error = registry.remove_share(share).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<ShareError>(),
+            Some(&ShareError::RevocationPending)
+        );
+        assert!(registry.config(share).is_ok());
+        assert!(registry.read_grant(&grant_key(nonce)).unwrap().is_some());
+
+        let cancel = ActivationCancel::for_grant(
+            &registry
+                .read_grant(&grant_key(nonce))
+                .unwrap()
+                .unwrap()
+                .grant,
+            None,
+            [0xa8; 16],
+        );
+        registry.cancel_activation(&cancel, peer).unwrap();
+        registry.remove_share(share).unwrap();
+        assert!(registry.relationship(foreign_owner, share).is_ok());
     }
 
     #[test]
