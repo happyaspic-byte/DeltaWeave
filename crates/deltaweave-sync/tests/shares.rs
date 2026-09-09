@@ -192,16 +192,37 @@ fn managed_read_only_partial_swarm_emits_single_fallback_event() {
     );
 }
 
+#[test]
+fn managed_read_only_mid_transfer_supplier_loss_is_observed() {
+    isolated(
+        "managed_read_only_mid_transfer_supplier_loss_is_observed",
+        || {
+            tokio::runtime::Runtime::new().unwrap().block_on(
+                run_managed_read_only_two_suppliers_with_options(false, true),
+            );
+        },
+    );
+}
+
 async fn run_managed_read_only_two_suppliers(force_owner_fallback: bool) {
+    run_managed_read_only_two_suppliers_with_options(force_owner_fallback, false).await;
+}
+
+async fn run_managed_read_only_two_suppliers_with_options(
+    force_owner_fallback: bool,
+    interrupt_provider: bool,
+) {
     let temp = tempfile::tempdir().unwrap();
     let base = temp.path();
     let owner = ShareService::open(base.join("owner-device"), NetworkMode::DirectOnly, None)
         .await
         .unwrap();
-    let provider = ShareService::open(base.join("provider-device"), NetworkMode::DirectOnly, None)
+    let provider_path = base.join("provider-device");
+    let provider = ShareService::open(&provider_path, NetworkMode::DirectOnly, None)
         .await
         .unwrap();
-    let consumer = ShareService::open(base.join("consumer-device"), NetworkMode::DirectOnly, None)
+    let consumer_path = base.join("consumer-device");
+    let consumer = ShareService::open(&consumer_path, NetworkMode::DirectOnly, None)
         .await
         .unwrap();
     let share_events = Arc::new(Mutex::new(Vec::<ShareTransferEvent>::new()));
@@ -292,6 +313,49 @@ async fn run_managed_read_only_two_suppliers(force_owner_fallback: bool) {
         .await
         .unwrap();
     probe.close().await;
+    let provider_peer_id = provider.endpoint_id();
+    let mut provider_holder = Some(provider);
+    let mut provider_engine_holder = Some(provider_engine);
+    let interrupted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let provider_stop = if interrupt_provider {
+        let stop = Arc::new(tokio::sync::Notify::new());
+        let observed = Arc::clone(&share_events);
+        let interrupted_by_observer = Arc::clone(&interrupted);
+        let stop_observer = stop.clone();
+        let observer = ShareTransferObserver::new(move |event| {
+            observed
+                .lock()
+                .expect("share observer lock")
+                .push(event.clone());
+            if event.phase == SharePhase::Swarm
+                && event.direction == TransferDirection::Outbound
+                && event.bytes > 0
+                && !interrupted_by_observer.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                // Keep the provider operation in-flight long enough for the
+                // independent service shutdown to close its connection.  A
+                // positive outbound event is the byte-level interruption
+                // marker; this delay is only a scheduling barrier.
+                stop_observer.notify_one();
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        });
+        provider_holder
+            .as_ref()
+            .expect("provider service")
+            .set_share_observer(Some(observer));
+        let provider = provider_holder.take().expect("provider service");
+        let provider_engine = provider_engine_holder
+            .take()
+            .expect("provider managed engine");
+        Some(tokio::spawn(async move {
+            stop.notified().await;
+            provider.shutdown().await.unwrap();
+            provider_engine.shutdown().await.unwrap();
+        }))
+    } else {
+        None
+    };
     let deleted_owner_chunk = if force_owner_fallback {
         // Force one owner-assigned chunk to be absent after the
         // authenticated manifest response.  The member supplier
@@ -365,10 +429,84 @@ async fn run_managed_read_only_two_suppliers(force_owner_fallback: bool) {
         observed.lock().expect("observer lock").push(event);
     });
     let share_event_start = share_events.lock().expect("share observer lock").len();
-    let report = consumer_engine
-        .sync_read_only(Some(observer))
-        .await
-        .unwrap();
+    let first_result = consumer_engine.sync_read_only(Some(observer)).await;
+    let mut provider_stop = provider_stop;
+    if interrupt_provider {
+        assert!(
+            interrupted.load(std::sync::atomic::Ordering::SeqCst),
+            "provider shutdown was triggered only after a positive payload event"
+        );
+        if let Some(stop_task) = provider_stop.take() {
+            tokio::time::timeout(std::time::Duration::from_secs(20), stop_task)
+                .await
+                .expect("provider shutdown task must finish")
+                .expect("provider shutdown task must not panic");
+        }
+    }
+    let first_report = match first_result {
+        Ok(report) => {
+            assert!(
+                !interrupt_provider,
+                "provider shutdown must interrupt the managed transfer"
+            );
+            Some(report)
+        }
+        Err(error) if interrupt_provider => {
+            // A provider connection loss after positive bytes is not proof
+            // that either side drained its activation.  The exact grant must
+            // remain pending across recovery until the owner receives the
+            // missing endpoint acknowledgement; this test must never turn
+            // that unknown state into a successful public apply.
+            assert_eq!(
+                ShareError::classify(&error),
+                ShareError::RevocationPending,
+                "mid-transfer provider loss remains a durable blocker"
+            );
+            {
+                let events = share_events.lock().expect("share observer lock");
+                assert!(events[share_event_start..].iter().any(|event| {
+                    event.phase == SharePhase::Swarm
+                        && event.direction == TransferDirection::Outbound
+                        && event.peer == consumer.endpoint_id()
+                        && event.bytes > 0
+                        && event.grant.is_some()
+                }));
+            }
+
+            // Reopen the same member service through recovery-only mode. It
+            // must have no heartbeat or supplier registration and must return
+            // the same pending classification without touching the public
+            // namespace. A later owner-side bilateral drain is required
+            // before any retry can materialize the retained private CAS.
+            consumer_engine.shutdown().await.unwrap();
+            consumer.shutdown().await.unwrap();
+            let consumer = ShareService::open(&consumer_path, NetworkMode::DirectOnly, None)
+                .await
+                .unwrap();
+            let recovery = ManagedSyncEngine::open_recovery(
+                &consumer,
+                owner.endpoint_id(),
+                provider_grant.share_id,
+                config(base, "consumer"),
+            )
+            .unwrap();
+            let recovery_error = recovery
+                .recover_pending()
+                .await
+                .expect_err("unknown bilateral drain must remain pending");
+            assert_eq!(
+                ShareError::classify(&recovery_error),
+                ShareError::RevocationPending
+            );
+            assert!(!base.join("consumer-root/payload.bin").exists());
+            recovery.shutdown().await.unwrap();
+            consumer.shutdown().await.unwrap();
+            owner.shutdown().await.unwrap();
+            return;
+        }
+        Err(_) => panic!("non-interrupted transfer failed"),
+    };
+    let report = first_report.expect("non-interrupted transfer has a report");
     assert_eq!(report.status, "pass");
     assert!(report.pulled_bytes > 0);
     if let Some(deleted_owner_chunk) = deleted_owner_chunk {
@@ -445,17 +583,22 @@ async fn run_managed_read_only_two_suppliers(force_owner_fallback: bool) {
         let provider_peers: BTreeSet<_> = events
             .iter()
             .filter(|event| inbound_swarm(event))
-            .filter(|event| {
-                event.peer == provider.endpoint_id() || event.peer == owner.endpoint_id()
-            })
+            .filter(|event| event.peer == provider_peer_id || event.peer == owner.endpoint_id())
             .filter(|event| event.bytes > 0)
             .map(|event| event.peer)
             .collect();
-        assert_eq!(
-            provider_peers.len(),
-            2,
-            "both authenticated suppliers delivered verified bytes"
-        );
+        if interrupt_provider {
+            assert!(
+                provider_peers.contains(&provider_peer_id),
+                "the interrupted member supplier delivered bytes before shutdown"
+            );
+        } else {
+            assert_eq!(
+                provider_peers.len(),
+                2,
+                "both authenticated suppliers delivered verified bytes"
+            );
+        }
         let first_verified = events
             .iter()
             .position(|event| inbound_swarm(&event) && event.bytes > 0)
@@ -465,20 +608,24 @@ async fn run_managed_read_only_two_suppliers(force_owner_fallback: bool) {
             .filter(|event| inbound_swarm(event) && event.bytes == 0)
             .map(|event| event.operation_id)
             .collect();
-        assert!(
-            started_before_first.len() >= 2,
-            "two admitted providers must start before the first verified chunk"
-        );
-        let verified_swarm_bytes = events
-            .iter()
-            .filter(|event| inbound_swarm(event) && event.bytes > 0)
-            .map(|event| event.bytes)
-            .sum::<u64>();
-        assert_eq!(
-            verified_swarm_bytes + fallback_bytes,
-            report.pulled_bytes,
-            "typed verified swarm plus fallback bytes equals the aggregate report"
-        );
+        if !interrupt_provider {
+            assert!(
+                started_before_first.len() >= 2,
+                "two admitted providers must start before the first verified chunk"
+            );
+        }
+        if !interrupt_provider {
+            let verified_swarm_bytes = events
+                .iter()
+                .filter(|event| inbound_swarm(event) && event.bytes > 0)
+                .map(|event| event.bytes)
+                .sum::<u64>();
+            assert_eq!(
+                verified_swarm_bytes + fallback_bytes,
+                report.pulled_bytes,
+                "typed verified swarm plus fallback bytes equals the aggregate report"
+            );
+        }
     }
     assert_eq!(
         fs::read(base.join("consumer-root/payload.bin")).unwrap(),
@@ -489,10 +636,20 @@ async fn run_managed_read_only_two_suppliers(force_owner_fallback: bool) {
     // recover that terminal provider failure and continue through
     // the authenticated owner source/fallback instead of turning
     // one unavailable roster hint into a false global failure.
-    let provider_peer = provider.endpoint_id().to_string();
+    let provider_peer = provider_peer_id.to_string();
     let owner_peer = owner.endpoint_id().to_string();
-    provider_engine.shutdown().await.unwrap();
-    provider.shutdown().await.unwrap();
+    provider_engine_holder
+        .take()
+        .expect("provider managed engine")
+        .shutdown()
+        .await
+        .unwrap();
+    provider_holder
+        .take()
+        .expect("provider service")
+        .shutdown()
+        .await
+        .unwrap();
     let consumer2 =
         ShareService::open(base.join("consumer2-device"), NetworkMode::DirectOnly, None)
             .await
