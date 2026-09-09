@@ -1,8 +1,9 @@
 use super::authority::{
     ActivationBinding, ActivationCancel, ActivationReceipt, ActivationStateView,
-    ActivationStatusQuery, ApplyDrained, ApplyPermit, ApplyStart, AuthoritativeSnapshot,
-    ClientIntentPhase, ClientIntentRow, ClientSide, ManifestAttestation, RevocationReceipt,
-    ShareGrant, SnapshotToken, request_hash, validate_hash_subset,
+    ActivationStatusQuery, ApplyCancel, ApplyDrained, ApplyPermit, ApplyReceipt, ApplyStart,
+    ApplyStateView, ApplyStatusQuery, AuthoritativeSnapshot, ClientIntentPhase, ClientIntentRow,
+    ClientSide, ManifestAttestation, RevocationReceipt, ShareGrant, SnapshotToken, request_hash,
+    validate_hash_subset,
 };
 use super::roster::{
     MAX_ROSTER_ENTRIES, MAX_ROSTER_FRAME_BYTES, ROSTER_STALE_AFTER_SECONDS, ROSTER_TTL_SECONDS,
@@ -321,6 +322,18 @@ impl Registry {
                 {
                     row.phase = ClientIntentPhase::Unknown;
                     row.boot_id = boot_id;
+                    let bytes = postcard::to_stdvec(&row)?;
+                    table.insert(key.as_str(), bytes.as_slice())?;
+                } else if matches!(
+                    row.phase,
+                    ClientIntentPhase::Drained | ClientIntentPhase::Cancelled
+                ) && row.terminal_at_wall.is_none()
+                {
+                    // Rows written before terminal timestamps were added are
+                    // retained conservatively from this migration point; an
+                    // old start time must never cause immediate cleanup of a
+                    // terminal record whose confirmation age is unknown.
+                    row.terminal_at_wall = Some(now());
                     let bytes = postcard::to_stdvec(&row)?;
                     table.insert(key.as_str(), bytes.as_slice())?;
                 }
@@ -1422,7 +1435,8 @@ impl Registry {
                     row.phase,
                     ClientIntentPhase::Drained | ClientIntentPhase::Cancelled
                 ) && row
-                    .started_at_wall
+                    .terminal_at_wall
+                    .unwrap_or(row.started_at_wall)
                     .saturating_add(CLIENT_INTENT_RETENTION_SECONDS)
                     <= wall
             })
@@ -1479,6 +1493,7 @@ impl Registry {
             phase: ClientIntentPhase::Prepared,
             boot_id: self.boot_id,
             started_at_wall: wall,
+            terminal_at_wall: None,
         };
         let intents = self.read_client_intents()?;
         let row_bytes = postcard::to_stdvec(&row)?.len();
@@ -1542,6 +1557,8 @@ impl Registry {
             // An Unknown operation may only be terminalized by a recovery
             // control path. It must never restart payload admission with the
             // old nonce after a crash or a cancelled stream.
+            | (ClientIntentPhase::Unknown, ClientIntentPhase::Draining)
+            | (ClientIntentPhase::Unknown, ClientIntentPhase::Drained)
             | (ClientIntentPhase::Unknown, ClientIntentPhase::Cancelled) => true,
             (ClientIntentPhase::Drained, ClientIntentPhase::Drained)
             | (ClientIntentPhase::Cancelled, ClientIntentPhase::Cancelled) => true,
@@ -1549,6 +1566,13 @@ impl Registry {
         };
         ensure!(valid, ShareError::GrantReplay);
         row.phase = phase;
+        if matches!(
+            phase,
+            ClientIntentPhase::Drained | ClientIntentPhase::Cancelled
+        ) && row.terminal_at_wall.is_none()
+        {
+            row.terminal_at_wall = Some(now());
+        }
         self.write_client_intent(&key, &row)?;
         Ok(row)
     }
@@ -1556,6 +1580,44 @@ impl Registry {
     #[allow(dead_code)]
     pub(crate) fn client_intent(&self, grant: &ShareGrant) -> Result<Option<ClientIntentRow>> {
         self.read_client_intent(&grant_key(grant.nonce))
+    }
+
+    /// Returns the bounded endpoint-local journal without exposing its
+    /// storage keys. Callers must still validate the exact grant binding and
+    /// operation before acting on a row; enumeration is for restart
+    /// recovery only and never grants payload permission.
+    pub(crate) fn client_intents(&self) -> Result<Vec<ClientIntentRow>> {
+        Ok(self
+            .read_client_intents()?
+            .into_iter()
+            .map(|(_, row)| row)
+            .collect())
+    }
+
+    /// Reads one exact journal row for recovery. A nonce collision with a
+    /// different grant, side, or operation is a replay/conflict rather than
+    /// an invitation to create a replacement intent.
+    pub(crate) fn client_intent_exact(
+        &self,
+        grant: &ShareGrant,
+        side: ClientSide,
+        operation_id: [u8; 16],
+    ) -> Result<Option<ClientIntentRow>> {
+        // Recovery may run after the grant's wall-clock expiry, so validate
+        // its immutable owner signature without treating expiry as permission
+        // to start payload work.
+        grant.verify_signature_for(grant.owner, grant.share)?;
+        let Some(row) = self.client_intent(grant)? else {
+            return Ok(None);
+        };
+        ensure!(
+            row.grant == *grant
+                && row.binding == super::authority::ActivationBinding::from_grant(grant)
+                && row.side == side
+                && row.operation_id == operation_id,
+            ShareError::GrantReplay
+        );
+        Ok(Some(row))
     }
 
     /// Persists one complete owner snapshot in the separate swarm namespace.
@@ -1890,6 +1952,130 @@ impl Registry {
             ApplyState::Denied => Err(ShareError::MemberRevoked.into()),
             _ => Err(ShareError::GrantReplay.into()),
         }
+    }
+
+    fn apply_receipt_from_row(row: &ApplyRow) -> ApplyReceipt {
+        let state = match row.state {
+            ApplyState::Prepared => ApplyStateView::Prepared,
+            ApplyState::Started => ApplyStateView::Started,
+            ApplyState::Restarted => ApplyStateView::Restarted,
+            ApplyState::Drained => ApplyStateView::Drained,
+            ApplyState::Denied => ApplyStateView::Denied,
+            ApplyState::Expired => ApplyStateView::Expired,
+        };
+        ApplyReceipt {
+            owner: row.permit.owner,
+            share: row.permit.share,
+            consumer: row.permit.consumer,
+            permit_nonce: row.permit.nonce,
+            operation_id: row.operation_id,
+            state,
+            committed: row.committed,
+            revoked: row.revoked,
+            admission_open: true,
+        }
+    }
+
+    fn validate_apply_status_binding(
+        row: &ApplyRow,
+        owner: EndpointId,
+        share: ShareId,
+        consumer: EndpointId,
+        permit_nonce: GrantNonce,
+        operation_id: Option<[u8; 16]>,
+        authenticated_peer: EndpointId,
+    ) -> Result<()> {
+        ensure!(owner == row.permit.owner, ShareError::OwnerMismatch);
+        ensure!(share == row.permit.share, ShareError::OwnerMismatch);
+        ensure!(
+            consumer == row.permit.consumer,
+            ShareError::EndpointMismatch
+        );
+        ensure!(permit_nonce == row.permit.nonce, ShareError::GrantReplay);
+        ensure!(authenticated_peer == consumer, ShareError::EndpointMismatch);
+        match (row.operation_id, operation_id) {
+            (Some(expected), Some(actual)) => ensure!(expected == actual, ShareError::GrantReplay),
+            (None, None) => {}
+            (None, Some(_)) => ensure!(row.state == ApplyState::Prepared, ShareError::GrantReplay),
+            (Some(_), None) => return Err(ShareError::GrantReplay.into()),
+        }
+        row.permit.verify_signature_for(owner, share, consumer)
+    }
+
+    /// Reads the exact apply journal row in a single owner-authenticated
+    /// operation. Expiry and restart states are returned as stored; status
+    /// never extends a lease or silently terminalizes an unknown row.
+    pub(crate) fn apply_status(
+        &self,
+        query: &ApplyStatusQuery,
+        authenticated_peer: EndpointId,
+    ) -> Result<ApplyReceipt> {
+        let _serial = self
+            .serial
+            .lock()
+            .map_err(|_| ShareError::StateUnavailable)?;
+        let catalog = self.read()?;
+        ensure!(query.owner == catalog.owner, ShareError::OwnerMismatch);
+        let key = grant_key(query.permit_nonce);
+        let row = self
+            .read_apply(key.as_str())?
+            .ok_or(ShareError::GrantReplay)?;
+        Self::validate_apply_status_binding(
+            &row,
+            query.owner,
+            query.share,
+            query.consumer,
+            query.permit_nonce,
+            query.operation_id,
+            authenticated_peer,
+        )?;
+        Ok(Self::apply_receipt_from_row(&row))
+    }
+
+    /// Atomically cancels a Prepared apply. Started/Restarted rows retain their
+    /// exact operation and writer-drain blocker; a late cancel cannot turn an
+    /// active write into a false Denied completion.
+    pub(crate) fn cancel_apply(
+        &self,
+        cancel: &ApplyCancel,
+        authenticated_peer: EndpointId,
+    ) -> Result<ApplyReceipt> {
+        let _serial = self
+            .serial
+            .lock()
+            .map_err(|_| ShareError::StateUnavailable)?;
+        let catalog = self.read()?;
+        ensure!(cancel.owner == catalog.owner, ShareError::OwnerMismatch);
+        let key = grant_key(cancel.permit_nonce);
+        let mut row = self
+            .read_apply(key.as_str())?
+            .ok_or(ShareError::GrantReplay)?;
+        ensure!(
+            row.permit.owner == cancel.owner
+                && row.permit.share == cancel.share
+                && row.permit.consumer == cancel.consumer
+                && row.permit.nonce == cancel.permit_nonce
+                && authenticated_peer == cancel.consumer,
+            ShareError::EndpointMismatch
+        );
+        row.permit
+            .verify_signature_for(cancel.owner, cancel.share, cancel.consumer)?;
+        if let Some(existing) = row.operation_id {
+            ensure!(existing == cancel.operation_id, ShareError::GrantReplay);
+        }
+        match row.state {
+            ApplyState::Prepared => {
+                row.operation_id = Some(cancel.operation_id);
+                row.state = ApplyState::Denied;
+                self.write_apply(&key, &row)?;
+            }
+            ApplyState::Started
+            | ApplyState::Restarted
+            | ApplyState::Drained
+            | ApplyState::Denied
+            | ApplyState::Expired => {}
+        }
+        Ok(Self::apply_receipt_from_row(&row))
     }
 
     #[allow(dead_code)]
@@ -2977,6 +3163,93 @@ mod tests {
     }
 
     #[test]
+    fn one_sided_grant_drain_keeps_client_intent_recoverable() {
+        let (_temp, owner, share, peer, registry) = authority_fixture();
+        let nonce = [0xd1; 32];
+        let activation_id = [0xd2; 16];
+        let grant = ShareGrant::sign(
+            &owner,
+            share,
+            peer,
+            owner.public(),
+            1,
+            0,
+            [0xd3; 32],
+            Hash32::digest(b"one-sided-manifest"),
+            Hash32::digest(b"one-sided-request"),
+            nonce,
+            now(),
+        )
+        .unwrap();
+        registry
+            .write_grant(
+                &grant_key(nonce),
+                &GrantRow {
+                    grant: grant.clone(),
+                    state: GrantState::Active,
+                    activation_id: Some(activation_id),
+                    activation_deadline: Some(now().saturating_add(15)),
+                    revoked: false,
+                },
+            )
+            .unwrap();
+        registry
+            .prepare_client_intent(&grant, ClientSide::Consumer, [0xd4; 16])
+            .unwrap();
+        registry
+            .transition_client_intent(
+                &grant,
+                ClientSide::Consumer,
+                [0xd4; 16],
+                ClientIntentPhase::AwaitingActivation,
+                Some(activation_id),
+            )
+            .unwrap();
+        registry
+            .transition_client_intent(
+                &grant,
+                ClientSide::Consumer,
+                [0xd4; 16],
+                ClientIntentPhase::Active,
+                Some(activation_id),
+            )
+            .unwrap();
+        registry
+            .transition_client_intent(
+                &grant,
+                ClientSide::Consumer,
+                [0xd4; 16],
+                ClientIntentPhase::Draining,
+                Some(activation_id),
+            )
+            .unwrap();
+
+        // The consumer acknowledgement is authenticated, but the provider
+        // acknowledgement is intentionally withheld. The owner grant and
+        // local journal must remain active/recoverable and GC must not infer
+        // completion from one side.
+        registry
+            .drain_grant(share, nonce, activation_id, peer)
+            .unwrap();
+        let receipt = registry
+            .activation_receipt(
+                &ActivationStatusQuery::for_grant(&grant, Some(activation_id)),
+                peer,
+            )
+            .unwrap();
+        assert!(matches!(receipt.state, ActivationStateView::Active));
+        assert!(receipt.consumer_drained && !receipt.provider_drained);
+        assert!(matches!(
+            registry.client_intent(&grant).unwrap().unwrap().phase,
+            ClientIntentPhase::Draining
+        ));
+        registry
+            .gc_client_intents(now().saturating_add(CLIENT_INTENT_RETENTION_SECONDS + 1))
+            .unwrap();
+        assert!(registry.client_intent(&grant).unwrap().is_some());
+    }
+
+    #[test]
     fn activation_status_and_cancel_are_exact_and_idempotent() {
         let (_temp, owner, share, peer, registry) = authority_fixture();
         let nonce = [0xa1; 32];
@@ -3588,6 +3861,94 @@ mod tests {
                 .read_apply(&grant_key(apply_nonce))
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn apply_status_and_prepared_cancel_are_exact_and_replay_safe() {
+        let (_temp, owner, share, peer, registry) = authority_fixture();
+        let permit = ApplyPermit::sign(
+            &owner,
+            share,
+            peer,
+            1,
+            [0xb1; 32],
+            Hash32::digest(b"status-root"),
+            now(),
+            [0xb2; 32],
+        )
+        .unwrap();
+        registry
+            .write_apply(
+                &grant_key(permit.nonce),
+                &ApplyRow {
+                    permit: permit.clone(),
+                    state: ApplyState::Prepared,
+                    operation_id: None,
+                    committed: false,
+                    revoked: false,
+                },
+            )
+            .unwrap();
+        let prepared = registry
+            .apply_status(&ApplyStatusQuery::for_permit(&permit, None), peer)
+            .unwrap();
+        assert!(matches!(prepared.state, ApplyStateView::Prepared));
+        assert_eq!(prepared.operation_id, None);
+
+        let operation_id = [0xb3; 16];
+        // The caller may know its local operation id even when the response
+        // was lost before ApplyStart reached the owner.  Prepared is the one
+        // state where that query remains exact by permit binding while the
+        // durable row correctly reports no operation id yet.
+        let prepared_with_local_id = registry
+            .apply_status(
+                &ApplyStatusQuery::for_permit(&permit, Some(operation_id)),
+                peer,
+            )
+            .unwrap();
+        assert_eq!(prepared_with_local_id, prepared);
+        let denied = registry
+            .cancel_apply(&ApplyCancel::for_permit(&permit, operation_id), peer)
+            .unwrap();
+        assert!(matches!(denied.state, ApplyStateView::Denied));
+        assert_eq!(denied.operation_id, Some(operation_id));
+        let replay = registry
+            .cancel_apply(&ApplyCancel::for_permit(&permit, operation_id), peer)
+            .unwrap();
+        assert_eq!(replay, denied);
+        let status = registry
+            .apply_status(
+                &ApplyStatusQuery::for_permit(&permit, Some(operation_id)),
+                peer,
+            )
+            .unwrap();
+        assert_eq!(status, denied);
+        assert_eq!(
+            registry
+                .apply_start(
+                    owner.public(),
+                    share,
+                    peer,
+                    permit.root_hash,
+                    &ApplyStart {
+                        operation_id,
+                        permit_nonce: permit.nonce,
+                    },
+                )
+                .unwrap_err()
+                .downcast_ref::<ShareError>(),
+            Some(&ShareError::MemberRevoked)
+        );
+
+        let mut wrong = ApplyStatusQuery::for_permit(&permit, Some(operation_id));
+        wrong.operation_id = Some([0xb4; 16]);
+        assert_eq!(
+            registry
+                .apply_status(&wrong, peer)
+                .unwrap_err()
+                .downcast_ref::<ShareError>(),
+            Some(&ShareError::GrantReplay)
         );
     }
 }

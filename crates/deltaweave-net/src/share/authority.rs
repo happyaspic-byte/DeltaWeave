@@ -262,6 +262,12 @@ pub struct ClientIntentRow {
     pub phase: ClientIntentPhase,
     pub boot_id: [u8; 16],
     pub started_at_wall: u64,
+    /// Wall-clock time at which this endpoint observed the authenticated
+    /// terminal result and durably recorded it.  Retention is measured from
+    /// this confirmation rather than from the operation start, so a delayed
+    /// owner response cannot make a still-recoverable row disappear early.
+    #[serde(default)]
+    pub terminal_at_wall: Option<u64>,
 }
 
 /// Secret-free result of a verified share-swarm transfer.
@@ -273,6 +279,13 @@ pub struct SwarmTransferReceipt {
     pub transferred_bytes: u64,
     pub missing_chunks: u16,
     pub verified: bool,
+    /// True when local bytes were verified and the local endpoint sent its
+    /// drain acknowledgement, but the owner has not yet authenticated the
+    /// bilateral terminal state. This is intentionally part of the result so
+    /// callers cannot mistake a successful byte transfer for a completed
+    /// grant lifecycle.
+    #[serde(default)]
+    pub drain_pending: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -301,6 +314,80 @@ pub struct ApplyDrained {
     pub operation_id: [u8; 16],
     pub permit_nonce: GrantNonce,
     pub committed: bool,
+}
+
+/// Queries the owner's durable apply journal. `operation_id` is optional only
+/// while a permit is still Prepared and has not yet received ApplyStart; once
+/// the owner has recorded a start it must match exactly.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ApplyStatusQuery {
+    pub owner: EndpointId,
+    pub share: ShareId,
+    pub consumer: EndpointId,
+    pub permit_nonce: GrantNonce,
+    pub operation_id: Option<[u8; 16]>,
+}
+
+impl ApplyStatusQuery {
+    pub fn for_permit(permit: &ApplyPermit, operation_id: Option<[u8; 16]>) -> Self {
+        Self {
+            owner: permit.owner,
+            share: permit.share,
+            consumer: permit.consumer,
+            permit_nonce: permit.nonce,
+            operation_id,
+        }
+    }
+}
+
+/// Atomically cancels a Prepared apply. Started/Restarted applies are only
+/// queried and drained after their actual local writer has stopped.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ApplyCancel {
+    pub owner: EndpointId,
+    pub share: ShareId,
+    pub consumer: EndpointId,
+    pub permit_nonce: GrantNonce,
+    pub operation_id: [u8; 16],
+}
+
+impl ApplyCancel {
+    pub fn for_permit(permit: &ApplyPermit, operation_id: [u8; 16]) -> Self {
+        Self {
+            owner: permit.owner,
+            share: permit.share,
+            consumer: permit.consumer,
+            permit_nonce: permit.nonce,
+            operation_id,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplyStateView {
+    Prepared,
+    Started,
+    Restarted,
+    Drained,
+    Denied,
+    Expired,
+}
+
+/// Authenticated owner response for apply recovery. It is a journal view,
+/// not a permit and never extends an apply lease.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ApplyReceipt {
+    pub owner: EndpointId,
+    pub share: ShareId,
+    pub consumer: EndpointId,
+    pub permit_nonce: GrantNonce,
+    pub operation_id: Option<[u8; 16]>,
+    pub state: ApplyStateView,
+    pub committed: bool,
+    pub revoked: bool,
+    #[serde(default = "default_admission_open")]
+    pub admission_open: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -788,6 +875,19 @@ impl ShareGrant {
     pub fn verify_for(&self, owner: EndpointId, share: ShareId, now: u64) -> Result<()> {
         ensure!(self.owner == owner, ShareError::OwnerMismatch);
         ensure!(self.share == share, ShareError::OwnerMismatch);
+        self.verify_signature_for(owner, share)?;
+        check_issued_at(self.issued_at, now)?;
+        ensure!(self.expires_at > now, ShareError::GrantExpired);
+        Ok(())
+    }
+
+    /// Verifies the immutable signed binding while deliberately ignoring the
+    /// grant's wall-clock expiry.  Restart recovery may need to query or
+    /// cancel an already-expired row, but it must never use that fact to admit
+    /// a new payload operation.
+    pub(crate) fn verify_signature_for(&self, owner: EndpointId, share: ShareId) -> Result<()> {
+        ensure!(self.owner == owner, ShareError::OwnerMismatch);
+        ensure!(self.share == share, ShareError::OwnerMismatch);
         self.validate_shape()?;
         verify_signature(
             self.owner,
@@ -795,8 +895,6 @@ impl ShareGrant {
             &grant_payload(self),
             &self.signature,
         )?;
-        check_issued_at(self.issued_at, now)?;
-        ensure!(self.expires_at > now, ShareError::GrantExpired);
         Ok(())
     }
 
@@ -943,6 +1041,27 @@ impl ApplyPermit {
         )?;
         check_issued_at(self.issued_at, now)?;
         ensure!(self.expires_at > now, ShareError::GrantExpired);
+        Ok(())
+    }
+
+    /// Verifies an expired permit's immutable signature for journal recovery;
+    /// callers must still reject it for any new apply admission.
+    pub(crate) fn verify_signature_for(
+        &self,
+        owner: EndpointId,
+        share: ShareId,
+        consumer: EndpointId,
+    ) -> Result<()> {
+        ensure!(self.owner == owner, ShareError::OwnerMismatch);
+        ensure!(self.share == share, ShareError::OwnerMismatch);
+        ensure!(self.consumer == consumer, ShareError::EndpointMismatch);
+        self.validate_shape()?;
+        verify_signature(
+            self.owner,
+            APPLY_DOMAIN,
+            &apply_payload(self),
+            &self.signature,
+        )?;
         Ok(())
     }
 }

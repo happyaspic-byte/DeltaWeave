@@ -1,8 +1,9 @@
 use super::{
     ActivateGrantReply, ActivateGrantRequest, ActivationCancel, ActivationReceipt,
-    ActivationStatusQuery, ApplyDrained, ApplyPermit, ApplyStart, AuthoritativeSnapshot,
-    GrantNonce, LegacyProof, ManifestAttestation, Membership, RosterHeartbeat, ShareError,
-    ShareGrant, ShareId, ShareTicket, SignedRoster, SnapshotToken, TicketPreview,
+    ActivationStatusQuery, ApplyCancel, ApplyDrained, ApplyPermit, ApplyReceipt, ApplyStart,
+    ApplyStatusQuery, AuthoritativeSnapshot, GrantNonce, LegacyProof, ManifestAttestation,
+    Membership, RosterHeartbeat, ShareError, ShareGrant, ShareId, ShareTicket, SignedRoster,
+    SnapshotToken, TicketPreview,
 };
 use crate::{read_frame, write_frame};
 use anyhow::{Result, ensure};
@@ -69,6 +70,10 @@ pub(crate) enum Operation {
     /// Atomically cancels an Issued activation, or returns the existing
     /// Active/terminal receipt when activation won the race.
     ActivationCancel(ActivationCancel),
+    /// Queries the owner's durable apply journal without extending its lease.
+    ApplyStatus(ApplyStatusQuery),
+    /// Atomically cancels a Prepared apply; active writer rows remain blockers.
+    ApplyCancel(ApplyCancel),
 }
 #[derive(Serialize, Deserialize)]
 pub(crate) enum Reply {
@@ -102,6 +107,8 @@ pub(crate) enum Reply {
     GrantDrained,
     /// Owner-authenticated durable activation state for status and cancel.
     ActivationReceipt(ActivationReceipt),
+    /// Owner-authenticated durable apply state for status and recovery.
+    ApplyReceipt(ApplyReceipt),
 }
 
 /// The grant-gated data stream is deliberately separate from the legacy
