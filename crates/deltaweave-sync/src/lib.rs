@@ -2262,23 +2262,26 @@ impl ReplicaState {
                         }
                         batch = batch.saturating_add(1);
                     }
-                    let receipt = if missing.is_empty() {
-                        PullReceipt {
-                            record: (*source).clone(),
-                            manifest: attestation.manifest.clone(),
-                            transferred_bytes,
-                            reused_extents: attestation
-                                .manifest
-                                .chunks
-                                .len()
-                                .saturating_sub(initial_missing_count),
-                        }
+                    let (receipt, fallback_transferred_bytes) = if missing.is_empty() {
+                        (
+                            PullReceipt {
+                                record: (*source).clone(),
+                                manifest: attestation.manifest.clone(),
+                                transferred_bytes,
+                                reused_extents: attestation
+                                    .manifest
+                                    .chunks
+                                    .len()
+                                    .saturating_sub(initial_missing_count),
+                            },
+                            0,
+                        )
                     } else {
                         // share/3 remains an authenticated CAS-only fallback;
                         // it never receives the public destination path. Its
                         // returned record/manifest must match the owner
                         // attestation before private materialization.
-                        let mut receipt = session
+                        let mut fallback_receipt = session
                             .pull_record_to_with_budget(
                                 (*source).clone(),
                                 Arc::clone(&self.store),
@@ -2287,17 +2290,32 @@ impl ReplicaState {
                                 pending_local_bytes,
                             )
                             .await?;
-                        receipt.transferred_bytes = receipt
+                        let fallback_transferred_bytes = fallback_receipt.transferred_bytes;
+                        fallback_receipt.transferred_bytes = fallback_receipt
                             .transferred_bytes
                             .checked_add(transferred_bytes)
                             .context("managed pulled-byte counter overflow")?;
-                        receipt
+                        (fallback_receipt, fallback_transferred_bytes)
                     };
                     ensure!(receipt.record == **source, ShareError::ManifestMismatch);
                     ensure!(
                         receipt.manifest == attestation.manifest,
                         ShareError::ManifestMismatch
                     );
+                    if fallback_transferred_bytes > 0 {
+                        // Keep this separate from the aggregate event: the
+                        // management layer counts typed swarm payloads and
+                        // adds this event only for bytes actually supplied by
+                        // the authenticated share/3 fallback.  CAS reuse and
+                        // swarm-only completion therefore emit no duplicate.
+                        self.observe(
+                            observer,
+                            "file_received_fallback",
+                            Some(&source.path),
+                            Some("pull"),
+                            fallback_transferred_bytes,
+                        );
+                    }
                     self.observe(
                         observer,
                         "file_received",
