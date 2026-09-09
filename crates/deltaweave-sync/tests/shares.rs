@@ -1,7 +1,9 @@
 use deltaweave_core::ChunkingProfile;
-use deltaweave_net::{NetworkMode, share::*};
-use deltaweave_sync::{ManagedSyncConfig, ManagedSyncEngine};
+use deltaweave_net::{NetworkMode, TransferEvent, TransferObserver, share::*};
+use deltaweave_sync::{ManagedSyncConfig, ManagedSyncEngine, ManagedSyncFailure};
+use std::collections::BTreeSet;
 use std::fs;
+use std::sync::{Arc, Mutex};
 
 fn isolated(name: &str, body: impl FnOnce()) {
     if std::env::var("DW_MANAGED_SYNC_TEST").ok().as_deref() == Some(name) {
@@ -146,6 +148,218 @@ fn independent_owner_rw_ro_roundtrip_preserves_local_work_and_restart() {
                 writer.shutdown().await.unwrap();
                 ro.shutdown().await.unwrap();
                 rw.shutdown().await.unwrap();
+                owner.shutdown().await.unwrap();
+            });
+        },
+    );
+}
+
+#[test]
+fn managed_read_only_uses_owner_and_member_suppliers_for_real_chunks() {
+    isolated(
+        "managed_read_only_uses_owner_and_member_suppliers_for_real_chunks",
+        || {
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                let temp = tempfile::tempdir().unwrap();
+                let base = temp.path();
+                let owner =
+                    ShareService::open(base.join("owner-device"), NetworkMode::DirectOnly, None)
+                        .await
+                        .unwrap();
+                let provider =
+                    ShareService::open(base.join("provider-device"), NetworkMode::DirectOnly, None)
+                        .await
+                        .unwrap();
+                let consumer =
+                    ShareService::open(base.join("consumer-device"), NetworkMode::DirectOnly, None)
+                        .await
+                        .unwrap();
+                let owned = owner
+                    .create_owned_share(
+                        "two suppliers".into(),
+                        base.join("owner-root"),
+                        base.join("owner-state"),
+                        None,
+                        0,
+                    )
+                    .await
+                    .unwrap();
+                // This deterministic 8 MiB payload produces multiple default
+                // FastCDC chunks, allowing the managed scheduler to assign
+                // distinct subsets to both authenticated providers.
+                let mut payload = Vec::with_capacity(8 * 1024 * 1024);
+                for block in 0..8192_u64 {
+                    let mut state = block ^ 0x9e37_79b9_7f4a_7c15;
+                    for _ in 0..1024 {
+                        state ^= state << 7;
+                        state ^= state >> 9;
+                        state ^= state << 8;
+                        payload.push((state >> 24) as u8);
+                    }
+                }
+                fs::write(base.join("owner-root/payload.bin"), &payload).unwrap();
+                owned.refresh_inventory().await.unwrap();
+                let provider_grant = provider
+                    .enroll(
+                        &owned
+                            .issue_key(Permission::ReadOnly, None, owner.endpoint_addr())
+                            .unwrap(),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let provider_engine = ManagedSyncEngine::open(
+                    &provider,
+                    provider_grant.owner,
+                    provider_grant.share_id,
+                    config(base, "provider"),
+                )
+                .unwrap();
+                let probe = provider
+                    .open_session(provider_grant.owner, provider_grant.share_id)
+                    .unwrap();
+                let probe_snapshot = probe
+                    .fetch_authoritative_snapshot(
+                        &deltaweave_reconcile::MerkleTree::from_records(Vec::new()).unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(probe_snapshot.records.len(), 1);
+                let probe_record = probe_snapshot.records[0].clone();
+                let probe_manifest = probe
+                    .request_manifest(&probe_snapshot.token, &probe_record)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    probe_manifest.manifest.file_hash,
+                    probe_record.content_hash.unwrap()
+                );
+                let probe_hashes: BTreeSet<_> = probe_manifest
+                    .manifest
+                    .chunks
+                    .iter()
+                    .map(|chunk| chunk.hash)
+                    .collect();
+                assert!(probe_hashes.len() >= 2);
+                assert!(probe_manifest.manifest.chunks.len() <= 64);
+                let probe_hashes: Vec<_> = probe_manifest
+                    .manifest
+                    .chunks
+                    .iter()
+                    .map(|chunk| chunk.hash)
+                    .collect();
+                let mut probe_hashes = probe_hashes;
+                probe_hashes.sort();
+                probe
+                    .request_swarm_grant(
+                        owner.endpoint_id(),
+                        &probe_snapshot.token,
+                        &probe_manifest,
+                        &probe_hashes,
+                    )
+                    .await
+                    .unwrap();
+                probe.close().await;
+                let provider_events = Arc::new(Mutex::new(Vec::<TransferEvent>::new()));
+                let provider_observed = Arc::clone(&provider_events);
+                let provider_observer = TransferObserver::new(move |event| {
+                    provider_observed.lock().expect("observer lock").push(event);
+                });
+                let provider_result = provider_engine
+                    .sync_read_only(Some(provider_observer))
+                    .await;
+                let provider_report = provider_result.unwrap_or_else(|error| {
+                    let phases: Vec<_> = provider_events
+                        .lock()
+                        .expect("observer lock")
+                        .iter()
+                        .map(|event| event.phase.clone())
+                        .collect();
+                    panic!(
+                        "provider sync class={:?} phases={phases:?}",
+                        ManagedSyncFailure::classify(&error)
+                    );
+                });
+                assert!(provider_report.pulled_bytes > 0);
+                let consumer_grant = consumer
+                    .enroll(
+                        &owned
+                            .issue_key(Permission::ReadOnly, None, owner.endpoint_addr())
+                            .unwrap(),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let consumer_engine = ManagedSyncEngine::open(
+                    &consumer,
+                    consumer_grant.owner,
+                    consumer_grant.share_id,
+                    config(base, "consumer"),
+                )
+                .unwrap();
+                let events = Arc::new(Mutex::new(Vec::<TransferEvent>::new()));
+                let observed = Arc::clone(&events);
+                let observer = TransferObserver::new(move |event| {
+                    observed.lock().expect("observer lock").push(event);
+                });
+                let report = consumer_engine
+                    .sync_read_only(Some(observer))
+                    .await
+                    .unwrap();
+                assert_eq!(report.status, "pass");
+                assert!(report.pulled_bytes > 0);
+                let events = events.lock().expect("observer lock");
+                let starts: Vec<_> = events
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, event)| event.phase == "swarm_provider_started")
+                    .collect();
+                let verified: Vec<_> = events
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, event)| {
+                        event.phase == "swarm_provider_verified" && event.bytes > 0
+                    })
+                    .collect();
+                let started_peers: BTreeSet<_> = starts
+                    .iter()
+                    .filter_map(|(_, event)| event.peer.as_deref())
+                    .collect();
+                let verified_peers: BTreeSet<_> = verified
+                    .iter()
+                    .filter_map(|(_, event)| event.peer.as_deref())
+                    .collect();
+                assert!(started_peers.len() >= 2);
+                if verified_peers.len() < 2 {
+                    let owner_peer = owner.endpoint_id().to_string();
+                    let summary: Vec<_> = events
+                        .iter()
+                        .map(|event| {
+                            (
+                                event.phase.as_str(),
+                                event.bytes,
+                                match event.peer.as_deref() {
+                                    Some(peer) if peer == owner_peer => "owner",
+                                    Some(_) => "member",
+                                    None => "none",
+                                },
+                            )
+                        })
+                        .collect();
+                    panic!("provider event summary={summary:?}");
+                }
+                assert!(starts.len() >= 2);
+                assert!(verified.first().is_some_and(|(first_verified, _)| {
+                    starts.iter().all(|(started, _)| started < first_verified)
+                }));
+                assert_eq!(
+                    fs::read(base.join("consumer-root/payload.bin")).unwrap(),
+                    payload
+                );
+                provider_engine.shutdown().await.unwrap();
+                consumer_engine.shutdown().await.unwrap();
+                provider.shutdown().await.unwrap();
+                consumer.shutdown().await.unwrap();
                 owner.shutdown().await.unwrap();
             });
         },

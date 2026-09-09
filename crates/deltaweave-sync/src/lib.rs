@@ -25,8 +25,8 @@ use deltaweave_net::{
 use deltaweave_net::{
     root_admission,
     share::{
-        ApplyStateView, AuthoritativeSnapshot, ClientIntentPhase, ManifestAttestation, ShareError,
-        ShareGrant, ShareId, ShareSession, SnapshotToken, SwarmTransferReceipt,
+        ApplyPermit, ApplyStateView, AuthoritativeSnapshot, ClientIntentPhase, ManifestAttestation,
+        ShareError, ShareGrant, ShareId, ShareSession, SnapshotToken, SwarmTransferReceipt,
     },
 };
 use deltaweave_reconcile::{
@@ -532,7 +532,22 @@ async fn run_managed_swarm_assignment(
     manifest: ManifestAttestation,
     operation_id: [u8; 16],
     hashes: Vec<Hash32>,
+    observer: Option<TransferObserver>,
+    start_gate: Arc<tokio::sync::Barrier>,
 ) -> ManagedSwarmOutcome {
+    if let Some(observer) = &observer {
+        observer.emit(TransferEvent {
+            phase: "swarm_provider_started".into(),
+            path: Some(record.path.as_str().into()),
+            direction: Some("pull".into()),
+            bytes: 0,
+            peer: Some(grant.provider.to_string()),
+        });
+    }
+    // The barrier makes the scheduler's concurrency contract observable: all
+    // accepted provider assignments enter the fetch before any one task can
+    // complete.  It is bounded by the number of assignments in this batch.
+    start_gate.wait().await;
     let result = session
         .fetch_swarm_chunks(
             store,
@@ -544,6 +559,15 @@ async fn run_managed_swarm_assignment(
             operation_id,
         )
         .await;
+    if let (Some(observer), Ok(receipt)) = (&observer, &result) {
+        observer.emit(TransferEvent {
+            phase: "swarm_provider_verified".into(),
+            path: Some(record.path.as_str().into()),
+            direction: Some("pull".into()),
+            bytes: receipt.transferred_bytes,
+            peer: Some(grant.provider.to_string()),
+        });
+    }
     ManagedSwarmOutcome { assignment, result }
 }
 
@@ -832,6 +856,13 @@ impl ReplicaState {
                 .causal
                 .as_ref()
                 .context(deltaweave_net::share::ShareError::StateUnavailable)?;
+            // Store intentionally treats authorization as opaque.  A matching
+            // owner record alone is therefore insufficient to prove that a
+            // retained causal attempt was created for this managed share.
+            // Validate the signed, immutable permit before considering the
+            // record for recovery; an old epoch/root is allowed to become a
+            // stale attempt and roll back under the fresh permit below.
+            let authorization = Self::validate_managed_causal_authorization(session, binding)?;
             let owner_record = owner_records
                 .iter()
                 .find(|record| record.path == binding.record.path);
@@ -842,7 +873,9 @@ impl ReplicaState {
             // owner round.  An already-adopted target is retained and merely
             // finalized below, since rolling it back would discard an index
             // transition that already happened before the crash.
-            let stale_owner = owner_record.is_none_or(|record| record != &binding.record);
+            let stale_owner = owner_record.is_none_or(|record| record != &binding.record)
+                || authorization.epoch > session.membership().epoch
+                || authorization.root_hash != snapshot.root_hash;
             let indexed = self
                 .index
                 .get(&change.path)?
@@ -956,6 +989,38 @@ impl ReplicaState {
                 Err(drain_error) => Err(drain_error),
             },
         }
+    }
+
+    /// Validates the opaque Store authorization attached to a managed causal
+    /// journal.  The permit is checked at its own issue time so restart recovery
+    /// can authenticate an expired historical signature without treating it as a
+    /// fresh admission.  Fresh epoch/root authorization is still required before
+    /// any resumed public/index mutation; a historical mismatch is handled as a
+    /// stale attempt and rolled back rather than adopted.
+    fn validate_managed_causal_authorization(
+        session: &ShareSession,
+        binding: &deltaweave_store::CausalBinding,
+    ) -> Result<ApplyPermit> {
+        let bytes = binding
+            .authorization
+            .as_deref()
+            .context(ShareError::StateUnavailable)?;
+        let permit: ApplyPermit = postcard::from_bytes(bytes)
+            .map_err(|_| anyhow::Error::new(ShareError::StateUnavailable))?;
+        let membership = session.membership();
+        permit
+            .verify_for(
+                membership.owner,
+                membership.share_id,
+                membership.endpoint,
+                permit.issued_at,
+            )
+            .map_err(|_| anyhow::Error::new(ShareError::StateUnavailable))?;
+        ensure!(
+            permit.epoch > 0 && permit.epoch <= membership.epoch,
+            ShareError::StateUnavailable
+        );
+        Ok(permit)
     }
 
     /// Runs the managed RW algorithm.  This deliberately lives beside the
@@ -1602,9 +1667,20 @@ impl ReplicaState {
                             && attestation.manifest.size == source.size,
                         ShareError::ManifestMismatch
                     );
+                    self.observe(
+                        observer,
+                        "swarm_manifest_ok",
+                        Some(&source.path),
+                        Some("pull"),
+                        0,
+                    );
                     let mut missing =
                         missing_chunks(Arc::clone(&self.store), attestation.manifest.clone())
                             .await?;
+                    // The manifest preserves file order, while the owner
+                    // grant binds a strictly sorted subset.  Keep the local
+                    // CAS inventory deterministic before issuing any grant.
+                    missing.sort();
                     let initial_missing_count = missing.len();
                     let providers = self.managed_swarm_providers(session).await;
                     let mut transferred_bytes = 0_u64;
@@ -1674,8 +1750,24 @@ impl ReplicaState {
                                     {
                                         continue;
                                     }
-                                    Err(error) => return Err(error),
+                                    Err(error) => {
+                                        self.observe(
+                                            observer,
+                                            "swarm_grant_error",
+                                            Some(&source.path),
+                                            Some("pull"),
+                                            0,
+                                        );
+                                        return Err(error);
+                                    }
                                 };
+                                self.observe(
+                                    observer,
+                                    "swarm_grant_ok",
+                                    Some(&source.path),
+                                    Some("pull"),
+                                    0,
+                                );
                                 let operation = managed_swarm_operation_id(
                                     &snapshot.token,
                                     source,
@@ -1704,6 +1796,7 @@ impl ReplicaState {
                         }
 
                         let mut fetches = tokio::task::JoinSet::new();
+                        let start_gate = Arc::new(tokio::sync::Barrier::new(assignments.len()));
                         for (assignment, item) in assignments.iter().enumerate() {
                             fetches.spawn(run_managed_swarm_assignment(
                                 assignment,
@@ -1715,6 +1808,8 @@ impl ReplicaState {
                                 attestation.clone(),
                                 item.operation_id,
                                 item.hashes.clone(),
+                                observer.clone(),
+                                Arc::clone(&start_gate),
                             ));
                         }
                         let mut outcomes: Vec<Option<Result<SwarmTransferReceipt>>> =
@@ -1839,6 +1934,7 @@ impl ReplicaState {
                         missing =
                             missing_chunks(Arc::clone(&self.store), attestation.manifest.clone())
                                 .await?;
+                        missing.sort();
                         if missing.is_empty() {
                             break;
                         }
@@ -2336,6 +2432,7 @@ mod tests {
     use std::{collections::HashSet, fs};
 
     use deltaweave_core::{SYNC_RECORD_SCHEMA_V1, VersionVector};
+    use deltaweave_net::share::{Permission, ShareService};
     use deltaweave_net::{
         NetworkMode, PeerPolicy, ServerConfig, start_server, start_server_observed,
     };
@@ -2383,6 +2480,127 @@ mod tests {
             .expect("inventory helper completes");
 
         assert_eq!(missing, vec![first, second]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn managed_causal_authorization_rejects_missing_and_cross_share_permits() {
+        let base = TempDir::new().expect("share test root can be created");
+        let owner = ShareService::open(
+            base.path().join("owner-device"),
+            NetworkMode::DirectOnly,
+            None,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("owner service opens: {error:#}"));
+        let member = ShareService::open(
+            base.path().join("member-device"),
+            NetworkMode::DirectOnly,
+            None,
+        )
+        .await
+        .expect("member service opens");
+        let first = owner
+            .create_owned_share(
+                "first".into(),
+                base.path().join("first-root"),
+                base.path().join("first-state"),
+                None,
+                0,
+            )
+            .await
+            .expect("first share opens");
+        let second = owner
+            .create_owned_share(
+                "second".into(),
+                base.path().join("second-root"),
+                base.path().join("second-state"),
+                None,
+                0,
+            )
+            .await
+            .expect("second share opens");
+        let first_grant = member
+            .enroll(
+                &first
+                    .issue_key(Permission::ReadWrite, None, owner.endpoint_addr())
+                    .expect("first ticket issues"),
+                None,
+            )
+            .await
+            .expect("first membership enrolls");
+        let second_grant = member
+            .enroll(
+                &second
+                    .issue_key(Permission::ReadWrite, None, owner.endpoint_addr())
+                    .expect("second ticket issues"),
+                None,
+            )
+            .await
+            .expect("second membership enrolls");
+        let first_session = member
+            .open_session(first_grant.owner, first_grant.share_id)
+            .expect("first session opens");
+        let second_session = member
+            .open_session(second_grant.owner, second_grant.share_id)
+            .expect("second session opens");
+        let empty = MerkleTree::from_records(Vec::new()).expect("empty tree builds");
+        let first_snapshot = first_session
+            .fetch_authoritative_snapshot(&empty)
+            .await
+            .expect("first snapshot fetches");
+        let first_permit = first_session
+            .revalidate_before_apply(&first_snapshot.token)
+            .await
+            .expect("first permit issues");
+        let second_snapshot = second_session
+            .fetch_authoritative_snapshot(&empty)
+            .await
+            .expect("second snapshot fetches");
+        let second_permit = second_session
+            .revalidate_before_apply(&second_snapshot.token)
+            .await
+            .expect("second permit issues");
+        let record = SyncRecord {
+            schema_version: SYNC_RECORD_SCHEMA_V1,
+            path: WirePath::new("retained.bin").expect("record path validates"),
+            kind: SyncEntryKind::File,
+            size: 0,
+            content_hash: Some(Hash32::digest(&[])),
+            readonly: false,
+            version: VersionVector::default(),
+            tombstone: false,
+        };
+        let binding = |authorization| deltaweave_store::CausalBinding {
+            record: record.clone(),
+            precondition: None,
+            authorization,
+        };
+
+        assert!(
+            ReplicaState::validate_managed_causal_authorization(&first_session, &binding(None),)
+                .is_err(),
+            "missing opaque authorization must not become a managed recovery"
+        );
+        assert!(
+            ReplicaState::validate_managed_causal_authorization(
+                &first_session,
+                &binding(Some(postcard::to_stdvec(&second_permit).unwrap())),
+            )
+            .is_err(),
+            "a valid permit from another share must not authorize this journal"
+        );
+        assert!(
+            ReplicaState::validate_managed_causal_authorization(
+                &first_session,
+                &binding(Some(postcard::to_stdvec(&first_permit).unwrap())),
+            )
+            .is_ok(),
+            "the exact owner/share/consumer permit must authenticate"
+        );
+        first_session.close().await;
+        second_session.close().await;
+        member.shutdown().await.expect("member shuts down");
+        owner.shutdown().await.expect("owner shuts down");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
