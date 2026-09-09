@@ -7,8 +7,8 @@ use super::authority::{
 use super::roster::random_nonce;
 use super::{
     ALPN_SWARM_V1, ALPN_V3, GrantNonce, LegacyProof, MemberRelationship, Membership,
-    OwnedShareConfig, RosterHeartbeat, ShareError, ShareId, ShareTicket, SignedRoster,
-    TicketPreview,
+    OwnedShareConfig, RosterHeartbeat, ShareError, ShareId, SharePhase, ShareTicket,
+    ShareTransferEvent, ShareTransferObserver, SignedRoster, TicketPreview, TransferDirection,
 };
 use super::{
     registry::Registry,
@@ -40,13 +40,35 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, RwLock, Weak,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
 
 const CONTROL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
 const MAX_SWARM_OPERATION_KEYS: usize = 4096;
+
+fn query_event_id(sequence: &AtomicU64, share: ShareId, peer: EndpointId, tag: &[u8]) -> [u8; 16] {
+    let mut bytes = b"deltaweave/share-event/query/v1\0".to_vec();
+    bytes.extend_from_slice(&share.0);
+    bytes.extend_from_slice(peer.as_bytes());
+    bytes.extend_from_slice(tag);
+    bytes.extend_from_slice(&sequence.fetch_add(1, Ordering::Relaxed).to_le_bytes());
+    let digest = Hash32::digest(&bytes);
+    let mut operation_id = [0_u8; 16];
+    operation_id.copy_from_slice(&digest.as_bytes()[..16]);
+    operation_id
+}
+
+fn emit_share_event(
+    observer: &Arc<Mutex<Option<ShareTransferObserver>>>,
+    event: ShareTransferEvent,
+) {
+    let observer = observer.lock().ok().and_then(|observer| observer.clone());
+    if let Some(observer) = observer {
+        observer.emit(event);
+    }
+}
 
 type SupplierMap = Arc<RwLock<BTreeMap<(EndpointId, ShareId), Arc<SupplierRegistrationGuard>>>>;
 
@@ -617,6 +639,8 @@ pub struct ShareService {
     suppliers: SupplierMap,
     supplier_lifecycle: Arc<SupplierLifecycle>,
     swarm_tasks: Arc<SwarmTaskRegistry>,
+    share_observer: Arc<Mutex<Option<ShareTransferObserver>>>,
+    share_event_sequence: Arc<AtomicU64>,
     /// Rotates bounded recovery batches so a slow first row cannot starve
     /// later endpoint-local intents across managed ticks.
     intent_recovery_cursor: AtomicUsize,
@@ -932,6 +956,8 @@ impl ShareService {
             max_connections.saturating_mul(2).max(1),
         ));
         let swarm_inflight = Arc::new(Mutex::new(BTreeSet::new()));
+        let share_observer = Arc::new(Mutex::new(None));
+        let share_event_sequence = Arc::new(AtomicU64::new(1));
         #[cfg(test)]
         let admission_limit = limit.clone();
         let endpoint_for_swarm = endpoint.clone();
@@ -957,6 +983,8 @@ impl ShareService {
                     tasks: swarm_tasks.clone(),
                     streams: swarm_streams.clone(),
                     inflight: swarm_inflight.clone(),
+                    share_observer: share_observer.clone(),
+                    share_event_sequence: share_event_sequence.clone(),
                 },
             )
             .spawn();
@@ -971,6 +999,8 @@ impl ShareService {
             suppliers,
             supplier_lifecycle,
             swarm_tasks,
+            share_observer,
+            share_event_sequence,
             intent_recovery_cursor: AtomicUsize::new(0),
             #[cfg(test)]
             admission_limit,
@@ -978,6 +1008,15 @@ impl ShareService {
     }
     pub fn endpoint_id(&self) -> EndpointId {
         self.key.public()
+    }
+
+    /// Installs the additive share-operation observer on this already-bound
+    /// endpoint. Existing sessions and both inbound protocol handlers see the
+    /// same callback through the shared service state.
+    pub fn set_share_observer(&self, observer: Option<ShareTransferObserver>) {
+        if let Ok(mut current) = self.share_observer.lock() {
+            *current = observer;
+        }
     }
     #[cfg(test)]
     fn available_admission_slots(&self) -> usize {
@@ -1456,6 +1495,8 @@ impl ShareService {
             relationship,
             self.active.clone(),
             self.swarm_tasks.clone(),
+            self.share_observer.clone(),
+            self.share_event_sequence.clone(),
         ))
     }
 
@@ -1516,6 +1557,8 @@ impl ShareService {
             tasks: self.swarm_tasks.clone(),
             streams: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Mutex::new(BTreeSet::new())),
+            share_observer: self.share_observer.clone(),
+            share_event_sequence: self.share_event_sequence.clone(),
         };
         let rows = self.registry.client_intents()?;
         if rows.is_empty() {
@@ -1730,7 +1773,18 @@ impl ShareService {
             // Store/index generation has stopped using the root.  The
             // supplier counter is the exact local writer boundary; require
             // it even when the controller also supplied a matching lease.
-            if row.grant.provider == self.endpoint_id() && row.grant.owner != self.endpoint_id() {
+            // A row carried over from a previous process generation has no
+            // live supplier registration by definition.  The exact managed
+            // lease plus the old operation-generation boundary is the proof
+            // that its former local IO cannot still be running.  Requiring a
+            // newly registered supplier here would strand paused/revoked
+            // recovery after a clean service reopen.  Same-boot rows still
+            // require the live supplier counter below because a marker alone
+            // cannot prove that a current writer has stopped.
+            if row.previous_boot_id.is_none()
+                && row.grant.provider == self.endpoint_id()
+                && row.grant.owner != self.endpoint_id()
+            {
                 return self
                     .suppliers
                     .read()
@@ -1874,6 +1928,8 @@ struct ShareSessionState {
     roster: Mutex<RosterCache>,
     roster_gate: tokio::sync::Mutex<()>,
     transport: SyncSession,
+    share_observer: Arc<Mutex<Option<ShareTransferObserver>>>,
+    share_event_sequence: Arc<AtomicU64>,
 }
 
 /// A control connection closes even when its awaiting operation is cancelled.
@@ -1908,6 +1964,8 @@ impl ShareSession {
         relationship: MemberRelationship,
         active: Arc<tokio::sync::RwLock<()>>,
         tasks: Arc<SwarmTaskRegistry>,
+        share_observer: Arc<Mutex<Option<ShareTransferObserver>>>,
+        share_event_sequence: Arc<AtomicU64>,
     ) -> Self {
         let owner = relationship.membership.owner;
         let share = relationship.membership.share_id;
@@ -1934,12 +1992,43 @@ impl ShareSession {
                     observation: Arc::new(std::sync::RwLock::new(None)),
                     n0_lookup: Arc::new(std::sync::RwLock::new(None)),
                 },
+                share_observer,
+                share_event_sequence,
             }),
         }
     }
 
     pub fn membership(&self) -> &Membership {
         &self.state.membership
+    }
+
+    /// Registers an observer for this share session. The observer is shared
+    /// with the service's inbound handlers, so events from the consumer and
+    /// provider sides retain one endpoint lifetime and one operation ID space.
+    pub fn with_share_observer(self, observer: ShareTransferObserver) -> Self {
+        self.set_share_observer(Some(observer));
+        self
+    }
+
+    /// Replaces the observer for this session without opening another
+    /// endpoint or changing the authenticated membership binding.
+    pub fn set_share_observer(&self, observer: Option<ShareTransferObserver>) {
+        if let Ok(mut current) = self.state.share_observer.lock() {
+            *current = observer;
+        }
+    }
+
+    fn emit_share_event(&self, event: ShareTransferEvent) {
+        emit_share_event(&self.state.share_observer, event);
+    }
+
+    fn next_query_event_id(&self, peer: EndpointId, tag: &[u8]) -> [u8; 16] {
+        query_event_id(
+            &self.state.share_event_sequence,
+            self.state.membership.share_id,
+            peer,
+            tag,
+        )
     }
 
     /// Proves that this session's exact grant operation has no remaining
@@ -2218,21 +2307,75 @@ impl ShareSession {
         &self,
         _local: &MerkleTree,
     ) -> Result<AuthoritativeSnapshot> {
-        let result = self.control_exchange(Operation::Snapshot).await?;
-        let snapshot = match result {
-            Reply::Snapshot(snapshot) => snapshot,
-            _ => return Err(ShareError::Protocol.into()),
-        };
-        snapshot.verify_complete(
-            self.state.membership.owner,
-            self.state.membership.share_id,
-            super::now(),
-        )?;
-        ensure!(
-            snapshot.token.epoch == self.state.membership.epoch,
-            ShareError::EpochMismatch
-        );
-        Ok(snapshot)
+        let peer = self.state.membership.owner;
+        let operation_id = self.next_query_event_id(peer, b"snapshot");
+        let mut admitted = false;
+        let result: Result<AuthoritativeSnapshot> = async {
+            let result = self.control_exchange(Operation::Snapshot).await?;
+            admitted = true;
+            // A failed/offline connect never becomes an active peer.  Emit
+            // the operation only after the authenticated control exchange
+            // has produced a response; validation failures below still get a
+            // terminal Reject event for this admitted operation.
+            self.emit_share_event(ShareTransferEvent {
+                operation_id,
+                share: self.state.membership.share_id,
+                peer,
+                phase: SharePhase::Query,
+                direction: TransferDirection::Outbound,
+                bytes: 0,
+                epoch: self.state.membership.epoch,
+                provider_epoch: None,
+                grant: None,
+            });
+            let snapshot = match result {
+                Reply::Snapshot(snapshot) => snapshot,
+                _ => return Err(ShareError::Protocol.into()),
+            };
+            snapshot.verify_complete(
+                self.state.membership.owner,
+                self.state.membership.share_id,
+                super::now(),
+            )?;
+            ensure!(
+                snapshot.token.epoch == self.state.membership.epoch,
+                ShareError::EpochMismatch
+            );
+            Ok(snapshot)
+        }
+        .await;
+        match result {
+            Ok(snapshot) => {
+                self.emit_share_event(ShareTransferEvent {
+                    operation_id,
+                    share: self.state.membership.share_id,
+                    peer,
+                    phase: SharePhase::Done,
+                    direction: TransferDirection::Outbound,
+                    bytes: 0,
+                    epoch: self.state.membership.epoch,
+                    provider_epoch: None,
+                    grant: None,
+                });
+                Ok(snapshot)
+            }
+            Err(error) => {
+                if admitted {
+                    self.emit_share_event(ShareTransferEvent {
+                        operation_id,
+                        share: self.state.membership.share_id,
+                        peer,
+                        phase: SharePhase::Reject,
+                        direction: TransferDirection::Outbound,
+                        bytes: 0,
+                        epoch: self.state.membership.epoch,
+                        provider_epoch: None,
+                        grant: None,
+                    });
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Requests an owner attestation for one exact snapshot record.
@@ -2241,27 +2384,77 @@ impl ShareSession {
         snapshot: &SnapshotToken,
         record: &SyncRecord,
     ) -> Result<ManifestAttestation> {
-        ensure!(
-            snapshot.epoch == self.state.membership.epoch,
-            ShareError::EpochMismatch
-        );
-        let result = self
-            .control_exchange(Operation::Manifest {
-                snapshot: snapshot.clone(),
-                record: record.clone(),
-            })
-            .await?;
-        let attestation = match result {
-            Reply::Manifest(attestation) => attestation,
-            _ => return Err(ShareError::Protocol.into()),
-        };
-        attestation.verify_for(
-            self.state.membership.owner,
-            self.state.membership.share_id,
-            super::now(),
-        )?;
-        attestation.verify_record(snapshot, record)?;
-        Ok(attestation)
+        let peer = self.state.membership.owner;
+        let operation_id = self.next_query_event_id(peer, b"manifest");
+        let mut admitted = false;
+        let result: Result<ManifestAttestation> = async {
+            ensure!(
+                snapshot.epoch == self.state.membership.epoch,
+                ShareError::EpochMismatch
+            );
+            let result = self
+                .control_exchange(Operation::Manifest {
+                    snapshot: snapshot.clone(),
+                    record: record.clone(),
+                })
+                .await?;
+            admitted = true;
+            self.emit_share_event(ShareTransferEvent {
+                operation_id,
+                share: self.state.membership.share_id,
+                peer,
+                phase: SharePhase::Manifest,
+                direction: TransferDirection::Outbound,
+                bytes: 0,
+                epoch: self.state.membership.epoch,
+                provider_epoch: None,
+                grant: None,
+            });
+            let attestation = match result {
+                Reply::Manifest(attestation) => attestation,
+                _ => return Err(ShareError::Protocol.into()),
+            };
+            attestation.verify_for(
+                self.state.membership.owner,
+                self.state.membership.share_id,
+                super::now(),
+            )?;
+            attestation.verify_record(snapshot, record)?;
+            Ok(attestation)
+        }
+        .await;
+        match result {
+            Ok(attestation) => {
+                self.emit_share_event(ShareTransferEvent {
+                    operation_id,
+                    share: self.state.membership.share_id,
+                    peer,
+                    phase: SharePhase::Done,
+                    direction: TransferDirection::Outbound,
+                    bytes: 0,
+                    epoch: self.state.membership.epoch,
+                    provider_epoch: None,
+                    grant: None,
+                });
+                Ok(attestation)
+            }
+            Err(error) => {
+                if admitted {
+                    self.emit_share_event(ShareTransferEvent {
+                        operation_id,
+                        share: self.state.membership.share_id,
+                        peer,
+                        phase: SharePhase::Reject,
+                        direction: TransferDirection::Outbound,
+                        bytes: 0,
+                        epoch: self.state.membership.epoch,
+                        provider_epoch: None,
+                        grant: None,
+                    });
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Requests one owner-signed grant for a sorted, duplicate-free subset of
@@ -2274,57 +2467,106 @@ impl ShareSession {
         manifest: &ManifestAttestation,
         hashes: &[Hash32],
     ) -> Result<ShareGrant> {
-        ensure!(
-            snapshot.epoch == self.state.membership.epoch,
-            ShareError::EpochMismatch
-        );
-        ensure!(
-            snapshot.share == self.state.membership.share_id,
-            ShareError::OwnerMismatch
-        );
-        ensure!(
-            manifest.share == snapshot.share,
-            ShareError::ManifestMismatch
-        );
-        ensure!(manifest.epoch == snapshot.epoch, ShareError::EpochMismatch);
-        super::authority::validate_hash_subset(hashes)?;
-        let result = self
-            .control_exchange(Operation::SwarmGrant {
-                provider,
-                snapshot: snapshot.clone(),
-                manifest: manifest.clone(),
-                hashes: hashes.to_vec(),
-            })
-            .await?;
-        let grant = match result {
-            Reply::Grant(grant) => grant,
-            _ => return Err(ShareError::Protocol.into()),
-        };
-        grant.verify_for(
-            self.state.membership.owner,
-            self.state.membership.share_id,
-            super::now(),
-        )?;
-        ensure!(
-            grant.consumer == self.state.membership.endpoint,
-            ShareError::EndpointMismatch
-        );
-        ensure!(grant.provider == provider, ShareError::EndpointMismatch);
-        ensure!(
-            grant.epoch == self.state.membership.epoch,
-            ShareError::EpochMismatch
-        );
-        ensure!(
-            grant.request_hash
-                == request_hash(
-                    self.state.membership.share_id,
-                    snapshot.snapshot,
-                    manifest.manifest_hash,
-                    hashes,
-                )?,
-            ShareError::ManifestMismatch
-        );
-        Ok(grant)
+        let operation_id = self.next_query_event_id(provider, b"grant");
+        let mut admitted = false;
+        let result: Result<ShareGrant> = async {
+            ensure!(
+                snapshot.epoch == self.state.membership.epoch,
+                ShareError::EpochMismatch
+            );
+            ensure!(
+                snapshot.share == self.state.membership.share_id,
+                ShareError::OwnerMismatch
+            );
+            ensure!(
+                manifest.share == snapshot.share,
+                ShareError::ManifestMismatch
+            );
+            ensure!(manifest.epoch == snapshot.epoch, ShareError::EpochMismatch);
+            super::authority::validate_hash_subset(hashes)?;
+            let result = self
+                .control_exchange(Operation::SwarmGrant {
+                    provider,
+                    snapshot: snapshot.clone(),
+                    manifest: manifest.clone(),
+                    hashes: hashes.to_vec(),
+                })
+                .await?;
+            admitted = true;
+            self.emit_share_event(ShareTransferEvent {
+                operation_id,
+                share: self.state.membership.share_id,
+                peer: provider,
+                phase: SharePhase::Grant,
+                direction: TransferDirection::Outbound,
+                bytes: 0,
+                epoch: self.state.membership.epoch,
+                provider_epoch: None,
+                grant: None,
+            });
+            let grant = match result {
+                Reply::Grant(grant) => grant,
+                _ => return Err(ShareError::Protocol.into()),
+            };
+            grant.verify_for(
+                self.state.membership.owner,
+                self.state.membership.share_id,
+                super::now(),
+            )?;
+            ensure!(
+                grant.consumer == self.state.membership.endpoint,
+                ShareError::EndpointMismatch
+            );
+            ensure!(grant.provider == provider, ShareError::EndpointMismatch);
+            ensure!(
+                grant.epoch == self.state.membership.epoch,
+                ShareError::EpochMismatch
+            );
+            ensure!(
+                grant.request_hash
+                    == request_hash(
+                        self.state.membership.share_id,
+                        snapshot.snapshot,
+                        manifest.manifest_hash,
+                        hashes,
+                    )?,
+                ShareError::ManifestMismatch
+            );
+            Ok(grant)
+        }
+        .await;
+        match result {
+            Ok(grant) => {
+                self.emit_share_event(ShareTransferEvent {
+                    operation_id,
+                    share: self.state.membership.share_id,
+                    peer: provider,
+                    phase: SharePhase::Done,
+                    direction: TransferDirection::Outbound,
+                    bytes: 0,
+                    epoch: self.state.membership.epoch,
+                    provider_epoch: Some(grant.provider_epoch),
+                    grant: Some(grant.nonce),
+                });
+                Ok(grant)
+            }
+            Err(error) => {
+                if admitted {
+                    self.emit_share_event(ShareTransferEvent {
+                        operation_id,
+                        share: self.state.membership.share_id,
+                        peer: provider,
+                        phase: SharePhase::Reject,
+                        direction: TransferDirection::Outbound,
+                        bytes: 0,
+                        epoch: self.state.membership.epoch,
+                        provider_epoch: None,
+                        grant: None,
+                    });
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Activates one member-provider grant at the owner.  The provider's
@@ -3107,6 +3349,19 @@ impl ShareSession {
                     None,
                 );
             }
+            if result.is_err() {
+                session.emit_share_event(ShareTransferEvent {
+                    operation_id,
+                    share: grant.share,
+                    peer: grant.provider,
+                    phase: SharePhase::Reject,
+                    direction: TransferDirection::Inbound,
+                    bytes: 0,
+                    epoch: grant.epoch,
+                    provider_epoch: Some(grant.provider_epoch),
+                    grant: Some(grant.nonce),
+                });
+            }
             let _ = result_tx.send(result);
         });
         if !tasks.register_and_start(task, start_tx) {
@@ -3285,6 +3540,17 @@ impl ShareSession {
                 && receipt.activation_id == owner_receipt.activation_id,
             ShareError::GrantReplay
         );
+        self.emit_share_event(ShareTransferEvent {
+            operation_id,
+            share: grant.share,
+            peer: grant.provider,
+            phase: SharePhase::Swarm,
+            direction: TransferDirection::Inbound,
+            bytes: 0,
+            epoch: grant.epoch,
+            provider_epoch: Some(grant.provider_epoch),
+            grant: Some(grant.nonce),
+        });
         self.state.registry.transition_client_intent(
             grant,
             ClientSide::Consumer,
@@ -3354,6 +3620,17 @@ impl ShareSession {
                 .await
                 .map_err(|_| anyhow::Error::new(ShareError::CasUnavailable))??;
             transferred_bytes = transferred_bytes.saturating_add(length as u64);
+            self.emit_share_event(ShareTransferEvent {
+                operation_id,
+                share: grant.share,
+                peer: grant.provider,
+                phase: SharePhase::Swarm,
+                direction: TransferDirection::Inbound,
+                bytes: length as u64,
+                epoch: grant.epoch,
+                provider_epoch: Some(grant.provider_epoch),
+                grant: Some(grant.nonce),
+            });
         }
         let finished = read_swarm_frame::<wire::SwarmResponse>(&mut receive, deadline).await?;
         let mut transfer = match finished {
@@ -3386,11 +3663,35 @@ impl ShareSession {
             ClientIntentPhase::Draining,
             Some(activation_id),
         )?;
+        self.emit_share_event(ShareTransferEvent {
+            operation_id,
+            share: grant.share,
+            peer: grant.provider,
+            phase: SharePhase::Drain,
+            direction: TransferDirection::Inbound,
+            bytes: 0,
+            epoch: grant.epoch,
+            provider_epoch: Some(grant.provider_epoch),
+            grant: Some(grant.nonce),
+        });
         self.grant_drained(grant, activation_id).await?;
         let drain_confirmed = self
             .finalize_consumer_intent_after_drain(grant, operation_id, activation_id, deadline)
             .await?;
         transfer.drain_pending = !drain_confirmed;
+        if drain_confirmed {
+            self.emit_share_event(ShareTransferEvent {
+                operation_id,
+                share: grant.share,
+                peer: grant.provider,
+                phase: SharePhase::Done,
+                direction: TransferDirection::Inbound,
+                bytes: 0,
+                epoch: grant.epoch,
+                provider_epoch: Some(grant.provider_epoch),
+                grant: Some(grant.nonce),
+            });
+        }
         connection.close(0u8.into(), b"share swarm receive complete");
         Ok(transfer)
     }
@@ -3529,6 +3830,8 @@ struct SwarmAdmissionHandler {
     tasks: Arc<SwarmTaskRegistry>,
     streams: Arc<tokio::sync::Semaphore>,
     inflight: Arc<Mutex<BTreeSet<GrantNonce>>>,
+    share_observer: Arc<Mutex<Option<ShareTransferObserver>>>,
+    share_event_sequence: Arc<AtomicU64>,
 }
 
 impl ProtocolHandler for SwarmAdmissionHandler {
@@ -3567,6 +3870,10 @@ impl ProtocolHandler for SwarmAdmissionHandler {
 }
 
 impl SwarmAdmissionHandler {
+    fn emit_share_event(&self, event: ShareTransferEvent) {
+        emit_share_event(&self.share_observer, event);
+    }
+
     async fn run(&self, connection: Connection) -> Result<()> {
         let deadline = Instant::now() + CONTROL_DEADLINE;
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -3677,6 +3984,19 @@ impl SwarmAdmissionHandler {
         // opportunity.  Shutdown/recovery therefore cannot observe a proof
         // while this handler still owns stream bytes or storage admission.
         let transport_drained = Handler::wait_closed_bounded(connection).await;
+        if result.is_err() && transport_drained {
+            self.emit_share_event(ShareTransferEvent {
+                operation_id,
+                share: grant.share,
+                peer: grant.consumer,
+                phase: SharePhase::Reject,
+                direction: TransferDirection::Outbound,
+                bytes: 0,
+                epoch: grant.epoch,
+                provider_epoch: Some(grant.provider_epoch),
+                grant: Some(grant.nonce),
+            });
+        }
         let retain_recovery_evidence = self
             .registry
             .client_intent(&grant)
@@ -3761,6 +4081,17 @@ impl SwarmAdmissionHandler {
         let receipt = self
             .ensure_provider_admission(&grant, activation_id, &source, activation_deadline)
             .await?;
+        self.emit_share_event(ShareTransferEvent {
+            operation_id,
+            share: grant.share,
+            peer: remote_consumer,
+            phase: SharePhase::Swarm,
+            direction: TransferDirection::Outbound,
+            bytes: 0,
+            epoch: grant.epoch,
+            provider_epoch: Some(grant.provider_epoch),
+            grant: Some(grant.nonce),
+        });
         self.registry.transition_client_intent(
             &grant,
             ClientSide::Provider,
@@ -3854,6 +4185,17 @@ impl SwarmAdmissionHandler {
                 .await
                 .map_err(|_| anyhow::Error::new(ShareError::GrantExpired))??;
             transferred_bytes = transferred_bytes.saturating_add(bytes.len() as u64);
+            self.emit_share_event(ShareTransferEvent {
+                operation_id,
+                share: grant.share,
+                peer: remote_consumer,
+                phase: SharePhase::Swarm,
+                direction: TransferDirection::Outbound,
+                bytes: bytes.len() as u64,
+                epoch: grant.epoch,
+                provider_epoch: Some(grant.provider_epoch),
+                grant: Some(grant.nonce),
+            });
         }
 
         self.registry.transition_client_intent(
@@ -3893,11 +4235,23 @@ impl SwarmAdmissionHandler {
             .map_err(|_| anyhow::Error::new(ShareError::GrantExpired))?
             .map_err(|_| anyhow::Error::new(ShareError::TransferFailed))?;
         ensure!(stopped.is_none(), ShareError::TransferFailed);
+        self.emit_share_event(ShareTransferEvent {
+            operation_id,
+            share: grant.share,
+            peer: remote_consumer,
+            phase: SharePhase::Drain,
+            direction: TransferDirection::Outbound,
+            bytes: 0,
+            epoch: grant.epoch,
+            provider_epoch: Some(grant.provider_epoch),
+            grant: Some(grant.nonce),
+        });
         self.ack_provider_drain(&grant, activation_id).await?;
         // The local stream is drained, but the provider intent remains
         // recoverable until the owner confirms both endpoint acknowledgements.
         // A lost status response therefore leaves `Draining` durable instead
         // of falsely publishing completion.
+        let mut terminal_confirmed = false;
         if let Ok(receipt) = self
             .provider_activation_status(&grant, Some(activation_id), activation_deadline)
             .await
@@ -3919,7 +4273,21 @@ impl SwarmAdmissionHandler {
                     phase,
                     Some(activation_id),
                 )?;
+                terminal_confirmed = true;
             }
+        }
+        if terminal_confirmed {
+            self.emit_share_event(ShareTransferEvent {
+                operation_id,
+                share: grant.share,
+                peer: remote_consumer,
+                phase: SharePhase::Done,
+                direction: TransferDirection::Outbound,
+                bytes: 0,
+                epoch: grant.epoch,
+                provider_epoch: Some(grant.provider_epoch),
+                grant: Some(grant.nonce),
+            });
         }
         Ok(())
     }
@@ -4073,6 +4441,8 @@ impl SwarmAdmissionHandler {
                 relationship,
                 self.active.clone(),
                 self.tasks.clone(),
+                self.share_observer.clone(),
+                self.share_event_sequence.clone(),
             );
             let lease = session.activate_grant(grant).await?;
             let activation_id = lease.reply.activation_id;
@@ -4148,6 +4518,8 @@ impl SwarmAdmissionHandler {
                 relationship,
                 self.active.clone(),
                 self.tasks.clone(),
+                self.share_observer.clone(),
+                self.share_event_sequence.clone(),
             );
             session
                 .activation_status_until(grant, Some(activation_id), deadline)
@@ -4176,6 +4548,8 @@ impl SwarmAdmissionHandler {
                 relationship,
                 self.active.clone(),
                 self.tasks.clone(),
+                self.share_observer.clone(),
+                self.share_event_sequence.clone(),
             );
             session.grant_drained(grant, activation_id).await
         }
@@ -4202,6 +4576,8 @@ impl SwarmAdmissionHandler {
             relationship,
             self.active.clone(),
             self.tasks.clone(),
+            self.share_observer.clone(),
+            self.share_event_sequence.clone(),
         );
         session
             .cancel_activation(grant, activation_id, operation_id)
@@ -4432,6 +4808,8 @@ impl SwarmAdmissionHandler {
             relationship,
             self.active.clone(),
             self.tasks.clone(),
+            self.share_observer.clone(),
+            self.share_event_sequence.clone(),
         );
         session
             .activation_status_until(grant, activation_id, deadline)
@@ -5797,13 +6175,11 @@ mod tests {
         // binding while ensuring the stale address is genuinely exercised.
         provider_membership_session.close().await;
         provider.shutdown().await.unwrap();
-        let provider = ShareService::open(
-            temp.path().join("provider-service"),
-            NetworkMode::DirectOnly,
-            None,
-        )
-        .await
-        .unwrap();
+        let provider_service_path = temp.path().join("provider-service");
+        let provider =
+            ShareService::open(provider_service_path.clone(), NetworkMode::DirectOnly, None)
+                .await
+                .unwrap();
 
         // The session intentionally has an unusable persisted hint. The test
         // enables the Internet lookup path on this otherwise DirectOnly
@@ -5842,6 +6218,8 @@ mod tests {
                     observation: Arc::new(std::sync::RwLock::new(None)),
                     n0_lookup: Arc::new(std::sync::RwLock::new(None)),
                 },
+                share_observer: Arc::new(Mutex::new(None)),
+                share_event_sequence: Arc::new(AtomicU64::new(1)),
             }),
         };
         assert_eq!(
@@ -6173,6 +6551,18 @@ mod tests {
         )
         .await
         .unwrap();
+        let observed_events = Arc::new(Mutex::new(Vec::<ShareTransferEvent>::new()));
+        let observer = ShareTransferObserver::new({
+            let observed_events = observed_events.clone();
+            move |event| {
+                observed_events
+                    .lock()
+                    .expect("share event mutex")
+                    .push(event);
+            }
+        });
+        owner.set_share_observer(Some(observer.clone()));
+        member.set_share_observer(Some(observer));
         let root = temp.path().join("shared-root");
         let state = temp.path().join("shared-state");
         std::fs::create_dir_all(&root).unwrap();
@@ -6249,6 +6639,62 @@ mod tests {
         for hash in hashes.iter().copied() {
             assert!(consumer_store.chunks().contains(hash));
         }
+        let events = observed_events.lock().expect("share event mutex").clone();
+        assert!(events.iter().any(|event| {
+            event.phase == SharePhase::Query
+                && event.direction == TransferDirection::Outbound
+                && event.peer == owner.endpoint_id()
+        }));
+        assert!(events.iter().any(|event| {
+            event.phase == SharePhase::Manifest
+                && event.direction == TransferDirection::Outbound
+                && event.peer == owner.endpoint_id()
+        }));
+        assert!(events.iter().any(|event| {
+            event.phase == SharePhase::Grant
+                && event.direction == TransferDirection::Outbound
+                && event.peer == owner.endpoint_id()
+        }));
+        let inbound_bytes: u64 = events
+            .iter()
+            .filter(|event| {
+                event.operation_id == [0x72; 16]
+                    && event.phase == SharePhase::Swarm
+                    && event.direction == TransferDirection::Inbound
+            })
+            .map(|event| event.bytes)
+            .sum();
+        assert_eq!(inbound_bytes, transfer.transferred_bytes);
+        assert!(events.iter().any(|event| {
+            event.operation_id == [0x72; 16]
+                && event.phase == SharePhase::Drain
+                && event.direction == TransferDirection::Inbound
+        }));
+        assert!(events.iter().any(|event| {
+            event.operation_id == [0x72; 16]
+                && event.phase == SharePhase::Done
+                && event.direction == TransferDirection::Inbound
+                && event.grant == Some(grant.nonce)
+        }));
+        // A local binding failure happens before an authenticated control
+        // exchange. It must not create a query/active-peer event (or a
+        // terminal event for an operation that was never admitted).
+        let event_count = events.len();
+        let mut wrong_epoch = snapshot.token.clone();
+        wrong_epoch.epoch = wrong_epoch.epoch.saturating_add(1);
+        let error = session
+            .request_manifest(&wrong_epoch, &record)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<ShareError>(),
+            Some(&ShareError::EpochMismatch)
+        );
+        assert_eq!(
+            observed_events.lock().expect("share event mutex").len(),
+            event_count,
+            "preflight rejection must not inflate authenticated operation telemetry"
+        );
         let permit = session.revalidate(&snapshot.token).await.unwrap();
         let operation_id = [0x71; 16];
         let prepared = session
@@ -6291,10 +6737,29 @@ mod tests {
             super::super::RevocationReceipt::Complete { .. }
         ));
 
+        // Once the owner endpoint is closed, cancelling an in-flight control
+        // query must not leave an active-peer event behind.  The timeout is
+        // only a cancellation boundary; the assertion relies on the event
+        // count, rather than on a sleep or a guessed transport error.
+        let event_count = observed_events.lock().expect("share event mutex").len();
+        owner.shutdown().await.unwrap();
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(250),
+            session.fetch_authoritative_snapshot(&empty),
+        )
+        .await;
+        assert!(
+            cancelled.is_err() || cancelled.expect("timeout result").is_err(),
+            "closed owner must not complete an authoritative query"
+        );
+        assert_eq!(
+            observed_events.lock().expect("share event mutex").len(),
+            event_count,
+            "offline/cancelled query must not inflate authenticated telemetry"
+        );
         session.close().await;
         drop(owner_share);
         member.shutdown().await.unwrap();
-        owner.shutdown().await.unwrap();
     }
 
     #[test]
@@ -6750,13 +7215,11 @@ mod tests {
         )
         .await
         .unwrap();
-        let provider = ShareService::open(
-            temp.path().join("provider-service"),
-            NetworkMode::DirectOnly,
-            None,
-        )
-        .await
-        .unwrap();
+        let provider_service_path = temp.path().join("provider-service");
+        let provider =
+            ShareService::open(provider_service_path.clone(), NetworkMode::DirectOnly, None)
+                .await
+                .unwrap();
 
         let owner_root = temp.path().join("owner-root");
         std::fs::create_dir_all(&owner_root).unwrap();
@@ -6909,8 +7372,8 @@ mod tests {
         assert!(Arc::ptr_eq(nested_guard.index(), direct_guard.index()));
         let nested_lease = ManagedAdmissionLease::new(
             nested_guard.root_lease().clone(),
-            provider_root,
-            provider_state,
+            provider_root.clone(),
+            provider_state.clone(),
         )
         .unwrap();
         let mut nested_leases = BTreeMap::new();
@@ -6932,12 +7395,108 @@ mod tests {
             nested_row.phase,
             ClientIntentPhase::Cancelled | ClientIntentPhase::Drained
         ));
+
+        // Keep one nonterminal provider intent across a real service reopen.
+        // The owner then revokes and pauses the share while the provider is
+        // offline. Recovery must still use the old exact managed lease and
+        // operation-generation evidence; requiring a freshly registered
+        // supplier here would strand this paused/revoked row forever.
+        let reopen_grant = consumer_session
+            .request_swarm_grant(provider.endpoint_id(), &snapshot.token, &manifest, &hashes)
+            .await
+            .unwrap();
+        let reopen_operation = [0xe3; 16];
+        provider
+            .registry
+            .prepare_client_intent(&reopen_grant, ClientSide::Provider, reopen_operation)
+            .unwrap();
+        provider
+            .registry
+            .transition_client_intent(
+                &reopen_grant,
+                ClientSide::Provider,
+                reopen_operation,
+                ClientIntentPhase::Unknown,
+                None,
+            )
+            .unwrap();
+        let before_reopen = provider
+            .registry
+            .client_intent_exact(&reopen_grant, ClientSide::Provider, reopen_operation)
+            .unwrap()
+            .unwrap();
+        assert!(before_reopen.previous_boot_id.is_none());
         nested_guard.drain().await.unwrap();
+        drop(nested_guard);
+        drop(direct_guard);
+        assert!(matches!(
+            owner_share
+                .revoke_member_strong(provider.endpoint_id())
+                .await
+                .unwrap(),
+            super::super::RevocationReceipt::Complete { .. }
+                | super::super::RevocationReceipt::Pending { .. }
+        ));
+        owner_share.pause().await;
+        provider_session.close().await;
+        drop(direct_leases);
+        drop(nested_leases);
+        provider.shutdown().await.unwrap();
+
+        let reopened =
+            ShareService::open(provider_service_path.clone(), NetworkMode::DirectOnly, None)
+                .await
+                .unwrap();
+        let reopened_row = reopened
+            .registry
+            .client_intent_exact(&reopen_grant, ClientSide::Provider, reopen_operation)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(reopened_row.phase, ClientIntentPhase::Unknown));
+        assert_eq!(
+            reopened_row.previous_boot_id,
+            Some(before_reopen.boot_id),
+            "a service reopen must retain the previous generation marker"
+        );
+        let reopened_lease = Arc::new(
+            root_admission::acquire_with_private(
+                &provider_root,
+                RootUse::Managed {
+                    share: share.0,
+                    owner: *owner.endpoint_id().as_bytes(),
+                },
+                std::slice::from_ref(&provider_state),
+            )
+            .unwrap(),
+        );
+        let reopened_admission = ManagedAdmissionLease::new(
+            reopened_lease,
+            provider_root.clone(),
+            provider_state.clone(),
+        )
+        .unwrap();
+        let mut reopened_leases = BTreeMap::new();
+        reopened_leases.insert(share, reopened_admission);
+        assert!(
+            reopened.local_io_drain_is_proven(&reopened_row, &reopened_leases),
+            "old-boot recovery uses the exact lease even without a supplier registration"
+        );
+        let recovered = reopened
+            .recover_client_intents_with_budget_and_leases(Duration::from_secs(5), &reopened_leases)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.operation_id == reopen_operation)
+            .unwrap();
+        assert!(matches!(
+            recovered.phase,
+            ClientIntentPhase::Cancelled | ClientIntentPhase::Drained
+        ));
+        assert!(reopened.suppliers.read().unwrap().is_empty());
+        reopened.shutdown().await.unwrap();
 
         consumer_session.close().await;
-        provider_session.close().await;
         drop(owner_share);
-        provider.shutdown().await.unwrap();
         consumer.shutdown().await.unwrap();
         owner.shutdown().await.unwrap();
     }
