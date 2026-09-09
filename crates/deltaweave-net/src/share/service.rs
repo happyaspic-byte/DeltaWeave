@@ -161,6 +161,9 @@ pub struct ShareService {
     suppliers: SupplierMap,
     supplier_lifecycle: Arc<SupplierLifecycle>,
     swarm_tasks: Arc<SwarmTaskRegistry>,
+    /// Rotates bounded recovery batches so a slow first row cannot starve
+    /// later endpoint-local intents across managed ticks.
+    intent_recovery_cursor: AtomicUsize,
     #[cfg(test)]
     admission_limit: Arc<tokio::sync::Semaphore>,
 }
@@ -404,6 +407,7 @@ impl ShareService {
             suppliers,
             supplier_lifecycle,
             swarm_tasks,
+            intent_recovery_cursor: AtomicUsize::new(0),
             #[cfg(test)]
             admission_limit,
         }
@@ -633,10 +637,13 @@ impl ShareService {
         };
         let key = (owner, share);
         let mut suppliers = self.suppliers.write().expect("supplier map");
-        if let Some(existing) = suppliers.get(&key) {
-            ensure!(existing.is_drained(), ShareError::Busy);
-            suppliers.remove(&key);
-        }
+        // A drained registration remains in the map until its own drain
+        // operation has waited for accepted storage users and removed the
+        // exact generation.  Replacing it here would let a new engine acquire
+        // the same root/index/store while the old generation still owns an
+        // in-flight operation.  Callers must await `SupplierRegistrationGuard
+        // ::drain` before registering a replacement.
+        ensure!(!suppliers.contains_key(&key), ShareError::Busy);
         suppliers.insert(key, Arc::new(guard.clone()));
         Ok(guard)
     }
@@ -892,9 +899,28 @@ impl ShareService {
     /// signed binding and operation ID, and a nonterminal row is never
     /// replaced with a newly issued grant. This is intended for manager
     /// restart/pending recovery before a fresh data snapshot is requested.
+    /// One bounded control budget covers the whole enumeration. Rows that do
+    /// not get a turn because an owner is slow or offline remain `Unknown`
+    /// and are retried by a later managed tick instead of serially extending
+    /// manager startup by one timeout per share.
     pub async fn recover_client_intents(
         &self,
         local_io_drained: bool,
+    ) -> Result<Vec<ClientIntentRow>> {
+        self.recover_client_intents_with_budget(local_io_drained, CONTROL_DEADLINE)
+            .await
+    }
+
+    /// Bounded variant used by a managed tick. The budget is shared by all
+    /// rows in this invocation, so an offline owner cannot monopolize the
+    /// worker loop with one full timeout per intent. This method has the same
+    /// recovery-only semantics as `recover_client_intents`: it never reopens
+    /// payload admission and only the caller's real drain barrier may pass
+    /// `local_io_drained = true`.
+    pub async fn recover_client_intents_with_budget(
+        &self,
+        local_io_drained: bool,
+        budget: Duration,
     ) -> Result<Vec<ClientIntentRow>> {
         let handler = SwarmAdmissionHandler {
             key: self.key.clone(),
@@ -909,14 +935,41 @@ impl ShareService {
             inflight: Arc::new(Mutex::new(BTreeSet::new())),
         };
         let rows = self.registry.client_intents()?;
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        // A shared budget is intentionally paired with a rotating start. If
+        // the first sorted row belongs to an offline owner and consumes the
+        // tick budget, the next tick must get a chance to process the next
+        // row rather than retrying the same owner forever.
+        let start = self.intent_recovery_cursor.fetch_add(1, Ordering::AcqRel) % rows.len();
+        let recovery_deadline = Instant::now() + budget;
         let mut recovered = Vec::new();
-        for row in rows {
+        for offset in 0..rows.len() {
+            let row = rows[(start + offset) % rows.len()].clone();
             if row.grant.provider == self.endpoint_id() && row.side == ClientSide::Provider {
-                recovered.push(
-                    handler
-                        .recover_provider_intent(&row.grant, row.operation_id, local_io_drained)
-                        .await?,
-                );
+                let remaining = recovery_deadline.saturating_duration_since(Instant::now());
+                let result = if remaining.is_zero() {
+                    None
+                } else {
+                    Some(
+                        tokio::time::timeout(
+                            remaining,
+                            handler.recover_provider_intent(
+                                &row.grant,
+                                row.operation_id,
+                                local_io_drained,
+                            ),
+                        )
+                        .await,
+                    )
+                };
+                match result {
+                    Some(Ok(Ok(row))) => recovered.push(row),
+                    Some(Ok(Err(_))) | Some(Err(_)) | None => {
+                        recovered.push(self.preserve_client_intent_after_error(&row)?)
+                    }
+                }
             } else if row.grant.consumer == self.endpoint_id()
                 && row.side == ClientSide::Consumer
                 && row.grant.owner != self.endpoint_id()
@@ -929,28 +982,92 @@ impl ShareService {
                 // Internet mode can resolve the owner by identity.  Offline
                 // remains an error with the exact intent row preserved.
                 let session = match self.open_session(row.grant.owner, row.grant.share) {
-                    Ok(session) => session,
+                    Ok(session) => Some(session),
                     Err(error)
                         if error.downcast_ref::<ShareError>() == Some(&ShareError::NotMember) =>
                     {
-                        self.resume_membership(
-                            row.grant.owner,
-                            row.grant.share,
-                            EndpointAddr::new(row.grant.owner),
-                        )
-                        .await?;
-                        self.open_session(row.grant.owner, row.grant.share)?
+                        let remaining = recovery_deadline.saturating_duration_since(Instant::now());
+                        let resume = if remaining.is_zero() {
+                            None
+                        } else {
+                            Some(
+                                tokio::time::timeout(
+                                    remaining,
+                                    self.resume_membership(
+                                        row.grant.owner,
+                                        row.grant.share,
+                                        EndpointAddr::new(row.grant.owner),
+                                    ),
+                                )
+                                .await,
+                            )
+                        };
+                        match resume {
+                            Some(Ok(Ok(_))) => {
+                                self.open_session(row.grant.owner, row.grant.share).ok()
+                            }
+                            Some(Ok(Err(_))) | Some(Err(_)) | None => None,
+                        }
                     }
-                    Err(error) => return Err(error),
+                    Err(_) => None,
                 };
-                recovered.push(
-                    session
-                        .recover_swarm_intent(&row.grant, row.operation_id, local_io_drained)
-                        .await?,
-                );
+                let Some(session) = session else {
+                    recovered.push(self.preserve_client_intent_after_error(&row)?);
+                    continue;
+                };
+                let remaining = recovery_deadline.saturating_duration_since(Instant::now());
+                let result = if remaining.is_zero() {
+                    None
+                } else {
+                    Some(
+                        tokio::time::timeout(
+                            remaining,
+                            session.recover_swarm_intent(
+                                &row.grant,
+                                row.operation_id,
+                                local_io_drained,
+                            ),
+                        )
+                        .await,
+                    )
+                };
+                match result {
+                    Some(Ok(Ok(row))) => recovered.push(row),
+                    Some(Ok(Err(_))) | Some(Err(_)) | None => {
+                        recovered.push(self.preserve_client_intent_after_error(&row)?)
+                    }
+                }
             }
         }
         Ok(recovered)
+    }
+
+    /// Preserves one row when its owner or peer is temporarily unavailable.
+    /// Recovery errors are row-scoped: the exact signed grant, operation ID,
+    /// and binding remain durable as `Unknown`, while state/database failures
+    /// from this transition still propagate to the caller.  A later managed
+    /// tick can retry the authenticated status path without inventing a new
+    /// grant or blocking unrelated shares during service startup.
+    fn preserve_client_intent_after_error(&self, row: &ClientIntentRow) -> Result<ClientIntentRow> {
+        let current = self
+            .registry
+            .client_intent(&row.grant)?
+            .ok_or(ShareError::StateUnavailable)?;
+        if !matches!(
+            current.phase,
+            ClientIntentPhase::Unknown | ClientIntentPhase::Drained | ClientIntentPhase::Cancelled
+        ) {
+            self.registry.transition_client_intent(
+                &current.grant,
+                current.side,
+                current.operation_id,
+                ClientIntentPhase::Unknown,
+                current.activation_id,
+            )?;
+        }
+        self.registry
+            .client_intent(&current.grant)?
+            .ok_or(ShareError::StateUnavailable.into())
     }
 
     /// A managed member engine must retain this lease for its entire lifetime.
@@ -5480,6 +5597,24 @@ mod tests {
             assert!(consumer_store.chunks().contains(hash));
         }
 
+        // A close marker alone is not enough to permit replacement: the
+        // original generation still owns the exact storage Arcs until its
+        // awaited drain removes the map entry.  This catches a re-register
+        // race that could otherwise overlap two suppliers on one root.
+        let duplicate = provider.register_supplier_storage(
+            owner.endpoint_id(),
+            share,
+            provider_guard.membership(),
+            &provider_root,
+            provider_guard.root_lease().clone(),
+            provider_guard.index().clone(),
+            provider_guard.store().clone(),
+        );
+        assert_eq!(
+            duplicate.unwrap_err().downcast_ref::<ShareError>(),
+            Some(&ShareError::Busy)
+        );
+
         let grant = consumer_session
             .request_swarm_grant(provider.endpoint_id(), &snapshot.token, &manifest, &hashes)
             .await
@@ -5572,6 +5707,21 @@ mod tests {
                 .expect("supplier map")
                 .contains_key(&(owner.endpoint_id(), share))
         );
+
+        // Once the first generation has fully drained and been removed, a
+        // replacement may use the same admitted storage handles safely.
+        let replacement = provider
+            .register_supplier_storage(
+                owner.endpoint_id(),
+                share,
+                &provider_membership,
+                &provider_root,
+                provider_guard.root_lease().clone(),
+                provider_guard.index().clone(),
+                provider_guard.store().clone(),
+            )
+            .unwrap();
+        replacement.drain().await.unwrap();
 
         consumer_session.close().await;
         provider_session.close().await;

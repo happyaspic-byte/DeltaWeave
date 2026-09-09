@@ -1385,10 +1385,22 @@ impl Registry {
             Err(error) => return Err(error.into()),
         };
         let mut rows = Vec::new();
+        let mut total_bytes = 0usize;
         for item in table.iter()? {
             let (key, value) = item?;
             ensure!(
+                rows.len() < MAX_AUTHORITY_ROWS,
+                ShareError::StateUnavailable
+            );
+            ensure!(
                 value.value().len() <= super::authority::MAX_AUTHORITY_FRAME_BYTES,
+                ShareError::StateUnavailable
+            );
+            total_bytes = total_bytes
+                .checked_add(value.value().len())
+                .ok_or(ShareError::StateUnavailable)?;
+            ensure!(
+                total_bytes <= MAX_AUTHORITY_BYTES,
                 ShareError::StateUnavailable
             );
             rows.push((key.value().to_owned(), postcard::from_bytes(value.value())?));

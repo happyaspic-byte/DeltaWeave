@@ -2214,6 +2214,18 @@ impl Manager {
             return Ok(());
         }
         let service = self.ensure_managed_service().await?;
+        // Reconcile endpoint-local swarm intents before restoring fresh
+        // workers. A lost owner response or a temporarily offline peer is a
+        // share-scoped pending condition; the net service preserves that
+        // exact row as Unknown so one unavailable share cannot abort legacy
+        // startup or prevent unrelated managed shares from reopening.
+        // A process restart has no proof that a pre-crash writer drained. The
+        // net recovery path therefore quarantines active/restarted intents
+        // and only the owning engine's real drain barrier may later pass
+        // `local_io_drained = true`.
+        let recovered_intents = service.recover_client_intents(false).await?;
+        self.mark_recovered_intents_waiting(&recovered_intents)
+            .await?;
         let owned = service.owned_configs()?;
         let (tombstones, configured, intents) = {
             let state = self.shared.lock().expect("snapshot mutex");
@@ -2323,6 +2335,64 @@ impl Manager {
             .await?;
         }
         self.restore_managed_workers(service).await
+    }
+
+    /// Reflects endpoint-local recovery blockers in the matching managed
+    /// share row. The network journal remains the source of truth; this
+    /// status only keeps the UI and later ticks from presenting an Unknown or
+    /// Draining intent as Complete. Paused/Revoked lifecycle decisions retain
+    /// precedence over transient recovery observations.
+    async fn mark_recovered_intents_waiting(
+        &self,
+        intents: &[deltaweave_net::share::ClientIntentRow],
+    ) -> Result<()> {
+        let waiting_shares: std::collections::BTreeSet<_> = intents
+            .iter()
+            .filter(|row| {
+                !matches!(
+                    row.phase,
+                    deltaweave_net::share::ClientIntentPhase::Drained
+                        | deltaweave_net::share::ClientIntentPhase::Cancelled
+                )
+            })
+            .map(|row| share_id_string(row.grant.share))
+            .collect();
+        if waiting_shares.is_empty() {
+            return Ok(());
+        }
+        let now = managed_now();
+        let needs_update = {
+            let state = self.shared.lock().expect("snapshot mutex");
+            state.config.managed.shares.iter().any(|record| {
+                waiting_shares.contains(&record.share_id)
+                    && !matches!(
+                        record.status,
+                        ManagedStatus::Paused | ManagedStatus::Revoked
+                    )
+                    && (record.status != ManagedStatus::Waiting
+                        || record.phase.as_deref() != Some("waiting")
+                        || record.retry_at.is_none_or(|retry_at| retry_at <= now))
+            })
+        };
+        if !needs_update {
+            return Ok(());
+        }
+        self.persist(|config| {
+            for record in &mut config.managed.shares {
+                if waiting_shares.contains(&record.share_id)
+                    && !matches!(
+                        record.status,
+                        ManagedStatus::Paused | ManagedStatus::Revoked
+                    )
+                {
+                    record.status = ManagedStatus::Waiting;
+                    record.phase = Some("waiting".into());
+                    record.retry_at = Some(now.saturating_add(MANAGED_TICK_SECONDS));
+                }
+            }
+            Ok(())
+        })
+        .await
     }
 
     async fn cleanup_tombstones(
@@ -2916,6 +2986,18 @@ impl Manager {
                 return Ok(());
             }
             return Err(error);
+        }
+        // Retry quarantined endpoint-local intents on each managed tick using
+        // one short shared budget. Startup retains Unknown rows; this path
+        // lets an owner that comes back online converge without blocking
+        // other shares for one full control timeout per row. The `false`
+        // drain argument is deliberate: a manager tick has no authority to
+        // claim that an old CAS writer drained.
+        if let Some(service) = self.managed_service.lock().await.as_ref().cloned() {
+            let recovered = service
+                .recover_client_intents_with_budget(false, std::time::Duration::from_secs(1))
+                .await?;
+            self.mark_recovered_intents_waiting(&recovered).await?;
         }
         self.gc_pending_tickets().await?;
         self.gc_key_responses()?;
