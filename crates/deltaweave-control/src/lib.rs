@@ -606,14 +606,35 @@ const MANAGED_OBSERVATION_RESAVE_LIMIT: usize = 2;
 #[derive(Default)]
 struct TestPersistGate {
     next: Mutex<Vec<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    resave: Mutex<Vec<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    final_save: Mutex<Vec<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    after_save: Mutex<Vec<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 
 #[cfg(test)]
 impl TestPersistGate {
     fn arm(&self) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        Self::arm_queue(&self.next)
+    }
+
+    fn arm_resave(&self) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        Self::arm_queue(&self.resave)
+    }
+
+    fn arm_final_save(&self) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        Self::arm_queue(&self.final_save)
+    }
+
+    fn arm_after_save(&self) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        Self::arm_queue(&self.after_save)
+    }
+
+    fn arm_queue(
+        queue: &Mutex<Vec<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
         let (entered_sender, entered_receiver) = std::sync::mpsc::channel();
         let (release_sender, release_receiver) = std::sync::mpsc::channel();
-        self.next
+        queue
             .lock()
             .expect("persist test gate mutex")
             .push((entered_sender, release_receiver));
@@ -621,12 +642,30 @@ impl TestPersistGate {
     }
 
     fn wait(&self) {
+        Self::wait_queue(&self.next);
+    }
+
+    fn wait_resave(&self) {
+        Self::wait_queue(&self.resave);
+    }
+
+    fn wait_final_save(&self) {
+        Self::wait_queue(&self.final_save);
+    }
+
+    fn wait_after_save(&self) {
+        Self::wait_queue(&self.after_save);
+    }
+
+    fn wait_queue(
+        queue: &Mutex<Vec<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    ) {
         let pending = {
-            let mut next = self.next.lock().expect("persist test gate mutex");
-            if next.is_empty() {
+            let mut queue = queue.lock().expect("persist test gate mutex");
+            if queue.is_empty() {
                 None
             } else {
-                Some(next.remove(0))
+                Some(queue.remove(0))
             }
         };
         if let Some((entered, release)) = pending {
@@ -1106,6 +1145,8 @@ impl Manager {
             let mut changed = changed;
             loop {
                 config::save(&dir, &config)?;
+                #[cfg(test)]
+                test_persist_gate.wait_after_save();
                 let mut state = shared.lock().expect("snapshot mutex");
                 let current_observation_revision = observation_counter.load(Ordering::Acquire);
                 if current_observation_revision == saved_observation_revision {
@@ -1125,13 +1166,30 @@ impl Manager {
                 );
                 drop(state);
 
+                #[cfg(test)]
+                test_persist_gate.wait_resave();
+
                 if observation_resaves >= MANAGED_OBSERVATION_RESAVE_LIMIT {
                     // Publish the latest coalesced observation after a bounded
-                    // final save.  A callback arriving after this snapshot is
-                    // applied to the newly published in-memory state and its
-                    // generation remains dirty for the next persistence pass.
+                    // final save.  Refresh the publication from shared state
+                    // after the save too: a callback can run during the final
+                    // fsync, and assigning the old config directly would lose
+                    // that callback.  A callback arriving after this final
+                    // state lock is applied to the newly published state and
+                    // its generation remains dirty for the next persistence
+                    // pass.
                     config::save(&dir, &config)?;
+                    #[cfg(test)]
+                    test_persist_gate.wait_final_save();
+                    #[cfg(test)]
+                    test_persist_gate.wait_after_save();
                     let mut state = shared.lock().expect("snapshot mutex");
+                    let current_shares = state.config.managed.shares.clone();
+                    changed |= merge_managed_observations(
+                        &mut config.managed.shares,
+                        &observation_baseline,
+                        &current_shares,
+                    );
                     state.config = config;
                     state.trim();
                     if changed {
@@ -6771,6 +6829,237 @@ mod managed_error_tests {
                 record.last_error.as_ref().map(|error| error.code.as_str()),
                 Some("member_revoked")
             );
+            reopened.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn final_save_preserves_callback_before_memory_publication_and_next_flush() {
+        let name = "managed_error_tests::final_save_preserves_callback_before_memory_publication_and_next_flush";
+        if std::env::var("DELTAWEAVE_FINAL_OBSERVATION_SAVE_CHILD")
+            .ok()
+            .as_deref()
+            != Some(name)
+        {
+            let home = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture"])
+                .env("DELTAWEAVE_FINAL_OBSERVATION_SAVE_CHILD", name)
+                .env("HOME", home.path())
+                .env("USERPROFILE", home.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let data_dir = temp.path().join("admin");
+            let options = ManagerOptions {
+                managed_network: NetworkMode::DirectOnly,
+                managed_bind: None,
+            };
+            let manager = Manager::open_with_options(data_dir.clone(), options)
+                .await
+                .unwrap();
+            let managed_root = data_dir.join("managed");
+            root_admission::reserve_private(&managed_root).unwrap();
+            private::prepare_directory(&managed_root).unwrap();
+
+            // Keep the real persistence task for the automatic-flush
+            // assertion, while stopping the managed worker ticker which
+            // cannot operate on this deliberately in-memory observation row.
+            // This is a test-only fixture boundary; production startup keeps
+            // both background tasks and shutdown drains them normally.
+            let managed_task = manager
+                .background
+                .lock()
+                .await
+                .pop()
+                .expect("managed ticker is registered after persistence");
+            managed_task.abort();
+            let _ = managed_task.await;
+
+            let share = ShareId([0; 32]);
+            {
+                let mut state = manager.shared.lock().expect("snapshot mutex");
+                let mut record = observation_record(ManagedStatus::Complete, "complete");
+                record.role = ShareRole::Member;
+                record.permission = Some(Permission::ReadOnly);
+                state.config.managed.shares.push(record);
+            }
+            let observer = manager.managed_observer(share, BTreeMap::new());
+            let (initial_entered, initial_release) = manager.test_persist_gate.arm();
+            // The persistence task sleeps before its first pass.  Arming this
+            // second FIFO gate before starting the mutation lets the test
+            // observe that existing automatic persistence, rather than a
+            // manual persist call, performs the follow-up save.
+            let (background_entered, background_release) = manager.test_persist_gate.arm();
+            let (resave_one_entered, resave_one_release) = manager.test_persist_gate.arm_resave();
+            let (resave_two_entered, resave_two_release) = manager.test_persist_gate.arm_resave();
+            let (final_entered, final_release) = manager.test_persist_gate.arm_final_save();
+
+            let persist_manager = Arc::clone(&manager);
+            let save = tokio::spawn(async move {
+                persist_manager
+                    .persist(|config| {
+                        config.settings.node_name = "final observer save".into();
+                        Ok(())
+                    })
+                    .await
+            });
+            tokio::task::spawn_blocking(move || {
+                initial_entered
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("initial save must reach the writer barrier");
+            })
+            .await
+            .unwrap();
+
+            observer.emit(deltaweave_net::TransferEvent {
+                phase: "syncing".into(),
+                path: None,
+                direction: Some("push".into()),
+                bytes: 1,
+                peer: None,
+            });
+            initial_release.send(()).unwrap();
+            tokio::task::spawn_blocking(move || {
+                resave_one_entered
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("first bounded observer resave must be reached");
+            })
+            .await
+            .unwrap();
+
+            observer.emit(deltaweave_net::TransferEvent {
+                phase: "syncing".into(),
+                path: None,
+                direction: Some("push".into()),
+                bytes: 2,
+                peer: None,
+            });
+            resave_one_release.send(()).unwrap();
+            tokio::task::spawn_blocking(move || {
+                resave_two_entered
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("second bounded observer resave must be reached");
+            })
+            .await
+            .unwrap();
+
+            observer.emit(deltaweave_net::TransferEvent {
+                phase: "syncing".into(),
+                path: None,
+                direction: Some("push".into()),
+                bytes: 3,
+                peer: None,
+            });
+            resave_two_release.send(()).unwrap();
+            tokio::task::spawn_blocking(move || {
+                final_entered
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("bounded final save must be reached");
+            })
+            .await
+            .unwrap();
+
+            // This mutation occurs after the final fsync and before the
+            // in-memory publication.  The publication must merge it instead
+            // of assigning the stale saved config over the callback state.
+            manager
+                .mark_managed_memory_failure(share, &anyhow::Error::new(ShareError::MemberRevoked));
+            final_release.send(()).unwrap();
+            save.await.unwrap().unwrap();
+
+            let memory_record = manager
+                .snapshot()
+                .await
+                .shares
+                .into_iter()
+                .find(|record| record.share_id == share_id_string(share))
+                .expect("published managed record");
+            assert_eq!(memory_record.status, ManagedStatus::Revoked);
+            assert_eq!(memory_record.phase.as_deref(), Some("revoked"));
+            assert!(memory_record.transferred_bytes >= 6);
+            assert_eq!(
+                memory_record
+                    .last_error
+                    .as_ref()
+                    .map(|error| error.code.as_str()),
+                Some("member_revoked")
+            );
+
+            // The final save predated the injected callback.  Wait for the
+            // manager's existing automatic persistence task to acquire the
+            // writer, then release it.  No caller-issued persist is used here.
+            let (automatic_save_entered, automatic_save_release) =
+                manager.test_persist_gate.arm_after_save();
+            tokio::task::spawn_blocking(move || {
+                background_entered
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("automatic persistence must flush the dirty observation");
+            })
+            .await
+            .unwrap();
+            background_release.send(()).unwrap();
+            tokio::task::spawn_blocking(move || {
+                automatic_save_entered
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("automatic persistence must complete its config save");
+            })
+            .await
+            .unwrap();
+            let automatic_config = config::read(&data_dir).unwrap();
+            let automatic_record = automatic_config
+                .managed
+                .shares
+                .iter()
+                .find(|record| record.share_id == share_id_string(share))
+                .expect("automatic persistence wrote the managed record");
+            assert_eq!(automatic_record.status, ManagedStatus::Revoked);
+            assert_eq!(automatic_record.phase.as_deref(), Some("revoked"));
+            assert!(automatic_record.transferred_bytes >= 6);
+            assert_eq!(
+                automatic_record
+                    .last_error
+                    .as_ref()
+                    .map(|error| error.code.as_str()),
+                Some("member_revoked")
+            );
+            automatic_save_release.send(()).unwrap();
+
+            // Shutdown drains the automatic task and performs the final
+            // quiescent save after workers/observers have been stopped.
+            manager.shutdown().await.unwrap();
+            let after_shutdown_record = manager
+                .snapshot()
+                .await
+                .shares
+                .into_iter()
+                .find(|record| record.share_id == share_id_string(share))
+                .expect("post-shutdown managed record");
+            assert_eq!(after_shutdown_record.status, ManagedStatus::Revoked);
+            let saved_config = config::read(&data_dir).unwrap();
+            let saved_record = saved_config
+                .managed
+                .shares
+                .iter()
+                .find(|record| record.share_id == share_id_string(share))
+                .expect("saved managed record");
+            assert_eq!(saved_record.status, ManagedStatus::Revoked);
+            let reopened = Manager::open_with_options(data_dir, options).await.unwrap();
+            let durable_record = reopened
+                .snapshot()
+                .await
+                .shares
+                .into_iter()
+                .find(|record| record.share_id == share_id_string(share))
+                .expect("durable managed record");
+            assert_eq!(durable_record.status, ManagedStatus::Revoked);
+            assert_eq!(durable_record.phase.as_deref(), Some("revoked"));
+            assert!(durable_record.transferred_bytes >= 6);
             reopened.shutdown().await.unwrap();
         });
     }
