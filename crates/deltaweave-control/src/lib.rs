@@ -3091,12 +3091,25 @@ impl Manager {
         // Retry quarantined endpoint-local intents on each managed tick using
         // one short shared budget. Startup retains Unknown rows; this path
         // lets an owner that comes back online converge without blocking
-        // other shares for one full control timeout per row. The `false`
-        // drain argument is deliberate: a manager tick has no authority to
-        // claim that an old CAS writer drained.
+        // other shares for one full control timeout per row. The recovery
+        // lease map is built from the exact managed roots held by this
+        // controller. An unavailable/busy share keeps its row recoverable;
+        // no caller-supplied boolean is accepted as a drain proof.
         if let Some(service) = self.managed_service.lock().await.as_ref().cloned() {
+            let configured = self
+                .shared
+                .lock()
+                .expect("snapshot mutex")
+                .config
+                .managed
+                .shares
+                .clone();
+            let recovery_leases = self.managed_recovery_leases(&configured);
             let recovered = service
-                .recover_client_intents_with_budget(false, std::time::Duration::from_secs(1))
+                .recover_client_intents_with_budget_and_leases(
+                    std::time::Duration::from_secs(1),
+                    &recovery_leases,
+                )
                 .await?;
             self.mark_recovered_intents_waiting(&recovered).await?;
         }
