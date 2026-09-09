@@ -884,7 +884,10 @@ fn managed_pending_resume_survives_ticket_loss_and_owner_offline() {
                     }
                 }
                 write_json(&member_data, &config);
-                tokio::time::sleep(Duration::from_secs(3)).await;
+                assert!(
+                    now_seconds() >= expires_at,
+                    "the bounded expiry wait must finish before reopening"
+                );
                 let resumed = open_manager(member_data.clone(), None).await;
                 wait_status(&resumed, share, ManagedStatus::Complete).await;
                 let resumed_config = config_value(&member_data);

@@ -6,9 +6,9 @@
 
 작성 agent: `qsync_contracts` / Luna Max
 
-현재 단계: B control cancellation/observer checkpoint. A 계약 문서는 `121d042`로
-통합되었고, B의 현재 source/test checkpoint는 `7a29c7b`이다. B 완료·통합·push로
-표시하지 않는다.
+현재 단계: B control final acceptance fixture follow-up. A 계약 문서는 `121d042`로
+통합되었고, B의 현재 source/test checkpoint는 `5702ab1`이며 fixture follow-up은
+`16e8882` 이후 진행 중이다. D/E와 최종 통합·push는 root가 조정한다.
 
 ## 작업 공간과 agent
 
@@ -18,7 +18,7 @@
 | A contracts | `/home/ubuntu/project/DeltaWeave-qsync-contracts-20260908` | `feat/qsync-contracts-20260908` | `121d042` 완료 |
 | A protocol audit | 별도 agent `qsync_protocol_audit` | root 기록 예정 | `8d50a14` network 계약 완료, D/E 입력 |
 | baseline validation | `luna_protocol_plan` 재사용 | root 기록 예정 | CI 실패 원인 조사 |
-| B control | `/home/ubuntu/project/DeltaWeave-qsync-control-20260908` | `feat/qsync-control-20260908` | `7a29c7b` cancellation/observer checkpoint, focused 검증 통과, B 계속 구현 |
+| B control | `/home/ubuntu/project/DeltaWeave-qsync-control-20260908` | `feat/qsync-control-20260908` | `5702ab1` final source; acceptance fixture follow-up `16e8882` |
 | C web | `/home/ubuntu/project/DeltaWeave-qsync-web-20260908` | `feat/qsync-web-20260908` | 병렬 구현 진행 |
 | validation | `/home/ubuntu/project/DeltaWeave-qsync-verification-20260908` | `test/qsync-verification-20260908` | 후속 검증 |
 
@@ -119,7 +119,7 @@ flow, D N0/relay/address update, E swarm grant/manifest/max-8/fallback, root saf
 | duplicate pending/active binding 및 immutable root/state | fixed + tested | `test-duplicate-binding-20260908T222550Z.log`, `test-managed-acceptance-harness-20260908T223255Z.log` |
 | same-Arc lease handoff 및 provenance(role/share/private root) | fixed; metadata tested | `test-admission-provenance-20260908T222455Z.log`, `test-net-root-admission-20260908T223651Z.log`; forced engine-open failure에서 동일 lease 유지 회귀는 후속 |
 | pending-only join retry API 및 response-loss journal mapping | fixed + tested | `test-pending-retry-api-final-20260908T225952Z.log`; background completion race는 preflight 없이 helper 후 journal/record를 재조회해 enrolled 결과를 우선하며 C의 authenticated HTTP adapter는 후속 |
-| public cancellation / shutdown ownership | fixed + focused tested | manager-owned shutdown completion은 첫 caller 취소 뒤에도 drain/final persist/ownership release를 끝내며 후속 caller가 같은 결과를 기다린다. public join/retry와 writer barrier도 caller abort 뒤 계속된다. `7a29c7b`; 실제 test/evidence는 위 B cancellation checkpoint 행 참조 |
+| public cancellation / shutdown ownership | fixed + focused tested | manager-owned shutdown completion은 첫 caller 취소 뒤에도 drain/final persist/ownership release를 끝내며 후속 caller가 같은 결과를 기다린다. public join/retry와 writer barrier도 caller abort 뒤 계속된다. final source `5702ab1`; 실제 test/evidence는 위 B cancellation checkpoint 행 참조 |
 | managed observer direct publication / lifecycle precedence | fixed + focused tested | snapshot save 중 observer/failure callback 필드를 merge하고, target pause/resume/revoke 상태를 stale callback이 덮지 않는다. 관측 세대 재저장은 bounded/coalesced (`2`회 후 final save)이며 final fsync 직후 callback은 memory에 보존한 뒤 기존 자동 persistence가 disk에 flush한다. source `5702ab1`; `observer-p2-*`, `final-save-auto-flush-durable-20260909.log` |
 | per-member revoke pending/drain and observer zeroing | implemented; immediate owner drain tested | acceptance에서 `Revoked`/observer 0 확인; delayed writer ACK의 `Pending → Complete` 실제 증거는 D/E transport hook 후속 |
 | D/E network ownership | pending dependency | provider/requester remote-id, monotonic lease, cancellation/admission-close, roster/heartbeat/address refresh는 B가 구현하지 않으며 protocol audit/root가 선행 확정 |
