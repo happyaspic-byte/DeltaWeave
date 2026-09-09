@@ -70,6 +70,51 @@ fn emit_share_event(
     }
 }
 
+/// Owns the event lifetime after a control frame has reached the authenticated
+/// handler. A transport failure before a reply creates no guard and therefore
+/// no active-peer event. If the caller is cancelled after admission but before
+/// synchronous reply validation completes, dropping this guard emits Reject so
+/// the operation cannot remain active forever.
+struct ShareEventGuard {
+    observer: Arc<Mutex<Option<ShareTransferObserver>>>,
+    event: ShareTransferEvent,
+    finished: bool,
+}
+
+impl ShareEventGuard {
+    fn admitted(
+        observer: &Arc<Mutex<Option<ShareTransferObserver>>>,
+        event: ShareTransferEvent,
+    ) -> Self {
+        emit_share_event(observer, event.clone());
+        Self {
+            observer: observer.clone(),
+            event,
+            finished: false,
+        }
+    }
+
+    fn finish(mut self, phase: SharePhase, provider_epoch: Option<u64>, grant: Option<GrantNonce>) {
+        self.finished = true;
+        self.event.phase = phase;
+        self.event.provider_epoch = provider_epoch;
+        self.event.grant = grant;
+        emit_share_event(&self.observer, self.event.clone());
+    }
+}
+
+impl Drop for ShareEventGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.event.phase = SharePhase::Reject;
+            self.event.bytes = 0;
+            self.event.provider_epoch = None;
+            self.event.grant = None;
+            emit_share_event(&self.observer, self.event.clone());
+        }
+    }
+}
+
 type SupplierMap = Arc<RwLock<BTreeMap<(EndpointId, ShareId), Arc<SupplierRegistrationGuard>>>>;
 
 /// The service-owned lifecycle coordinator for supplier registrations.  A
@@ -2294,6 +2339,55 @@ impl ShareSession {
         result.map_err(|_| anyhow::Error::new(ShareError::Offline))?
     }
 
+    /// Performs one control exchange while retaining the distinction between
+    /// a transport failure and a received authenticated `Reply::Error`.
+    /// Query/manifest/grant telemetry starts only after a complete reply frame
+    /// has arrived; the returned guard owns the terminal event on validation
+    /// failure or caller cancellation.
+    async fn control_exchange_observed_until(
+        &self,
+        operation: Operation,
+        deadline: Instant,
+        phase: SharePhase,
+        peer: EndpointId,
+        operation_id: [u8; 16],
+    ) -> Result<(Reply, ShareEventGuard)> {
+        let connection = self.connect_control_until(deadline).await?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        ensure!(!remaining.is_zero(), ShareError::Offline);
+        let result = tokio::time::timeout(
+            remaining,
+            wire::exchange_raw(
+                &connection,
+                Hello {
+                    version: 3,
+                    share_id: self.state.membership.share_id,
+                    operation,
+                },
+            ),
+        )
+        .await;
+        self.state
+            .transport
+            .refresh_transport_observation(&connection);
+        let reply = result.map_err(|_| anyhow::Error::new(ShareError::Offline))??;
+        let guard = ShareEventGuard::admitted(
+            &self.state.share_observer,
+            ShareTransferEvent {
+                operation_id,
+                share: self.state.membership.share_id,
+                peer,
+                phase,
+                direction: TransferDirection::Outbound,
+                bytes: 0,
+                epoch: self.state.membership.epoch,
+                provider_epoch: None,
+                grant: None,
+            },
+        );
+        Ok((reply, guard))
+    }
+
     async fn connect_control_until(&self, deadline: Instant) -> Result<ControlConnection> {
         Ok(ControlConnection(
             self.state.transport.connect_control_until(deadline).await?,
@@ -2309,27 +2403,19 @@ impl ShareSession {
     ) -> Result<AuthoritativeSnapshot> {
         let peer = self.state.membership.owner;
         let operation_id = self.next_query_event_id(peer, b"snapshot");
-        let mut admitted = false;
-        let result: Result<AuthoritativeSnapshot> = async {
-            let result = self.control_exchange(Operation::Snapshot).await?;
-            admitted = true;
-            // A failed/offline connect never becomes an active peer.  Emit
-            // the operation only after the authenticated control exchange
-            // has produced a response; validation failures below still get a
-            // terminal Reject event for this admitted operation.
-            self.emit_share_event(ShareTransferEvent {
-                operation_id,
-                share: self.state.membership.share_id,
+        let (reply, event) = self
+            .control_exchange_observed_until(
+                Operation::Snapshot,
+                Instant::now() + CONTROL_DEADLINE,
+                SharePhase::Query,
                 peer,
-                phase: SharePhase::Query,
-                direction: TransferDirection::Outbound,
-                bytes: 0,
-                epoch: self.state.membership.epoch,
-                provider_epoch: None,
-                grant: None,
-            });
-            let snapshot = match result {
+                operation_id,
+            )
+            .await?;
+        let result: Result<AuthoritativeSnapshot> = (|| {
+            let snapshot = match reply {
                 Reply::Snapshot(snapshot) => snapshot,
+                Reply::Error(error) => return Err(error.into()),
                 _ => return Err(ShareError::Protocol.into()),
             };
             snapshot.verify_complete(
@@ -2342,37 +2428,14 @@ impl ShareSession {
                 ShareError::EpochMismatch
             );
             Ok(snapshot)
-        }
-        .await;
+        })();
         match result {
             Ok(snapshot) => {
-                self.emit_share_event(ShareTransferEvent {
-                    operation_id,
-                    share: self.state.membership.share_id,
-                    peer,
-                    phase: SharePhase::Done,
-                    direction: TransferDirection::Outbound,
-                    bytes: 0,
-                    epoch: self.state.membership.epoch,
-                    provider_epoch: None,
-                    grant: None,
-                });
+                event.finish(SharePhase::Done, None, None);
                 Ok(snapshot)
             }
             Err(error) => {
-                if admitted {
-                    self.emit_share_event(ShareTransferEvent {
-                        operation_id,
-                        share: self.state.membership.share_id,
-                        peer,
-                        phase: SharePhase::Reject,
-                        direction: TransferDirection::Outbound,
-                        bytes: 0,
-                        epoch: self.state.membership.epoch,
-                        provider_epoch: None,
-                        grant: None,
-                    });
-                }
+                event.finish(SharePhase::Reject, None, None);
                 Err(error)
             }
         }
@@ -2386,32 +2449,26 @@ impl ShareSession {
     ) -> Result<ManifestAttestation> {
         let peer = self.state.membership.owner;
         let operation_id = self.next_query_event_id(peer, b"manifest");
-        let mut admitted = false;
-        let result: Result<ManifestAttestation> = async {
-            ensure!(
-                snapshot.epoch == self.state.membership.epoch,
-                ShareError::EpochMismatch
-            );
-            let result = self
-                .control_exchange(Operation::Manifest {
+        ensure!(
+            snapshot.epoch == self.state.membership.epoch,
+            ShareError::EpochMismatch
+        );
+        let (reply, event) = self
+            .control_exchange_observed_until(
+                Operation::Manifest {
                     snapshot: snapshot.clone(),
                     record: record.clone(),
-                })
-                .await?;
-            admitted = true;
-            self.emit_share_event(ShareTransferEvent {
-                operation_id,
-                share: self.state.membership.share_id,
+                },
+                Instant::now() + CONTROL_DEADLINE,
+                SharePhase::Manifest,
                 peer,
-                phase: SharePhase::Manifest,
-                direction: TransferDirection::Outbound,
-                bytes: 0,
-                epoch: self.state.membership.epoch,
-                provider_epoch: None,
-                grant: None,
-            });
-            let attestation = match result {
+                operation_id,
+            )
+            .await?;
+        let result: Result<ManifestAttestation> = (|| {
+            let attestation = match reply {
                 Reply::Manifest(attestation) => attestation,
+                Reply::Error(error) => return Err(error.into()),
                 _ => return Err(ShareError::Protocol.into()),
             };
             attestation.verify_for(
@@ -2421,37 +2478,14 @@ impl ShareSession {
             )?;
             attestation.verify_record(snapshot, record)?;
             Ok(attestation)
-        }
-        .await;
+        })();
         match result {
             Ok(attestation) => {
-                self.emit_share_event(ShareTransferEvent {
-                    operation_id,
-                    share: self.state.membership.share_id,
-                    peer,
-                    phase: SharePhase::Done,
-                    direction: TransferDirection::Outbound,
-                    bytes: 0,
-                    epoch: self.state.membership.epoch,
-                    provider_epoch: None,
-                    grant: None,
-                });
+                event.finish(SharePhase::Done, None, None);
                 Ok(attestation)
             }
             Err(error) => {
-                if admitted {
-                    self.emit_share_event(ShareTransferEvent {
-                        operation_id,
-                        share: self.state.membership.share_id,
-                        peer,
-                        phase: SharePhase::Reject,
-                        direction: TransferDirection::Outbound,
-                        bytes: 0,
-                        epoch: self.state.membership.epoch,
-                        provider_epoch: None,
-                        grant: None,
-                    });
-                }
+                event.finish(SharePhase::Reject, None, None);
                 Err(error)
             }
         }
@@ -2468,44 +2502,38 @@ impl ShareSession {
         hashes: &[Hash32],
     ) -> Result<ShareGrant> {
         let operation_id = self.next_query_event_id(provider, b"grant");
-        let mut admitted = false;
-        let result: Result<ShareGrant> = async {
-            ensure!(
-                snapshot.epoch == self.state.membership.epoch,
-                ShareError::EpochMismatch
-            );
-            ensure!(
-                snapshot.share == self.state.membership.share_id,
-                ShareError::OwnerMismatch
-            );
-            ensure!(
-                manifest.share == snapshot.share,
-                ShareError::ManifestMismatch
-            );
-            ensure!(manifest.epoch == snapshot.epoch, ShareError::EpochMismatch);
-            super::authority::validate_hash_subset(hashes)?;
-            let result = self
-                .control_exchange(Operation::SwarmGrant {
+        ensure!(
+            snapshot.epoch == self.state.membership.epoch,
+            ShareError::EpochMismatch
+        );
+        ensure!(
+            snapshot.share == self.state.membership.share_id,
+            ShareError::OwnerMismatch
+        );
+        ensure!(
+            manifest.share == snapshot.share,
+            ShareError::ManifestMismatch
+        );
+        ensure!(manifest.epoch == snapshot.epoch, ShareError::EpochMismatch);
+        super::authority::validate_hash_subset(hashes)?;
+        let (reply, event) = self
+            .control_exchange_observed_until(
+                Operation::SwarmGrant {
                     provider,
                     snapshot: snapshot.clone(),
                     manifest: manifest.clone(),
                     hashes: hashes.to_vec(),
-                })
-                .await?;
-            admitted = true;
-            self.emit_share_event(ShareTransferEvent {
+                },
+                Instant::now() + CONTROL_DEADLINE,
+                SharePhase::Grant,
+                provider,
                 operation_id,
-                share: self.state.membership.share_id,
-                peer: provider,
-                phase: SharePhase::Grant,
-                direction: TransferDirection::Outbound,
-                bytes: 0,
-                epoch: self.state.membership.epoch,
-                provider_epoch: None,
-                grant: None,
-            });
-            let grant = match result {
+            )
+            .await?;
+        let result: Result<ShareGrant> = (|| {
+            let grant = match reply {
                 Reply::Grant(grant) => grant,
+                Reply::Error(error) => return Err(error.into()),
                 _ => return Err(ShareError::Protocol.into()),
             };
             grant.verify_for(
@@ -2533,37 +2561,18 @@ impl ShareSession {
                 ShareError::ManifestMismatch
             );
             Ok(grant)
-        }
-        .await;
+        })();
         match result {
             Ok(grant) => {
-                self.emit_share_event(ShareTransferEvent {
-                    operation_id,
-                    share: self.state.membership.share_id,
-                    peer: provider,
-                    phase: SharePhase::Done,
-                    direction: TransferDirection::Outbound,
-                    bytes: 0,
-                    epoch: self.state.membership.epoch,
-                    provider_epoch: Some(grant.provider_epoch),
-                    grant: Some(grant.nonce),
-                });
+                event.finish(
+                    SharePhase::Done,
+                    Some(grant.provider_epoch),
+                    Some(grant.nonce),
+                );
                 Ok(grant)
             }
             Err(error) => {
-                if admitted {
-                    self.emit_share_event(ShareTransferEvent {
-                        operation_id,
-                        share: self.state.membership.share_id,
-                        peer: provider,
-                        phase: SharePhase::Reject,
-                        direction: TransferDirection::Outbound,
-                        bytes: 0,
-                        epoch: self.state.membership.epoch,
-                        provider_epoch: None,
-                        grant: None,
-                    });
-                }
+                event.finish(SharePhase::Reject, None, None);
                 Err(error)
             }
         }
@@ -6736,6 +6745,27 @@ mod tests {
                 .unwrap(),
             super::super::RevocationReceipt::Complete { .. }
         ));
+        let revoked_event_start = observed_events.lock().expect("share event mutex").len();
+        let revoked_error = session
+            .fetch_authoritative_snapshot(&empty)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            revoked_error.downcast_ref::<ShareError>(),
+            Some(&ShareError::MemberRevoked)
+        );
+        let revoked_events = observed_events.lock().expect("share event mutex");
+        assert!(
+            revoked_events[revoked_event_start..]
+                .iter()
+                .any(|event| event.phase == SharePhase::Query)
+        );
+        assert!(
+            revoked_events[revoked_event_start..]
+                .iter()
+                .any(|event| event.phase == SharePhase::Reject)
+        );
+        drop(revoked_events);
 
         // Once the owner endpoint is closed, cancelling an in-flight control
         // query must not leave an active-peer event behind.  The timeout is
