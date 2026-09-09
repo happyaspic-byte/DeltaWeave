@@ -32,30 +32,57 @@ pub(crate) fn prepare_directory(path: &Path) -> io::Result<()> {
         return Err(permission_error(PRIVATE_ERROR));
     }
 
-    reject_reparse_components(path)?;
+    if let Err(error) = reject_reparse_components(path) {
+        #[cfg(windows)]
+        log_acl_diagnostic("pre_reparse", None);
+        return Err(error);
+    }
     let existed = match fs::symlink_metadata(path) {
         Ok(metadata) => {
             validate_directory_metadata(&metadata)?;
             true
         }
         Err(error) if error.kind() == ErrorKind::NotFound => false,
-        Err(error) => return Err(safe_io_error(error, PRIVATE_ERROR)),
+        Err(error) => {
+            #[cfg(windows)]
+            log_acl_diagnostic("metadata", None);
+            return Err(safe_io_error(error, PRIVATE_ERROR));
+        }
     };
 
     if !existed {
-        create_private_leaf(path).map_err(|error| {
+        let created = create_private_leaf(path).map_err(|error| {
             if error.kind() == ErrorKind::NotFound {
                 safe_io_error(error, PRIVATE_MISSING_PARENT)
             } else {
                 safe_io_error(error, PRIVATE_ERROR)
             }
-        })?;
+        });
+        if let Err(error) = created {
+            #[cfg(windows)]
+            log_acl_diagnostic("create", None);
+            return Err(error);
+        }
         // A concurrent replacement must not turn the chmod/ACL operation into
         // an operation on an attacker-selected link or reparse point.
-        reject_reparse_components(path)?;
-        let metadata =
-            fs::symlink_metadata(path).map_err(|error| safe_io_error(error, PRIVATE_ERROR))?;
-        validate_directory_kind(&metadata)?;
+        if let Err(error) = reject_reparse_components(path) {
+            #[cfg(windows)]
+            log_acl_diagnostic("post_create_reparse", None);
+            return Err(error);
+        }
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(value) => value,
+            Err(error) => {
+                #[cfg(windows)]
+                log_acl_diagnostic("post_create_metadata", None);
+                return Err(safe_io_error(error, PRIVATE_ERROR));
+            }
+        };
+        if let Err(error) = validate_directory_kind(&metadata) {
+            #[cfg(windows)]
+            log_acl_diagnostic("post_create_validate", None);
+            return Err(error);
+        }
     }
 
     #[cfg(unix)]
@@ -202,7 +229,7 @@ fn prepare_windows_acl(path: &Path, allow_initial_repair: bool) -> io::Result<()
     if !output.status.success() {
         // Do not return PowerShell's path-bearing or localized output.  The
         // caller only needs a fail-closed security result.
-        log_acl_diagnostic("script", output.status.code());
+        log_acl_script_diagnostic("script", output.status.code(), &output.stdout);
         return Err(permission_error(PRIVATE_ERROR));
     }
 
@@ -239,6 +266,80 @@ fn log_acl_diagnostic(stage: &'static str, exit_code: Option<i32>) {
     match exit_code {
         Some(code) => eprintln!("managed private ACL diagnostic: stage={stage} exit_code={code}"),
         None => eprintln!("managed private ACL diagnostic: stage={stage}"),
+    }
+}
+
+#[cfg(windows)]
+fn log_acl_script_diagnostic(stage: &'static str, exit_code: Option<i32>, stdout: &[u8]) {
+    log_acl_diagnostic(stage, exit_code);
+    if std::env::var("DELTAWEAVE_PRIVATE_ACL_DIAGNOSTICS")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        return;
+    }
+
+    const STAGES: &[&str] = &[
+        "current_identity",
+        "initial_get_item",
+        "directory_security",
+        "access_rule_protection",
+        "security_identifier",
+        "set_owner",
+        "access_rule",
+        "add_access_rule",
+        "set_acl",
+        "post_get_item",
+        "get_acl",
+        "get_owner",
+        "get_access_rules",
+        "access_rule_validate",
+    ];
+    const CLASSES: &[&str] = &[
+        "unauthorized_access",
+        "security",
+        "argument",
+        "io",
+        "win32",
+        "platform",
+        "invalid_operation",
+        "method_invocation",
+        "runtime",
+        "cmdlet_invocation",
+        "directory_not_found",
+        "file_not_found",
+        "not_supported",
+        "other",
+    ];
+
+    for line in String::from_utf8_lossy(stdout).lines() {
+        let Some(fields) = line.strip_prefix("DELTAWEAVE_ACL_FAILURE|") else {
+            continue;
+        };
+        let mut fields = fields.split('|');
+        let Some(script_stage) = fields.next().and_then(|field| field.strip_prefix("stage="))
+        else {
+            continue;
+        };
+        let Some(class) = fields.next().and_then(|field| field.strip_prefix("class=")) else {
+            continue;
+        };
+        let Some(hresult) = fields
+            .next()
+            .and_then(|field| field.strip_prefix("hresult="))
+            .and_then(|value| value.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if fields.next().is_some() || !STAGES.contains(&script_stage) || !CLASSES.contains(&class) {
+            continue;
+        }
+        eprintln!(
+            "managed private ACL diagnostic: stage={stage} exit_code={:?} exception_stage={script_stage} exception_class={class} hresult={hresult}",
+            exit_code
+        );
+        break;
     }
 }
 
@@ -282,47 +383,85 @@ fn trusted_windows_executable(relative_path: &Path) -> io::Result<PathBuf> {
 const WINDOWS_ACL_SCRIPT: &str = r#"
 $ErrorActionPreference = 'Stop'
 $path = $env:DELTAWEAVE_PRIVATE_ACL_PATH
-$userSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $systemSid = 'S-1-5-18'
 $repair = $env:DELTAWEAVE_PRIVATE_ACL_REPAIR -eq '1'
 
+function Exit-WithDiagnostic([string]$stage, [int]$code, $errorRecord) {
+    if ($env:DELTAWEAVE_PRIVATE_ACL_DIAGNOSTICS -eq '1') {
+        $exceptionName = ''
+        $exception = $null
+        try {
+            $exception = $errorRecord.Exception
+            $exceptionName = $exception.GetType().Name
+            if ($exception.InnerException -and @('MethodInvocationException', 'RuntimeException', 'CmdletInvocationException') -contains $exceptionName) {
+                $exception = $exception.InnerException
+                $exceptionName = $exception.GetType().Name
+            }
+        } catch {
+            $exceptionName = ''
+        }
+        $class = 'other'
+        if ($exceptionName -eq 'UnauthorizedAccessException') { $class = 'unauthorized_access' }
+        elseif ($exceptionName -eq 'SecurityException') { $class = 'security' }
+        elseif ($exceptionName -eq 'ArgumentException' -or $exceptionName -eq 'ArgumentNullException') { $class = 'argument' }
+        elseif ($exceptionName -eq 'IOException') { $class = 'io' }
+        elseif ($exceptionName -eq 'Win32Exception') { $class = 'win32' }
+        elseif ($exceptionName -eq 'PlatformNotSupportedException') { $class = 'platform' }
+        elseif ($exceptionName -eq 'InvalidOperationException') { $class = 'invalid_operation' }
+        elseif ($exceptionName -eq 'MethodInvocationException') { $class = 'method_invocation' }
+        elseif ($exceptionName -eq 'RuntimeException') { $class = 'runtime' }
+        elseif ($exceptionName -eq 'CmdletInvocationException') { $class = 'cmdlet_invocation' }
+        elseif ($exceptionName -eq 'DirectoryNotFoundException') { $class = 'directory_not_found' }
+        elseif ($exceptionName -eq 'FileNotFoundException') { $class = 'file_not_found' }
+        elseif ($exceptionName -eq 'NotSupportedException') { $class = 'not_supported' }
+        $hresult = 0
+        try { $hresult = [int64]$exception.HResult } catch { $hresult = 0 }
+        Write-Output ("DELTAWEAVE_ACL_FAILURE|stage={0}|class={1}|hresult={2}" -f $stage, $class, $hresult)
+    }
+    exit $code
+}
+
+try { $userSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value } catch { Exit-WithDiagnostic 'current_identity' 39 $_ }
+
 if ([string]::IsNullOrWhiteSpace($path) -or [string]::IsNullOrWhiteSpace($userSid)) { exit 31 }
-$item = Get-Item -LiteralPath $path -Force
+try { $item = Get-Item -LiteralPath $path -Force } catch { Exit-WithDiagnostic 'initial_get_item' 40 $_ }
 if (-not $item.PSIsContainer -or (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)) { exit 32 }
 
 $sids = @($userSid, $systemSid) | Sort-Object -Unique
 if ($repair) {
-    $acl = New-Object System.Security.AccessControl.DirectorySecurity
-    $acl.SetAccessRuleProtection($true, $false)
-    $userIdentity = New-Object System.Security.Principal.SecurityIdentifier($userSid)
-    $acl.SetOwner($userIdentity)
+    try { $acl = New-Object System.Security.AccessControl.DirectorySecurity } catch { Exit-WithDiagnostic 'directory_security' 41 $_ }
+    try { $acl.SetAccessRuleProtection($true, $false) } catch { Exit-WithDiagnostic 'access_rule_protection' 41 $_ }
+    try { $userIdentity = New-Object System.Security.Principal.SecurityIdentifier($userSid) } catch { Exit-WithDiagnostic 'security_identifier' 41 $_ }
+    try { $acl.SetOwner($userIdentity) } catch { Exit-WithDiagnostic 'set_owner' 41 $_ }
     $rights = [System.Security.AccessControl.FileSystemRights]::FullControl
     $inheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
     $propagation = [System.Security.AccessControl.PropagationFlags]::None
     $allow = [System.Security.AccessControl.AccessControlType]::Allow
     foreach ($sid in $sids) {
-        $identity = New-Object System.Security.Principal.SecurityIdentifier($sid)
-        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($identity, $rights, $inheritance, $propagation, $allow)
-        $acl.AddAccessRule($rule)
+        try { $identity = New-Object System.Security.Principal.SecurityIdentifier($sid) } catch { Exit-WithDiagnostic 'security_identifier' 41 $_ }
+        try { $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($identity, $rights, $inheritance, $propagation, $allow) } catch { Exit-WithDiagnostic 'access_rule' 41 $_ }
+        try { $acl.AddAccessRule($rule) } catch { Exit-WithDiagnostic 'add_access_rule' 41 $_ }
     }
-    Set-Acl -LiteralPath $path -AclObject $acl
+    try { Set-Acl -LiteralPath $path -AclObject $acl } catch { Exit-WithDiagnostic 'set_acl' 41 $_ }
 }
 
-$item = Get-Item -LiteralPath $path -Force
+try { $item = Get-Item -LiteralPath $path -Force } catch { Exit-WithDiagnostic 'post_get_item' 42 $_ }
 if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { exit 33 }
-$acl = Get-Acl -LiteralPath $path
+try { $acl = Get-Acl -LiteralPath $path } catch { Exit-WithDiagnostic 'get_acl' 43 $_ }
 if (-not $acl.AreAccessRulesProtected) { exit 34 }
-$owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+try { $owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value } catch { Exit-WithDiagnostic 'get_owner' 44 $_ }
 if ($owner -notin $sids) { exit 37 }
-$rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+try { $rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) } catch { Exit-WithDiagnostic 'get_access_rules' 45 $_ }
 if ($rules.Count -ne $sids.Count) { exit 35 }
 $rights = [System.Security.AccessControl.FileSystemRights]::FullControl
 $inheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
 $propagation = [System.Security.AccessControl.PropagationFlags]::None
 $allow = [System.Security.AccessControl.AccessControlType]::Allow
-foreach ($rule in $rules) {
-    if ($rule.IsInherited -or $rule.IdentityReference.Value -notin $sids -or $rule.AccessControlType -ne $allow -or $rule.FileSystemRights -ne $rights -or $rule.InheritanceFlags -ne $inheritance -or $rule.PropagationFlags -ne $propagation) { exit 36 }
-}
+try {
+    foreach ($rule in $rules) {
+        if ($rule.IsInherited -or $rule.IdentityReference.Value -notin $sids -or $rule.AccessControlType -ne $allow -or $rule.FileSystemRights -ne $rights -or $rule.InheritanceFlags -ne $inheritance -or $rule.PropagationFlags -ne $propagation) { exit 36 }
+    }
+} catch { Exit-WithDiagnostic 'access_rule_validate' 46 $_ }
 exit 0
 "#;
 
