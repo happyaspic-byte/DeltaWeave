@@ -986,21 +986,43 @@ fn authenticated_owner_rollback_divergence_and_missing_tombstones_are_rejected()
                 )
                 .unwrap()
                 .secret_key;
-                let bind = *owner.endpoint_addr().ip_addrs().next().unwrap();
                 session.close().await;
+                let before = engine.preserved_changes().unwrap();
+                // Drain the old session and release its lease before replacing the
+                // owner endpoint. The resumed engine below must reopen the same
+                // index/store, rather than silently creating a fresh binding.
+                engine.shutdown().await.unwrap();
                 owner.shutdown().await.unwrap();
-                // Restore/hostile owner uses the original authenticated identity and address.
+                // The replacement uses the original authenticated identity, but a
+                // fresh ephemeral UDP port. Reusing the old socket is a separate
+                // transport guarantee covered by the network tests.
                 let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
                     .secret_key(key)
                     .alpns(vec![ALPN_V3.to_vec()])
                     .clear_ip_transports()
-                    .bind_addr(bind)
+                    .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
                     .unwrap()
                     .bind()
                     .await
                     .unwrap();
+                let address = iroh::EndpointAddr::new(endpoint.id())
+                    .with_ip_addr(endpoint.bound_sockets()[0]);
+                let resumed_membership = grant.clone();
                 let serving = endpoint.clone();
                 let responses = tokio::spawn(async move {
+                    // Authenticate the address update through the real resume
+                    // operation before serving the three hostile snapshots.
+                    let connection = serving.accept().await.unwrap().await.unwrap();
+                    let (mut send, mut receive) = connection.accept_bi().await.unwrap();
+                    let hello = raw_read(&mut receive).await;
+                    assert_eq!(hello[0], 3);
+                    raw_write(
+                        &mut send,
+                        &postcard::to_stdvec(&(4_u32, resumed_membership)).unwrap(),
+                    )
+                    .await;
+                    send.finish().unwrap();
+                    connection.closed().await;
                     for records in [old, divergent, Vec::new()] {
                         let tree = MerkleTree::from_records(records).unwrap();
                         let connection = serving.accept().await.unwrap().await.unwrap();
@@ -1027,19 +1049,41 @@ fn authenticated_owner_rollback_divergence_and_missing_tombstones_are_rejected()
                         connection.closed().await;
                     }
                 });
-                let before = engine.preserved_changes().unwrap();
+                let resumed = member
+                    .resume_membership(grant.owner, grant.share_id, address.clone())
+                    .await
+                    .unwrap();
+                assert_eq!(resumed, grant);
+                let relationship = member
+                    .relationships()
+                    .unwrap()
+                    .into_iter()
+                    .find(|item| {
+                        item.membership.owner == grant.owner
+                            && item.membership.share_id == grant.share_id
+                    })
+                    .unwrap();
+                assert_eq!(relationship.membership, grant);
+                assert_eq!(relationship.address, address);
+                let resumed_engine = ManagedSyncEngine::resume(
+                    &member,
+                    grant.owner,
+                    grant.share_id,
+                    config(base.path(), "ro"),
+                )
+                .unwrap();
                 for _ in 0..3 {
-                    let error = engine.sync_read_only(None).await.err().unwrap();
+                    let error = resumed_engine.sync_read_only(None).await.err().unwrap();
                     assert_eq!(ShareError::classify(&error), ShareError::InvalidRecord);
                     assert_eq!(
                         fs::read(base.path().join("ro-root/file")).unwrap(),
                         b"trusted new owner"
                     );
-                    assert_eq!(engine.preserved_changes().unwrap(), before);
+                    assert_eq!(resumed_engine.preserved_changes().unwrap(), before);
                 }
                 responses.await.unwrap();
                 endpoint.close().await;
-                engine.shutdown().await.unwrap();
+                resumed_engine.shutdown().await.unwrap();
                 member.shutdown().await.unwrap();
             });
         },

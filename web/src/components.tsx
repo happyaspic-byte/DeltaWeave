@@ -269,7 +269,7 @@ export function Modal({
         ),
       ).filter((x) => !x.closest("details:not([open])") && !x.hidden);
     (
-      focusables().find((x) => x.tagName === "INPUT") ??
+      focusables().find((x) => ["INPUT", "TEXTAREA", "SELECT"].includes(x.tagName)) ??
       focusables()[0] ??
       el
     ).focus();
@@ -310,7 +310,31 @@ export function Modal({
     return () => {
       document.removeEventListener("keydown", key);
       document.body.style.overflow = oldOverflow;
-      previous?.focus();
+      // React may finish removing the dialog after this passive-effect cleanup.
+      // Restore focus after the overlay is detached so the browser cannot move
+      // it back to BODY while the overlay is being removed.
+      if (previous?.isConnected) {
+        const restoreFocus = () => {
+          // StrictMode's effect probe cleans up while this node is still
+          // connected. A real unmount leaves no dialog to receive focus; if a
+          // replacement dialog is already open, let that dialog keep focus.
+          const dialogs = document.querySelectorAll<HTMLElement>(
+            '[role="dialog"][aria-modal="true"]',
+          );
+          const topmost = dialogs[dialogs.length - 1];
+          if (
+            !el.isConnected &&
+            previous.isConnected &&
+            (dialogs.length === 0 || topmost?.contains(previous))
+          ) {
+            previous.focus({ preventScroll: true });
+          }
+        };
+        queueMicrotask(() => {
+          if (el.isConnected) window.setTimeout(restoreFocus, 0);
+          else restoreFocus();
+        });
+      }
     };
   }, []);
   return (
@@ -1127,7 +1151,7 @@ export function CopyButton({
   }
   return (
     <>
-      <button className="btn subtle small" onClick={copy}>
+      <button type="button" className="btn subtle small" onClick={copy}>
         {copied ? <CheckCircle size={15} /> : <Copy size={15} />}
         {copied ? "복사됨" : label}
       </button>

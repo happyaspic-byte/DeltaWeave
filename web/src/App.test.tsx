@@ -41,6 +41,24 @@ const snapshot: AppSnapshot = {
   },
   revision: 7,
 };
+const managedShare = {
+  share_id: "a".repeat(64),
+  name: "관리형 테스트 공유",
+  role: "owner" as const,
+  permission: "read_only" as const,
+  root: "/managed/source",
+  status: "initial_sync" as const,
+  phase: "manifest",
+  last_sync_at: null,
+  retry_at: null,
+  files_count: 1,
+  total_bytes: 38,
+  transferred_bytes: 0,
+  speed_bps: 0,
+  active_peer_count: 0,
+  connected_devices: [],
+  last_error: null,
+};
 class BrowserEvents {
   static current: BrowserEvents;
   onopen: (() => void) | null = null;
@@ -78,16 +96,29 @@ afterEach(() => vi.unstubAllGlobals());
 it("shows honest empty folders and no successful response for a merely registered device", async () => {
   install();
   render(<App />);
-  expect(await screen.findByText("첫 번째 폴더를 연결해 보세요")).toBeVisible();
+  expect(await screen.findByText("첫 폴더를 공유해 보세요")).toBeVisible();
+  expect(screen.getByRole("button", { name: "첫 폴더 공유" })).toBeVisible();
   expect(screen.getByText("아직 응답 기록 없음")).toBeVisible();
   expect(
     screen.getByText("첫 동기화가 끝나면 그래프가 시작됩니다."),
   ).toBeVisible();
 });
+it("puts a managed share first and hides duplicate legacy empty panels", async () => {
+  install({ ...snapshot, shares: [managedShare] });
+  render(<App />);
+  expect(await screen.findByText("관리형 테스트 공유")).toBeVisible();
+  expect(screen.queryByText("첫 폴더를 공유해 보세요")).not.toBeInTheDocument();
+  expect(screen.queryByRole("heading", { name: "동기화 폴더" })).not.toBeInTheDocument();
+
+  await userEvent.click(screen.getByRole("button", { name: "폴더 0" }));
+  expect(screen.getByText("관리형 테스트 공유")).toBeVisible();
+  expect(screen.queryByRole("heading", { name: "내 폴더" })).not.toBeInTheDocument();
+  expect(screen.queryByText("아직 연결된 폴더가 없습니다")).not.toBeInTheDocument();
+});
 it("keeps the last snapshot visible with a disconnected transport warning", async () => {
   install();
   render(<App />);
-  await screen.findByText("첫 번째 폴더를 연결해 보세요");
+  await screen.findByText("첫 폴더를 공유해 보세요");
   act(() => BrowserEvents.current.onerror?.());
   expect(screen.getByText("실시간 연결 끊김")).toBeVisible();
   expect(
@@ -100,7 +131,7 @@ it("keeps the last snapshot visible with a disconnected transport warning", asyn
 it("recovers a full snapshot when a restarted server resets its revision", async () => {
   install();
   render(<App />);
-  await screen.findByText("첫 번째 폴더를 연결해 보세요");
+  await screen.findByText("첫 폴더를 공유해 보세요");
   act(() =>
     BrowserEvents.current.send({
       ...snapshot,
@@ -117,7 +148,7 @@ it("recovers a full snapshot when a restarted server resets its revision", async
 it("preserves settings edits when the server rejects the save", async () => {
   install();
   render(<App />);
-  await screen.findByText("첫 번째 폴더를 연결해 보세요");
+  await screen.findByText("첫 폴더를 공유해 보세요");
   await userEvent.click(screen.getByRole("button", { name: "설정" }));
   const name = screen.getByLabelText("장치 표시 이름");
   await userEvent.clear(name);
@@ -150,7 +181,7 @@ it("opens server directory browsing from a blank path without sending an empty p
       : original(url, init);
   });
   render(<App />);
-  await screen.findByText("첫 번째 폴더를 연결해 보세요");
+  await screen.findByText("첫 폴더를 공유해 보세요");
   await userEvent.click(screen.getByRole("button", { name: "폴더 추가" }));
   await userEvent.click(screen.getByRole("button", { name: "찾아보기" }));
   await waitFor(() => expect(calls).toContain("/api/v1/browse"));
@@ -161,7 +192,7 @@ it("moves mobile menu focus into navigation and dismisses it from outside", asyn
   install();
   const user = userEvent.setup();
   const { container } = render(<App />);
-  await screen.findByText("첫 번째 폴더를 연결해 보세요");
+  await screen.findByText("첫 폴더를 공유해 보세요");
   const toggle = container.querySelector<HTMLButtonElement>(".mobile-toggle")!;
   const nav = screen.getByRole("navigation", { name: "주 메뉴" });
   const currentPage = nav.querySelector<HTMLButtonElement>(
@@ -205,7 +236,7 @@ it("pages activities, returns to the first filtered page, and clamps after a liv
   install(state);
   const user = userEvent.setup();
   const { container } = render(<App />);
-  await screen.findByText("첫 번째 폴더를 연결해 보세요");
+  await screen.findByText("첫 폴더를 공유해 보세요");
   await user.click(screen.getByRole("button", { name: "활동" }));
   expect(
     container.querySelectorAll(".full-activities .activity-row"),

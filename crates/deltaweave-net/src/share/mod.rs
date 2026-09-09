@@ -1,15 +1,29 @@
 //! Owner-mediated, folder-scoped sharing over one persistent device endpoint.
+mod authority;
 mod registry;
+mod roster;
 mod runtime;
 mod service;
 mod ticket;
 pub(crate) mod wire;
+pub use authority::{
+    ActivateGrantReply, ActivateGrantRequest, ApplyDrained, ApplyPermit, ApplyStart,
+    AuthoritativeSnapshot, ManifestAttestation, RevocationReceipt, ShareGrant, SnapshotToken,
+};
 pub use registry::{Invitation, MemberRelationship, Membership, OwnedShareConfig};
+pub use roster::{
+    GrantNonce, PermissionEpoch, ROSTER_HEARTBEAT_INTERVAL_SECONDS, RosterEntry, RosterHeartbeat,
+    SignedRoster, SnapshotId,
+};
 pub(crate) use runtime::Authorization;
 pub use runtime::{MutationProvenance, OwnerShare};
-pub use service::{ShareService, ShareSession};
+pub use service::{ActivationLease, ShareService, ShareSession};
 
 pub const ALPN_V3: &[u8] = b"deltaweave/share/3";
+/// Separate grant-gated data protocol.  D2 registers the endpoint and
+/// rejects unauthenticated streams; E supplies the chunk adapter after the
+/// authority contract is verified.
+pub const ALPN_SWARM_V1: &[u8] = b"deltaweave/share-swarm/1";
 pub use ticket::{InvitationId, LegacyProof, Permission, ShareId, ShareTicket, TicketPreview};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -31,6 +45,17 @@ pub enum ShareError {
     Protocol,
     OwnerMismatch,
     TransferFailed,
+    HeartbeatExpired,
+    HeartbeatReplay,
+    EpochMismatch,
+    EndpointMismatch,
+    ClockRollback,
+    RosterStale,
+    GrantExpired,
+    GrantReplay,
+    ManifestMismatch,
+    CasUnavailable,
+    RevocationPending,
 }
 impl std::fmt::Display for ShareError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -51,6 +76,17 @@ impl std::fmt::Display for ShareError {
             Self::Protocol => "invalid share protocol",
             Self::OwnerMismatch => "share owner mismatch",
             Self::TransferFailed => "share transfer failed",
+            Self::HeartbeatExpired => "share heartbeat expired",
+            Self::HeartbeatReplay => "share heartbeat replayed",
+            Self::EpochMismatch => "share permission epoch mismatch",
+            Self::EndpointMismatch => "share endpoint mismatch",
+            Self::ClockRollback => "share clock rollback",
+            Self::RosterStale => "share roster is stale",
+            Self::GrantExpired => "share grant expired",
+            Self::GrantReplay => "share grant replayed",
+            Self::ManifestMismatch => "share manifest mismatch",
+            Self::CasUnavailable => "share content unavailable",
+            Self::RevocationPending => "share revocation is pending",
         })
     }
 }

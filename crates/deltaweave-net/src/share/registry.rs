@@ -1,19 +1,50 @@
+use super::authority::{
+    ApplyDrained, ApplyPermit, ApplyStart, AuthoritativeSnapshot, ManifestAttestation,
+    RevocationReceipt, ShareGrant, SnapshotToken, request_hash, validate_hash_subset,
+};
+use super::roster::{
+    MAX_ROSTER_ENTRIES, MAX_ROSTER_FRAME_BYTES, ROSTER_STALE_AFTER_SECONDS, ROSTER_TTL_SECONDS,
+    ROSTER_VERSION, heartbeat_expiry, random_nonce,
+};
 use super::ticket::random_bytes;
-use super::{InvitationId, LegacyProof, Permission, ShareError, ShareId, ShareTicket, now};
+use super::{
+    GrantNonce, InvitationId, LegacyProof, Permission, ShareError, ShareId, ShareTicket,
+    SnapshotId, now,
+};
+use super::{RosterEntry, RosterHeartbeat, SignedRoster};
 use anyhow::{Result, ensure};
-use deltaweave_core::{Hash32, ReplicaId};
-use iroh::{EndpointAddr, EndpointId};
+use deltaweave_core::{Hash32, ReplicaId, SyncRecord};
+use iroh::{EndpointAddr, EndpointId, SecretKey};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::Mutex,
+    time::Instant,
 };
 
 const CATALOG: TableDefinition<u8, &[u8]> = TableDefinition::new("owner_share_catalog_v3");
+const ROSTERS: TableDefinition<&str, &[u8]> = TableDefinition::new("share_roster_v1");
+const HEARTBEATS: TableDefinition<&str, &[u8]> = TableDefinition::new("share_roster_heartbeat_v1");
+const SNAPSHOTS: TableDefinition<&str, &[u8]> = TableDefinition::new("share-swarm-snapshot-v1");
+const GRANTS: TableDefinition<&str, &[u8]> = TableDefinition::new("share-swarm-grant-v1");
+/// Endpoint drain acknowledgements are additive to the grant journal.  They
+/// live in a separate table so the original GrantRow postcard remains
+/// decodable by older deployments and by rows written before bilateral drain
+/// tracking was introduced.
+const GRANT_DRAINS: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("share-swarm-grant-drain-v1");
+const APPLIES: TableDefinition<&str, &[u8]> = TableDefinition::new("share-swarm-apply-v1");
+/// Durable high-water mark for authority timestamps.  This table is separate
+/// from the legacy catalog so a managed clock quarantine never prevents
+/// opening manual shares.
+const CLOCK: TableDefinition<u8, &[u8]> = TableDefinition::new("share-swarm-clock-v1");
 const MAX_MEMBERS: usize = 4096;
 pub(crate) const MAX_REPLICAS: usize = 4096;
+const MAX_AUTHORITY_ROWS: usize = 4096;
+const MAX_AUTHORITY_BYTES: usize = 16 * 1024 * 1024;
+const AUTHORITY_RETENTION_SECONDS: u64 = 60 * 60;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OwnedShareConfig {
@@ -68,10 +99,92 @@ struct Catalog {
     shares: BTreeMap<ShareId, ShareEntry>,
     relationships: BTreeMap<(EndpointId, ShareId), MemberRelationship>,
 }
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct HeartbeatChallenge {
+    version: u8,
+    owner: EndpointId,
+    share: ShareId,
+    member: EndpointId,
+    challenge: [u8; 32],
+    issued_at: u64,
+    expires_at: u64,
+    used: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+enum GrantState {
+    Issued,
+    Active,
+    Drained,
+    Denied,
+    /// An active grant observed after process restart.  It remains a drain
+    /// blocker, but cannot be reactivated or silently promoted to complete.
+    Restarted,
+    /// An unactivated grant whose bounded wall lifetime elapsed. It is
+    /// terminal for replay/error purposes and is retained only for the
+    /// finite authority journal retention window.
+    Expired,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct GrantRow {
+    grant: ShareGrant,
+    state: GrantState,
+    activation_id: Option<[u8; 16]>,
+    activation_deadline: Option<u64>,
+    /// Revocation is retained separately from the lifecycle state so an
+    /// already admitted activation remains a durable drain blocker.
+    #[serde(default)]
+    revoked: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+struct GrantDrainState {
+    provider_drained: bool,
+    consumer_drained: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+enum ApplyState {
+    Prepared,
+    Started,
+    Drained,
+    Denied,
+    /// An in-flight apply observed after process restart.  The peer must send
+    /// a fresh authenticated drain acknowledgement before it can complete.
+    Restarted,
+    /// A permit that was never started before its bounded lifetime elapsed.
+    Expired,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct ApplyRow {
+    permit: ApplyPermit,
+    state: ApplyState,
+    operation_id: Option<[u8; 16]>,
+    committed: bool,
+    /// A started apply remains visible after revocation until its drain ACK.
+    #[serde(default)]
+    revoked: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct ClockAnchor {
+    version: u8,
+    last_wall: u64,
+    boot: [u8; 16],
+    quarantined: bool,
+}
+
 #[derive(Debug)]
 pub(crate) struct Registry {
     db: Database,
     serial: Mutex<()>,
+    /// Live monotonic activation deadlines.  Durable rows retain the wall
+    /// value for audit/display; this map prevents a late response from
+    /// extending a process-local 15 second lease.
+    activation_deadlines: Mutex<BTreeMap<GrantNonce, Instant>>,
 }
 
 pub(crate) fn resolver() -> ReplicaId {
@@ -97,10 +210,86 @@ impl Registry {
                 table.insert(0, bytes.as_slice())?;
             }
         }
+        // Authority journals are additive tables.  Opening them here keeps a
+        // newly-created registry deterministic and gives restart recovery one
+        // transaction in which to quarantine a clock and retain drain
+        // blockers.  Legacy catalog bytes are never rewritten by this path.
+        {
+            let wall = now();
+            let mut clock_table = tx.open_table(CLOCK)?;
+            let previous = clock_table
+                .get(0)?
+                .map(|value| postcard::from_bytes::<ClockAnchor>(value.value()))
+                .transpose()?;
+            let mut anchor = previous.unwrap_or(ClockAnchor {
+                version: 1,
+                last_wall: wall,
+                boot: [0; 16],
+                quarantined: false,
+            });
+            ensure!(anchor.version == 1, ShareError::StateUnavailable);
+            if wall.saturating_add(super::authority::MAX_CLOCK_SKEW_SECONDS) < anchor.last_wall {
+                anchor.quarantined = true;
+            } else {
+                anchor.last_wall = anchor.last_wall.max(wall);
+            }
+            let bytes = random_bytes();
+            anchor.boot.copy_from_slice(&bytes[..16]);
+            let encoded = postcard::to_stdvec(&anchor)?;
+            clock_table.insert(0, encoded.as_slice())?;
+        }
+        {
+            // Existing Active/Started rows are unsafe to reactivate after a
+            // restart.  Preserve the row and mark it as an unknown-drain
+            // blocker; a fresh authenticated drain is required to finish it.
+            let rows = {
+                let table = tx.open_table(GRANTS)?;
+                let mut rows = Vec::new();
+                for item in table.iter()? {
+                    let (key, value) = item?;
+                    let row: GrantRow = postcard::from_bytes(value.value())?;
+                    rows.push((key.value().to_owned(), row));
+                }
+                rows
+            };
+            let mut table = tx.open_table(GRANTS)?;
+            for (key, mut row) in rows {
+                if row.state == GrantState::Active {
+                    row.state = GrantState::Restarted;
+                    let bytes = postcard::to_stdvec(&row)?;
+                    table.insert(key.as_str(), bytes.as_slice())?;
+                }
+            }
+        }
+        {
+            let rows = {
+                let table = tx.open_table(APPLIES)?;
+                let mut rows = Vec::new();
+                for item in table.iter()? {
+                    let (key, value) = item?;
+                    let row: ApplyRow = postcard::from_bytes(value.value())?;
+                    rows.push((key.value().to_owned(), row));
+                }
+                rows
+            };
+            let mut table = tx.open_table(APPLIES)?;
+            for (key, mut row) in rows {
+                if row.state == ApplyState::Started {
+                    row.state = ApplyState::Restarted;
+                    let bytes = postcard::to_stdvec(&row)?;
+                    table.insert(key.as_str(), bytes.as_slice())?;
+                }
+            }
+        }
+        // Opening all tables is also an additive migration marker.  No rows
+        // are removed here; cleanup is explicit and bounded below.
+        tx.open_table(SNAPSHOTS)?;
+        tx.open_table(GRANT_DRAINS)?;
         tx.commit()?;
         let registry = Self {
             db,
             serial: Mutex::new(()),
+            activation_deadlines: Mutex::new(BTreeMap::new()),
         };
         let catalog = registry.read()?;
         ensure!(
@@ -124,6 +313,9 @@ impl Registry {
             .serial
             .lock()
             .map_err(|_| ShareError::StateUnavailable)?;
+        self.update_locked(f)
+    }
+    fn update_locked<T>(&self, f: impl FnOnce(&mut Catalog) -> Result<T>) -> Result<T> {
         let mut catalog = self.read()?;
         let result = f(&mut catalog)?;
         let bytes = postcard::to_stdvec(&catalog)?;
@@ -200,6 +392,99 @@ impl Registry {
             .config
             .clone())
     }
+    pub fn remove_share(&self, id: ShareId) -> Result<()> {
+        let _serial = self
+            .serial
+            .lock()
+            .map_err(|_| ShareError::StateUnavailable)?;
+        let mut catalog = self.read()?;
+        ensure!(
+            catalog.shares.remove(&id).is_some(),
+            ShareError::UnknownShare
+        );
+        catalog.relationships.retain(|(_, share), _| *share != id);
+        let catalog_bytes = postcard::to_stdvec(&catalog)?;
+        ensure!(
+            catalog_bytes.len() <= 16 * 1024 * 1024,
+            ShareError::StateUnavailable
+        );
+
+        let snapshot_remove: Vec<_> = self
+            .read_snapshot_rows()?
+            .into_iter()
+            .filter(|(_, row)| row.token.share == id)
+            .map(|(key, _)| key)
+            .collect();
+        let grant_rows = self
+            .read_grant_rows()?
+            .into_iter()
+            .filter(|(_, row)| row.grant.share == id)
+            .collect::<Vec<_>>();
+        let grant_remove: Vec<_> = grant_rows.iter().map(|(key, _)| key.clone()).collect();
+        let grant_nonces: Vec<_> = grant_rows.iter().map(|(_, row)| row.grant.nonce).collect();
+        let apply_remove: Vec<_> = self
+            .read_apply_rows()?
+            .into_iter()
+            .filter(|(_, row)| row.permit.share == id)
+            .map(|(key, _)| key)
+            .collect();
+        let heartbeat_prefix = format!("{}:", roster_key(id));
+        let heartbeat_remove = {
+            let read = self.db.begin_read()?;
+            let table = read.open_table(HEARTBEATS)?;
+            let mut keys = Vec::new();
+            for item in table.iter()? {
+                let (key, _) = item?;
+                if key.value().starts_with(&heartbeat_prefix) {
+                    keys.push(key.value().to_owned());
+                }
+            }
+            keys
+        };
+        let tx = self.db.begin_write()?;
+        tx.open_table(CATALOG)?
+            .insert(0, catalog_bytes.as_slice())?;
+        {
+            let mut table = tx.open_table(ROSTERS)?;
+            table.remove(roster_key(id).as_str())?;
+        }
+        {
+            let mut table = tx.open_table(HEARTBEATS)?;
+            for key in heartbeat_remove {
+                table.remove(key.as_str())?;
+            }
+        }
+        {
+            let mut table = tx.open_table(SNAPSHOTS)?;
+            for key in snapshot_remove {
+                table.remove(key.as_str())?;
+            }
+        }
+        {
+            let mut table = tx.open_table(GRANTS)?;
+            for key in &grant_remove {
+                table.remove(key.as_str())?;
+            }
+        }
+        {
+            let mut table = tx.open_table(GRANT_DRAINS)?;
+            for key in &grant_remove {
+                table.remove(key.as_str())?;
+            }
+        }
+        {
+            let mut table = tx.open_table(APPLIES)?;
+            for key in apply_remove {
+                table.remove(key.as_str())?;
+            }
+        }
+        tx.commit()?;
+        self.activation_deadlines
+            .lock()
+            .map_err(|_| ShareError::StateUnavailable)?
+            .retain(|nonce, _| !grant_nonces.contains(nonce));
+        Ok(())
+    }
     pub fn remember_replicas(
         &self,
         id: ShareId,
@@ -225,8 +510,27 @@ impl Registry {
             .clone())
     }
     pub fn issue(&self, ticket: &ShareTicket) -> Result<()> {
+        self.issue_with_revocation(ticket, None)
+    }
+
+    /// Commits one signed issuance and, for rotation, revokes the old
+    /// invitation in the same catalog transaction. Replaying an already
+    /// committed signed ticket is exact and never changes revocation state.
+    pub fn issue_with_revocation(
+        &self,
+        ticket: &ShareTicket,
+        revoke: Option<InvitationId>,
+    ) -> Result<()> {
         ticket.verify_at(now())?;
-        self.update(|catalog| {
+        let _serial = self
+            .serial
+            .lock()
+            .map_err(|_| ShareError::StateUnavailable)?;
+        // Invitation issuance is a managed authority mutation.  A durable
+        // wall-clock rollback quarantine must stop creating a new bearer;
+        // deny/revoke and legacy catalog reads remain available separately.
+        self.observe_authority_clock(now())?;
+        self.update_locked(|catalog| {
             let entry = catalog
                 .shares
                 .get_mut(&ticket.body.share_id)
@@ -235,6 +539,43 @@ impl Registry {
                 entry.config.owner == ticket.body.owner && entry.config.name == ticket.body.name,
                 ShareError::InvalidTicket
             );
+            let digest = ticket.issuance_digest()?;
+            if let Some(existing) = entry.invitations.get(&ticket.body.invitation_id) {
+                // A recovered issuance intent may replay the same signed
+                // ticket.  It must be an exact replay and can never resurrect
+                // a revoked invitation or overwrite its durable role/expiry.
+                ensure!(
+                    existing.share_id == ticket.body.share_id
+                        && existing.permission == ticket.body.permission
+                        && existing.expires_at == ticket.body.expires_at
+                        && existing.digest == digest
+                        && existing.revoked_at.is_none(),
+                    ShareError::InvalidTicket
+                );
+                if let Some(revoke) = revoke {
+                    ensure!(
+                        revoke != ticket.body.invitation_id,
+                        ShareError::InvalidTicket
+                    );
+                    let old = entry
+                        .invitations
+                        .get_mut(&revoke)
+                        .ok_or(ShareError::InvalidTicket)?;
+                    old.revoked_at.get_or_insert(now());
+                }
+                return Ok(());
+            }
+            if let Some(revoke) = revoke {
+                ensure!(
+                    revoke != ticket.body.invitation_id,
+                    ShareError::InvalidTicket
+                );
+                let old = entry
+                    .invitations
+                    .get_mut(&revoke)
+                    .ok_or(ShareError::InvalidTicket)?;
+                old.revoked_at.get_or_insert(now());
+            }
             ensure!(entry.invitations.len() < 4096, ShareError::Busy);
             entry.invitations.insert(
                 ticket.body.invitation_id,
@@ -244,7 +585,7 @@ impl Registry {
                     permission: ticket.body.permission,
                     expires_at: ticket.body.expires_at,
                     revoked_at: None,
-                    digest: ticket.issuance_digest()?,
+                    digest,
                 },
             );
             Ok(())
@@ -399,6 +740,7 @@ impl Registry {
             Ok(())
         })
     }
+    #[allow(dead_code)]
     pub fn revoke_member(&self, share: ShareId, peer: EndpointId) -> Result<()> {
         self.update(|catalog| {
             let entry = catalog
@@ -428,9 +770,25 @@ impl Registry {
             let key = (member.owner, member.share_id);
             if let Some(existing) = catalog.relationships.get(&key) {
                 ensure!(
-                    existing.membership.replica == member.replica,
+                    existing.membership.replica == member.replica
+                        && existing.membership.permission == member.permission
+                        && existing.membership.enrolled_at == member.enrolled_at
+                        && existing.membership.endpoint == member.endpoint
+                        && existing.membership.owner == member.owner,
                     ShareError::ReplicaClaimRejected
                 );
+                if existing.membership.revoked_at.is_none() && member.revoked_at.is_some() {
+                    ensure!(
+                        member.epoch >= existing.membership.epoch,
+                        ShareError::ReplicaClaimRejected
+                    );
+                } else {
+                    ensure!(
+                        existing.membership.epoch == member.epoch
+                            && existing.membership.revoked_at == member.revoked_at,
+                        ShareError::ReplicaClaimRejected
+                    );
+                }
             }
             catalog.relationships.insert(key, relationship);
             Ok(())
@@ -445,11 +803,1379 @@ impl Registry {
             .remove(&(owner, share))
             .ok_or_else(|| ShareError::NotMember.into())
     }
+    pub fn forget_relationship(&self, owner: EndpointId, share: ShareId) -> Result<()> {
+        self.update(|catalog| {
+            catalog.relationships.remove(&(owner, share));
+            Ok(())
+        })
+    }
+
+    /// Issues one owner-authenticated challenge and stores its replay state in
+    /// a separate v1 table.  The challenge does not grant enrollment or
+    /// change the catalog membership.
+    pub(crate) fn issue_roster_challenge(
+        &self,
+        owner_key: &SecretKey,
+        share: ShareId,
+        member: EndpointId,
+    ) -> Result<(SignedRoster, [u8; 32])> {
+        let _serial = self
+            .serial
+            .lock()
+            .map_err(|_| ShareError::StateUnavailable)?;
+        let catalog = self.read()?;
+        ensure!(
+            catalog.owner == owner_key.public(),
+            ShareError::OwnerMismatch
+        );
+        let member_record = catalog
+            .shares
+            .get(&share)
+            .ok_or(ShareError::UnknownShare)?
+            .members
+            .get(&member)
+            .ok_or(ShareError::NotMember)?;
+        ensure!(
+            member_record.revoked_at.is_none(),
+            ShareError::MemberRevoked
+        );
+        let now = now();
+        self.observe_authority_clock(now)?;
+        let previous = self.read_roster(share)?;
+        let roster = self.sign_roster(owner_key, &catalog, share, previous.as_ref(), now)?;
+        let challenge = random_nonce();
+        let record = HeartbeatChallenge {
+            version: ROSTER_VERSION,
+            owner: catalog.owner,
+            share,
+            member,
+            challenge,
+            issued_at: now,
+            expires_at: now.saturating_add(ROSTER_STALE_AFTER_SECONDS),
+            used: false,
+        };
+        self.write_roster_and_challenge(&roster, &record)?;
+        Ok((roster, challenge))
+    }
+
+    /// Accepts a member-signed address update only after checking the
+    /// authenticated QUIC peer, the one-use durable challenge, and the live
+    /// catalog epoch.  Address freshness is liveness metadata; it never
+    /// creates or changes membership.
+    pub(crate) fn accept_roster_heartbeat(
+        &self,
+        owner_key: &SecretKey,
+        heartbeat: &RosterHeartbeat,
+        remote_peer: EndpointId,
+    ) -> Result<SignedRoster> {
+        let _serial = self
+            .serial
+            .lock()
+            .map_err(|_| ShareError::StateUnavailable)?;
+        ensure!(
+            heartbeat.owner == owner_key.public() && heartbeat.member == remote_peer,
+            ShareError::EndpointMismatch
+        );
+        let now = now();
+        self.observe_authority_clock(now)?;
+        heartbeat.verify_at(now)?;
+        let catalog = self.read()?;
+        ensure!(
+            catalog.owner == owner_key.public(),
+            ShareError::OwnerMismatch
+        );
+        let member_record = catalog
+            .shares
+            .get(&heartbeat.share)
+            .ok_or(ShareError::UnknownShare)?
+            .members
+            .get(&heartbeat.member)
+            .ok_or(ShareError::NotMember)?;
+        ensure!(
+            member_record.revoked_at.is_none(),
+            ShareError::MemberRevoked
+        );
+        let mut challenge = self
+            .read_challenge(heartbeat.share, heartbeat.member)?
+            .ok_or(ShareError::HeartbeatReplay)?;
+        ensure!(
+            challenge.version == ROSTER_VERSION
+                && challenge.owner == catalog.owner
+                && challenge.share == heartbeat.share
+                && challenge.member == heartbeat.member
+                && challenge.challenge == heartbeat.challenge
+                && !challenge.used,
+            ShareError::HeartbeatReplay
+        );
+        ensure!(
+            now < challenge.expires_at
+                && heartbeat.sent_at >= challenge.issued_at.saturating_sub(5)
+                && heartbeat.sent_at <= challenge.expires_at,
+            ShareError::HeartbeatExpired
+        );
+        let previous = self.read_roster(heartbeat.share)?;
+        let mut entries = self.roster_entries(&catalog, heartbeat.share, previous.as_ref())?;
+        let entry = entries
+            .iter_mut()
+            .find(|entry| entry.member == heartbeat.member)
+            .ok_or(ShareError::NotMember)?;
+        entry.address = heartbeat.address.clone();
+        // `sent_at` is only a bounded freshness proof. The owner receive
+        // timestamp is authoritative so a delayed heartbeat cannot extend
+        // liveness by claiming a future or otherwise shifted wall time.
+        entry.heartbeat_at = now;
+        entry.heartbeat_expires_at = heartbeat_expiry(now);
+        let roster = SignedRoster::sign(
+            owner_key,
+            heartbeat.share,
+            random_nonce(),
+            entries,
+            now,
+            now.saturating_add(ROSTER_TTL_SECONDS),
+        )?;
+        challenge.used = true;
+        self.write_roster_and_challenge(&roster, &challenge)?;
+        Ok(roster)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stored_roster(&self, share: ShareId) -> Result<Option<SignedRoster>> {
+        self.read_roster(share)
+    }
+
+    fn sign_roster(
+        &self,
+        owner_key: &SecretKey,
+        catalog: &Catalog,
+        share: ShareId,
+        previous: Option<&SignedRoster>,
+        now: u64,
+    ) -> Result<SignedRoster> {
+        let entries = self.roster_entries(catalog, share, previous)?;
+        SignedRoster::sign(
+            owner_key,
+            share,
+            random_nonce(),
+            entries,
+            now,
+            now.saturating_add(ROSTER_TTL_SECONDS),
+        )
+    }
+
+    fn roster_entries(
+        &self,
+        catalog: &Catalog,
+        share: ShareId,
+        previous: Option<&SignedRoster>,
+    ) -> Result<Vec<RosterEntry>> {
+        let share_entry = catalog.shares.get(&share).ok_or(ShareError::UnknownShare)?;
+        if let Some(previous) = previous {
+            ensure!(
+                previous.owner == catalog.owner && previous.share == share,
+                ShareError::StateUnavailable
+            );
+            previous.verify_signature()?;
+        }
+        let mut entries = Vec::new();
+        for member in share_entry.members.values() {
+            if member.revoked_at.is_some() {
+                continue;
+            }
+            let old = previous.and_then(|roster| roster.member(member.endpoint));
+            let (address, heartbeat_at, heartbeat_expires_at) = old
+                .filter(|entry| {
+                    entry.owner == catalog.owner
+                        && entry.share == share
+                        && entry.member == member.endpoint
+                        && entry.address.id == member.endpoint
+                        && entry.member_epoch == member.epoch
+                })
+                .map(|entry| {
+                    (
+                        entry.address.clone(),
+                        entry.heartbeat_at,
+                        entry.heartbeat_expires_at,
+                    )
+                })
+                .unwrap_or_else(|| (EndpointAddr::new(member.endpoint), 0, 0));
+            entries.push(RosterEntry {
+                owner: catalog.owner,
+                share,
+                member: member.endpoint,
+                address,
+                permission: member.permission,
+                member_epoch: member.epoch,
+                heartbeat_at,
+                heartbeat_expires_at,
+            });
+        }
+        ensure!(entries.len() <= MAX_ROSTER_ENTRIES, ShareError::Busy);
+        ensure!(
+            postcard::to_stdvec(&entries)?.len() <= MAX_ROSTER_FRAME_BYTES,
+            ShareError::Busy
+        );
+        Ok(entries)
+    }
+
+    fn read_roster(&self, share: ShareId) -> Result<Option<SignedRoster>> {
+        let read = self.db.begin_read()?;
+        let table = match read.open_table(ROSTERS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let key = roster_key(share);
+        let Some(value) = table.get(key.as_str())? else {
+            return Ok(None);
+        };
+        ensure!(
+            value.value().len() <= MAX_ROSTER_FRAME_BYTES,
+            ShareError::StateUnavailable
+        );
+        Ok(Some(postcard::from_bytes(value.value())?))
+    }
+
+    fn read_challenge(
+        &self,
+        share: ShareId,
+        member: EndpointId,
+    ) -> Result<Option<HeartbeatChallenge>> {
+        let read = self.db.begin_read()?;
+        let table = match read.open_table(HEARTBEATS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let key = heartbeat_key(share, member);
+        let Some(value) = table.get(key.as_str())? else {
+            return Ok(None);
+        };
+        ensure!(value.value().len() <= 4096, ShareError::StateUnavailable);
+        Ok(Some(postcard::from_bytes(value.value())?))
+    }
+
+    fn write_roster_and_challenge(
+        &self,
+        roster: &SignedRoster,
+        challenge: &HeartbeatChallenge,
+    ) -> Result<()> {
+        let roster_bytes = postcard::to_stdvec(roster)?;
+        let challenge_bytes = postcard::to_stdvec(challenge)?;
+        ensure!(
+            roster_bytes.len() <= MAX_ROSTER_FRAME_BYTES && challenge_bytes.len() <= 4096,
+            ShareError::StateUnavailable
+        );
+        let roster_key = roster_key(roster.share);
+        let challenge_key = heartbeat_key(roster.share, challenge.member);
+        let tx = self.db.begin_write()?;
+        tx.open_table(ROSTERS)?
+            .insert(roster_key.as_str(), roster_bytes.as_slice())?;
+        tx.open_table(HEARTBEATS)?
+            .insert(challenge_key.as_str(), challenge_bytes.as_slice())?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Rejects managed authority mutations after a durable wall-clock
+    /// regression.  The legacy catalog remains readable/openable while this
+    /// namespace is quarantined.  Monotonic operation deadlines are enforced
+    /// by the live service; this high-water mark protects restart/replay
+    /// decisions that necessarily cross a process boundary.
+    fn observe_authority_clock(&self, wall: u64) -> Result<()> {
+        let read = self.db.begin_read()?;
+        let table = read.open_table(CLOCK)?;
+        let value = table.get(0)?.ok_or(ShareError::StateUnavailable)?;
+        let mut anchor: ClockAnchor = postcard::from_bytes(value.value())?;
+        ensure!(anchor.version == 1, ShareError::StateUnavailable);
+        if anchor.quarantined
+            || wall.saturating_add(super::authority::MAX_CLOCK_SKEW_SECONDS) < anchor.last_wall
+        {
+            drop(value);
+            drop(table);
+            drop(read);
+            anchor.quarantined = true;
+            let bytes = postcard::to_stdvec(&anchor)?;
+            let tx = self.db.begin_write()?;
+            tx.open_table(CLOCK)?.insert(0, bytes.as_slice())?;
+            tx.commit()?;
+            return Err(ShareError::ClockRollback.into());
+        }
+        if wall > anchor.last_wall {
+            anchor.last_wall = wall;
+            let bytes = postcard::to_stdvec(&anchor)?;
+            drop(value);
+            drop(table);
+            drop(read);
+            let tx = self.db.begin_write()?;
+            tx.open_table(CLOCK)?.insert(0, bytes.as_slice())?;
+            tx.commit()?;
+        }
+        Ok(())
+    }
+
+    fn read_snapshot_rows(&self) -> Result<Vec<(String, AuthoritativeSnapshot)>> {
+        let read = self.db.begin_read()?;
+        let table = read.open_table(SNAPSHOTS)?;
+        let mut rows = Vec::new();
+        for item in table.iter()? {
+            let (key, value) = item?;
+            ensure!(
+                value.value().len() <= super::authority::MAX_AUTHORITY_FRAME_BYTES,
+                ShareError::StateUnavailable
+            );
+            rows.push((key.value().to_owned(), postcard::from_bytes(value.value())?));
+        }
+        Ok(rows)
+    }
+
+    /// Deletes only terminal, expired authority rows.  In-flight or
+    /// post-restart rows are deliberately retained because removing them would
+    /// turn an unknown remote writer into a false Complete result.
+    fn gc_authority(&self, wall: u64) -> Result<()> {
+        let snapshots = self.read_snapshot_rows()?;
+        let mut grants = self.read_grant_rows()?;
+        let mut applies = self.read_apply_rows()?;
+        // Unactivated rows cannot later become writers after their bounded
+        // lease elapsed. Terminalizing them keeps repeated offline requests
+        // from exhausting the authority cap while preserving a stable
+        // GrantExpired result until retention cleanup.
+        for (_, row) in &mut grants {
+            if row.state == GrantState::Issued && row.grant.expires_at <= wall {
+                row.state = GrantState::Expired;
+            }
+        }
+        for (_, row) in &mut applies {
+            if row.state == ApplyState::Prepared && row.permit.expires_at <= wall {
+                row.state = ApplyState::Expired;
+            }
+        }
+        let mut referenced = BTreeSet::new();
+        for (_, row) in &grants {
+            referenced.insert(row.grant.snapshot);
+        }
+        for (_, row) in &applies {
+            referenced.insert(row.permit.snapshot);
+        }
+        let snapshot_remove: Vec<_> = snapshots
+            .iter()
+            .filter(|(_, snapshot)| {
+                snapshot
+                    .token
+                    .expires_at
+                    .saturating_add(AUTHORITY_RETENTION_SECONDS)
+                    <= wall
+                    && !referenced.contains(&snapshot.token.snapshot)
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        let grant_remove: Vec<_> = grants
+            .iter()
+            .filter(|(_, row)| {
+                matches!(
+                    row.state,
+                    GrantState::Drained | GrantState::Denied | GrantState::Expired
+                ) && row
+                    .grant
+                    .expires_at
+                    .saturating_add(AUTHORITY_RETENTION_SECONDS)
+                    <= wall
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        let apply_remove: Vec<_> = applies
+            .iter()
+            .filter(|(_, row)| {
+                matches!(
+                    row.state,
+                    ApplyState::Drained | ApplyState::Denied | ApplyState::Expired
+                ) && row
+                    .permit
+                    .expires_at
+                    .saturating_add(AUTHORITY_RETENTION_SECONDS)
+                    <= wall
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        let changed_grants: Vec<_> = grants
+            .iter()
+            .filter(|(key, row)| {
+                row.state == GrantState::Expired
+                    && !grant_remove.iter().any(|candidate| candidate == key)
+            })
+            .map(|(key, row)| (key.clone(), row.clone()))
+            .collect();
+        let changed_applies: Vec<_> = applies
+            .iter()
+            .filter(|(key, row)| {
+                row.state == ApplyState::Expired
+                    && !apply_remove.iter().any(|candidate| candidate == key)
+            })
+            .map(|(key, row)| (key.clone(), row.clone()))
+            .collect();
+        if snapshot_remove.is_empty()
+            && grant_remove.is_empty()
+            && apply_remove.is_empty()
+            && changed_grants.is_empty()
+            && changed_applies.is_empty()
+        {
+            return Ok(());
+        }
+        let tx = self.db.begin_write()?;
+        {
+            let mut table = tx.open_table(SNAPSHOTS)?;
+            for key in snapshot_remove {
+                table.remove(key.as_str())?;
+            }
+        }
+        {
+            let mut table = tx.open_table(GRANTS)?;
+            for (key, row) in changed_grants {
+                let bytes = postcard::to_stdvec(&row)?;
+                table.insert(key.as_str(), bytes.as_slice())?;
+            }
+            for key in &grant_remove {
+                table.remove(key.as_str())?;
+            }
+        }
+        {
+            let mut table = tx.open_table(GRANT_DRAINS)?;
+            for key in &grant_remove {
+                table.remove(key.as_str())?;
+            }
+        }
+        {
+            let mut table = tx.open_table(APPLIES)?;
+            for (key, row) in changed_applies {
+                let bytes = postcard::to_stdvec(&row)?;
+                table.insert(key.as_str(), bytes.as_slice())?;
+            }
+            for key in apply_remove {
+                table.remove(key.as_str())?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn ensure_authority_capacity(
+        &self,
+        additional_rows: usize,
+        additional_bytes: usize,
+    ) -> Result<()> {
+        let snapshots = self.read_snapshot_rows()?;
+        let grants = self.read_grant_rows()?;
+        let applies = self.read_apply_rows()?;
+        let rows = snapshots.len() + grants.len() + applies.len();
+        let bytes = snapshots
+            .iter()
+            .map(|(_, row)| postcard::to_stdvec(row).map(|bytes| bytes.len()))
+            .chain(
+                grants
+                    .iter()
+                    .map(|(_, row)| postcard::to_stdvec(row).map(|bytes| bytes.len())),
+            )
+            .chain(
+                applies
+                    .iter()
+                    .map(|(_, row)| postcard::to_stdvec(row).map(|bytes| bytes.len())),
+            )
+            .try_fold(0usize, |total, size| {
+                Ok::<usize, postcard::Error>(total.saturating_add(size?))
+            })?;
+        ensure!(
+            rows.saturating_add(additional_rows) <= MAX_AUTHORITY_ROWS,
+            ShareError::Busy
+        );
+        ensure!(
+            bytes.saturating_add(additional_bytes) <= MAX_AUTHORITY_BYTES,
+            ShareError::Busy
+        );
+        Ok(())
+    }
+
+    /// Persists one complete owner snapshot in the separate swarm namespace.
+    /// The catalog postcard remains untouched; the signed token is the only
+    /// authority a later manifest or grant request may reference.
+    pub(crate) fn store_snapshot(&self, snapshot: &AuthoritativeSnapshot) -> Result<()> {
+        let _serial = self
+            .serial
+            .lock()
+            .map_err(|_| ShareError::StateUnavailable)?;
+        let wall = now();
+        self.observe_authority_clock(wall)?;
+        let catalog = self.read()?;
+        snapshot.verify_complete(catalog.owner, snapshot.token.share, wall)?;
+        ensure!(
+            catalog.shares.contains_key(&snapshot.token.share),
+            ShareError::UnknownShare
+        );
+        let bytes = postcard::to_stdvec(snapshot)?;
+        ensure!(
+            bytes.len() <= super::authority::MAX_AUTHORITY_FRAME_BYTES,
+            ShareError::StateUnavailable
+        );
+        self.gc_authority(wall)?;
+        let key = snapshot_key(snapshot.token.snapshot);
+        let existing = self.snapshot(snapshot.token.snapshot)?;
+        if let Some(existing) = existing {
+            ensure!(existing == *snapshot, ShareError::GrantReplay);
+            return Ok(());
+        }
+        self.ensure_authority_capacity(1, bytes.len())?;
+        let tx = self.db.begin_write()?;
+        tx.open_table(SNAPSHOTS)?
+            .insert(key.as_str(), bytes.as_slice())?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn snapshot(&self, snapshot: SnapshotId) -> Result<Option<AuthoritativeSnapshot>> {
+        let read = self.db.begin_read()?;
+        let table = match read.open_table(SNAPSHOTS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let key = snapshot_key(snapshot);
+        let Some(value) = table.get(key.as_str())? else {
+            return Ok(None);
+        };
+        ensure!(
+            value.value().len() <= super::authority::MAX_AUTHORITY_FRAME_BYTES,
+            ShareError::StateUnavailable
+        );
+        Ok(Some(postcard::from_bytes(value.value())?))
+    }
+
+    /// Issues one exact provider grant after rechecking both memberships and
+    /// the durable owner snapshot. A member provider must have a fresh signed
+    /// roster heartbeat; the owner provider is the explicit epoch-zero case.
+    pub(crate) fn issue_swarm_grant(
+        &self,
+        owner_key: &SecretKey,
+        consumer: EndpointId,
+        provider: EndpointId,
+        snapshot: &SnapshotToken,
+        manifest: &ManifestAttestation,
+        hashes: &[Hash32],
+    ) -> Result<ShareGrant> {
+        let _serial = self
+            .serial
+            .lock()
+            .map_err(|_| ShareError::StateUnavailable)?;
+        let now = now();
+        self.observe_authority_clock(now)?;
+        self.gc_authority(now)?;
+        snapshot.verify_for(owner_key.public(), snapshot.share, now)?;
+        manifest.verify_for(owner_key.public(), snapshot.share, now)?;
+        validate_hash_subset(hashes)?;
+        let stored = self
+            .snapshot(snapshot.snapshot)?
+            .ok_or(ShareError::ManifestMismatch)?;
+        ensure!(stored.token == *snapshot, ShareError::ManifestMismatch);
+        let stored_record = stored
+            .records
+            .iter()
+            .find(|record| record.logical_hash() == manifest.record_hash)
+            .ok_or(ShareError::ManifestMismatch)?;
+        manifest.verify_record(snapshot, stored_record)?;
+        for hash in hashes {
+            ensure!(
+                manifest
+                    .manifest
+                    .chunks
+                    .iter()
+                    .any(|chunk| chunk.hash == *hash),
+                ShareError::ManifestMismatch
+            );
+        }
+        let catalog = self.read()?;
+        ensure!(
+            catalog.owner == owner_key.public(),
+            ShareError::OwnerMismatch
+        );
+        let share_entry = catalog
+            .shares
+            .get(&snapshot.share)
+            .ok_or(ShareError::UnknownShare)?;
+        let consumer_member = share_entry
+            .members
+            .get(&consumer)
+            .ok_or(ShareError::NotMember)?;
+        ensure!(
+            consumer_member.revoked_at.is_none(),
+            ShareError::MemberRevoked
+        );
+        ensure!(
+            consumer_member.epoch == snapshot.epoch,
+            ShareError::EpochMismatch
+        );
+        ensure!(provider != consumer, ShareError::EndpointMismatch);
+        let provider_epoch = if provider == catalog.owner {
+            0
+        } else {
+            let provider_member = share_entry
+                .members
+                .get(&provider)
+                .ok_or(ShareError::NotMember)?;
+            ensure!(
+                provider_member.revoked_at.is_none(),
+                ShareError::MemberRevoked
+            );
+            let roster = self
+                .read_roster(snapshot.share)?
+                .ok_or(ShareError::RosterStale)?;
+            roster.verify_for(catalog.owner, snapshot.share, now)?;
+            ensure!(
+                roster.member_is_fresh(provider, now),
+                ShareError::RosterStale
+            );
+            ensure!(
+                roster.member(provider).is_some_and(|entry| {
+                    entry.member_epoch == provider_member.epoch
+                        && entry.permission == provider_member.permission
+                }),
+                ShareError::EpochMismatch
+            );
+            provider_member.epoch
+        };
+        let request_hash = request_hash(
+            snapshot.share,
+            snapshot.snapshot,
+            manifest.manifest_hash,
+            hashes,
+        )?;
+        let grant = ShareGrant::sign(
+            owner_key,
+            snapshot.share,
+            consumer,
+            provider,
+            consumer_member.epoch,
+            provider_epoch,
+            snapshot.snapshot,
+            manifest.manifest_hash,
+            request_hash,
+            random_nonce(),
+            now,
+        )?;
+        let bytes = postcard::to_stdvec(&GrantRow {
+            grant: grant.clone(),
+            state: GrantState::Issued,
+            activation_id: None,
+            activation_deadline: None,
+            revoked: false,
+        })?;
+        ensure!(
+            bytes.len() <= super::authority::MAX_AUTHORITY_FRAME_BYTES,
+            ShareError::StateUnavailable
+        );
+        self.ensure_authority_capacity(1, bytes.len())?;
+        let key = grant_key(grant.nonce);
+        let tx = self.db.begin_write()?;
+        let mut table = tx.open_table(GRANTS)?;
+        ensure!(table.get(key.as_str())?.is_none(), ShareError::GrantReplay);
+        table.insert(key.as_str(), bytes.as_slice())?;
+        drop(table);
+        let drain = postcard::to_stdvec(&GrantDrainState::default())?;
+        tx.open_table(GRANT_DRAINS)?
+            .insert(key.as_str(), drain.as_slice())?;
+        tx.commit()?;
+        Ok(grant)
+    }
+
+    /// Revalidates a complete snapshot against the owner's current root and
+    /// records a bounded apply permit in the separate apply journal.
+    pub(crate) fn issue_apply_permit(
+        &self,
+        owner_key: &SecretKey,
+        consumer: EndpointId,
+        snapshot: &SnapshotToken,
+        current_root: Hash32,
+    ) -> Result<ApplyPermit> {
+        let _serial = self
+            .serial
+            .lock()
+            .map_err(|_| ShareError::StateUnavailable)?;
+        let now = now();
+        self.observe_authority_clock(now)?;
+        self.gc_authority(now)?;
+        snapshot.verify_for(owner_key.public(), snapshot.share, now)?;
+        ensure!(
+            snapshot.root_hash == current_root,
+            ShareError::ManifestMismatch
+        );
+        let stored = self
+            .snapshot(snapshot.snapshot)?
+            .ok_or(ShareError::ManifestMismatch)?;
+        ensure!(stored.token == *snapshot, ShareError::ManifestMismatch);
+        let member = self.authorize(snapshot.share, consumer, false)?;
+        ensure!(member.epoch == snapshot.epoch, ShareError::EpochMismatch);
+        let permit = ApplyPermit::sign(
+            owner_key,
+            snapshot.share,
+            consumer,
+            member.epoch,
+            snapshot.snapshot,
+            current_root,
+            now,
+            random_nonce(),
+        )?;
+        let row = ApplyRow {
+            permit: permit.clone(),
+            state: ApplyState::Prepared,
+            operation_id: None,
+            committed: false,
+            revoked: false,
+        };
+        let bytes = postcard::to_stdvec(&row)?;
+        ensure!(
+            bytes.len() <= super::authority::MAX_AUTHORITY_FRAME_BYTES,
+            ShareError::StateUnavailable
+        );
+        self.ensure_authority_capacity(1, bytes.len())?;
+        let key = grant_key(permit.nonce);
+        let tx = self.db.begin_write()?;
+        let mut table = tx.open_table(APPLIES)?;
+        ensure!(table.get(key.as_str())?.is_none(), ShareError::GrantReplay);
+        table.insert(key.as_str(), bytes.as_slice())?;
+        drop(table);
+        tx.commit()?;
+        Ok(permit)
+    }
+
+    pub(crate) fn apply_start(
+        &self,
+        owner: EndpointId,
+        share: ShareId,
+        peer: EndpointId,
+        current_root: Hash32,
+        start: &ApplyStart,
+    ) -> Result<()> {
+        let _serial = self
+            .serial
+            .lock()
+            .map_err(|_| ShareError::StateUnavailable)?;
+        self.observe_authority_clock(now())?;
+        let key = grant_key(start.permit_nonce);
+        let mut row = self
+            .read_apply(key.as_str())?
+            .ok_or(ShareError::GrantReplay)?;
+        ensure!(
+            row.permit.owner == owner && row.permit.share == share && row.permit.consumer == peer,
+            ShareError::EndpointMismatch
+        );
+        ensure!(!row.revoked, ShareError::MemberRevoked);
+        let member = self.authorize(share, peer, false)?;
+        ensure!(member.epoch == row.permit.epoch, ShareError::EpochMismatch);
+        ensure!(
+            row.permit.root_hash == current_root,
+            ShareError::ManifestMismatch
+        );
+        row.permit.verify_for(owner, share, peer, now())?;
+        match row.state {
+            ApplyState::Prepared => {
+                row.state = ApplyState::Started;
+                row.operation_id = Some(start.operation_id);
+            }
+            ApplyState::Started if row.operation_id == Some(start.operation_id) => return Ok(()),
+            ApplyState::Drained if row.operation_id == Some(start.operation_id) => return Ok(()),
+            ApplyState::Denied => return Err(ShareError::MemberRevoked.into()),
+            ApplyState::Restarted => return Err(ShareError::GrantReplay.into()),
+            ApplyState::Expired => return Err(ShareError::GrantExpired.into()),
+            _ => return Err(ShareError::GrantReplay.into()),
+        }
+        self.write_apply(&key, &row)
+    }
+
+    pub(crate) fn apply_drained(
+        &self,
+        owner: EndpointId,
+        share: ShareId,
+        peer: EndpointId,
+        drained: &ApplyDrained,
+    ) -> Result<()> {
+        let _serial = self
+            .serial
+            .lock()
+            .map_err(|_| ShareError::StateUnavailable)?;
+        let key = grant_key(drained.permit_nonce);
+        let mut row = self
+            .read_apply(key.as_str())?
+            .ok_or(ShareError::GrantReplay)?;
+        ensure!(
+            row.permit.owner == owner && row.permit.share == share && row.permit.consumer == peer,
+            ShareError::EndpointMismatch
+        );
+        ensure!(
+            row.operation_id == Some(drained.operation_id),
+            ShareError::GrantReplay
+        );
+        match row.state {
+            ApplyState::Started => {
+                row.state = ApplyState::Drained;
+                row.committed = drained.committed;
+                self.write_apply(&key, &row)
+            }
+            ApplyState::Drained if row.committed == drained.committed => Ok(()),
+            ApplyState::Restarted => {
+                row.state = ApplyState::Drained;
+                row.committed = drained.committed;
+                self.write_apply(&key, &row)
+            }
+            ApplyState::Denied => Err(ShareError::MemberRevoked.into()),
+            _ => Err(ShareError::GrantReplay.into()),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn active_apply_blockers(&self, share: ShareId, peer: EndpointId) -> Result<u32> {
+        let mut blockers = 0_u32;
+        for (_, row) in self.read_apply_rows()? {
+            if row.permit.share == share
+                && row.permit.consumer == peer
+                && matches!(row.state, ApplyState::Started | ApplyState::Restarted)
+            {
+                blockers = blockers.saturating_add(1);
+            }
+        }
+        Ok(blockers)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn active_grant_blockers(&self, share: ShareId, peer: EndpointId) -> Result<u32> {
+        let mut blockers = 0_u32;
+        for (_, row) in self.read_grant_rows()? {
+            if row.grant.share == share
+                && (row.grant.consumer == peer || row.grant.provider == peer)
+                && matches!(row.state, GrantState::Active | GrantState::Restarted)
+            {
+                blockers = blockers.saturating_add(1);
+            }
+        }
+        Ok(blockers)
+    }
+
+    /// Validates the provider side of an already activated grant and returns
+    /// the process-local monotonic stream deadline.  E's data handler must
+    /// still perform its own bounded chunk/CAS checks, but it can use this
+    /// primitive to ensure the authenticated connection direction is exact:
+    /// the local endpoint is the signed provider and the remote endpoint is
+    /// the signed consumer.  A restarted, revoked, drained-side, or unknown
+    /// activation is never admitted by this path.
+    #[allow(dead_code)]
+    pub(crate) fn validate_provider_grant(
+        &self,
+        grant: &ShareGrant,
+        local_provider: EndpointId,
+        remote_consumer: EndpointId,
+    ) -> Result<Instant> {
+        let _serial = self
+            .serial
+            .lock()
+            .map_err(|_| ShareError::StateUnavailable)?;
+        ensure!(
+            grant.provider == local_provider,
+            ShareError::EndpointMismatch
+        );
+        ensure!(
+            grant.consumer == remote_consumer,
+            ShareError::EndpointMismatch
+        );
+        let row = self
+            .read_grant(grant_key(grant.nonce).as_str())?
+            .ok_or(ShareError::GrantReplay)?;
+        ensure!(row.grant == *grant, ShareError::GrantReplay);
+        ensure!(!row.revoked, ShareError::MemberRevoked);
+        ensure!(row.state == GrantState::Active, ShareError::GrantReplay);
+        let drain = self.read_grant_drain(grant_key(grant.nonce).as_str())?;
+        ensure!(
+            !drain.provider_drained && !drain.consumer_drained,
+            ShareError::GrantReplay
+        );
+        let deadline = self
+            .activation_deadlines
+            .lock()
+            .map_err(|_| ShareError::StateUnavailable)?
+            .get(&grant.nonce)
+            .copied()
+            .ok_or(ShareError::GrantReplay)?;
+        ensure!(Instant::now() < deadline, ShareError::GrantExpired);
+        grant.verify_for(grant.owner, grant.share, now())?;
+        Ok(deadline)
+    }
+
+    /// Commits membership revocation and grant denial in one redb transaction.
+    /// Started apply rows remain visible so the caller cannot report false
+    /// completion while a remote writer is still draining.
+    pub(crate) fn revoke_member_durable(
+        &self,
+        share: ShareId,
+        peer: EndpointId,
+    ) -> Result<Membership> {
+        let _serial = self
+            .serial
+            .lock()
+            .map_err(|_| ShareError::StateUnavailable)?;
+        let mut catalog = self.read()?;
+        let member = catalog
+            .shares
+            .get_mut(&share)
+            .ok_or(ShareError::UnknownShare)?
+            .members
+            .get_mut(&peer)
+            .ok_or(ShareError::NotMember)?;
+        if member.revoked_at.is_none() {
+            member.revoked_at = Some(now());
+            member.epoch = member
+                .epoch
+                .checked_add(1)
+                .ok_or(ShareError::StateUnavailable)?;
+        }
+        let result = member.clone();
+        let catalog_bytes = postcard::to_stdvec(&catalog)?;
+        let mut grants = self.read_grant_rows()?;
+        for (_, row) in &mut grants {
+            if row.grant.share == share
+                && (row.grant.consumer == peer || row.grant.provider == peer)
+                && matches!(
+                    row.state,
+                    GrantState::Issued | GrantState::Active | GrantState::Restarted
+                )
+            {
+                row.revoked = true;
+                if row.state == GrantState::Issued {
+                    row.state = GrantState::Denied;
+                }
+            }
+        }
+        let mut applies = self.read_apply_rows()?;
+        for (_, row) in &mut applies {
+            if row.permit.share == share && row.permit.consumer == peer {
+                row.revoked = true;
+                if row.state == ApplyState::Prepared {
+                    row.state = ApplyState::Denied;
+                }
+            }
+        }
+        let tx = self.db.begin_write()?;
+        tx.open_table(CATALOG)?
+            .insert(0, catalog_bytes.as_slice())?;
+        {
+            let mut table = tx.open_table(GRANTS)?;
+            for (key, row) in grants {
+                let bytes = postcard::to_stdvec(&row)?;
+                table.insert(key.as_str(), bytes.as_slice())?;
+            }
+        }
+        {
+            let mut table = tx.open_table(APPLIES)?;
+            for (key, row) in applies {
+                let bytes = postcard::to_stdvec(&row)?;
+                table.insert(key.as_str(), bytes.as_slice())?;
+            }
+        }
+        tx.commit()?;
+        Ok(result)
+    }
+
+    /// Returns the durable revoke result without confusing a closed local
+    /// connection with a remote writer drain acknowledgement.  Active and
+    /// post-restart rows remain blockers until their explicit drain records
+    /// are committed.
+    pub(crate) fn revocation_receipt(
+        &self,
+        share: ShareId,
+        peer: EndpointId,
+    ) -> Result<RevocationReceipt> {
+        let member = self
+            .read()?
+            .shares
+            .get(&share)
+            .ok_or(ShareError::UnknownShare)?
+            .members
+            .get(&peer)
+            .ok_or(ShareError::NotMember)?
+            .clone();
+        ensure!(member.revoked_at.is_some(), ShareError::NotMember);
+        let grants = self.read_grant_rows()?;
+        let applies = self.read_apply_rows()?;
+        let mut blockers = 0_u32;
+        let mut deadline = now();
+        for (_, row) in grants {
+            if row.grant.share == share
+                && (row.grant.consumer == peer || row.grant.provider == peer)
+                && matches!(row.state, GrantState::Active | GrantState::Restarted)
+            {
+                blockers = blockers.saturating_add(1);
+                deadline = deadline.max(row.activation_deadline.unwrap_or_else(|| {
+                    now().saturating_add(u64::from(super::authority::MAX_ACTIVATE_TTL_SECONDS))
+                }));
+            }
+        }
+        for (_, row) in applies {
+            if row.permit.share == share
+                && row.permit.consumer == peer
+                && matches!(row.state, ApplyState::Started | ApplyState::Restarted)
+            {
+                blockers = blockers.saturating_add(1);
+                deadline = deadline.max(row.permit.expires_at);
+            }
+        }
+        if blockers == 0 {
+            Ok(RevocationReceipt::Complete {
+                member_epoch: member.epoch,
+                completed_at: now(),
+            })
+        } else {
+            Ok(RevocationReceipt::Pending {
+                member_epoch: member.epoch,
+                deadline,
+                blockers,
+            })
+        }
+    }
+
+    /// Commits one authenticated endpoint drain acknowledgement.  Expiry
+    /// alone is never a completion proof, and one endpoint's acknowledgement
+    /// cannot stand in for the other endpoint's writer/reader drain.  An
+    /// Active/Restarted row becomes Drained only after the exact activation
+    /// identifier has been acknowledged by both consumer and provider.
+    #[allow(dead_code)]
+    pub(crate) fn drain_grant(
+        &self,
+        share: ShareId,
+        nonce: GrantNonce,
+        activation_id: [u8; 16],
+        remote_peer: EndpointId,
+    ) -> Result<()> {
+        let _serial = self
+            .serial
+            .lock()
+            .map_err(|_| ShareError::StateUnavailable)?;
+        let key = grant_key(nonce);
+        let mut row = self
+            .read_grant(key.as_str())?
+            .ok_or(ShareError::GrantReplay)?;
+        ensure!(row.grant.share == share, ShareError::OwnerMismatch);
+        ensure!(
+            row.grant.consumer == remote_peer || row.grant.provider == remote_peer,
+            ShareError::EndpointMismatch
+        );
+        ensure!(
+            row.activation_id == Some(activation_id),
+            ShareError::GrantReplay
+        );
+        let is_consumer = row.grant.consumer == remote_peer;
+        let is_provider = row.grant.provider == remote_peer;
+        ensure!(is_consumer || is_provider, ShareError::EndpointMismatch);
+        match row.state {
+            GrantState::Active | GrantState::Restarted => {
+                let mut drain = self.read_grant_drain(key.as_str())?;
+                if is_consumer {
+                    drain.consumer_drained = true;
+                }
+                if is_provider {
+                    drain.provider_drained = true;
+                }
+                if drain.consumer_drained && drain.provider_drained {
+                    row.state = GrantState::Drained;
+                    self.activation_deadlines
+                        .lock()
+                        .map_err(|_| ShareError::StateUnavailable)?
+                        .remove(&nonce);
+                }
+                self.write_grant_and_drain(&key, &row, &drain)
+            }
+            GrantState::Drained => Ok(()),
+            GrantState::Issued | GrantState::Denied | GrantState::Expired => {
+                Err(ShareError::GrantReplay.into())
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn activate_grant(
+        &self,
+        owner_key: &SecretKey,
+        request: &super::authority::ActivateGrantRequest,
+        remote_peer: EndpointId,
+    ) -> Result<super::authority::ActivateGrantReply> {
+        self.activate_grant_at(owner_key, request, remote_peer, Instant::now())
+    }
+
+    pub(crate) fn activate_grant_at(
+        &self,
+        owner_key: &SecretKey,
+        request: &super::authority::ActivateGrantRequest,
+        remote_peer: EndpointId,
+        request_started: Instant,
+    ) -> Result<super::authority::ActivateGrantReply> {
+        let _serial = self
+            .serial
+            .lock()
+            .map_err(|_| ShareError::StateUnavailable)?;
+        ensure!(
+            request_started.elapsed()
+                <= std::time::Duration::from_secs(u64::from(
+                    super::authority::MAX_ACTIVATE_TTL_SECONDS
+                ),),
+            ShareError::GrantExpired
+        );
+        self.observe_authority_clock(now())?;
+        ensure!(
+            request.provider == remote_peer,
+            ShareError::EndpointMismatch
+        );
+        let key = grant_key(request.nonce);
+        let mut row = self
+            .read_grant(key.as_str())?
+            .ok_or(ShareError::GrantReplay)?;
+        ensure!(
+            row.grant.activate_request() == *request,
+            ShareError::GrantReplay
+        );
+        if row.revoked {
+            return Err(ShareError::MemberRevoked.into());
+        }
+        match row.state {
+            GrantState::Issued => {
+                row.grant
+                    .verify_for(owner_key.public(), request.share, now())?;
+            }
+            GrantState::Active | GrantState::Drained | GrantState::Restarted => {
+                return Err(ShareError::GrantReplay.into());
+            }
+            GrantState::Denied => return Err(ShareError::MemberRevoked.into()),
+            GrantState::Expired => return Err(ShareError::GrantExpired.into()),
+        }
+        let catalog = self.read()?;
+        ensure!(
+            catalog.owner == owner_key.public(),
+            ShareError::OwnerMismatch
+        );
+        let share_entry = catalog
+            .shares
+            .get(&request.share)
+            .ok_or(ShareError::UnknownShare)?;
+        let consumer = share_entry
+            .members
+            .get(&request.consumer)
+            .ok_or(ShareError::NotMember)?;
+        ensure!(consumer.revoked_at.is_none(), ShareError::MemberRevoked);
+        ensure!(consumer.epoch == request.epoch, ShareError::EpochMismatch);
+        if request.provider != catalog.owner {
+            let provider = share_entry
+                .members
+                .get(&request.provider)
+                .ok_or(ShareError::NotMember)?;
+            ensure!(provider.revoked_at.is_none(), ShareError::MemberRevoked);
+            ensure!(
+                provider.epoch == request.provider_epoch,
+                ShareError::EpochMismatch
+            );
+            let roster = self
+                .read_roster(request.share)?
+                .ok_or(ShareError::RosterStale)?;
+            roster.verify_for(catalog.owner, request.share, now())?;
+            ensure!(
+                roster.member_is_fresh(request.provider, now())
+                    && roster.member(request.provider).is_some_and(|entry| {
+                        entry.member_epoch == provider.epoch && entry.address.id == request.provider
+                    }),
+                ShareError::RosterStale
+            );
+        } else {
+            ensure!(request.provider_epoch == 0, ShareError::EpochMismatch);
+        }
+        let activation_id = {
+            let bytes = random_nonce();
+            let mut id = [0_u8; 16];
+            id.copy_from_slice(&bytes[..16]);
+            id
+        };
+        let reply = super::authority::ActivateGrantReply::sign(
+            owner_key,
+            request.share,
+            request.provider,
+            request.nonce,
+            activation_id,
+            true,
+            super::authority::MAX_ACTIVATE_TTL_SECONDS,
+        )?;
+        row.state = GrantState::Active;
+        row.activation_id = Some(activation_id);
+        let wall_deadline =
+            now().saturating_add(u64::from(super::authority::MAX_ACTIVATE_TTL_SECONDS));
+        row.activation_deadline = Some(wall_deadline);
+        self.activation_deadlines
+            .lock()
+            .map_err(|_| ShareError::StateUnavailable)?
+            .insert(
+                request.nonce,
+                request_started
+                    + std::time::Duration::from_secs(u64::from(
+                        super::authority::MAX_ACTIVATE_TTL_SECONDS,
+                    )),
+            );
+        self.write_grant(&key, &row)?;
+        Ok(reply)
+    }
+
+    fn read_grant(&self, key: &str) -> Result<Option<GrantRow>> {
+        let read = self.db.begin_read()?;
+        let table = match read.open_table(GRANTS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let Some(value) = table.get(key)? else {
+            return Ok(None);
+        };
+        ensure!(
+            value.value().len() <= super::authority::MAX_AUTHORITY_FRAME_BYTES,
+            ShareError::StateUnavailable
+        );
+        Ok(Some(postcard::from_bytes(value.value())?))
+    }
+
+    fn read_grant_drain(&self, key: &str) -> Result<GrantDrainState> {
+        let read = self.db.begin_read()?;
+        let table = match read.open_table(GRANT_DRAINS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(GrantDrainState::default()),
+            Err(error) => return Err(error.into()),
+        };
+        let Some(value) = table.get(key)? else {
+            // Rows created before this additive table existed conservatively
+            // start with neither endpoint acknowledged.
+            return Ok(GrantDrainState::default());
+        };
+        ensure!(value.value().len() <= 1024, ShareError::StateUnavailable);
+        Ok(postcard::from_bytes(value.value())?)
+    }
+
+    fn read_grant_rows(&self) -> Result<Vec<(String, GrantRow)>> {
+        let read = self.db.begin_read()?;
+        let table = match read.open_table(GRANTS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut rows = Vec::new();
+        for item in table.iter()? {
+            let (key, value) = item?;
+            ensure!(
+                value.value().len() <= super::authority::MAX_AUTHORITY_FRAME_BYTES,
+                ShareError::StateUnavailable
+            );
+            rows.push((key.value().to_owned(), postcard::from_bytes(value.value())?));
+        }
+        Ok(rows)
+    }
+
+    fn write_grant(&self, key: &str, row: &GrantRow) -> Result<()> {
+        let drain = self.read_grant_drain(key)?;
+        self.write_grant_and_drain(key, row, &drain)
+    }
+
+    fn write_grant_and_drain(
+        &self,
+        key: &str,
+        row: &GrantRow,
+        drain: &GrantDrainState,
+    ) -> Result<()> {
+        let bytes = postcard::to_stdvec(row)?;
+        let drain_bytes = postcard::to_stdvec(drain)?;
+        let tx = self.db.begin_write()?;
+        tx.open_table(GRANTS)?.insert(key, bytes.as_slice())?;
+        tx.open_table(GRANT_DRAINS)?
+            .insert(key, drain_bytes.as_slice())?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn read_apply(&self, key: &str) -> Result<Option<ApplyRow>> {
+        let read = self.db.begin_read()?;
+        let table = match read.open_table(APPLIES) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let Some(value) = table.get(key)? else {
+            return Ok(None);
+        };
+        ensure!(
+            value.value().len() <= super::authority::MAX_AUTHORITY_FRAME_BYTES,
+            ShareError::StateUnavailable
+        );
+        Ok(Some(postcard::from_bytes(value.value())?))
+    }
+
+    fn read_apply_rows(&self) -> Result<Vec<(String, ApplyRow)>> {
+        let read = self.db.begin_read()?;
+        let table = match read.open_table(APPLIES) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut rows = Vec::new();
+        for item in table.iter()? {
+            let (key, value) = item?;
+            ensure!(
+                value.value().len() <= super::authority::MAX_AUTHORITY_FRAME_BYTES,
+                ShareError::StateUnavailable
+            );
+            rows.push((key.value().to_owned(), postcard::from_bytes(value.value())?));
+        }
+        Ok(rows)
+    }
+
+    fn write_apply(&self, key: &str, row: &ApplyRow) -> Result<()> {
+        let bytes = postcard::to_stdvec(row)?;
+        let tx = self.db.begin_write()?;
+        tx.open_table(APPLIES)?.insert(key, bytes.as_slice())?;
+        tx.commit()?;
+        Ok(())
+    }
+}
+
+fn roster_key(share: ShareId) -> String {
+    hex::encode(share.0)
+}
+
+fn heartbeat_key(share: ShareId, member: EndpointId) -> String {
+    format!("{}:{}", roster_key(share), hex::encode(member.as_bytes()))
+}
+
+fn snapshot_key(snapshot: SnapshotId) -> String {
+    hex::encode(snapshot)
+}
+
+fn grant_key(nonce: GrantNonce) -> String {
+    hex::encode(nonce)
+}
+
+#[allow(dead_code)]
+fn snapshot_record(
+    registry: &Registry,
+    snapshot: &SnapshotToken,
+    manifest: &ManifestAttestation,
+) -> Result<SyncRecord> {
+    registry
+        .snapshot(snapshot.snapshot)?
+        .and_then(|stored| {
+            stored
+                .records
+                .into_iter()
+                .find(|record| record.logical_hash() == manifest.record_hash)
+        })
+        .ok_or_else(|| ShareError::ManifestMismatch.into())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deltaweave_reconcile::MerkleTree;
     use iroh::SecretKey;
     #[test]
     fn issuance_membership_and_tombstones_are_distinct_durable_authorities() {
@@ -518,6 +2244,10 @@ mod tests {
             .revoke_key(share, ticket.preview().invitation_id)
             .unwrap();
         assert!(registry.validate(&ticket).is_err());
+        assert!(
+            registry.issue(&ticket).is_err(),
+            "replaying a revoked issuance must never resurrect its invitation"
+        );
         assert!(registry.authorize(share, peer, false).is_ok());
         assert!(registry.authorize(share, peer, true).is_err());
         registry.revoke_member(share, peer).unwrap();
@@ -613,6 +2343,554 @@ mod tests {
                 .enroll(&ticket, winner.endpoint, Some(&retry_proof))
                 .unwrap(),
             winner
+        );
+    }
+
+    #[test]
+    fn resume_relationship_requires_exact_binding_and_only_monotonic_revoke() {
+        let temp = tempfile::tempdir().unwrap();
+        let owner = SecretKey::generate();
+        let peer = SecretKey::generate().public();
+        let share = ShareId([9; 32]);
+        let owner_registry =
+            Registry::open(&temp.path().join("owner-private"), owner.public()).unwrap();
+        owner_registry
+            .insert_share(
+                OwnedShareConfig {
+                    share_id: share,
+                    owner: owner.public(),
+                    name: "Files".into(),
+                    root: temp.path().join("root"),
+                    state_root: temp.path().join("state"),
+                    replica: ReplicaId(Hash32::digest(b"owner")),
+                    min_free_space_bytes: 0,
+                },
+                BTreeSet::new(),
+            )
+            .unwrap();
+        let ticket = ShareTicket::issue(
+            &owner,
+            share,
+            "Files".into(),
+            Permission::ReadWrite,
+            None,
+            EndpointAddr::new(owner.public()),
+            now(),
+        )
+        .unwrap();
+        owner_registry.issue(&ticket).unwrap();
+        let membership = owner_registry.enroll(&ticket, peer, None).unwrap();
+        let address = EndpointAddr::new(owner.public());
+        let registry = Registry::open(&temp.path().join("member-private"), peer).unwrap();
+        registry
+            .store_relationship(MemberRelationship {
+                membership: membership.clone(),
+                address: address.clone(),
+            })
+            .unwrap();
+
+        for mutate in [
+            |candidate: &mut Membership| candidate.permission = Permission::ReadOnly,
+            |candidate: &mut Membership| candidate.enrolled_at += 1,
+            |candidate: &mut Membership| candidate.epoch += 1,
+        ] as [fn(&mut Membership); 3]
+        {
+            let mut changed = membership.clone();
+            mutate(&mut changed);
+            assert_eq!(
+                registry
+                    .store_relationship(MemberRelationship {
+                        membership: changed,
+                        address: address.clone(),
+                    })
+                    .unwrap_err()
+                    .downcast_ref::<ShareError>(),
+                Some(&ShareError::ReplicaClaimRejected)
+            );
+        }
+
+        let mut revoked = membership.clone();
+        revoked.revoked_at = Some(now());
+        revoked.epoch += 1;
+        registry
+            .store_relationship(MemberRelationship {
+                membership: revoked.clone(),
+                address: address.clone(),
+            })
+            .unwrap();
+        let mut revived = revoked;
+        revived.revoked_at = None;
+        assert_eq!(
+            registry
+                .store_relationship(MemberRelationship {
+                    membership: revived,
+                    address,
+                })
+                .unwrap_err()
+                .downcast_ref::<ShareError>(),
+            Some(&ShareError::ReplicaClaimRejected)
+        );
+    }
+
+    fn authority_fixture() -> (tempfile::TempDir, SecretKey, ShareId, EndpointId, Registry) {
+        let temp = tempfile::tempdir().unwrap();
+        let owner = SecretKey::generate();
+        let peer = SecretKey::generate().public();
+        let share = ShareId([0x44; 32]);
+        let registry = Registry::open(&temp.path().join("private"), owner.public()).unwrap();
+        registry
+            .insert_share(
+                OwnedShareConfig {
+                    share_id: share,
+                    owner: owner.public(),
+                    name: "Authority".into(),
+                    root: temp.path().join("root"),
+                    state_root: temp.path().join("state"),
+                    replica: ReplicaId(Hash32::digest(b"authority-owner")),
+                    min_free_space_bytes: 0,
+                },
+                BTreeSet::new(),
+            )
+            .unwrap();
+        let ticket = ShareTicket::issue(
+            &owner,
+            share,
+            "Authority".into(),
+            Permission::ReadWrite,
+            None,
+            EndpointAddr::new(owner.public()),
+            now(),
+        )
+        .unwrap();
+        registry.issue(&ticket).unwrap();
+        registry.enroll(&ticket, peer, None).unwrap();
+        (temp, owner, share, peer, registry)
+    }
+
+    #[test]
+    fn restart_keeps_active_grant_as_unknown_drain_blocker() {
+        let (_temp, owner, share, peer, registry) = authority_fixture();
+        let nonce = [0x51; 32];
+        let grant = ShareGrant::sign(
+            &owner,
+            share,
+            peer,
+            owner.public(),
+            1,
+            0,
+            [0x52; 32],
+            Hash32::digest(b"manifest"),
+            Hash32::digest(b"request"),
+            nonce,
+            now(),
+        )
+        .unwrap();
+        registry
+            .write_grant(
+                &grant_key(nonce),
+                &GrantRow {
+                    grant,
+                    state: GrantState::Active,
+                    activation_id: Some([0x53; 16]),
+                    activation_deadline: Some(now().saturating_add(15)),
+                    revoked: false,
+                },
+            )
+            .unwrap();
+        drop(registry);
+        let registry = Registry::open(&_temp.path().join("private"), owner.public()).unwrap();
+        assert_eq!(
+            registry
+                .read_grant(&grant_key(nonce))
+                .unwrap()
+                .unwrap()
+                .state,
+            GrantState::Restarted
+        );
+        assert_eq!(registry.active_grant_blockers(share, peer).unwrap(), 1);
+        assert!(
+            registry
+                .activate_grant(
+                    &owner,
+                    &ShareGrant::sign(
+                        &owner,
+                        share,
+                        peer,
+                        owner.public(),
+                        1,
+                        0,
+                        [0x52; 32],
+                        Hash32::digest(b"manifest"),
+                        Hash32::digest(b"request"),
+                        nonce,
+                        now(),
+                    )
+                    .unwrap()
+                    .activate_request(),
+                    owner.public(),
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn durable_revoke_stays_pending_until_exact_grant_drain() {
+        let (_temp, owner, share, peer, registry) = authority_fixture();
+        let nonce = [0x61; 32];
+        let activation_id = [0x62; 16];
+        let grant = ShareGrant::sign(
+            &owner,
+            share,
+            peer,
+            owner.public(),
+            1,
+            0,
+            [0x63; 32],
+            Hash32::digest(b"manifest"),
+            Hash32::digest(b"request"),
+            nonce,
+            now(),
+        )
+        .unwrap();
+        registry
+            .write_grant(
+                &grant_key(nonce),
+                &GrantRow {
+                    grant,
+                    state: GrantState::Active,
+                    activation_id: Some(activation_id),
+                    activation_deadline: Some(now().saturating_add(15)),
+                    revoked: false,
+                },
+            )
+            .unwrap();
+        let revoked = registry.revoke_member_durable(share, peer).unwrap();
+        assert!(revoked.revoked_at.is_some());
+        assert!(matches!(
+            registry.revocation_receipt(share, peer).unwrap(),
+            RevocationReceipt::Pending { blockers: 1, .. }
+        ));
+        registry
+            .drain_grant(share, nonce, activation_id, owner.public())
+            .unwrap();
+        assert!(matches!(
+            registry.revocation_receipt(share, peer).unwrap(),
+            RevocationReceipt::Pending { blockers: 1, .. }
+        ));
+        assert_eq!(
+            registry
+                .read_grant(&grant_key(nonce))
+                .unwrap()
+                .unwrap()
+                .state,
+            GrantState::Active
+        );
+        registry
+            .drain_grant(share, nonce, activation_id, peer)
+            .unwrap();
+        assert!(matches!(
+            registry.revocation_receipt(share, peer).unwrap(),
+            RevocationReceipt::Complete { .. }
+        ));
+    }
+
+    #[test]
+    fn activation_rejects_after_request_start_monotonic_deadline() {
+        let (_temp, owner, share, peer, registry) = authority_fixture();
+        let nonce = [0x81; 32];
+        let grant = ShareGrant::sign(
+            &owner,
+            share,
+            peer,
+            owner.public(),
+            1,
+            0,
+            [0x82; 32],
+            Hash32::digest(b"manifest"),
+            Hash32::digest(b"request"),
+            nonce,
+            now(),
+        )
+        .unwrap();
+        registry
+            .write_grant(
+                &grant_key(nonce),
+                &GrantRow {
+                    grant: grant.clone(),
+                    state: GrantState::Issued,
+                    activation_id: None,
+                    activation_deadline: None,
+                    revoked: false,
+                },
+            )
+            .unwrap();
+        let stale_start = Instant::now() - std::time::Duration::from_secs(16);
+        let error = registry
+            .activate_grant_at(
+                &owner,
+                &grant.activate_request(),
+                owner.public(),
+                stale_start,
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<ShareError>(),
+            Some(&ShareError::GrantExpired)
+        );
+        assert_eq!(
+            registry
+                .read_grant(&grant_key(nonce))
+                .unwrap()
+                .unwrap()
+                .state,
+            GrantState::Issued
+        );
+    }
+
+    #[test]
+    fn missing_grant_drain_rows_default_to_two_sided_pending_drain() {
+        let (_temp, owner, share, peer, registry) = authority_fixture();
+        let nonce = [0x92; 32];
+        let grant = ShareGrant::sign(
+            &owner,
+            share,
+            peer,
+            owner.public(),
+            1,
+            0,
+            [0x91; 32],
+            Hash32::digest(b"manifest"),
+            Hash32::digest(b"request"),
+            nonce,
+            now(),
+        )
+        .unwrap();
+        let activation_id = [0x93; 16];
+        registry
+            .write_grant(
+                &grant_key(nonce),
+                &GrantRow {
+                    grant,
+                    state: GrantState::Active,
+                    activation_id: Some(activation_id),
+                    activation_deadline: Some(now().saturating_add(15)),
+                    revoked: false,
+                },
+            )
+            .unwrap();
+        let tx = registry.db.begin_write().unwrap();
+        tx.open_table(GRANT_DRAINS)
+            .unwrap()
+            .remove(grant_key(nonce).as_str())
+            .unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            registry
+                .read_grant_drain(grant_key(nonce).as_str())
+                .unwrap(),
+            GrantDrainState::default()
+        );
+        registry
+            .drain_grant(share, nonce, activation_id, owner.public())
+            .unwrap();
+        assert_eq!(
+            registry
+                .read_grant_drain(grant_key(nonce).as_str())
+                .unwrap(),
+            GrantDrainState {
+                provider_drained: true,
+                consumer_drained: false,
+            }
+        );
+    }
+
+    #[test]
+    fn authority_clock_quarantine_is_managed_only_and_preserves_catalog() {
+        let (temp, owner, share, _peer, registry) = authority_fixture();
+        let empty_root = MerkleTree::from_records(Vec::new()).unwrap().root_hash();
+        let first_token =
+            SnapshotToken::sign(&owner, share, 1, [0x72; 32], empty_root, 0, now()).unwrap();
+        registry
+            .store_snapshot(&AuthoritativeSnapshot {
+                token: first_token,
+                records: Vec::new(),
+            })
+            .unwrap();
+        let config_before = registry.config(share).unwrap();
+        let future = now().saturating_add(30);
+        let anchor = ClockAnchor {
+            version: 1,
+            last_wall: future,
+            boot: [0x73; 16],
+            quarantined: false,
+        };
+        let bytes = postcard::to_stdvec(&anchor).unwrap();
+        let tx = registry.db.begin_write().unwrap();
+        tx.open_table(CLOCK)
+            .unwrap()
+            .insert(0, bytes.as_slice())
+            .unwrap();
+        tx.commit().unwrap();
+        let second_token =
+            SnapshotToken::sign(&owner, share, 1, [0x74; 32], empty_root, 0, now()).unwrap();
+        assert!(matches!(
+            registry.store_snapshot(&AuthoritativeSnapshot {
+                token: second_token,
+                records: Vec::new(),
+            }),
+            Err(error) if error.downcast_ref::<ShareError>() == Some(&ShareError::ClockRollback)
+        ));
+        let ticket = ShareTicket::issue(
+            &owner,
+            share,
+            "Authority".into(),
+            Permission::ReadOnly,
+            None,
+            EndpointAddr::new(owner.public()),
+            now(),
+        )
+        .unwrap();
+        assert!(matches!(
+            registry.issue(&ticket),
+            Err(error) if error.downcast_ref::<ShareError>() == Some(&ShareError::ClockRollback)
+        ));
+        assert_eq!(registry.config(share).unwrap(), config_before);
+        drop(registry);
+        // Reopening a quarantined managed authority must still leave its
+        // legacy catalog readable for manual UI/configuration paths.
+        let reopened = Registry::open(&temp.path().join("private"), owner.public()).unwrap();
+        assert_eq!(reopened.config(share).unwrap(), config_before);
+    }
+
+    #[test]
+    fn restart_keeps_started_apply_as_unknown_drain_blocker() {
+        let (temp, owner, share, peer, registry) = authority_fixture();
+        let permit = ApplyPermit::sign(
+            &owner,
+            share,
+            peer,
+            1,
+            [0x81; 32],
+            Hash32::digest(b"apply-root"),
+            now(),
+            [0x82; 32],
+        )
+        .unwrap();
+        registry
+            .write_apply(
+                &grant_key(permit.nonce),
+                &ApplyRow {
+                    permit,
+                    state: ApplyState::Started,
+                    operation_id: Some([0x83; 16]),
+                    committed: false,
+                    revoked: false,
+                },
+            )
+            .unwrap();
+        drop(registry);
+        let reopened = Registry::open(&temp.path().join("private"), owner.public()).unwrap();
+        assert_eq!(
+            reopened
+                .read_apply(&grant_key([0x82; 32]))
+                .unwrap()
+                .unwrap()
+                .state,
+            ApplyState::Restarted
+        );
+        assert_eq!(reopened.active_apply_blockers(share, peer).unwrap(), 1);
+    }
+
+    #[test]
+    fn authority_gc_expires_unactivated_rows_then_removes_after_retention() {
+        let (_temp, owner, share, peer, registry) = authority_fixture();
+        let issued_at = now().saturating_sub(5_000);
+        let grant_nonce = [0xa1; 32];
+        let grant = ShareGrant::sign(
+            &owner,
+            share,
+            peer,
+            owner.public(),
+            1,
+            0,
+            [0xa2; 32],
+            Hash32::digest(b"gc-manifest"),
+            Hash32::digest(b"gc-request"),
+            grant_nonce,
+            issued_at,
+        )
+        .unwrap();
+        registry
+            .write_grant(
+                &grant_key(grant_nonce),
+                &GrantRow {
+                    grant: grant.clone(),
+                    state: GrantState::Issued,
+                    activation_id: None,
+                    activation_deadline: None,
+                    revoked: false,
+                },
+            )
+            .unwrap();
+
+        let apply_nonce = [0xa3; 32];
+        let permit = ApplyPermit::sign(
+            &owner,
+            share,
+            peer,
+            1,
+            [0xa4; 32],
+            Hash32::digest(b"gc-root"),
+            issued_at,
+            apply_nonce,
+        )
+        .unwrap();
+        registry
+            .write_apply(
+                &grant_key(apply_nonce),
+                &ApplyRow {
+                    permit: permit.clone(),
+                    state: ApplyState::Prepared,
+                    operation_id: None,
+                    committed: false,
+                    revoked: false,
+                },
+            )
+            .unwrap();
+
+        let expired_at = grant.expires_at.max(permit.expires_at);
+        registry.gc_authority(expired_at).unwrap();
+        assert_eq!(
+            registry
+                .read_grant(&grant_key(grant_nonce))
+                .unwrap()
+                .unwrap()
+                .state,
+            GrantState::Expired
+        );
+        assert_eq!(
+            registry
+                .read_apply(&grant_key(apply_nonce))
+                .unwrap()
+                .unwrap()
+                .state,
+            ApplyState::Expired
+        );
+
+        registry
+            .gc_authority(expired_at.saturating_add(AUTHORITY_RETENTION_SECONDS + 1))
+            .unwrap();
+        assert!(
+            registry
+                .read_grant(&grant_key(grant_nonce))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            registry
+                .read_apply(&grant_key(apply_nonce))
+                .unwrap()
+                .is_none()
         );
     }
 }

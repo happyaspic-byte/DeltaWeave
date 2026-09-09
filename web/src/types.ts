@@ -91,6 +91,8 @@ export interface AppSnapshot {
   };
   settings: Settings;
   revision: number;
+  shares?: ManagedShareView[];
+  pending?: PendingView[];
 }
 export interface Session {
   authenticated: boolean;
@@ -100,4 +102,114 @@ export interface Directory {
   path: string;
   parent: string | null;
   entries: { name: string; path: string }[];
+}
+
+/** Managed share values mirror deltaweave-control's public JSON contract. */
+export type Permission = "read_only" | "read_write";
+export type ShareRole = "owner" | "member";
+export type ManagedStatus =
+  | "waiting"
+  | "offline"
+  | "initial_sync"
+  | "complete"
+  | "conflict"
+  | "revoked"
+  | "error"
+  | "paused";
+export type EnrollmentState = "waiting" | "enrolled" | "revoked" | "error";
+export type KeyIssuance = "not_checked" | "validated";
+export type MutationCompletion = "pending" | "complete";
+
+export interface ErrorSummary {
+  code: string;
+  message: string;
+}
+export interface ConnectedDeviceView {
+  member_id: string;
+  permission: Permission;
+  active_operations: number;
+  last_seen_at: number | null;
+}
+export interface ManagedShareView {
+  share_id: string;
+  name: string;
+  role: ShareRole;
+  permission: Permission | null;
+  root: string;
+  status: ManagedStatus;
+  phase: string | null;
+  last_sync_at: number | null;
+  retry_at: number | null;
+  files_count: number;
+  total_bytes: number;
+  transferred_bytes: number;
+  speed_bps: number;
+  active_peer_count: number;
+  connected_devices: ConnectedDeviceView[];
+  last_error: ErrorSummary | null;
+}
+export type ShareView = ManagedShareView;
+export interface PendingView {
+  request_id: string;
+  share_id: string;
+  status: ManagedStatus;
+  created_at: number;
+  retry_at: number | null;
+}
+export interface KeySummary {
+  invitation_id: string;
+  share_id: string;
+  permission: Permission;
+  issued_at: number | null;
+  expires_at: number | null;
+  revoked_at: number | null;
+}
+export interface MemberView {
+  member_id: string;
+  permission: Permission;
+  enrolled_at: number;
+  revoked_at: number | null;
+  active_operations: number;
+  last_seen_at: number | null;
+  revocation_pending: boolean;
+}
+export interface KeyPreview {
+  share_id: string;
+  name: string;
+  permission: Permission;
+  invitation_id: string;
+  expires_at: number | null;
+  signature_valid: boolean;
+  issuance: KeyIssuance;
+}
+export interface IssuedKey {
+  request_id: string;
+  share_id: string;
+  invitation_id: string;
+  permission: Permission;
+  expires_at: number | null;
+  /** Display-once bearer. Keep this value in React memory only. */
+  key: string;
+}
+export interface JoinResult {
+  request_id: string;
+  share_id: string;
+  enrollment: EnrollmentState;
+  status: ManagedStatus;
+  permission: Permission | null;
+  member_id: string | null;
+}
+export interface MutationResult {
+  request_id: string;
+  accepted: boolean;
+  status: ManagedStatus;
+  completion: MutationCompletion;
+  retry_at: number | null;
+}
+export interface ShareCommandResult extends ManagedShareView {}
+
+export interface ApiErrorPayload {
+  error: string;
+  error_code?: string;
+  request_id?: string;
 }
