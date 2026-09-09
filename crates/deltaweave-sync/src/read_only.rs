@@ -258,14 +258,17 @@ pub(crate) fn preserved(local: &ReplicaState) -> Result<Vec<PreservedLocalChange
         .into_iter()
         .filter(|c| c.root == local.root)
     {
-        for artifact in [&change.artifact, &change.rollback_artifact] {
-            if fs::symlink_metadata(artifact).is_ok() {
-                preserved.push(PreservedLocalChange {
-                    path: change.path.clone(),
-                    operation_id: change.id.clone(),
-                    preserved_path: artifact.clone(),
-                });
-            }
+        // `artifact` is the displaced local object. `rollback_artifact` is
+        // retained incoming owner data after an unadopted rollback; exposing
+        // it here would mislabel remote bytes as a local edit/conflict. Keep
+        // that incoming object durable in Store for recovery, but report only
+        // the user's displaced artifact through the RO API.
+        if fs::symlink_metadata(&change.artifact).is_ok() {
+            preserved.push(PreservedLocalChange {
+                path: change.path.clone(),
+                operation_id: change.id.clone(),
+                preserved_path: change.artifact.clone(),
+            });
         }
     }
     Ok(preserved)
@@ -949,5 +952,108 @@ mod tests {
         assert_eq!(pending.stage_identity, None);
         assert_eq!(pending.stage, Stage::Materialized);
         assert_eq!(decoded.apply, Some(apply));
+    }
+
+    #[test]
+    fn preserved_reports_displaced_local_only_not_unadopted_incoming() {
+        let temp = tempfile::tempdir().expect("preserved fixture root");
+        let root = temp.path().join("root");
+        let state_root = temp.path().join("state");
+        std::fs::create_dir_all(&root).expect("public root");
+        std::fs::create_dir_all(&state_root).expect("private root");
+        let owner = iroh::SecretKey::generate().public();
+        let share = ShareId([0x61; 32]);
+        let replica = ReplicaId(Hash32::digest(b"preserved fixture replica"));
+        deltaweave_net::root_admission::reserve_private(&state_root).expect("state reservation");
+        let lease = deltaweave_net::root_admission::acquire_with_private(
+            &root,
+            deltaweave_net::root_admission::RootUse::Managed {
+                share: share.0,
+                owner: *owner.as_bytes(),
+            },
+            std::slice::from_ref(&state_root),
+        )
+        .expect("managed lease");
+        let index = Arc::new(
+            LocalIndex::open(
+                &root,
+                state_root.join("index.redb"),
+                replica,
+                IndexOptions::default(),
+            )
+            .expect("index"),
+        );
+        let store = Arc::new(
+            Store::open_with_recovery_reserver(state_root.join("store"), |path| {
+                deltaweave_net::root_admission::reserve_private(path)
+            })
+            .expect("store"),
+        );
+        let local = ReplicaState {
+            _root_lease: Arc::new(lease),
+            root: root.clone(),
+            index,
+            store: Arc::clone(&store),
+            swarm_sources: Vec::new(),
+            profile: ChunkingProfile::DEFAULT,
+            min_free_space_bytes: 0,
+            peer: owner.to_string(),
+        };
+
+        let incoming = temp.path().join("incoming");
+        std::fs::write(&incoming, b"owner incoming").expect("incoming bytes");
+        let incoming_manifest = store
+            .ingest_file(&incoming, ChunkingProfile::DEFAULT)
+            .expect("incoming manifest");
+        let incoming_path = WirePath::new("new.txt").expect("incoming path");
+        let mut incoming_change = store
+            .prepare_path_change(
+                &root,
+                &incoming_path,
+                PathTarget::File(incoming_manifest),
+                None,
+                true,
+            )
+            .expect("incoming path change");
+        store
+            .capture_path_change(&mut incoming_change)
+            .expect("incoming capture");
+        store
+            .rollback_unadopted_path_change(&mut incoming_change)
+            .expect("incoming rollback");
+        assert_eq!(incoming_change.state, PathChangeState::RolledBack);
+        assert_eq!(
+            std::fs::read(&incoming_change.rollback_artifact).expect("retained incoming"),
+            b"owner incoming"
+        );
+
+        std::fs::write(root.join("local.txt"), b"user edit").expect("local bytes");
+        let local_source = temp.path().join("local-incoming");
+        std::fs::write(&local_source, b"owner replacement").expect("replacement bytes");
+        let local_manifest = store
+            .ingest_file(&local_source, ChunkingProfile::DEFAULT)
+            .expect("replacement manifest");
+        let local_path = WirePath::new("local.txt").expect("local path");
+        let expected = PathObservation::read(&root, &local_path).expect("local observation");
+        let mut local_change = store
+            .prepare_path_change(
+                &root,
+                &local_path,
+                PathTarget::File(local_manifest),
+                expected,
+                true,
+            )
+            .expect("local path change");
+        store
+            .capture_path_change(&mut local_change)
+            .expect("local capture");
+        let report = preserved(&local).expect("preserved report");
+        assert_eq!(report.len(), 1);
+        assert_eq!(report[0].path, local_path);
+        assert_eq!(
+            std::fs::read(&report[0].preserved_path).expect("displaced local bytes"),
+            b"user edit"
+        );
+        assert!(report.iter().all(|item| item.path != incoming_path));
     }
 }
