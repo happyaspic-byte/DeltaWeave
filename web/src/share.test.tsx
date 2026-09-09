@@ -8,7 +8,9 @@ import {
   ShareDetailFlow,
   ShareDirectoryPicker,
   ShareJoinFlow,
+  MEMBER_REVOKE_POLL_MS,
   MAX_EXPIRY_TIMER_MS,
+  SHARE_READ_TIMEOUT_MS,
   managedStatusLabels,
   scheduleExpiry,
   safeShareError,
@@ -18,7 +20,10 @@ import type {
   IssuedKey,
   JoinResult,
   KeyPreview,
+  KeySummary,
   ManagedShareView,
+  MemberView,
+  PendingView,
 } from "./types";
 
 const shareId = "a".repeat(64);
@@ -74,6 +79,30 @@ const directory: Directory = {
   path: "/srv/receiver",
   parent: "/srv",
   entries: [],
+};
+
+const pendingView: PendingView = {
+  request_id: "original-join-request",
+  share_id: shareId,
+  status: "waiting",
+  created_at: 1_788_610_000,
+  retry_at: null,
+};
+
+const member: MemberView = {
+  member_id: memberId,
+  permission: "read_only",
+  enrolled_at: 1_788_610_000,
+  revoked_at: null,
+  active_operations: 1,
+  last_seen_at: 1_788_610_000,
+  revocation_pending: false,
+};
+
+const pendingMember: MemberView = {
+  ...member,
+  revoked_at: 1_788_610_050,
+  revocation_pending: true,
 };
 
 function configureJoinApi(
@@ -179,6 +208,58 @@ describe("managed share web contract", () => {
     expect(api.joinShare).toHaveBeenCalledOnce();
   });
 
+  it("resumes a pending join with its original join request id", async () => {
+    const user = userEvent.setup();
+    const api = new Api();
+    const retry = vi.spyOn(api, "retryPendingJoin").mockResolvedValue(joined);
+    const onRefresh = vi.fn(async () => {});
+    render(
+      <ManagedSharesBoard
+        shares={[]}
+        pending={[pendingView]}
+        api={api}
+        onCreate={() => {}}
+        onJoin={() => {}}
+        onDetail={() => {}}
+        onRefresh={onRefresh}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "가입 재개" }));
+    await waitFor(() => expect(retry).toHaveBeenCalledOnce());
+    expect(retry).toHaveBeenCalledWith(
+      pendingView.request_id,
+      pendingView.share_id,
+    );
+    expect(onRefresh).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the original pending join id when its response is lost", async () => {
+    const user = userEvent.setup();
+    const api = new Api();
+    const retry = vi
+      .spyOn(api, "retryPendingJoin")
+      .mockRejectedValueOnce(new ApiError("offline", 503, "offline"))
+      .mockResolvedValueOnce(joined);
+    render(
+      <ManagedSharesBoard
+        shares={[]}
+        pending={[pendingView]}
+        api={api}
+        onCreate={() => {}}
+        onJoin={() => {}}
+        onDetail={() => {}}
+        onRefresh={async () => {}}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "가입 재개" }));
+    expect(await screen.findByText(/소유자에 연결할 수 없습니다/)).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "가입 재개" }));
+    await waitFor(() => expect(retry).toHaveBeenCalledTimes(2));
+    expect(retry.mock.calls[1]).toEqual(retry.mock.calls[0]);
+  });
+
   it("blocks a revoked key and keeps join unavailable", async () => {
     const user = userEvent.setup();
     const api = new Api();
@@ -279,17 +360,55 @@ describe("managed share web contract", () => {
     }
   });
 
+  it("aborts a preview request that exceeds the bounded read timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      const api = new Api();
+      let requestSignal: AbortSignal | undefined;
+      vi.spyOn(api, "previewShareKey").mockImplementation(
+        async (_requestId, _key, signal) => {
+          requestSignal = signal;
+          return await new Promise<KeyPreview>(() => {});
+        },
+      );
+      render(
+        <ShareJoinFlow
+          api={api}
+          browse={async () => directory}
+          onClose={() => {}}
+          onComplete={async () => {}}
+        />,
+      );
+      fireEvent.change(screen.getByLabelText("공유 키"), {
+        target: { value: "opaque-test-key" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "키 확인" }));
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(SHARE_READ_TIMEOUT_MS);
+      });
+      expect(requestSignal?.aborted).toBe(true);
+      expect(screen.getByText("요청을 처리하지 못했습니다. 다시 시도하세요.")).toBeVisible();
+      expect(screen.getByRole("button", { name: "키 확인" })).toBeEnabled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("does not reopen a directory after closing during a pending browse", async () => {
     const user = userEvent.setup();
     const pendingBrowse = deferred<Directory>();
+    let browseSignal: AbortSignal | undefined;
     const browse = vi
-      .fn<(path: string) => Promise<Directory>>()
+      .fn<(path: string, signal?: AbortSignal) => Promise<Directory>>()
       .mockResolvedValueOnce({
         path: "/srv",
         parent: "/",
         entries: [{ name: "child", path: "/srv/child" }],
       })
-      .mockReturnValueOnce(pendingBrowse.promise);
+      .mockImplementationOnce((_path, signal) => {
+        browseSignal = signal;
+        return pendingBrowse.promise;
+      });
     render(
       <ShareDirectoryPicker
         value=""
@@ -304,6 +423,7 @@ describe("managed share web contract", () => {
     await user.click(await screen.findByRole("button", { name: /child/ }));
     await user.click(screen.getByRole("button", { name: "폴더 탐색 닫기" }));
     expect(screen.getByRole("button", { name: "찾아보기" })).toBeEnabled();
+    expect(browseSignal?.aborted).toBe(true);
 
     pendingBrowse.resolve({ path: "/srv/child", parent: "/srv", entries: [] });
     await act(async () => {
@@ -519,6 +639,433 @@ describe("managed share web contract", () => {
 
     expect(issued).toHaveBeenCalledTimes(2);
     expect(issued.mock.calls[1][1]).not.toBe(issued.mock.calls[0][1]);
+  });
+
+  it("polls member revocation from pending to completion", async () => {
+    vi.useFakeTimers();
+    try {
+      const api = new Api();
+      vi.spyOn(api, "listKeys").mockResolvedValue([]);
+      const listMembers = vi
+        .spyOn(api, "listMembers")
+        .mockResolvedValueOnce([pendingMember])
+        .mockResolvedValueOnce([pendingMember])
+        .mockResolvedValueOnce([
+          { ...member, revoked_at: 1_788_610_100, revocation_pending: false },
+        ]);
+      render(
+        <ShareDetailFlow
+          share={share}
+          api={api}
+          onClose={() => {}}
+          onRefresh={async () => {}}
+        />,
+      );
+
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(listMembers).toHaveBeenCalledTimes(1);
+      expect(screen.getByText("연결 종료 확인 중")).toBeVisible();
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(MEMBER_REVOKE_POLL_MS);
+      });
+      expect(listMembers).toHaveBeenCalledTimes(2);
+      expect(screen.getByText("연결 종료 확인 중")).toBeVisible();
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(MEMBER_REVOKE_POLL_MS);
+      });
+      expect(listMembers).toHaveBeenCalledTimes(3);
+      expect(screen.getByText("철회 완료")).toBeVisible();
+      expect(screen.queryByText("연결 종료 확인 중")).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a member revocation pending across an unavailable owner", async () => {
+    vi.useFakeTimers();
+    try {
+      const api = new Api();
+      vi.spyOn(api, "listKeys").mockResolvedValue([]);
+      const listMembers = vi
+        .spyOn(api, "listMembers")
+        .mockResolvedValue([pendingMember]);
+      render(
+        <ShareDetailFlow
+          share={share}
+          api={api}
+          onClose={() => {}}
+          onRefresh={async () => {}}
+        />,
+      );
+      await act(async () => {
+        await Promise.resolve();
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(MEMBER_REVOKE_POLL_MS * 2);
+      });
+      expect(listMembers.mock.calls.length).toBeGreaterThanOrEqual(3);
+      expect(screen.getByText("연결 종료 확인 중")).toBeVisible();
+      expect(screen.queryByText("철회 완료")).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a pending member visible when one owner response omits it", async () => {
+    vi.useFakeTimers();
+    try {
+      const api = new Api();
+      vi.spyOn(api, "listKeys").mockResolvedValue([]);
+      const listMembers = vi
+        .spyOn(api, "listMembers")
+        .mockResolvedValueOnce([pendingMember])
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([
+          { ...member, revoked_at: 1_788_610_100, revocation_pending: false },
+        ]);
+      render(
+        <ShareDetailFlow
+          share={share}
+          api={api}
+          onClose={() => {}}
+          onRefresh={async () => {}}
+        />,
+      );
+
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(screen.getByText("연결 종료 확인 중")).toBeVisible();
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(MEMBER_REVOKE_POLL_MS);
+      });
+      expect(listMembers).toHaveBeenCalledTimes(2);
+      expect(screen.getByText("연결 종료 확인 중")).toBeVisible();
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(MEMBER_REVOKE_POLL_MS);
+      });
+      expect(listMembers).toHaveBeenCalledTimes(3);
+      expect(screen.getByText("철회 완료")).toBeVisible();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("aborts a stalled member read after the bounded timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      const api = new Api();
+      vi.spyOn(api, "listKeys").mockResolvedValue([]);
+      let requestSignal: AbortSignal | undefined;
+      const listMembers = vi
+        .spyOn(api, "listMembers")
+        .mockResolvedValueOnce([pendingMember])
+        .mockImplementationOnce(async (_shareId, signal) => {
+          requestSignal = signal;
+          return await new Promise<MemberView[]>(() => {});
+        })
+        .mockResolvedValue([pendingMember]);
+      render(
+        <ShareDetailFlow
+          share={share}
+          api={api}
+          onClose={() => {}}
+          onRefresh={async () => {}}
+        />,
+      );
+
+      await act(async () => {
+        await Promise.resolve();
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(MEMBER_REVOKE_POLL_MS);
+      });
+      expect(listMembers).toHaveBeenCalledTimes(2);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(SHARE_READ_TIMEOUT_MS);
+      });
+      expect(requestSignal?.aborted).toBe(true);
+      expect(screen.getByText("연결 종료 확인 중")).toBeVisible();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(MEMBER_REVOKE_POLL_MS);
+      });
+      expect(listMembers).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("clears reload loading when a member poll overtakes a delayed key read", async () => {
+    vi.useFakeTimers();
+    try {
+      const api = new Api();
+      const key: KeySummary = {
+        invitation_id: invitationId,
+        share_id: shareId,
+        permission: "read_only",
+        issued_at: null,
+        expires_at: null,
+        revoked_at: null,
+      };
+      const delayedKeys = deferred<KeySummary[]>();
+      const listKeys = vi
+        .spyOn(api, "listKeys")
+        .mockResolvedValueOnce([key])
+        .mockReturnValueOnce(delayedKeys.promise);
+      const listMembers = vi
+        .spyOn(api, "listMembers")
+        .mockResolvedValue([pendingMember]);
+      vi.spyOn(api, "rotateKey").mockResolvedValue({
+        request_id: "rotate-request",
+        share_id: shareId,
+        invitation_id: invitationId,
+        permission: "read_only",
+        expires_at: null,
+        key: "rotated-key",
+      });
+      render(
+        <ShareDetailFlow
+          share={share}
+          api={api}
+          onClose={() => {}}
+          onRefresh={async () => {}}
+        />,
+      );
+
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(listKeys).toHaveBeenCalledOnce();
+      expect(listMembers).toHaveBeenCalledOnce();
+
+      fireEvent.click(screen.getByRole("button", { name: "교체" }));
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(listKeys).toHaveBeenCalledTimes(2);
+      expect(screen.getByText("멤버 목록을 불러오는 중…")).toBeVisible();
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(MEMBER_REVOKE_POLL_MS);
+      });
+      expect(listMembers).toHaveBeenCalledTimes(2);
+      expect(screen.getByText("멤버 목록을 불러오는 중…")).toBeVisible();
+
+      await act(async () => {
+        delayedKeys.resolve([key]);
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(listMembers).toHaveBeenCalledTimes(3);
+      expect(screen.queryByText("멤버 목록을 불러오는 중…")).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps member polling alive after an issued key expires", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-09-08T00:00:00Z"));
+      const api = new Api();
+      vi.spyOn(api, "listKeys").mockResolvedValue([]);
+      const listMembers = vi
+        .spyOn(api, "listMembers")
+        .mockResolvedValue([pendingMember]);
+      vi.spyOn(api, "issueKey").mockResolvedValue({
+        request_id: "expiring-issue",
+        share_id: shareId,
+        invitation_id: invitationId,
+        permission: "read_only",
+        expires_at: Math.floor(Date.now() / 1000) + 1,
+        key: "expiring-key",
+      });
+      render(
+        <ShareDetailFlow
+          share={share}
+          api={api}
+          onClose={() => {}}
+          onRefresh={async () => {}}
+        />,
+      );
+
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(listMembers).toHaveBeenCalledOnce();
+      fireEvent.click(screen.getByRole("button", { name: "읽기 전용 키 발급" }));
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(screen.getByText("expiring-key")).toBeVisible();
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1000);
+      });
+      expect(screen.queryByText("expiring-key")).not.toBeInTheDocument();
+      expect(listMembers.mock.calls.length).toBeGreaterThanOrEqual(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a pending revoke request id across an unrelated key expiry", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-09-08T00:00:00Z"));
+      const api = new Api();
+      vi.spyOn(api, "listKeys").mockResolvedValue([]);
+      vi.spyOn(api, "listMembers").mockResolvedValue([member]);
+      const revoke = vi
+        .spyOn(api, "revokeMember")
+        .mockRejectedValueOnce(new ApiError("offline", 503, "offline"))
+        .mockResolvedValueOnce({
+          request_id: "revoke-request",
+          accepted: true,
+          status: "waiting",
+          completion: "pending",
+          retry_at: null,
+        });
+      vi.spyOn(api, "issueKey").mockResolvedValue({
+        request_id: "expiring-issue",
+        share_id: shareId,
+        invitation_id: invitationId,
+        permission: "read_only",
+        expires_at: Math.floor(Date.now() / 1000) + 1,
+        key: "expiring-key",
+      });
+      render(
+        <ShareDetailFlow
+          share={share}
+          api={api}
+          onClose={() => {}}
+          onRefresh={async () => {}}
+        />,
+      );
+
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      fireEvent.click(screen.getByRole("button", { name: "멤버 철회" }));
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(revoke).toHaveBeenCalledOnce();
+      expect(screen.getByText(/소유자에 연결할 수 없습니다/)).toBeVisible();
+
+      fireEvent.click(screen.getByRole("button", { name: "읽기 전용 키 발급" }));
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(screen.getByText("expiring-key")).toBeVisible();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1000);
+      });
+      expect(screen.queryByText("expiring-key")).not.toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole("button", { name: "멤버 철회" }));
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(revoke).toHaveBeenCalledTimes(2);
+      expect(revoke.mock.calls[1][2]).toBe(revoke.mock.calls[0][2]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("retries a member revoke with the same request id after a lost response", async () => {
+    const user = userEvent.setup();
+    const api = new Api();
+    vi.spyOn(api, "listKeys").mockResolvedValue([]);
+    vi.spyOn(api, "listMembers")
+      .mockResolvedValueOnce([member])
+      .mockResolvedValue([pendingMember]);
+    const revoke = vi
+      .spyOn(api, "revokeMember")
+      .mockRejectedValueOnce(new ApiError("offline", 503, "offline"))
+      .mockResolvedValueOnce({
+        request_id: "revoke-request",
+        accepted: true,
+        status: "waiting",
+        completion: "pending",
+        retry_at: null,
+      });
+    render(
+      <ShareDetailFlow
+        share={share}
+        api={api}
+        onClose={() => {}}
+        onRefresh={async () => {}}
+      />,
+    );
+    await waitFor(() => expect(screen.getByRole("button", { name: "멤버 철회" })).toBeVisible());
+
+    await user.click(screen.getByRole("button", { name: "멤버 철회" }));
+    expect(await screen.findByText(/소유자에 연결할 수 없습니다/)).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "멤버 철회" }));
+    await waitFor(() => expect(revoke).toHaveBeenCalledTimes(2));
+    expect(revoke.mock.calls[1][2]).toBe(revoke.mock.calls[0][2]);
+    expect(await screen.findByText("연결 종료 확인 중")).toBeVisible();
+  });
+
+  it("ignores a late member response after the detail switches shares", async () => {
+    const api = new Api();
+    vi.spyOn(api, "listKeys").mockResolvedValue([]);
+    const stale = deferred<MemberView[]>();
+    const listMembers = vi
+      .spyOn(api, "listMembers")
+      .mockResolvedValueOnce([pendingMember])
+      .mockReturnValueOnce(stale.promise)
+      .mockResolvedValueOnce([
+        { ...member, revoked_at: 1_788_610_100, revocation_pending: false },
+      ]);
+    const { rerender } = render(
+      <ShareDetailFlow
+        share={share}
+        api={api}
+        onClose={() => {}}
+        onRefresh={async () => {}}
+      />,
+    );
+    await waitFor(() => expect(listMembers).toHaveBeenCalledOnce());
+
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, MEMBER_REVOKE_POLL_MS));
+    });
+    expect(listMembers).toHaveBeenCalledTimes(2);
+    rerender(
+      <ShareDetailFlow
+        share={{ ...share, share_id: "d".repeat(64), name: "새 공유" }}
+        api={api}
+        onClose={() => {}}
+        onRefresh={async () => {}}
+      />,
+    );
+    await waitFor(() => expect(listMembers).toHaveBeenCalledTimes(3));
+    expect(screen.getByText("철회 완료")).toBeVisible();
+
+    stale.resolve([pendingMember]);
+    await act(async () => {
+      await stale.promise;
+    });
+    expect(screen.getByText("철회 완료")).toBeVisible();
+    expect(screen.queryByText("연결 종료 확인 중")).not.toBeInTheDocument();
   });
 
   it("uses three request ids for pause, resume, and pause after acknowledgement", async () => {
