@@ -1250,6 +1250,7 @@ fn closed_catalog_bytes(path: &std::path::Path) -> Vec<u8> {
         vec![
             "owner_share_catalog_v3",
             "share-swarm-apply-v1",
+            "share-swarm-client-intent-v1",
             "share-swarm-clock-v1",
             "share-swarm-grant-drain-v1",
             "share-swarm-grant-v1",
