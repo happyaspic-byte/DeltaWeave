@@ -28,11 +28,37 @@ const PRIVATE_PERMISSIONS: &str =
 /// must already exist; this function never creates a path recursively because
 /// doing so would make the security boundary depend on unvalidated parents.
 pub(crate) fn prepare_directory(path: &Path) -> io::Result<()> {
+    prepare_directory_inner(path, false)
+}
+
+/// Validates and hardens a directory that the admission catalog has just
+/// created as the final private leaf.
+///
+/// The admission callback supplies this distinction so Windows can replace
+/// inherited ACLs on a fresh leaf without weakening the fail-closed behavior
+/// for an existing directory.  This function never creates a missing path;
+/// the admission layer owns creation and its global lock.
+pub(crate) fn prepare_directory_created(path: &Path) -> io::Result<()> {
+    prepare_directory_inner(path, true)
+}
+
+/// Checks every original path component before admission canonicalizes a
+/// requested path.  Callers that pass an admission-canonical path to the
+/// preparation callback must run this check on the user-supplied path first so
+/// aliases and reparse points cannot be hidden by canonicalization.
+pub(crate) fn validate_directory_path(path: &Path) -> io::Result<()> {
+    if path.as_os_str().is_empty() {
+        return Err(permission_error(PRIVATE_ERROR));
+    }
+    log_acl_result(reject_reparse_components(path), "pre_reparse")
+}
+
+fn prepare_directory_inner(path: &Path, admission_created: bool) -> io::Result<()> {
     if path.as_os_str().is_empty() {
         return Err(permission_error(PRIVATE_ERROR));
     }
 
-    log_acl_result(reject_reparse_components(path), "pre_reparse")?;
+    validate_directory_path(path)?;
     let existed = match fs::symlink_metadata(path) {
         Ok(metadata) => {
             validate_directory_metadata(&metadata)?;
@@ -47,6 +73,9 @@ pub(crate) fn prepare_directory(path: &Path) -> io::Result<()> {
     };
 
     if !existed {
+        if admission_created {
+            return Err(io::Error::new(ErrorKind::NotFound, PRIVATE_ERROR));
+        }
         let created = create_private_leaf(path).map_err(|error| {
             if error.kind() == ErrorKind::NotFound {
                 safe_io_error(error, PRIVATE_MISSING_PARENT)
@@ -77,7 +106,7 @@ pub(crate) fn prepare_directory(path: &Path) -> io::Result<()> {
     }
 
     #[cfg(windows)]
-    prepare_windows_acl(path, !existed)?;
+    prepare_windows_acl(path, admission_created || !existed)?;
 
     Ok(())
 }

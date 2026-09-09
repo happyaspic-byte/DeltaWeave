@@ -92,6 +92,40 @@ pub fn reserve_private(path: impl AsRef<Path>) -> Result<PathBuf> {
     Ok(root)
 }
 
+/// Permanently excludes and prepares one private directory under the global
+/// admission lock.
+///
+/// The callback runs only after all namespace checks, private directory
+/// creation, and the private reservation commit.  It is called for each
+/// directory component created by this invocation in parent-to-child order
+/// with `created=true`; if the requested final directory already existed, it
+/// is called once for that final directory with `created=false`.  The callback
+/// must be short, synchronous, and must not recurse into admission.
+pub fn reserve_private_prepared(
+    path: impl AsRef<Path>,
+    mut prepare: impl FnMut(&Path, bool) -> Result<()>,
+) -> Result<PathBuf> {
+    let (_, root) = admit_at_with_creation(
+        &registry_path()?,
+        None,
+        &[path.as_ref().to_path_buf()],
+        &[],
+        true,
+        |_, private, created| {
+            ensure!(private.len() == 1);
+            let prepared_final = created.iter().any(|path| path == &private[0]);
+            for created_path in created {
+                prepare(created_path, true)?;
+            }
+            if !prepared_final {
+                prepare(&private[0], false)?;
+            }
+            Ok(private[0].clone())
+        },
+    )?;
+    Ok(root)
+}
+
 /// Permanently excludes one private file and public roots containing it.
 ///
 /// Existing aliases resolve to the actual file before admission. Only the exact
@@ -180,6 +214,74 @@ fn private_file(path: &Path) -> Result<File> {
     }
     ensure!(!path.is_symlink(), "private file must not be a symlink");
     Ok(options.open(path)?)
+}
+
+/// Creates a private directory using either the legacy recursive behavior or
+/// one-component-at-a-time creation for the prepared API.  The latter avoids
+/// treating a recursively created Windows leaf as an already trusted private
+/// directory and reports every component created by this call so the caller
+/// can harden them in parent-to-child order.
+fn create_private_directory(path: &Path, report_created: bool) -> Result<Vec<PathBuf>> {
+    if !report_created {
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(path)?;
+        return Ok(Vec::new());
+    }
+
+    let mut current = PathBuf::new();
+    let mut missing = false;
+    let mut created = Vec::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        if !missing {
+            match fs::symlink_metadata(&current) {
+                Ok(metadata) => {
+                    ensure!(
+                        metadata.is_dir(),
+                        "private path component is not a directory"
+                    );
+                    ensure!(
+                        fs::canonicalize(&current)? == current,
+                        "private path component changed during preparation"
+                    );
+                    continue;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    missing = true;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        match builder.create(&current) {
+            Ok(()) => created.push(current.clone()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let metadata = fs::symlink_metadata(&current)?;
+                ensure!(
+                    metadata.is_dir(),
+                    "private path component is not a directory"
+                );
+                ensure!(
+                    fs::canonicalize(&current)? == current,
+                    "private path component changed during preparation"
+                );
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(created)
 }
 
 fn binding(root: &Path) -> Result<String> {
@@ -354,6 +456,24 @@ fn admit_at_with_files<T>(
     private_files: &[PathBuf],
     prepare: impl FnOnce(Option<&Path>, &[PathBuf]) -> Result<T>,
 ) -> Result<(Option<RootLease>, T)> {
+    admit_at_with_creation(
+        registry,
+        public,
+        private_directories,
+        private_files,
+        false,
+        |public, private, _| prepare(public, private),
+    )
+}
+
+fn admit_at_with_creation<T>(
+    registry: &Path,
+    public: Option<(&Path, RootUse)>,
+    private_directories: &[PathBuf],
+    private_files: &[PathBuf],
+    prepared_creation: bool,
+    prepare: impl FnOnce(Option<&Path>, &[PathBuf], &[PathBuf]) -> Result<T>,
+) -> Result<(Option<RootLease>, T)> {
     // The registry itself is private even before the initial bootstrap mkdir.
     let proposed_registry = prospective_root(registry)?;
     if let Some((path, _)) = &public {
@@ -482,6 +602,7 @@ fn admit_at_with_files<T>(
     } else {
         None
     };
+    let mut private_created = Vec::new();
     for (index, path) in private.iter().enumerate() {
         let directory = if index < private_directories.len() {
             path.as_path()
@@ -492,14 +613,11 @@ fn admit_at_with_files<T>(
             );
             path.parent().context("private file has no parent")?
         };
-        let mut builder = fs::DirBuilder::new();
-        builder.recursive(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
+        if index < private_directories.len() {
+            private_created.extend(create_private_directory(directory, prepared_creation)?);
+        } else {
+            create_private_directory(directory, false)?;
         }
-        builder.create(directory)?;
         ensure!(
             fs::canonicalize(directory)? == directory,
             "private root changed during preparation"
@@ -511,6 +629,7 @@ fn admit_at_with_files<T>(
             );
         }
     }
+    private_created.sort_by_key(|path| path.components().count());
     let db = Database::create(registry.join("roots.redb"))?;
     // The writable catalog is opened only after namespace preflight succeeds.
     if db.begin_read()?.open_table(ROOTS).is_err() {
@@ -541,6 +660,7 @@ fn admit_at_with_files<T>(
     let result = prepare(
         public_state.as_ref().map(|(_, _, lease)| lease.root()),
         &private,
+        &private_created,
     )?;
     let lease = if let Some((key, mut entry, lease)) = public_state {
         ensure!(
@@ -766,6 +886,86 @@ mod tests {
         assert!(acquire_at(&registry, &private, RootUse::Legacy).is_err());
         assert!(acquire_at(&registry, &public, managed()).is_ok());
     }
+
+    #[test]
+    fn prepared_private_creation_reports_new_components_in_parent_order() {
+        let temp = TempDir::new().unwrap();
+        let registry = temp.path().join("registry");
+        let target = temp.path().join("private/nested/leaf");
+        let expected_target = fs::canonicalize(&target).unwrap_or_else(|_| target.clone());
+        let (_, returned) =
+            admit_at_with_creation(
+                &registry,
+                None,
+                std::slice::from_ref(&target),
+                &[],
+                true,
+                |_, private, created| {
+                    assert_eq!(private, std::slice::from_ref(&expected_target));
+                    assert_eq!(created.len(), 3);
+                    assert!(created.windows(2).all(|pair| {
+                        pair[0].components().count() < pair[1].components().count()
+                    }));
+                    assert_eq!(created.last(), Some(&expected_target));
+                    Ok(private[0].clone())
+                },
+            )
+            .unwrap();
+        assert_eq!(returned, expected_target);
+        assert!(target.is_dir());
+        assert!(
+            read_admission(&registry.join("roots.redb"))
+                .unwrap()
+                .private
+                .contains(&expected_target)
+        );
+    }
+
+    #[test]
+    fn prepared_private_existing_leaf_reports_no_creation_and_preserves_parent() {
+        let temp = TempDir::new().unwrap();
+        let registry = temp.path().join("registry");
+        let target = temp.path().join("private/nested/leaf");
+        fs::create_dir_all(&target).unwrap();
+        let (_, returned) = admit_at_with_creation(
+            &registry,
+            None,
+            std::slice::from_ref(&target),
+            &[],
+            true,
+            |_, private, created| {
+                assert!(created.is_empty());
+                Ok(private[0].clone())
+            },
+        )
+        .unwrap();
+        assert_eq!(returned, fs::canonicalize(target).unwrap());
+    }
+
+    #[test]
+    fn prepared_private_overlap_is_rejected_before_creation_or_callback() {
+        let temp = TempDir::new().unwrap();
+        let registry = temp.path().join("registry");
+        let public = temp.path().join("public");
+        let target = public.join("private/nested");
+        let _lease = acquire_at(&registry, &public, managed()).unwrap();
+        let callback_called = std::sync::atomic::AtomicBool::new(false);
+        let result = admit_at_with_creation(
+            &registry,
+            None,
+            std::slice::from_ref(&target),
+            &[],
+            true,
+            |_, _, _| {
+                callback_called.store(true, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert!(!target.exists());
+        assert!(!callback_called.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
     fn wait_file(path: &Path) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         while !path.exists() {
