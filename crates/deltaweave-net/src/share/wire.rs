@@ -104,6 +104,37 @@ pub(crate) enum Reply {
     ActivationReceipt(ActivationReceipt),
 }
 
+/// The grant-gated data stream is deliberately separate from the legacy
+/// sync/3 CAS protocol.  The signed grant and manifest are sent on every
+/// stream so a provider never authorizes a connection from an address hint or
+/// a caller-selected role.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) enum SwarmRequest {
+    Grant {
+        grant: super::ShareGrant,
+        snapshot: super::SnapshotToken,
+        record: deltaweave_core::SyncRecord,
+        manifest: super::ManifestAttestation,
+        hashes: Vec<deltaweave_core::Hash32>,
+        operation_id: [u8; 16],
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) enum SwarmResponse {
+    Ready(super::ActivationReceipt),
+    Chunks {
+        present: Vec<deltaweave_core::Hash32>,
+        missing: Vec<deltaweave_core::Hash32>,
+    },
+    ChunkHeader {
+        hash: deltaweave_core::Hash32,
+        length: u32,
+    },
+    Finished(super::SwarmTransferReceipt),
+    Error(ShareError),
+}
+
 pub(crate) async fn read_hello(receive: &mut RecvStream) -> Result<Hello> {
     let length = receive.read_u32().await? as usize;
     ensure!(length <= 16384, ShareError::Protocol);

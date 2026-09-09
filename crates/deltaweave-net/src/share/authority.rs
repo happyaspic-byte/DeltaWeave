@@ -196,6 +196,14 @@ pub struct ActivationReceipt {
     pub revoked: bool,
     pub provider_drained: bool,
     pub consumer_drained: bool,
+    /// Current owner-side admission gate. This is a runtime observation, not
+    /// a lease extension or proof that the peer has persisted its intent.
+    #[serde(default = "default_admission_open")]
+    pub admission_open: bool,
+}
+
+fn default_admission_open() -> bool {
+    true
 }
 
 impl ActivationReceipt {
@@ -216,6 +224,55 @@ impl ActivationReceipt {
         }
         Ok(())
     }
+}
+
+/// The endpoint-local side of one grant-gated data operation.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientSide {
+    Consumer,
+    Provider,
+}
+
+/// Durable endpoint-local intent phases.  Unknown and nonterminal phases are
+/// retained across a crash; they are never treated as permission to start a
+/// new payload operation.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientIntentPhase {
+    Prepared,
+    AwaitingActivation,
+    Active,
+    Draining,
+    Unknown,
+    Drained,
+    Cancelled,
+}
+
+/// Minimal durable client journal for one exact grant binding.  The signed
+/// grant is retained so recovery can query the owner without inventing a new
+/// signature; it contains no bearer key or private endpoint state.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ClientIntentRow {
+    pub grant: ShareGrant,
+    pub binding: ActivationBinding,
+    pub side: ClientSide,
+    pub activation_id: Option<[u8; 16]>,
+    pub operation_id: [u8; 16],
+    pub phase: ClientIntentPhase,
+    pub boot_id: [u8; 16],
+    pub started_at_wall: u64,
+}
+
+/// Secret-free result of a verified share-swarm transfer.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SwarmTransferReceipt {
+    pub share: ShareId,
+    pub provider: EndpointId,
+    pub transferred_chunks: u16,
+    pub transferred_bytes: u64,
+    pub missing_chunks: u16,
+    pub verified: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

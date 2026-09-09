@@ -9,8 +9,8 @@ pub(crate) mod wire;
 pub use authority::{
     ActivateGrantReply, ActivateGrantRequest, ActivationBinding, ActivationCancel,
     ActivationReceipt, ActivationStateView, ActivationStatusQuery, ApplyDrained, ApplyPermit,
-    ApplyStart, AuthoritativeSnapshot, ManifestAttestation, RevocationReceipt, ShareGrant,
-    SnapshotToken,
+    ApplyStart, AuthoritativeSnapshot, ClientIntentPhase, ClientIntentRow, ClientSide,
+    ManifestAttestation, RevocationReceipt, ShareGrant, SnapshotToken, SwarmTransferReceipt,
 };
 pub use registry::{Invitation, MemberRelationship, Membership, OwnedShareConfig};
 pub use roster::{
