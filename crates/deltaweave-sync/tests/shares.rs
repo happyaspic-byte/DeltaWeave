@@ -1,7 +1,7 @@
 use deltaweave_core::ChunkingProfile;
 use deltaweave_net::{NetworkMode, TransferEvent, TransferObserver, share::*};
 use deltaweave_sync::{ManagedSyncConfig, ManagedSyncEngine};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::sync::{Arc, Mutex};
 
@@ -42,6 +42,29 @@ fn unique_payload() -> Vec<u8> {
         }
     }
     payload
+}
+
+fn chunk_inventory(root: &std::path::Path) -> (usize, u64) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return (0, 0);
+    };
+    entries.flatten().fold((0, 0), |(count, bytes), entry| {
+        let path = entry.path();
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            return (count, bytes);
+        };
+        if metadata.file_type().is_symlink() {
+            return (count, bytes);
+        }
+        if metadata.is_dir() {
+            let (nested_count, nested_bytes) = chunk_inventory(&path);
+            (count + nested_count, bytes.saturating_add(nested_bytes))
+        } else if metadata.is_file() {
+            (count + 1, bytes.saturating_add(metadata.len()))
+        } else {
+            (count, bytes)
+        }
+    })
 }
 
 #[test]
@@ -473,11 +496,83 @@ async fn run_managed_read_only_two_suppliers_with_options(
                 }));
             }
 
+            // Before the provider-side recovery acknowledgement exists, a
+            // consumer-only recovery query must preserve the one-sided
+            // activation as pending. This guards the response-loss boundary
+            // independently of the successful bilateral recovery below.
+            let unknown_error = consumer_engine
+                .recover_pending()
+                .await
+                .expect_err("one-sided drain must remain pending");
+            assert_eq!(
+                ShareError::classify(&unknown_error),
+                ShareError::RevocationPending
+            );
+
+            let (partial_chunk_count, partial_chunk_bytes) =
+                chunk_inventory(&base.join("consumer-state/store/chunks"));
+            assert!(
+                partial_chunk_count > 0 && partial_chunk_bytes > 0,
+                "the interrupted transfer retained verified private CAS bytes"
+            );
+
+            // Reopen the stopped provider at its persisted identity through a
+            // recovery-only engine. Its exact managed admission lease is the
+            // evidence required by the service-level provider recovery API;
+            // the recovery path never registers a supplier or starts
+            // heartbeat/liveness before the old operation is reconciled.
+            let provider = ShareService::open(&provider_path, NetworkMode::DirectOnly, None)
+                .await
+                .unwrap();
+            let provider_recovery = ManagedSyncEngine::open_recovery(
+                &provider,
+                owner.endpoint_id(),
+                provider_grant.share_id,
+                config(base, "provider"),
+            )
+            .unwrap();
+            let provider_admission = provider_recovery.managed_admission_lease().unwrap();
+            let mut provider_leases = BTreeMap::new();
+            provider_leases.insert(provider_grant.share_id, provider_admission);
+            let provider_rows = provider
+                .recover_client_intents_with_budget_and_leases(
+                    std::time::Duration::from_secs(15),
+                    &provider_leases,
+                )
+                .await
+                .unwrap();
+            let provider_row = provider_rows
+                .into_iter()
+                .find(|row| {
+                    row.side == ClientSide::Provider
+                        && row.grant.provider == provider.endpoint_id()
+                        && row.grant.consumer == consumer.endpoint_id()
+                })
+                .expect("the interrupted provider intent is retained");
+            assert!(matches!(
+                provider_row.phase,
+                ClientIntentPhase::Draining | ClientIntentPhase::Drained
+            ));
+            let activation_id = provider_row
+                .activation_id
+                .expect("the interrupted provider activation is durable");
+            let provider_session = provider
+                .open_session(owner.endpoint_id(), provider_grant.share_id)
+                .unwrap();
+            let provider_receipt = provider_session
+                .activation_status(&provider_row.grant, Some(activation_id))
+                .await
+                .unwrap();
+            assert!(provider_receipt.provider_drained);
+            drop(provider_session);
+            drop(provider_leases);
+            provider_recovery.shutdown().await.unwrap();
+            provider.shutdown().await.unwrap();
+
             // Reopen the same member service through recovery-only mode. It
-            // must have no heartbeat or supplier registration and must return
-            // the same pending classification without touching the public
-            // namespace. A later owner-side bilateral drain is required
-            // before any retry can materialize the retained private CAS.
+            // must have no heartbeat or supplier registration and now may
+            // finish the exact consumer half of the bilateral drain. The
+            // private CAS remains the source for the subsequent normal round.
             consumer_engine.shutdown().await.unwrap();
             consumer.shutdown().await.unwrap();
             let consumer = ShareService::open(&consumer_path, NetworkMode::DirectOnly, None)
@@ -490,17 +585,61 @@ async fn run_managed_read_only_two_suppliers_with_options(
                 config(base, "consumer"),
             )
             .unwrap();
-            let recovery_error = recovery
-                .recover_pending()
-                .await
-                .expect_err("unknown bilateral drain must remain pending");
-            assert_eq!(
-                ShareError::classify(&recovery_error),
-                ShareError::RevocationPending
-            );
+            recovery.recover_pending().await.unwrap();
             assert!(!base.join("consumer-root/payload.bin").exists());
+            let terminal_session = consumer
+                .open_session(owner.endpoint_id(), provider_grant.share_id)
+                .unwrap();
+            let terminal = terminal_session
+                .activation_status(&provider_row.grant, Some(activation_id))
+                .await
+                .unwrap();
+            assert!(matches!(terminal.state, ActivationStateView::Drained));
+            assert!(terminal.provider_drained && terminal.consumer_drained);
+            drop(terminal_session);
             recovery.shutdown().await.unwrap();
             consumer.shutdown().await.unwrap();
+
+            // A fresh normal engine may now resume the same operation. The
+            // retained private chunks must be reused, so the resumed payload
+            // transfer is strictly smaller than the original file while the
+            // final public hash is exact.
+            let provider = ShareService::open(&provider_path, NetworkMode::DirectOnly, None)
+                .await
+                .unwrap();
+            let provider_engine = ManagedSyncEngine::open(
+                &provider,
+                provider_grant.owner,
+                provider_grant.share_id,
+                config(base, "provider"),
+            )
+            .unwrap();
+            let consumer = ShareService::open(&consumer_path, NetworkMode::DirectOnly, None)
+                .await
+                .unwrap();
+            let consumer_engine = ManagedSyncEngine::open(
+                &consumer,
+                owner.endpoint_id(),
+                provider_grant.share_id,
+                config(base, "consumer"),
+            )
+            .unwrap();
+            let resumed = consumer_engine.sync_read_only(None).await.unwrap();
+            assert_eq!(resumed.status, "pass");
+            assert!(resumed.pulled_bytes > 0);
+            assert!(resumed.pulled_bytes < payload.len() as u64);
+            assert_eq!(
+                fs::read(base.join("consumer-root/payload.bin")).unwrap(),
+                payload
+            );
+            let (final_chunk_count, final_chunk_bytes) =
+                chunk_inventory(&base.join("consumer-state/store/chunks"));
+            assert!(final_chunk_count >= partial_chunk_count);
+            assert!(final_chunk_bytes >= partial_chunk_bytes);
+            consumer_engine.shutdown().await.unwrap();
+            consumer.shutdown().await.unwrap();
+            provider_engine.shutdown().await.unwrap();
+            provider.shutdown().await.unwrap();
             owner.shutdown().await.unwrap();
             return;
         }
