@@ -724,6 +724,86 @@ fn recovery_retries_preservation_flush_before_installing_incoming_content() {
     assert_eq!(fs::read(&change.artifact).unwrap(), b"original");
 }
 
+#[cfg(windows)]
+#[test]
+fn windows_reparse_ancestors_are_rejected_for_private_cas_and_rollback() {
+    use deltaweave_core::{ChunkingProfile, WirePath};
+    use deltaweave_store::{PathChangeState, PathTarget, Store};
+    use std::{
+        fs,
+        process::{Command, Stdio},
+    };
+
+    fn create_junction(link: &std::path::Path, target: &std::path::Path) {
+        let status = Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "$ErrorActionPreference='Stop'; New-Item -ItemType Junction -Path $env:QSYNC_TEST_JUNCTION -Target $env:QSYNC_TEST_TARGET | Out-Null",
+            ])
+            .env("QSYNC_TEST_JUNCTION", link)
+            .env("QSYNC_TEST_TARGET", target)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("PowerShell can create a junction fixture");
+        assert!(status.success(), "junction fixture creation failed");
+    }
+
+    let base = tempfile::tempdir().unwrap();
+    let state = base.path().join("state");
+    let stage_root = state.join("managed-stage");
+    fs::create_dir_all(&stage_root).unwrap();
+    let source = base.path().join("source");
+    fs::write(&source, b"junction rejection fixture").unwrap();
+    let store = Store::open(&state).unwrap();
+    let manifest = store
+        .ingest_file(&source, ChunkingProfile::DEFAULT)
+        .unwrap();
+    let descriptor = manifest.chunks.first().unwrap();
+    let encoded = descriptor.hash.to_hex();
+    let chunk_prefix = state.join("chunks").join(&encoded[..2]);
+    let detached_prefix = base.path().join("detached-chunks");
+    fs::rename(&chunk_prefix, &detached_prefix).unwrap();
+    create_junction(&chunk_prefix, &detached_prefix);
+
+    assert!(
+        store
+            .materialize_private_verified(
+                &manifest,
+                &stage_root,
+                &WirePath::new("blocked.bin").unwrap()
+            )
+            .is_err(),
+        "CAS ancestor junction accepted"
+    );
+    assert!(!stage_root.join("blocked.bin").exists());
+    fs::remove_dir(&chunk_prefix).unwrap();
+    fs::rename(&detached_prefix, &chunk_prefix).unwrap();
+
+    let root = base.path().join("root");
+    fs::create_dir(&root).unwrap();
+    let outside = base.path().join("outside-public");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("file"), b"outside bytes").unwrap();
+    let path = WirePath::new("alias/file").unwrap();
+    let mut change = store
+        .prepare_path_change(&root, &path, PathTarget::File(manifest), None, false)
+        .unwrap();
+    fs::remove_dir(root.join("alias")).unwrap();
+    create_junction(&root.join("alias"), &outside);
+
+    assert!(
+        store.rollback_unadopted_path_change(&mut change).is_err(),
+        "public ancestor junction accepted"
+    );
+    assert_eq!(change.state, PathChangeState::Prepared);
+    assert_eq!(fs::read(outside.join("file")).unwrap(), b"outside bytes");
+    fs::remove_dir(root.join("alias")).unwrap();
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn symlinked_recovery_vault_is_rejected_before_capture() {

@@ -580,6 +580,10 @@ impl Store {
     }
 
     fn put_change(&self, change: &PathChange) -> Result<()> {
+        #[cfg(test)]
+        if self.fail_next_change_write.swap(false, Ordering::SeqCst) {
+            bail!("injected path-change journal write failure");
+        }
         let encoded = postcard::to_stdvec(change)?;
         let write = self.metadata.database.begin_write()?;
         write
@@ -587,6 +591,11 @@ impl Store {
             .insert(change.id.as_str(), encoded.as_slice())?;
         write.commit()?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn fail_next_change_write_for_test(&self) {
+        self.fail_next_change_write.store(true, Ordering::SeqCst);
     }
 
     fn validate_change(&self, change: &PathChange) -> Result<()> {
@@ -842,6 +851,7 @@ impl Store {
         let destination = checked_destination(&change.root, &change.path)?;
         let current = PathObservation::at(&destination)?;
         if change.state != PathChangeState::RollingBack {
+            let previous_state = change.state;
             ensure!(
                 path_is_absent(&change.rollback_artifact)?,
                 PreservationError::StateUnavailable
@@ -868,7 +878,12 @@ impl Store {
             // Write ahead before moving either the incoming object or the installed target.  A
             // crash after this commit can resume from the deterministic artifact paths below.
             change.state = PathChangeState::RollingBack;
-            self.put_change(change)?;
+            if let Err(error) = self.put_change(change) {
+                // No filesystem operation has started, so a failed journal commit must leave the
+                // caller-held value on its original precondition for a safe retry.
+                change.state = previous_state;
+                return Err(error);
+            }
         }
         self.continue_unadopted_rollback(change)
     }
@@ -1090,8 +1105,8 @@ fn validate_real_directory(path: &Path) -> Result<()> {
         }
         let metadata = fs::symlink_metadata(&cursor)?;
         ensure!(
-            metadata.is_dir() && !metadata.file_type().is_symlink(),
-            "recovery path contains a symlink or non-directory"
+            metadata.is_dir() && !metadata.file_type().is_symlink() && !is_reparse_point(&metadata),
+            "recovery path contains a symlink, reparse point, or non-directory"
         );
     }
     Ok(())
@@ -1155,7 +1170,7 @@ fn validate_private_components(path: &Path) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+pub(super) fn is_reparse_point(metadata: &fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
 
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
@@ -1163,7 +1178,7 @@ fn is_reparse_point(metadata: &fs::Metadata) -> bool {
 }
 
 #[cfg(not(windows))]
-const fn is_reparse_point(_metadata: &fs::Metadata) -> bool {
+pub(super) const fn is_reparse_point(_metadata: &fs::Metadata) -> bool {
     false
 }
 
@@ -1298,6 +1313,11 @@ fn capture_into_vault(source: &Path, destination: &Path) -> Result<()> {
 
 #[cfg(not(target_os = "linux"))]
 pub(super) fn rename_noreplace(source: &Path, destination: &Path) -> Result<()> {
+    // Recheck both sides at the operation boundary. The callers also validate their public
+    // destination before observing it, but a Windows junction can be introduced between that
+    // observation and this no-replace move.
+    validate_real_directory(source.parent().context("source lacks parent")?)?;
+    validate_real_directory(destination.parent().context("destination lacks parent")?)?;
     let metadata = fs::symlink_metadata(source)?;
     if metadata.is_file() && !metadata.file_type().is_symlink() {
         // Install/restore only: the source is private, so linking retains the same inode and
@@ -1416,6 +1436,44 @@ mod tests {
             assert!(!resumed.staging.exists());
             assert!(!resumed.artifact.exists());
         }
+    }
+
+    #[test]
+    fn initial_rollback_journal_failure_restores_caller_state_before_retry() {
+        let (_base, store, root, mut change) = checkpoint_fixture();
+        assert_eq!(change.state, PathChangeState::Prepared);
+        store.fail_next_change_write_for_test();
+
+        assert!(store.rollback_unadopted_path_change(&mut change).is_err());
+        assert_eq!(change.state, PathChangeState::Prepared);
+        assert_eq!(
+            store
+                .path_changes()
+                .expect("journal")
+                .into_iter()
+                .find(|candidate| candidate.id == change.id)
+                .expect("prepared journal")
+                .state,
+            PathChangeState::Prepared
+        );
+        assert!(!change.rollback_artifact.exists());
+        assert_eq!(
+            fs::read(root.join("file")).expect("local bytes"),
+            b"local content"
+        );
+
+        store
+            .rollback_unadopted_path_change(&mut change)
+            .expect("retry rollback");
+        assert_eq!(change.state, PathChangeState::RolledBack);
+        assert_eq!(
+            fs::read(root.join("file")).expect("restored bytes"),
+            b"local content"
+        );
+        assert_eq!(
+            fs::read(&change.rollback_artifact).expect("incoming bytes"),
+            b"incoming content"
+        );
     }
 
     #[test]

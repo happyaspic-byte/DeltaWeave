@@ -52,6 +52,10 @@ directories. Windows ACL/DACL protection belongs to the host admission caller (`
 and its secure-parent preparation); this crate does not add a duplicate ACL framework. The caller
 must fail closed if that reservation/ACL check is unavailable.
 
+The common directory walk used by the new CAS and rollback paths rejects both symbolic links and
+Windows reparse points/junctions on every existing ancestor. A normal Windows spelling and its
+verbatim `\\?\` spelling are accepted only when they resolve to the same directory identity.
+
 ## Durable unadopted rollback
 
 The method accepts `Prepared`, `Preserved`, `Materialized`, and a previously persisted
@@ -72,7 +76,9 @@ Continuation is deterministic and idempotent:
    An expected absence requires both the destination and old artifact to be absent.
 4. Only after filesystem syncs and observations succeed is the journal changed to `RolledBack`.
    If that final journal write fails, the caller-held value is returned to `RollingBack` so a later
-   retry can converge from the durable state.
+   retry can converge from the durable state. If the initial write-ahead journal write fails,
+   Store restores the caller-held state (`Prepared`, `Preserved`, or `Materialized`) and performs
+   no filesystem move, so the same object can retry the write-ahead step.
 
 If a local edit or an occupant makes a capture or restore unsafe, the method returns an error while
 leaving `RollingBack` and retaining the old artifact and incoming rollback artifact. A later
@@ -95,7 +101,10 @@ persist `RollingBack` after each of these checkpoints and reopen the Store befor
 
 The occupied-restore regression keeps both artifacts pending, then retries after the occupant is
 removed. Tests assert restored bytes, retained incoming bytes, no staging residue, and no artifact
-loss; they do not claim remote authorization or Windows ACL validation.
+loss. An injected initial journal failure asserts that the caller state and durable row remain at
+the original stage before retry. A Windows-only native regression creates junction ancestors in
+the CAS and public namespaces and asserts both are rejected without changing the outside target;
+that native test is not represented as passing by the Linux run below.
 
 Validation is recorded only when actually run. The implementation validation commands are:
 
@@ -112,10 +121,15 @@ remain caller/integration validation and are not represented as passing here.
 
 Observed validation for this worktree:
 
-- `cargo fmt --all -- --check`: exit 0, captured 2026-09-09T06:46:59Z–2026-09-09T06:47:01Z.
+- `cargo fmt --all -- --check`: exit 0, captured 2026-09-09T07:16:14Z–2026-09-09T07:16:16Z.
 - `cargo test --locked -p deltaweave-store --all-targets --all-features --no-fail-fast`: exit 0,
-  captured 2026-09-09T06:46:42Z–2026-09-09T06:46:44Z; 34 unit tests plus 16 preservation
+  captured 2026-09-09T07:16:16Z–2026-09-09T07:16:20Z; 35 unit tests plus 16 preservation
   integration tests passed, with no ignored failures.
 - `cargo clippy --locked -p deltaweave-store --all-targets --all-features -- -D warnings`: exit 0,
-  captured 2026-09-09T06:46:53Z.
-- `git diff --check`: exit 0, captured 2026-09-09T06:47:01Z.
+  captured 2026-09-09T07:16:20Z–2026-09-09T07:16:23Z.
+- `CARGO_TARGET_DIR=/home/ubuntu/project/DeltaWeave-qsync-web-20260908/target cargo check
+  --locked -p deltaweave-store --tests --all-features --target x86_64-pc-windows-gnu`: exit 0,
+  captured 2026-09-09T07:14:03Z–2026-09-09T07:14:18Z using the existing shared target cache.
+  This is a Windows-target compile check; the junction regression itself remains unrun on a
+  Windows host.
+- `git diff --check`: exit 0, captured 2026-09-09T07:16:23Z.

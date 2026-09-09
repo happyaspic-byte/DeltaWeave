@@ -490,6 +490,8 @@ pub struct Store {
     metadata: MetadataStore,
     materialize_lock: Mutex<()>,
     recovery_reserver: Option<RecoveryReserver>,
+    #[cfg(test)]
+    fail_next_change_write: std::sync::atomic::AtomicBool,
 }
 
 impl Store {
@@ -516,6 +518,8 @@ impl Store {
             metadata: MetadataStore::open(state_root.join("metadata.redb"))?,
             materialize_lock: Mutex::new(()),
             recovery_reserver,
+            #[cfg(test)]
+            fail_next_change_write: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1003,8 +1007,11 @@ pub struct RemoveOutcome {
 
 fn checked_destination(root: &Path, path: &WirePath) -> Result<PathBuf> {
     let root_metadata = fs::symlink_metadata(root)?;
-    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
-        bail!("destination root must be a real directory, not a symlink");
+    if root_metadata.file_type().is_symlink()
+        || preservation::is_reparse_point(&root_metadata)
+        || !root_metadata.is_dir()
+    {
+        bail!("destination root must be a real directory without reparse points");
     }
 
     let mut destination = root.to_path_buf();
@@ -1015,9 +1022,12 @@ fn checked_destination(root: &Path, path: &WirePath) -> Result<PathBuf> {
             continue;
         }
         match fs::symlink_metadata(&destination) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
+            Ok(metadata)
+                if metadata.file_type().is_symlink()
+                    || preservation::is_reparse_point(&metadata) =>
+            {
                 bail!(
-                    "refusing destination beneath symlink {}",
+                    "refusing destination beneath symlink or reparse point {}",
                     destination.display()
                 );
             }
