@@ -76,6 +76,33 @@ struct ManagedInner {
 type SupplierDrain =
     Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync>;
 
+async fn finish_managed_shutdown(
+    session: ShareSession,
+    heartbeat_task: Option<tokio::task::JoinHandle<()>>,
+    supplier_drain: Option<SupplierDrain>,
+) -> Result<()> {
+    let mut first_error = None;
+    if let Some(drain) = supplier_drain {
+        if let Err(error) = drain().await {
+            // Supplier cleanup must not skip heartbeat/session cleanup. Keep
+            // the original error and finish every independent local action.
+            first_error = Some(error);
+        }
+    }
+    if let Some(task) = heartbeat_task {
+        task.abort();
+        if let Err(error) = task.await {
+            if !error.is_cancelled() && first_error.is_none() {
+                first_error = Some(anyhow::anyhow!(
+                    "managed heartbeat task failed during shutdown"
+                ));
+            }
+        }
+    }
+    session.close().await;
+    first_error.map_or(Ok(()), Err)
+}
+
 impl ManagedSyncEngine {
     /// Opens or resumes a persisted enrollment using its issuing owner and assigned replica.
     /// Keep the device service alive until `shutdown` drains this engine.
@@ -367,15 +394,7 @@ impl ManagedSyncEngine {
             supplier_drain,
             ..
         } = inner;
-        if let Some(drain) = supplier_drain {
-            drain().await?;
-        }
-        if let Some(task) = heartbeat_task {
-            task.abort();
-            let _ = task.await;
-        }
-        session.close().await;
-        Ok(())
+        finish_managed_shutdown(session, heartbeat_task, supplier_drain).await
     }
 }
 
@@ -679,5 +698,101 @@ mod tests {
 
         engine.shutdown().await.unwrap();
         member.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_finishes_cleanup_after_supplier_drain_error() {
+        let name = "shared::tests::shutdown_finishes_cleanup_after_supplier_drain_error";
+        if std::env::var("DW_MANAGED_SHUTDOWN_DRAIN_ERROR_CHILD")
+            .ok()
+            .as_deref()
+            != Some(name)
+        {
+            let home = tempfile::tempdir().expect("isolated home");
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture"])
+                .env("DW_MANAGED_SHUTDOWN_DRAIN_ERROR_CHILD", name)
+                .env("HOME", home.path())
+                .env("USERPROFILE", home.path())
+                .status()
+                .expect("run isolated shutdown test");
+            assert!(status.success());
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("test root");
+        let owner = ShareService::open(
+            temp.path().join("owner-service"),
+            deltaweave_net::NetworkMode::DirectOnly,
+            None,
+        )
+        .await
+        .unwrap();
+        let member = ShareService::open(
+            temp.path().join("member-service"),
+            deltaweave_net::NetworkMode::DirectOnly,
+            None,
+        )
+        .await
+        .unwrap();
+        let owned = owner
+            .create_owned_share(
+                "Shutdown drain".into(),
+                temp.path().join("owner-root"),
+                temp.path().join("owner-state"),
+                None,
+                0,
+            )
+            .await
+            .unwrap();
+        let share = owned.config().share_id;
+        member
+            .enroll(
+                &owned
+                    .issue_key(Permission::ReadWrite, None, owner.endpoint_addr())
+                    .unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+        let session = member.open_session(owner.endpoint_id(), share).unwrap();
+
+        struct DropMarker(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DropMarker {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let heartbeat_stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let marker = DropMarker(Arc::clone(&heartbeat_stopped));
+        let heartbeat_task = tokio::spawn(async move {
+            let _marker = marker;
+            std::future::pending::<()>().await;
+        });
+        let drain_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let drain_called_by_task = Arc::clone(&drain_called);
+        let supplier_drain: SupplierDrain = Box::new(move || {
+            Box::pin(async move {
+                drain_called_by_task.store(true, std::sync::atomic::Ordering::SeqCst);
+                Err(ShareError::StateUnavailable.into())
+            })
+        });
+
+        let result =
+            finish_managed_shutdown(session, Some(heartbeat_task), Some(supplier_drain)).await;
+        assert!(matches!(
+            result
+                .as_ref()
+                .err()
+                .map(|error| ShareError::classify(error)),
+            Some(ShareError::StateUnavailable)
+        ));
+        assert!(drain_called.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(heartbeat_stopped.load(std::sync::atomic::Ordering::SeqCst));
+
+        drop(owned);
+        member.shutdown().await.unwrap();
+        owner.shutdown().await.unwrap();
     }
 }
