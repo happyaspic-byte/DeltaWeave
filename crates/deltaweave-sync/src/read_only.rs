@@ -956,6 +956,24 @@ mod tests {
 
     #[test]
     fn preserved_reports_displaced_local_only_not_unadopted_incoming() {
+        let name =
+            "read_only::tests::preserved_reports_displaced_local_only_not_unadopted_incoming";
+        if std::env::var("DW_MANAGED_PRESERVED_REPORT_CHILD")
+            .ok()
+            .as_deref()
+            != Some(name)
+        {
+            let home = tempfile::tempdir().expect("isolated home");
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture"])
+                .env("DW_MANAGED_PRESERVED_REPORT_CHILD", name)
+                .env("HOME", home.path())
+                .env("USERPROFILE", home.path())
+                .status()
+                .expect("run isolated preserved report test");
+            assert!(status.success());
+            return;
+        }
         let temp = tempfile::tempdir().expect("preserved fixture root");
         let root = temp.path().join("root");
         let state_root = temp.path().join("state");
