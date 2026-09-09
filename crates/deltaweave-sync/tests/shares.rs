@@ -249,10 +249,10 @@ async fn run_managed_read_only_two_suppliers(force_owner_fallback: bool) {
     let provider_report = provider_engine.sync_read_write(None).await.unwrap();
     assert!(provider_report.pushed_bytes > 0);
 
-    // The owner's inventory is authoritative, but an owner root
-    // scan alone does not populate its CAS.  Uploading through the
-    // authenticated RW member above makes both selected suppliers
-    // real CAS sources for the subsequent RO transfer.
+    // The owner's inventory scan supplies authoritative metadata.  The
+    // authenticated Manifest request below warms the already-open owner CAS;
+    // the RW upload above gives the member supplier its own complete CAS, so
+    // both selected suppliers are real sources for the subsequent RO transfer.
     let probe = provider
         .open_session(provider_grant.owner, provider_grant.share_id)
         .unwrap();
@@ -364,6 +364,7 @@ async fn run_managed_read_only_two_suppliers(force_owner_fallback: bool) {
     let observer = TransferObserver::new(move |event| {
         observed.lock().expect("observer lock").push(event);
     });
+    let share_event_start = share_events.lock().expect("share observer lock").len();
     let report = consumer_engine
         .sync_read_only(Some(observer))
         .await
@@ -393,6 +394,16 @@ async fn run_managed_read_only_two_suppliers(force_owner_fallback: bool) {
         assert_eq!(aggregate.len(), 1, "aggregate receive is emitted once");
         assert_eq!(aggregate[0].bytes, report.pulled_bytes);
         assert!(fallback[0].bytes < aggregate[0].bytes);
+    }
+    let fallback_bytes = events
+        .lock()
+        .expect("observer lock")
+        .iter()
+        .filter(|event| event.phase == "file_received_fallback")
+        .map(|event| event.bytes)
+        .sum::<u64>();
+    if !force_owner_fallback {
+        assert_eq!(fallback_bytes, 0, "swarm-only transfer emits no fallback");
     }
     {
         let events = events.lock().expect("observer lock");
@@ -424,7 +435,8 @@ async fn run_managed_read_only_two_suppliers(force_owner_fallback: bool) {
         }
     }
     {
-        let events = share_events.lock().expect("share observer lock");
+        let share_events = share_events.lock().expect("share observer lock");
+        let events = &share_events[share_event_start..];
         let inbound_swarm = |event: &&ShareTransferEvent| {
             event.phase == SharePhase::Swarm
                 && event.direction == TransferDirection::Inbound
@@ -456,6 +468,16 @@ async fn run_managed_read_only_two_suppliers(force_owner_fallback: bool) {
         assert!(
             started_before_first.len() >= 2,
             "two admitted providers must start before the first verified chunk"
+        );
+        let verified_swarm_bytes = events
+            .iter()
+            .filter(|event| inbound_swarm(event) && event.bytes > 0)
+            .map(|event| event.bytes)
+            .sum::<u64>();
+        assert_eq!(
+            verified_swarm_bytes + fallback_bytes,
+            report.pulled_bytes,
+            "typed verified swarm plus fallback bytes equals the aggregate report"
         );
     }
     assert_eq!(
