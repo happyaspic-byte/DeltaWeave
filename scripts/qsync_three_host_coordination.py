@@ -137,6 +137,17 @@ def verify(run_id: str, source_sha: str, keepalive_seconds: int, rw: dict[str, A
         raise CoordinationError("role_contract_invalid")
     if rw.get("keepalive_requested_seconds") != keepalive_seconds or rw.get("keepalive_observed") is not True:
         raise CoordinationError("keepalive_missing")
+    diagnostic_stages = rw.get("remote_diagnostic_stages")
+    diagnostic_counts = rw.get("remote_diagnostic_counts")
+    if (
+        not isinstance(diagnostic_stages, list)
+        or diagnostic_stages.count("keepalive_enter") != 1
+        or diagnostic_stages.count("keepalive_done") != 1
+        or not isinstance(diagnostic_counts, dict)
+        or diagnostic_counts.get("keepalive_enter") != keepalive_seconds
+        or diagnostic_counts.get("keepalive_done") != keepalive_seconds
+    ):
+        raise CoordinationError("keepalive_missing")
     rw_window = interval(rw, "remote_command_started_utc", "remote_command_finished_utc")
     ro_window = interval(ro, "join_started_utc", "join_finished_utc")
     ro_file_window = interval(ro, "file_hash_started_utc", "file_hash_finished_utc")

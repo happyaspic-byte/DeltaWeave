@@ -38,6 +38,8 @@ def valid_results() -> tuple[dict[str, object], dict[str, object]]:
         "keepalive_trace_done_elapsed_ms": 301000,
         "keepalive_enter_observed_utc": "2026-09-09T08:00:01.100000Z",
         "keepalive_done_observed_utc": "2026-09-09T08:05:01.100000Z",
+        "remote_diagnostic_stages": ["keepalive_enter", "keepalive_done"],
+        "remote_diagnostic_counts": {"keepalive_enter": 300, "keepalive_done": 300},
         "expected_file_hash": FILE_HASH,
         "expected_file_size_bytes": FIXTURE_SIZE,
         "remote_contract_valid": True,
@@ -100,6 +102,11 @@ class CoordinationTests(unittest.TestCase):
     def test_rejects_missing_keepalive_or_role_pass(self) -> None:
         rw, ro = valid_results()
         rw["keepalive_observed"] = False
+        result, output = self.invoke(rw, ro)
+        self.assertEqual(result, 1)
+        self.assertIn("keepalive_missing", output)
+        rw, ro = valid_results()
+        rw["remote_diagnostic_stages"] = ["keepalive_enter"]
         result, output = self.invoke(rw, ro)
         self.assertEqual(result, 1)
         self.assertIn("keepalive_missing", output)
