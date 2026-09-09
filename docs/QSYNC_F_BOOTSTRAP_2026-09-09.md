@@ -220,6 +220,14 @@ bodyless GET 수정 뒤의 retry11은 reopen 전에 test-owned console에 분류
 `pending`, transport cleanup은 true, 별도 probe는 동일하게 orphan 0이었다. 따라서
 retry10/11 어느 것도 graceful reopen pass나 3-host pass를 증명하지 않는다.
 
+콘솔 소유권을 짧게 재표본화하고 정확히 owner+target일 때만 Ctrl+C를 보내도록 한
+retry12(07:53:30Z~07:54:35Z)는 member 재시작 뒤 membership과 fixture file hash,
+`reopen_checks=63`을 통과했다. 마지막 재시작 member가 `stop_exit_timeout`에 걸려
+강제 정리로 끝났으므로 전체 결과는 여전히 `pending`이며 graceful cleanup 증거가
+아니다. 직후 읽기 전용 process probe(07:58:30Z)는 인증·조회에 성공했고
+`deltaweave=0`, `web=0`, orphan 0을 확인했다. 이 결과는 남은 종료 제어 경계를
+분리해 보여주며 3-host F 또는 E bilateral drain ACK를 증명하지 않는다.
+
 `qsync_three_host_winrm_keepalive.py`와 reusable workflow는 `provenance-and-linux-build`
 뒤에 Windows RW와 hosted Ubuntu RO를 병렬로 시작하고, RW의 1~900초 bounded
 keepalive trace와 두 role의 독립 binary hash를 coordination gate에서 확인한다.
@@ -240,5 +248,7 @@ owner 관리자 credential을 전달하지 않는다. 현재 workflow에는 동�
 `actions:read`만 전달하도록 수정됐고, Linux/Windows web test는 `npm --prefix web
 test -- --run`, CLI self-test는 `cargo run --locked --all-features -p deltaweave --
 self-test`를 사용한다. 이 수정으로 시작한 run `34324974244`는 source
-`860b03f2ed151754551f781e6c12947425256bce`에서 진행 중이며, 결과가 나올 때까지
-full F 판정으로 집계하지 않는다.
+`860b03f2ed151754551f781e6c12947425256bce`에서 Linux quality, Windows tests,
+native artifact, ACL probe가 모두 success로 완료됐고, `qsync-three-host-bootstrap`
+job은 `execute_ro=false`로 skipped였다. 따라서 이 run은 전체 CI/네이티브 artifact
+검증의 success이지 외부 3-host F 실행이나 full F 판정이 아니다.
