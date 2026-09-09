@@ -4812,9 +4812,45 @@ mod tests {
     use std::{collections::HashSet, fs, io};
 
     use deltaweave_core::{SYNC_RECORD_SCHEMA_V1, VersionVector};
+    use futures_lite::StreamExt;
+    use iroh::address_lookup::{
+        AddressLookup, EndpointData, EndpointInfo, Error as LookupError, Item,
+    };
     use tempfile::TempDir;
 
     use super::*;
+
+    #[derive(Debug, Clone)]
+    struct DelayedAddressLookup {
+        endpoint: EndpointAddr,
+        delay: Duration,
+    }
+
+    impl AddressLookup for DelayedAddressLookup {
+        fn publish(&self, _data: &EndpointData) {}
+
+        fn resolve(
+            &self,
+            endpoint_id: EndpointId,
+        ) -> Option<futures_lite::stream::Boxed<Result<Item, LookupError>>> {
+            if endpoint_id != self.endpoint.id {
+                return None;
+            }
+            let endpoint = self.endpoint.clone();
+            let delay = self.delay;
+            Some(
+                futures_lite::stream::once_future(async move {
+                    tokio::time::sleep(delay).await;
+                    Ok(Item::new(
+                        EndpointInfo::from(endpoint),
+                        "delayed-test",
+                        None,
+                    ))
+                })
+                .boxed(),
+            )
+        }
+    }
 
     fn regular_files_below(path: &Path) -> usize {
         let Ok(entries) = fs::read_dir(path) else {
@@ -4848,6 +4884,73 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn endpoint_id_fallback_reserves_budget_for_delayed_lookup() {
+        let server = Endpoint::builder(presets::Minimal)
+            .alpns(vec![ALPN_V3.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        let server_address = EndpointAddr::from_parts(
+            server.id(),
+            [TransportAddr::Ip(SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                server.bound_sockets()[0].port(),
+            ))],
+        );
+        let server_task = tokio::spawn({
+            let server = server.clone();
+            async move {
+                let incoming = server.accept().await.unwrap();
+                let connection = incoming.await.unwrap();
+                connection.closed().await;
+            }
+        });
+
+        let client = Endpoint::builder(presets::Minimal)
+            .alpns(vec![ALPN_V3.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        client.address_lookup().unwrap().add(DelayedAddressLookup {
+            endpoint: server_address.clone(),
+            delay: Duration::from_millis(1_200),
+        });
+        let stale = EndpointAddr::from_parts(
+            server.id(),
+            [TransportAddr::Ip("192.0.2.1:9".parse().unwrap())],
+        );
+        let session = SyncSession {
+            client: SyncClient {
+                secret_key: SecretKey::generate(),
+                remote: stale.clone(),
+                network_mode: NetworkMode::Internet,
+            },
+            endpoint: client.clone(),
+            share: None,
+            remote: Arc::new(RwLock::new(stale)),
+            fallback_endpoint: Some(server.id()),
+            observation: Arc::new(RwLock::new(None)),
+            n0_lookup: Arc::new(RwLock::new(None)),
+        };
+        let started = Instant::now();
+        let connection = session
+            .connect_raw_until(ALPN_V3, started + Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_eq!(connection.remote_id(), server.id());
+        assert_eq!(
+            session.transport_observation().unwrap().provenance,
+            LookupProvenance::EndpointId
+        );
+        assert!(session.n0_lookup_observation().unwrap().matched_endpoint);
+        connection.close(0u8.into(), b"delayed fallback complete");
+        client.close().await;
+        server.close().await;
+        server_task.await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
