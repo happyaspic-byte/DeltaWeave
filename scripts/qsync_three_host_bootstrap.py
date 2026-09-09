@@ -20,6 +20,7 @@ import json
 import os
 import re
 import secrets
+import signal
 import shutil
 import socket
 import subprocess
@@ -1118,6 +1119,8 @@ WINRM_POWER_SHELL_STDIN_ARGUMENTS = (
     "-Command",
     "-",
 )
+LOCAL_GRACEFUL_STOP_TIMEOUT_SECONDS = 30
+LOCAL_FORCED_STOP_TIMEOUT_SECONDS = 5
 
 
 @dataclass
@@ -1308,6 +1311,7 @@ def _run_winrm_powershell(
     command: str,
     *,
     command_deadline_seconds: int = WINRM_COMMAND_DEADLINE_SECONDS,
+    on_stdout: Callable[[bytes], None] | None = None,
 ) -> WinRMResult:
     """Run PowerShell through WinRS with bounded output polling.
 
@@ -1494,6 +1498,18 @@ def _run_winrm_powershell(
                             stdout_bytes = bytes(std_out)
                             std_out_parts.append(stdout_bytes)
                             observe_trace_bytes(stdout_bytes)
+                            if on_stdout is not None:
+                                try:
+                                    on_stdout(stdout_bytes)
+                                except Exception:
+                                    # A readiness observer is advisory to the
+                                    # remote process, but an observer failure
+                                    # must fail closed without exposing its
+                                    # exception text or discarding partial
+                                    # transport evidence.
+                                    transport_error_class = transport_error_class or "remote_failure"
+                                    status_code = -1
+                                    break
                         if std_err:
                             std_err_parts.append(bytes(std_err))
                         if sum(map(len, std_out_parts)) + sum(map(len, std_err_parts)) > WINRM_MAX_STDIN_PAYLOAD_BYTES:
@@ -1572,6 +1588,7 @@ def run_winrm_member(
     vault: SecretVault,
     keepalive_seconds: int = 0,
     expected_file_size: int | None = None,
+    on_stdout: Callable[[bytes], None] | None = None,
 ) -> RemoteRun:
     """Run the approved Windows role over encrypted WinRM without a fake local pass."""
 
@@ -1632,6 +1649,7 @@ def run_winrm_member(
                 session,
                 wrapper,
                 command_deadline_seconds=WINRM_COMMAND_DEADLINE_SECONDS + keepalive_seconds,
+                on_stdout=on_stdout,
             )
         except ImportError:
             # This is a controller precondition; no remote shell was created.
@@ -1814,6 +1832,7 @@ class LocalWebProcess:
         self.profile = run_root / (role + "-profile")
         self.profile_env: dict[str, str] = {}
         self.forced_termination = False
+        self.exit_code: int | None = None
         # A process exit is not a protocol drain acknowledgement.  Keep the
         # distinction explicit so cleanup cannot erase a state directory when
         # the harness only observed the OS process stopping.
@@ -1839,6 +1858,12 @@ class LocalWebProcess:
     def start(self) -> None:
         if self.spec.binary is None:
             fail("binary_missing")
+        if self.process is not None and self.process.poll() is None:
+            fail("process_start_failed")
+        self.process = None
+        self.exit_code = None
+        self.forced_termination = False
+        self.graceful_drain_proven = False
         self.prepare()
         port = free_tcp_port()
         try:
@@ -1855,14 +1880,21 @@ class LocalWebProcess:
                 if not public_host:
                     fail("config_invalid")
                 arguments.extend(("--allow-host", validate_host(public_host)))
-            self.process = subprocess.Popen(
-                arguments,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                env=self.child_environment(),
-                close_fds=True,
-            )
+            popen_kwargs: dict[str, Any] = {
+                "stdin": subprocess.DEVNULL,
+                "stdout": subprocess.DEVNULL,
+                "stderr": subprocess.DEVNULL,
+                "env": self.child_environment(),
+                "close_fds": True,
+            }
+            if os.name == "nt":
+                # CTRL_BREAK is delivered only to a process in a process
+                # group created for this Popen handle.  Never broadcast a
+                # console signal to an inherited or unrelated process.
+                popen_kwargs["creationflags"] = getattr(
+                    subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+                )
+            self.process = subprocess.Popen(arguments, **popen_kwargs)
             self.started_once = True
         except OSError:
             fail("process_start_failed")
@@ -1898,18 +1930,66 @@ class LocalWebProcess:
         process = self.process
         if process is None:
             return True
-        if process.poll() is None:
-            process.terminate()
+        if process.poll() is not None:
+            # An exit observed before our signal is not evidence that the
+            # application drained its managed state.
+            self.exit_code = process.returncode
+            self.graceful_drain_proven = False
+            self.process = None
+            return True
+
+        signal_sent = False
+        stop_signal = (
+            getattr(signal, "CTRL_BREAK_EVENT", None)
+            if os.name == "nt"
+            else signal.SIGTERM
+        )
+        if stop_signal is None:
+            return False
+        try:
+            process.send_signal(stop_signal)
+            signal_sent = True
+        except (OSError, ValueError):
+            # Keep the Popen handle so cleanup/reconciliation can distinguish
+            # an unknown live process from a confirmed stop.
+            if process.poll() is None:
+                return False
+
+        try:
+            return_code = process.wait(timeout=LOCAL_GRACEFUL_STOP_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            self.forced_termination = True
+            self.graceful_drain_proven = False
             try:
-                process.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                self.forced_termination = True
                 process.kill()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
+            except (OSError, ValueError):
+                if process.poll() is None:
                     return False
+            try:
+                return_code = process.wait(timeout=LOCAL_FORCED_STOP_TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired:
+                return False
+            except OSError:
+                if process.poll() is None:
+                    return False
+                return_code = process.returncode
+        except OSError:
+            if process.poll() is None:
+                return False
+            return_code = process.returncode
+
+        if return_code is None:
+            # A missing return code means the process was not conclusively
+            # reaped; retain the handle and do not claim a drain.
+            return False
+        self.exit_code = int(return_code)
         self.process = None
+        self.graceful_drain_proven = bool(
+            os.name == "posix"
+            and signal_sent
+            and not self.forced_termination
+            and self.exit_code == 0
+        )
         return True
 
 
