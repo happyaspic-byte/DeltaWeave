@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
     io::Write,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 const PRIVATE: TableDefinition<&str, &[u8]> = TableDefinition::new("private_roots_v1");
@@ -88,6 +88,37 @@ pub fn reserve_private(path: impl AsRef<Path>) -> Result<PathBuf> {
         None,
         &[path.as_ref().to_path_buf()],
         |_, private| Ok(private[0].clone()),
+    )?;
+    Ok(root)
+}
+
+/// Permanently excludes and prepares one private directory under the global
+/// admission lock.
+///
+/// The callback runs only after all namespace checks, private directory
+/// creation, and the private reservation commit.  It is called in
+/// parent-to-child order for the requested directory and the portion beneath
+/// its nearest already-reserved private ancestor.  A component created by
+/// this invocation has `created=true`; existing components are supplied with
+/// `created=false` so callers can validate them without repairing them.  The
+/// callback must be short, synchronous, and must not recurse into admission.
+pub fn reserve_private_prepared(
+    path: impl AsRef<Path>,
+    mut prepare: impl FnMut(&Path, bool) -> Result<()>,
+) -> Result<PathBuf> {
+    let (_, root) = admit_at_with_creation(
+        &registry_path()?,
+        None,
+        &[path.as_ref().to_path_buf()],
+        &[],
+        true,
+        |_, private, preparation| {
+            ensure!(private.len() == 1);
+            for (path, created) in preparation {
+                prepare(path, *created)?;
+            }
+            Ok(private[0].clone())
+        },
     )?;
     Ok(root)
 }
@@ -180,6 +211,230 @@ fn private_file(path: &Path) -> Result<File> {
     }
     ensure!(!path.is_symlink(), "private file must not be a symlink");
     Ok(options.open(path)?)
+}
+
+fn persist_private_reservations(
+    db: &Database,
+    private: &[PathBuf],
+    stale: &[String],
+) -> Result<()> {
+    if private.is_empty() && stale.is_empty() {
+        return Ok(());
+    }
+    let tx = db.begin_write()?;
+    {
+        let mut table = tx.open_table(PRIVATE)?;
+        for path in private {
+            table.insert(
+                binding(path)?.as_str(),
+                postcard::to_stdvec(path)?.as_slice(),
+            )?;
+        }
+    }
+    for key in stale {
+        tx.open_table(ROOTS)?.remove(key.as_str())?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn open_admission_database(registry: &Path) -> Result<Database> {
+    let db = Database::create(registry.join("roots.redb"))?;
+    if db.begin_read()?.open_table(ROOTS).is_err() {
+        let tx = db.begin_write()?;
+        tx.open_table(ROOTS)?;
+        tx.commit()?;
+    }
+    #[cfg(unix)]
+    File::open(registry)?.sync_all()?;
+    Ok(db)
+}
+
+/// Creates a private directory using either the legacy recursive behavior or
+/// one-component-at-a-time creation for the prepared API.  The latter avoids
+/// treating a recursively created Windows leaf as an already trusted private
+/// directory and reports every component created by this call so the caller
+/// can harden them in parent-to-child order.
+fn create_private_directory(path: &Path, report_created: bool) -> Result<Vec<(PathBuf, bool)>> {
+    if !report_created {
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(path)?;
+        return Ok(Vec::new());
+    }
+
+    let mut current = PathBuf::new();
+    let mut missing = false;
+    let mut created = Vec::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        if matches!(component, Component::Prefix(_)) {
+            continue;
+        }
+        if !missing {
+            match fs::symlink_metadata(&current) {
+                Ok(metadata) => {
+                    ensure!(
+                        metadata.is_dir(),
+                        "private path component is not a directory"
+                    );
+                    ensure!(
+                        fs::canonicalize(&current)? == current,
+                        "private path component changed during preparation"
+                    );
+                    continue;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    missing = true;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        match builder.create(&current) {
+            Ok(()) => created.push((current.clone(), true)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let metadata = fs::symlink_metadata(&current)?;
+                ensure!(
+                    metadata.is_dir(),
+                    "private path component is not a directory"
+                );
+                ensure!(
+                    fs::canonicalize(&current)? == current,
+                    "private path component changed during preparation"
+                );
+                created.push((current.clone(), false));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(created)
+}
+
+fn preparation_paths(
+    private: &[PathBuf],
+    private_directory_count: usize,
+    catalog_private: &[PathBuf],
+    created: &[(PathBuf, bool)],
+) -> Vec<(PathBuf, bool)> {
+    let mut result = Vec::new();
+    for target in private.iter().take(private_directory_count) {
+        // Keep every component touched by this mkdir attempt, even when a
+        // previously committed reservation is now the target boundary.  A
+        // retry may have had to recreate missing parents above that boundary;
+        // dropping them would leave a fresh Windows ACL unprepared.
+        let mut touched = created
+            .iter()
+            .filter(|(path, _)| target.starts_with(path))
+            .cloned()
+            .collect::<Vec<_>>();
+        touched.sort_by_key(|(path, _)| path.components().count());
+        for (path, was_created) in touched {
+            push_preparation(&mut result, path, was_created);
+        }
+
+        let boundary = catalog_private
+            .iter()
+            .filter(|candidate| target.starts_with(candidate))
+            .max_by_key(|candidate| candidate.components().count());
+
+        if let Some(boundary) = boundary {
+            push_preparation(
+                &mut result,
+                boundary.clone(),
+                component_created(created, boundary),
+            );
+            if let Ok(relative) = target.strip_prefix(boundary) {
+                let mut current = boundary.clone();
+                for component in relative.components() {
+                    current.push(component.as_os_str());
+                    push_preparation(
+                        &mut result,
+                        current.clone(),
+                        component_created(created, &current),
+                    );
+                }
+            }
+        } else if !result.iter().any(|(path, _)| path == target) {
+            push_preparation(&mut result, target.clone(), false);
+        }
+    }
+    result.sort_by_key(|(path, _)| path.components().count());
+    result
+}
+
+fn component_created(created: &[(PathBuf, bool)], path: &Path) -> bool {
+    created
+        .iter()
+        .find_map(|(created_path, was_created)| (created_path == path).then_some(*was_created))
+        .unwrap_or(false)
+}
+
+fn push_preparation(result: &mut Vec<(PathBuf, bool)>, path: PathBuf, created: bool) {
+    if let Some((_, known_created)) = result.iter_mut().find(|(known, _)| *known == path) {
+        *known_created |= created;
+    } else {
+        result.push((path, created));
+    }
+}
+
+/// Rejects aliases and reparse points without canonicalizing the requested
+/// path.  Prepared admission runs this once before lock acquisition and again
+/// while holding the global lock, closing the replacement window before its
+/// canonical path is derived.  Legacy admission keeps its alias-following
+/// behavior for compatibility.
+fn validate_private_path_components(path: &Path) -> Result<()> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut current = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(_) => current.push(component.as_os_str()),
+            Component::ParentDir => {
+                current.pop();
+            }
+            Component::CurDir => {}
+            Component::RootDir | Component::Normal(_) => {
+                current.push(component.as_os_str());
+                match fs::symlink_metadata(&current) {
+                    Ok(metadata) => ensure!(
+                        !metadata.file_type().is_symlink() && !is_reparse_point(&metadata),
+                        "prepared private path contains an alias or reparse point"
+                    ),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+const fn is_reparse_point(_metadata: &fs::Metadata) -> bool {
+    false
 }
 
 fn binding(root: &Path) -> Result<String> {
@@ -354,6 +609,29 @@ fn admit_at_with_files<T>(
     private_files: &[PathBuf],
     prepare: impl FnOnce(Option<&Path>, &[PathBuf]) -> Result<T>,
 ) -> Result<(Option<RootLease>, T)> {
+    admit_at_with_creation(
+        registry,
+        public,
+        private_directories,
+        private_files,
+        false,
+        |public, private, _| prepare(public, private),
+    )
+}
+
+fn admit_at_with_creation<T>(
+    registry: &Path,
+    public: Option<(&Path, RootUse)>,
+    private_directories: &[PathBuf],
+    private_files: &[PathBuf],
+    prepared_creation: bool,
+    prepare: impl FnOnce(Option<&Path>, &[PathBuf], &[(PathBuf, bool)]) -> Result<T>,
+) -> Result<(Option<RootLease>, T)> {
+    if prepared_creation {
+        for path in private_directories {
+            validate_private_path_components(path)?;
+        }
+    }
     // The registry itself is private even before the initial bootstrap mkdir.
     let proposed_registry = prospective_root(registry)?;
     if let Some((path, _)) = &public {
@@ -366,6 +644,11 @@ fn admit_at_with_files<T>(
     let registry = fs::canonicalize(registry)?;
     let global = private_file(&registry.join("registry.lock"))?;
     fs2::FileExt::lock_exclusive(&global)?;
+    if prepared_creation {
+        for path in private_directories {
+            validate_private_path_components(path)?;
+        }
+    }
     let public = public
         .map(|(path, kind)| Ok::<_, anyhow::Error>((prospective_root(path)?, kind)))
         .transpose()?;
@@ -388,10 +671,11 @@ fn admit_at_with_files<T>(
         }
     }
     let catalog = read_admission(&registry.join("roots.redb"))?;
-    for root in catalog.private {
+    let private_catalog = catalog.private.clone();
+    for root in &catalog.private {
         if let Some((public, _)) = &public {
             ensure!(
-                !overlaps(public, &root),
+                !overlaps(public, root),
                 "network root overlaps reserved private state"
             );
         }
@@ -434,8 +718,8 @@ fn admit_at_with_files<T>(
             );
         }
     }
-    // Complete every overlap check before touching any requested directory or
-    // calling the catalog writer. Global serialization continues through commit.
+    // Complete every overlap check before touching any requested directory.
+    // Global serialization continues through directory creation and commit.
     let public_state = if let Some((root, kind)) = public {
         let key = binding(&root)?;
         let lock = private_file(&registry.join(format!("{key}.lease")))?;
@@ -482,6 +766,19 @@ fn admit_at_with_files<T>(
     } else {
         None
     };
+    let mut db = prepared_creation
+        .then(|| open_admission_database(&registry))
+        .transpose()?;
+    // Prepared reservations are durable before mkdir.  If creation or ACL
+    // preparation fails, the conservative exclusion remains in the catalog.
+    if prepared_creation {
+        persist_private_reservations(
+            db.as_ref().expect("prepared admission database"),
+            &private,
+            &stale,
+        )?;
+    }
+    let mut private_components = Vec::new();
     for (index, path) in private.iter().enumerate() {
         let directory = if index < private_directories.len() {
             path.as_path()
@@ -492,14 +789,11 @@ fn admit_at_with_files<T>(
             );
             path.parent().context("private file has no parent")?
         };
-        let mut builder = fs::DirBuilder::new();
-        builder.recursive(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
+        if index < private_directories.len() {
+            private_components.extend(create_private_directory(directory, prepared_creation)?);
+        } else {
+            create_private_directory(directory, false)?;
         }
-        builder.create(directory)?;
         ensure!(
             fs::canonicalize(directory)? == directory,
             "private root changed during preparation"
@@ -511,36 +805,32 @@ fn admit_at_with_files<T>(
             );
         }
     }
-    let db = Database::create(registry.join("roots.redb"))?;
-    // The writable catalog is opened only after namespace preflight succeeds.
-    if db.begin_read()?.open_table(ROOTS).is_err() {
-        let tx = db.begin_write()?;
-        tx.open_table(ROOTS)?;
-        tx.commit()?;
+    private_components.sort_by_key(|(path, _)| path.components().count());
+    let private_preparation = if prepared_creation {
+        preparation_paths(
+            &private,
+            private_directories.len(),
+            &private_catalog,
+            &private_components,
+        )
+    } else {
+        Vec::new()
+    };
+    // Legacy callers retain their established create-then-commit behavior.
+    // Prepared callers already committed the exclusion before mkdir above.
+    if !prepared_creation {
+        db = Some(open_admission_database(&registry)?);
+        persist_private_reservations(
+            db.as_ref().expect("legacy admission database"),
+            &private,
+            &stale,
+        )?;
     }
-    #[cfg(unix)]
-    File::open(&registry)?.sync_all()?;
-    // Persist private exclusions before the callback may write any sensitive data.
-    // A later preparation failure intentionally leaves conservative reservations.
-    if !private.is_empty() || !stale.is_empty() {
-        let tx = db.begin_write()?;
-        {
-            let mut table = tx.open_table(PRIVATE)?;
-            for path in &private {
-                table.insert(
-                    binding(path)?.as_str(),
-                    postcard::to_stdvec(path)?.as_slice(),
-                )?;
-            }
-        }
-        for key in stale {
-            tx.open_table(ROOTS)?.remove(key.as_str())?;
-        }
-        tx.commit()?;
-    }
+    let db = db.expect("admission database");
     let result = prepare(
         public_state.as_ref().map(|(_, _, lease)| lease.root()),
         &private,
+        &private_preparation,
     )?;
     let lease = if let Some((key, mut entry, lease)) = public_state {
         ensure!(
@@ -696,6 +986,36 @@ mod tests {
         drop(lease);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn prepared_private_rejects_lexical_alias_before_reservation() {
+        let temp = TempDir::new().unwrap();
+        let registry = temp.path().join("registry");
+        let real = temp.path().join("real");
+        let alias = temp.path().join("alias");
+        fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let target = alias.join("nested/leaf");
+        let callback_called = std::sync::atomic::AtomicBool::new(false);
+
+        let result = admit_at_with_creation(
+            &registry,
+            None,
+            std::slice::from_ref(&target),
+            &[],
+            true,
+            |_, _, _| {
+                callback_called.store(true, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(!callback_called.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(!real.join("nested").exists());
+        assert!(!registry.exists());
+    }
+
     #[test]
     fn admission_registry_is_private_before_bootstrap_and_for_descendants() {
         let temp = TempDir::new().unwrap();
@@ -766,6 +1086,188 @@ mod tests {
         assert!(acquire_at(&registry, &private, RootUse::Legacy).is_err());
         assert!(acquire_at(&registry, &public, managed()).is_ok());
     }
+
+    #[test]
+    fn prepared_private_creation_reports_new_components_in_parent_order() {
+        let temp = TempDir::new().unwrap();
+        let registry = temp.path().join("registry");
+        let target = temp.path().join("private/nested/leaf");
+        let expected_target = fs::canonicalize(&target).unwrap_or_else(|_| target.clone());
+        let (_, returned) = admit_at_with_creation(
+            &registry,
+            None,
+            std::slice::from_ref(&target),
+            &[],
+            true,
+            |_, private, created| {
+                assert_eq!(private, std::slice::from_ref(&expected_target));
+                assert_eq!(created.len(), 3);
+                assert!(created.windows(2).all(|pair| {
+                    pair[0].0.components().count() < pair[1].0.components().count()
+                }));
+                assert_eq!(created.last().map(|(path, _)| path), Some(&expected_target));
+                assert!(created.iter().all(|(_, was_created)| *was_created));
+                Ok(private[0].clone())
+            },
+        )
+        .unwrap();
+        assert_eq!(returned, expected_target);
+        assert!(target.is_dir());
+        assert!(
+            read_admission(&registry.join("roots.redb"))
+                .unwrap()
+                .private
+                .contains(&expected_target)
+        );
+    }
+
+    #[test]
+    fn prepared_private_existing_leaf_reports_no_creation_and_preserves_parent() {
+        let temp = TempDir::new().unwrap();
+        let registry = temp.path().join("registry");
+        let target = temp.path().join("private/nested/leaf");
+        fs::create_dir_all(&target).unwrap();
+        let (_, returned) = admit_at_with_creation(
+            &registry,
+            None,
+            std::slice::from_ref(&target),
+            &[],
+            true,
+            |_, private, created| {
+                assert_eq!(created, &[(fs::canonicalize(&target).unwrap(), false)]);
+                Ok(private[0].clone())
+            },
+        )
+        .unwrap();
+        assert_eq!(returned, fs::canonicalize(target).unwrap());
+    }
+
+    #[test]
+    fn prepared_private_rechecks_existing_components_below_reserved_ancestor() {
+        let temp = TempDir::new().unwrap();
+        let registry = temp.path().join("registry");
+        let base = temp.path().join("private");
+        admit_at_with_creation(
+            &registry,
+            None,
+            std::slice::from_ref(&base),
+            &[],
+            true,
+            |_, _, _| Ok(()),
+        )
+        .unwrap();
+        let nested = base.join("nested");
+        fs::create_dir(&nested).unwrap();
+        let target = nested.join("leaf");
+        let (_, returned) = admit_at_with_creation(
+            &registry,
+            None,
+            std::slice::from_ref(&target),
+            &[],
+            true,
+            |_, private, preparation| {
+                assert_eq!(private[0], fs::canonicalize(&target).unwrap());
+                assert_eq!(
+                    preparation,
+                    &[
+                        (fs::canonicalize(&base).unwrap(), false),
+                        (fs::canonicalize(&nested).unwrap(), false),
+                        (fs::canonicalize(&target).unwrap(), true),
+                    ]
+                );
+                Ok(private[0].clone())
+            },
+        )
+        .unwrap();
+        assert_eq!(returned, fs::canonicalize(target).unwrap());
+    }
+
+    #[test]
+    fn prepared_private_callback_failure_keeps_reservation() {
+        let temp = TempDir::new().unwrap();
+        let registry = temp.path().join("registry");
+        let target = temp.path().join("private/leaf");
+        let expected_target = prospective_root(&target).unwrap();
+        let expected_parent = expected_target.parent().unwrap().to_path_buf();
+        let result = admit_at_with_creation(
+            &registry,
+            None,
+            std::slice::from_ref(&target),
+            &[],
+            true,
+            |_, _, _| -> Result<()> { anyhow::bail!("preparation failed") },
+        );
+        assert!(result.is_err());
+        assert!(
+            read_admission(&registry.join("roots.redb"))
+                .unwrap()
+                .private
+                .contains(&expected_target)
+        );
+        assert!(target.is_dir());
+        fs::remove_dir_all(temp.path().join("private")).unwrap();
+        let (_, returned) = admit_at_with_creation(
+            &registry,
+            None,
+            std::slice::from_ref(&target),
+            &[],
+            true,
+            |_, private, preparation| {
+                assert_eq!(
+                    preparation,
+                    &[(expected_parent, true), (expected_target.clone(), true),],
+                    "a committed missing target and its recreated parents must be prepared"
+                );
+                Ok(private[0].clone())
+            },
+        )
+        .unwrap();
+        assert_eq!(returned, expected_target);
+    }
+
+    #[test]
+    fn prepared_private_retry_preserves_existing_race_components() {
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("private/leaf");
+        let created = vec![(temp.path().join("private"), false), (target.clone(), true)];
+
+        assert_eq!(
+            preparation_paths(
+                std::slice::from_ref(&target),
+                1,
+                std::slice::from_ref(&target),
+                &created,
+            ),
+            created,
+            "an AlreadyExists component after the first missing path remains a
+             validation step even when the reservation is the boundary"
+        );
+    }
+
+    #[test]
+    fn prepared_private_overlap_is_rejected_before_creation_or_callback() {
+        let temp = TempDir::new().unwrap();
+        let registry = temp.path().join("registry");
+        let public = temp.path().join("public");
+        let target = public.join("private/nested");
+        let _lease = acquire_at(&registry, &public, managed()).unwrap();
+        let callback_called = std::sync::atomic::AtomicBool::new(false);
+        let result = admit_at_with_creation(
+            &registry,
+            None,
+            std::slice::from_ref(&target),
+            &[],
+            true,
+            |_, _, _| {
+                callback_called.store(true, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert!(!target.exists());
+        assert!(!callback_called.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
     fn wait_file(path: &Path) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         while !path.exists() {
