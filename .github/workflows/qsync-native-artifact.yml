@@ -143,8 +143,8 @@ jobs:
               throw 'web/dist/assets contains no JavaScript asset'
             }
 
-            Invoke-RecordedCommand -Phase 'native_build' -Command 'cargo build --locked --release --target x86_64-pc-windows-msvc -p deltaweave' {
-              cargo build --locked --release --target $target -p deltaweave
+            Invoke-RecordedCommand -Phase 'native_build' -Command 'cargo build --locked --all-features --release --target x86_64-pc-windows-msvc -p deltaweave' {
+              cargo build --locked --all-features --release --target $target -p deltaweave
             }
             Invoke-RecordedCommand -Phase 'cargo_lock' -Command 'git diff --exit-code -- Cargo.lock' {
               git diff --exit-code -- Cargo.lock

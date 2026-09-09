@@ -39,6 +39,7 @@ from typing import Any, Callable, Iterable, Mapping, NoReturn
 
 SOURCE_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+RUN_ID_RE = re.compile(r"^[0-9]{1,20}$")
 ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 ROLE_NAMES = ("owner", "rw_provider", "ro_consumer")
@@ -142,6 +143,12 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def utc_now_precise() -> str:
+    """Return a UTC timestamp precise enough to order short API phases."""
+
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
 def json_object(value: Any, error_class: str = "api_response_invalid") -> dict[str, Any]:
     if not isinstance(value, dict):
         fail(error_class)
@@ -164,6 +171,12 @@ def require_sha256(value: Any, error_class: str = "config_invalid") -> str:
 def require_source_sha(value: Any) -> str:
     value = require_string(value)
     if not SOURCE_SHA_RE.fullmatch(value):
+        fail("config_invalid")
+    return value
+
+
+def require_run_id(value: Any) -> str:
+    if not isinstance(value, str) or not RUN_ID_RE.fullmatch(value):
         fail("config_invalid")
     return value
 
@@ -485,7 +498,7 @@ class PhaseRecorder:
         action: Callable[[], Any],
     ) -> Outcome:
         started_at = time.monotonic()
-        started = utc_now()
+        started = utc_now_precise()
         try:
             value = action()
             if isinstance(value, Outcome):
@@ -512,7 +525,7 @@ class PhaseRecorder:
             outcome = Outcome("failed", "timeout", 124)
         except Exception:
             outcome = Outcome("failed", "unexpected", 1)
-        finished = utc_now()
+        finished = utc_now_precise()
         self.add(
             phase=phase,
             role=role,
@@ -938,6 +951,17 @@ REMOTE_REQUIRED_PHASES = (
     "member_reopen_membership",
     "cleanup",
 )
+REMOTE_REOPEN_TRACE_STAGES = (
+    "reopen_login_enter",
+    "reopen_login_done",
+    "reopen_membership_enter",
+    "reopen_membership_done",
+    "reopen_checks",
+)
+REMOTE_KEEPALIVE_TRACE_STAGES = (
+    "keepalive_enter",
+    "keepalive_done",
+)
 REMOTE_TRACE_STAGES = {
     "config_ok",
     "binary_done",
@@ -976,6 +1000,13 @@ REMOTE_TRACE_STAGES = {
     "owner_attach_enter",
     "owner_stop_enter",
     "member_reopen_enter",
+    "reopen_login_enter",
+    "reopen_login_done",
+    "reopen_membership_enter",
+    "reopen_membership_done",
+    "reopen_checks",
+    "keepalive_enter",
+    "keepalive_done",
     "artifact_download_enter",
     "artifact_download_done",
     "artifact_hash_done",
@@ -985,6 +1016,9 @@ REMOTE_TRACE_STAGES = {
     "streams_drained",
     "console_released",
     "stop_ctrlc_failed",
+    "stop_exit_probe",
+    "stop_exit_probe_timeout",
+    "stop_exit_code",
     "stop_exit_timeout",
     "stop_stream_timeout",
     "stop_release_failed",
@@ -1007,6 +1041,8 @@ def remote_contract_is_complete(
     expected_binary_size: int,
     expected_file_hash: str,
     expected_file_size: int | None = None,
+    *,
+    require_keepalive: bool = False,
 ) -> bool:
     """Require one complete transcript with independent binary/file bindings."""
 
@@ -1023,6 +1059,19 @@ def remote_contract_is_complete(
         return False
     if any(item.get("ok") is not True for item in remote.phases):
         return False
+    # The reopen phase is backed by a real HTTP login, an exact membership
+    # lookup, and a file re-read.  A phase-only transcript could otherwise
+    # claim success after observing just a non-null response.  Require each
+    # bounded diagnostic stage exactly once and the all-checks bitmask: 1 is
+    # login, 2 is HTTP 200, 4 is the same share, 8 is the file hash, 16 is a
+    # member role, and 32 is the expected permission.
+    required_trace_stages = REMOTE_REOPEN_TRACE_STAGES + (
+        REMOTE_KEEPALIVE_TRACE_STAGES if require_keepalive else ()
+    )
+    if any(remote.diagnostic_stages.count(stage) != 1 for stage in required_trace_stages):
+        return False
+    if remote.diagnostic_counts.get("reopen_checks") != 63:
+        return False
     binary = remote.phases[0]
     if binary.get("hash") != expected_binary_hash or binary.get("size") != expected_binary_size:
         return False
@@ -1030,6 +1079,11 @@ def remote_contract_is_complete(
     if file_hash.get("hash") != expected_file_hash or not isinstance(file_hash.get("size"), int) or file_hash["size"] <= 0:
         return False
     if expected_file_size is not None and file_hash.get("size") != expected_file_size:
+        return False
+    reopened = remote.phases[8]
+    if reopened.get("hash") != expected_file_hash or not isinstance(reopened.get("size"), int) or reopened["size"] <= 0:
+        return False
+    if expected_file_size is not None and reopened.get("size") != expected_file_size:
         return False
     cleanup = remote.phases[-1]
     return cleanup.get("signal") == "ctrl_c" and cleanup.get("forced") is not True
@@ -1080,6 +1134,7 @@ class RemoteRun:
     diagnostic_stages: list[str] = field(default_factory=list)
     diagnostic_counts: dict[str, int] = field(default_factory=dict)
     diagnostic_elapsed_ms: dict[str, int] = field(default_factory=dict)
+    diagnostic_observed_utc: dict[str, str] = field(default_factory=dict)
     transport_error_class: str | None = None
     output_bytes: int = 0
     status_code: int = 1
@@ -1095,6 +1150,7 @@ class WinRMResult:
     receive_poll_count: int = 0
     error_class: str | None = None
     output_bytes: int = 0
+    diagnostic_observed_utc: dict[str, str] = field(default_factory=dict)
 
 
 def parse_remote_output(stdout: bytes | str, expected_hash: str, expected_size: int | None = None) -> RemoteRun:
@@ -1121,7 +1177,7 @@ def parse_remote_output(stdout: bytes | str, expected_hash: str, expected_size: 
         if not match or match.group(1) not in REMOTE_PHASES:
             continue
         phase, ok, hash_value, size_value, forced, signal, error_class = match.groups()
-        if error_class not in ERROR_CLASSES:
+        if error_class is not None and error_class not in ERROR_CLASSES:
             error_class = "unexpected"
         if hash_value and phase == "file_hash":
             result.file_hash = hash_value
@@ -1194,8 +1250,8 @@ def record_remote_output(recorder: PhaseRecorder, role: str, remote: RemoteRun) 
             role=role,
             command_id=f"remote.{role}.{phase}.{index}",
             status="pass" if ok else "failed",
-            started=utc_now(),
-            finished=utc_now(),
+            started=utc_now_precise(),
+            finished=utc_now_precise(),
             elapsed_ms=0,
             exit_code=0 if ok else 1,
             error_class=error_class,
@@ -1247,7 +1303,12 @@ def _winrm_command_lengths(command: str) -> dict[str, int]:
     }
 
 
-def _run_winrm_powershell(session: Any, command: str) -> WinRMResult:
+def _run_winrm_powershell(
+    session: Any,
+    command: str,
+    *,
+    command_deadline_seconds: int = WINRM_COMMAND_DEADLINE_SECONDS,
+) -> WinRMResult:
     """Run PowerShell through WinRS with bounded output polling.
 
     ``Protocol.get_command_output`` intentionally retries operation timeouts
@@ -1282,6 +1343,8 @@ def _run_winrm_powershell(session: Any, command: str) -> WinRMResult:
     receive_poll_count = 0
     std_out_parts: list[bytes] = []
     std_err_parts: list[bytes] = []
+    trace_scan_buffer = b""
+    diagnostic_observed_utc: dict[str, str] = {}
     status_code = -1
     transport_error_class: str | None = None
     old_operation_timeout = getattr(protocol, "operation_timeout_sec", None)
@@ -1335,7 +1398,9 @@ def _run_winrm_powershell(session: Any, command: str) -> WinRMResult:
         if category == "timeout":
             command_timed_out = True
 
-    deadline = time.monotonic() + WINRM_COMMAND_DEADLINE_SECONDS
+    if not isinstance(command_deadline_seconds, int) or command_deadline_seconds < WINRM_COMMAND_DEADLINE_SECONDS:
+        fail("config_invalid")
+    deadline = time.monotonic() + command_deadline_seconds
 
     def before_command_rpc() -> bool:
         nonlocal command_timed_out, transport_error_class
@@ -1355,6 +1420,34 @@ def _run_winrm_powershell(session: Any, command: str) -> WinRMResult:
         except Exception as error:
             mark_transport_error(error)
             return False, None
+
+    def observe_trace_bytes(chunk: bytes, *, flush: bool = False) -> None:
+        """Capture controller receive times for the fixed keepalive traces."""
+
+        nonlocal trace_scan_buffer
+        if chunk:
+            trace_scan_buffer += chunk
+            if len(trace_scan_buffer) > 8192:
+                trace_scan_buffer = trace_scan_buffer[-8192:]
+        while b"\n" in trace_scan_buffer:
+            line, trace_scan_buffer = trace_scan_buffer.split(b"\n", 1)
+            try:
+                decoded = line.strip().decode("ascii")
+            except UnicodeDecodeError:
+                continue
+            trace = REMOTE_TRACE_RE.fullmatch(decoded)
+            if trace and trace.group(1) in REMOTE_KEEPALIVE_TRACE_STAGES:
+                diagnostic_observed_utc.setdefault(trace.group(1), utc_now_precise())
+        if flush and trace_scan_buffer:
+            try:
+                decoded = trace_scan_buffer.strip().decode("ascii")
+            except UnicodeDecodeError:
+                trace_scan_buffer = b""
+                return
+            trace_scan_buffer = b""
+            trace = REMOTE_TRACE_RE.fullmatch(decoded)
+            if trace and trace.group(1) in REMOTE_KEEPALIVE_TRACE_STAGES:
+                diagnostic_observed_utc.setdefault(trace.group(1), utc_now_precise())
 
     try:
         set_receive_timeouts()
@@ -1398,7 +1491,9 @@ def _run_winrm_powershell(session: Any, command: str) -> WinRMResult:
                         std_out, std_err, status_code, command_done = raw_output(shell_id, command_id)
                         receive_poll_count += 1
                         if std_out:
-                            std_out_parts.append(bytes(std_out))
+                            stdout_bytes = bytes(std_out)
+                            std_out_parts.append(stdout_bytes)
+                            observe_trace_bytes(stdout_bytes)
                         if std_err:
                             std_err_parts.append(bytes(std_err))
                         if sum(map(len, std_out_parts)) + sum(map(len, std_err_parts)) > WINRM_MAX_STDIN_PAYLOAD_BYTES:
@@ -1415,6 +1510,7 @@ def _run_winrm_powershell(session: Any, command: str) -> WinRMResult:
                         # hard deadline before issuing another Receive.
                         if not before_command_rpc():
                             break
+        observe_trace_bytes(b"", flush=True)
         if command_timed_out or transport_error_class in {"timeout", "api_response_invalid"}:
             status_code = -1
     finally:
@@ -1459,6 +1555,7 @@ def _run_winrm_powershell(session: Any, command: str) -> WinRMResult:
         receive_poll_count=receive_poll_count,
         error_class=transport_error_class,
         output_bytes=sum(map(len, std_out_parts)) + sum(map(len, std_err_parts)),
+        diagnostic_observed_utc=diagnostic_observed_utc,
     )
 
 
@@ -1473,11 +1570,14 @@ def run_winrm_member(
     public_host: str,
     artifact_size: int,
     vault: SecretVault,
+    keepalive_seconds: int = 0,
 ) -> RemoteRun:
     """Run the approved Windows role over encrypted WinRM without a fake local pass."""
 
     if not isinstance(artifact_size, int) or artifact_size <= 0:
         fail("manifest_invalid")
+    if not isinstance(keepalive_seconds, int) or not 0 <= keepalive_seconds <= 900:
+        fail("config_invalid")
     if not all((spec.winrm_host_env, spec.winrm_username_env, spec.winrm_password_env)):
         fail("config_invalid")
     host_raw = os.environ.get(spec.winrm_host_env or "")
@@ -1507,6 +1607,8 @@ def run_winrm_member(
             "destination_root": destination,
             "expected_file_hash": expected_file_hash,
             "expected_file_name": "fixture-a.bin",
+            "expected_permission": "read_write",
+            "keepalive_seconds": str(keepalive_seconds),
         }
         wrapper = _winrm_wrapper(script, remote_config)
         try:
@@ -1520,7 +1622,11 @@ def run_winrm_member(
                 operation_timeout_sec=45,
                 read_timeout_sec=60,
             )
-            result = _run_winrm_powershell(session, wrapper)
+            result = _run_winrm_powershell(
+                session,
+                wrapper,
+                command_deadline_seconds=WINRM_COMMAND_DEADLINE_SECONDS + keepalive_seconds,
+            )
         except ImportError:
             # This is a controller precondition; no remote shell was created.
             return RemoteRun(
@@ -1544,6 +1650,7 @@ def run_winrm_member(
         remote.receive_poll_count = result.receive_poll_count
         remote.transport_error_class = result.error_class
         remote.output_bytes = result.output_bytes
+        remote.diagnostic_observed_utc = result.diagnostic_observed_utc
         add_remote_timeout_phase(remote)
         if not server.served:
             remote.transport_error_class = remote.transport_error_class or "external_unavailable"

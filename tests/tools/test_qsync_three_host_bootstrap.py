@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPT = Path(__file__).parents[2] / "scripts" / "qsync_three_host_bootstrap.py"
@@ -20,6 +21,18 @@ SPEC.loader.exec_module(MODULE)
 
 
 class QsyncBootstrapTests(unittest.TestCase):
+    def test_phase_recorder_uses_subsecond_utc_timestamps(self) -> None:
+        recorder = MODULE.PhaseRecorder()
+        with mock.patch.object(
+            MODULE,
+            "utc_now_precise",
+            side_effect=["2026-09-09T08:00:00.100000Z", "2026-09-09T08:00:00.200000Z"],
+        ):
+            outcome = recorder.run("member_join", "ro_consumer", "test.join", lambda: None)
+        self.assertEqual(outcome.status, "pass")
+        self.assertEqual(recorder.phases[0]["started_utc"], "2026-09-09T08:00:00.100000Z")
+        self.assertEqual(recorder.phases[0]["finished_utc"], "2026-09-09T08:00:00.200000Z")
+
     def test_secret_config_is_rejected_but_environment_reference_is_allowed(self) -> None:
         with self.assertRaises(MODULE.HarnessError) as error:
             MODULE.reject_secret_config({"password": "never-in-config"})

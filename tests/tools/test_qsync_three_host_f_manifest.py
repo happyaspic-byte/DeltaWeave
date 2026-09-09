@@ -22,6 +22,13 @@ assert SPEC is not None and SPEC.loader is not None
 BOOTSTRAP = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = BOOTSTRAP
 SPEC.loader.exec_module(BOOTSTRAP)
+sys.modules.setdefault("qsync_three_host_bootstrap", BOOTSTRAP)
+ROLE_SPEC = importlib.util.spec_from_file_location(
+    "qsync_three_host_role_manifest_test", ROOT / "scripts" / "qsync_three_host_role.py"
+)
+assert ROLE_SPEC is not None and ROLE_SPEC.loader is not None
+ROLE = importlib.util.module_from_spec(ROLE_SPEC)
+ROLE_SPEC.loader.exec_module(ROLE)
 
 
 def digest(path: Path) -> str:
@@ -29,6 +36,20 @@ def digest(path: Path) -> str:
 
 
 class QsyncRoleManifestTests(unittest.TestCase):
+    def test_role_phase_window_reads_durable_recorder_timestamps(self) -> None:
+        phases = [
+            {
+                "phase": "member_join",
+                "status": "pass",
+                "started_utc": "2026-09-09T08:00:00.100000Z",
+                "finished_utc": "2026-09-09T08:00:00.200000Z",
+            }
+        ]
+        self.assertEqual(
+            ROLE.phase_window(phases, "member_join"),
+            ("2026-09-09T08:00:00.100000Z", "2026-09-09T08:00:00.200000Z"),
+        )
+
     def test_config_rejects_raw_share_key(self) -> None:
         with self.assertRaises(BOOTSTRAP.HarnessError) as error:
             BOOTSTRAP.reject_secret_config({"share_key": "raw-secret"})
@@ -99,6 +120,34 @@ class QsyncRoleManifestTests(unittest.TestCase):
             self.assertEqual(staged.read_bytes(), content)
             self.assertEqual(staged.stat().st_mode & 0o777, 0o700)
 
+    def test_rw_runner_stages_private_copy_and_owns_evidence_directory_creation(self) -> None:
+        runner = (ROOT / "scripts" / "qsync_three_host_winrm_keepalive.py").read_text(encoding="utf-8")
+        workflow = (ROOT / ".github" / "workflows" / "qsync-three-host-bootstrap.yml").read_text(encoding="utf-8")
+        self.assertIn("tempfile.mkdtemp(prefix=\"qsync-f-rw-\"", runner)
+        self.assertIn("bootstrap.stage_role_binary", runner)
+        self.assertIn("run_owned_copy_removed", runner)
+        self.assertIn("keepalive_observed(remote, args.keepalive_seconds)", runner)
+        self.assertIn('"file_hash_started_utc": file_hash_started_utc', (ROOT / "scripts" / "qsync_three_host_role.py").read_text(encoding="utf-8"))
+        self.assertIn('root.add_argument("--run-id", required=True)', runner)
+        self.assertIn("--run-id \"$COORDINATION_RUN_ID\"", workflow)
+        self.assertIn("hosted-ro-consumer", workflow)
+        self.assertIn("controller\n# downloads its redacted result", workflow)
+        self.assertNotIn("concurrent-role-gate", workflow)
+        self.assertIn("ro_share_key_secret_name", workflow)
+        self.assertNotIn("windows-rw-provider", workflow)
+        for forbidden in (
+            "QSYNC_F_WINRM_USERNAME",
+            "QSYNC_F_WINRM_PASSWORD",
+            "QSYNC_F_WINRM_HOST",
+            "QSYNC_F_WINRM_DESTINATION",
+            "QSYNC_F_OWNER_API_URL",
+            "QSYNC_F_ARTIFACT_PUBLIC_HOST",
+            "QSYNC_F_RW_SHARE_KEY",
+        ):
+            self.assertNotIn(forbidden, workflow)
+        self.assertNotRegex(workflow, r"mkdir[^\n]*qsync-f-rw-evidence")
+        self.assertNotRegex(workflow, r"mkdir[^\n]*qsync-f-evidence")
+
     def test_evidence_bundle_removes_partial_publication_on_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary) / "evidence"
@@ -123,20 +172,82 @@ class QsyncRoleManifestTests(unittest.TestCase):
         ]
         phases[0].update(hash=expected_binary, size=123)
         phases[7].update(hash=expected_file, size=256)
+        phases[8].update(hash=expected_file, size=256)
         phases[-1]["signal"] = "ctrl_c"
         remote = BOOTSTRAP.RemoteRun(
             phases=phases,
+            diagnostic_stages=list(BOOTSTRAP.REMOTE_REOPEN_TRACE_STAGES),
+            diagnostic_counts={"reopen_checks": 63},
             graceful_signal=True,
             transport_cleanup_completed=True,
             status_code=0,
         )
         self.assertTrue(BOOTSTRAP.remote_contract_is_complete(remote, expected_binary, 123, expected_file, 256))
+        self.assertFalse(
+            BOOTSTRAP.remote_contract_is_complete(
+                remote, expected_binary, 123, expected_file, 256, require_keepalive=True
+            )
+        )
+        remote.diagnostic_stages.extend(BOOTSTRAP.REMOTE_KEEPALIVE_TRACE_STAGES)
+        remote.diagnostic_counts.update({"keepalive_enter": 300, "keepalive_done": 300})
+        self.assertTrue(
+            BOOTSTRAP.remote_contract_is_complete(
+                remote, expected_binary, 123, expected_file, 256, require_keepalive=True
+            )
+        )
         self.assertFalse(BOOTSTRAP.remote_contract_is_complete(remote, expected_binary, 123, expected_binary, 123))
+        remote.phases[8]["size"] = 255
+        self.assertFalse(BOOTSTRAP.remote_contract_is_complete(remote, expected_binary, 123, expected_file, 256))
+        remote.phases[8]["size"] = 256
+        remote.diagnostic_counts["reopen_checks"] = 31
+        self.assertFalse(BOOTSTRAP.remote_contract_is_complete(remote, expected_binary, 123, expected_file, 256))
+        remote.diagnostic_counts["reopen_checks"] = 63
         remote.transport_error_class = "timeout"
         self.assertFalse(BOOTSTRAP.remote_contract_is_complete(remote, expected_binary, 123, expected_file, 256))
         remote.phases.pop(2)
         remote.transport_error_class = None
         self.assertFalse(BOOTSTRAP.remote_contract_is_complete(remote, expected_binary, 123, expected_file, 256))
+
+    def test_remote_parser_retains_keepalive_trace_for_gate(self) -> None:
+        expected_binary = "d" * 64
+        expected_file = "e" * 64
+        lines = []
+        for phase in BOOTSTRAP.REMOTE_REQUIRED_PHASES:
+            if phase == "binary_verification":
+                lines.append(f"FROLE|phase={phase}|ok=true|hash={expected_binary}|size=123")
+            elif phase in {"file_hash", "member_reopen_membership"}:
+                lines.append(f"FROLE|phase={phase}|ok=true|hash={expected_file}|size=256")
+            elif phase == "cleanup":
+                lines.append(f"FROLE|phase={phase}|ok=true|signal=ctrl_c")
+            else:
+                lines.append(f"FROLE|phase={phase}|ok=true")
+        lines.extend(
+            [
+                "FTRACE|stage=reopen_login_enter|elapsed_ms=10",
+                "FTRACE|stage=reopen_login_done|count=200|elapsed_ms=11",
+                "FTRACE|stage=reopen_membership_enter|elapsed_ms=12",
+                "FTRACE|stage=reopen_membership_done|count=200|elapsed_ms=13",
+                "FTRACE|stage=reopen_checks|count=63|elapsed_ms=14",
+                "FTRACE|stage=keepalive_enter|count=300|elapsed_ms=15",
+                "FTRACE|stage=keepalive_done|count=300|elapsed_ms=315",
+            ]
+        )
+        remote = BOOTSTRAP.parse_remote_output("\n".join(lines), expected_binary, 123)
+        remote.status_code = 0
+        remote.transport_cleanup_completed = True
+        remote.graceful_signal = True
+        self.assertEqual(remote.diagnostic_counts["keepalive_enter"], 300)
+        self.assertEqual(remote.diagnostic_counts["keepalive_done"], 300)
+        self.assertTrue(
+            BOOTSTRAP.remote_contract_is_complete(
+                remote,
+                expected_binary,
+                123,
+                expected_file,
+                256,
+                require_keepalive=True,
+            )
+        )
 
     def test_platform_hashes_may_differ_when_source_matches(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -353,8 +464,18 @@ class QsyncRoleManifestTests(unittest.TestCase):
         self.assertNotIn("BeginErrorReadLine", script)
         self.assertIn("CopyToAsync([IO.Stream]::Null)", script)
         self.assertIn("ProcessStreamTasks", script)
+        self.assertIn("$Method -eq 'Post' -and $PSBoundParameters.ContainsKey('Body')", script)
+        self.assertIn("'keepalive_enter', 'keepalive_done'", script)
+        self.assertIn("expected_permission", script)
         self.assertIn("console_test_extra_trusted", script)
         self.assertIn("LastStopErrorClass", script)
+        self.assertIn("for ($attempt = 0; $attempt -lt 20; $attempt++)", script)
+        self.assertIn("if ($Process.HasExited) { return $false }", script)
+        self.assertIn("if (Test-OwnedConsoleProcess $Process)", script)
+        self.assertIn("while ($waitTicks -lt 30 -and -not $exitObserved)", script)
+        self.assertIn("Emit-Diagnostic 'stop_exit_probe' -Count $waitTicks", script)
+        self.assertIn("Emit-Diagnostic 'stop_exit_probe_timeout' -Count $waitTicks", script)
+        self.assertIn("Emit-Diagnostic 'stop_exit_code' -Count $exitCode", script)
 
     def test_winrm_direct_protocol_bypasses_command_shell_and_closes_handles(self) -> None:
         class FakeProtocol:
@@ -431,6 +552,47 @@ class QsyncRoleManifestTests(unittest.TestCase):
         )
         self.assertTrue(large_inputs[-1][1][3]["end"])
 
+    def test_winrm_receive_records_controller_keepalive_observation_times(self) -> None:
+        class SplitTraceProtocol:
+            def __init__(self) -> None:
+                self.polls = 0
+
+            def open_shell(self) -> str:
+                return "shell"
+
+            def run_command(self, *_args: object, **_kwargs: object) -> str:
+                return "command"
+
+            def send_command_input(self, *_args: object, **_kwargs: object) -> None:
+                return None
+
+            def get_command_output_raw(self, *_args: object) -> tuple[bytes, bytes, int, bool]:
+                self.polls += 1
+                if self.polls == 1:
+                    return b"FTRACE|stage=keepalive_enter|count=300|elapsed_ms=10", b"", 0, False
+                return b"\nFTRACE|stage=keepalive_done|count=300|elapsed_ms=300010\n", b"", 0, True
+
+            def cleanup_command(self, *_args: object) -> None:
+                return None
+
+            def close_shell(self, *_args: object) -> None:
+                return None
+
+        with mock.patch.object(
+            BOOTSTRAP,
+            "utc_now_precise",
+            side_effect=["2026-09-09T08:00:00.100000Z", "2026-09-09T08:05:00.100000Z"],
+        ):
+            result = BOOTSTRAP._run_winrm_powershell(
+                type("Session", (), {"protocol": SplitTraceProtocol()})(), "Write-Output FTRACE"
+            )
+        self.assertEqual(result.status_code, 0)
+        self.assertRegex(result.diagnostic_observed_utc["keepalive_enter"], r"^2026-\d{2}-\d{2}T")
+        self.assertRegex(result.diagnostic_observed_utc["keepalive_done"], r"^2026-\d{2}-\d{2}T")
+        self.assertLess(
+            result.diagnostic_observed_utc["keepalive_enter"], result.diagnostic_observed_utc["keepalive_done"]
+        )
+
     def test_winrm_command_length_measurement_is_numeric_and_bounded(self) -> None:
         script = (ROOT / "scripts" / "qsync_three_host_winrm_member.ps1").read_text(encoding="utf-8")
         wrapper = BOOTSTRAP._winrm_wrapper(
@@ -444,6 +606,7 @@ class QsyncRoleManifestTests(unittest.TestCase):
                 "destination_root": r"C:\DeltaWeave-QSync-F-opaque\member-files",
                 "expected_file_hash": "c" * 64,
                 "expected_file_name": "fixture-a.bin",
+                "expected_permission": "read_write",
             },
         )
         lengths = BOOTSTRAP._winrm_command_lengths(wrapper)
@@ -481,6 +644,7 @@ class QsyncRoleManifestTests(unittest.TestCase):
             "destination_root": r"C:\DeltaWeave-QSync-F-opaque\member-files",
             "expected_file_hash": "c" * 64,
             "expected_file_name": "fixture-a.bin",
+            "expected_permission": "read_write",
         }
         wrapper = BOOTSTRAP._winrm_wrapper(script, config)
         encoded_match = re.search(r"-ConfigB64 '([A-Za-z0-9+/=]+)'$", wrapper)
