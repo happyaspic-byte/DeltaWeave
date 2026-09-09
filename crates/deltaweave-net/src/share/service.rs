@@ -37,10 +37,58 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, RwLock, atomic::Ordering},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 const CONTROL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The provider-side activation lease returned after a signed owner reply.
+///
+/// `deadline` is derived from the instant immediately before the activation
+/// request was sent.  Keeping that local monotonic deadline next to the reply
+/// prevents a caller from accidentally starting a fresh lease when a reply is
+/// received late.  The type is intentionally local to this process and is not
+/// serialized onto the wire.
+#[derive(Clone, Debug)]
+pub struct ActivationLease {
+    pub reply: super::ActivateGrantReply,
+    pub deadline: Instant,
+}
+
+impl ActivationLease {
+    fn from_reply_at(
+        reply: super::ActivateGrantReply,
+        request_started: Instant,
+        now: Instant,
+    ) -> Result<Self> {
+        ensure!(reply.accepted, ShareError::GrantReplay);
+        let duration = Duration::from_secs(u64::from(
+            reply
+                .max_duration_secs
+                .min(super::authority::MAX_ACTIVATE_TTL_SECONDS),
+        ));
+        let deadline = request_started
+            .checked_add(duration)
+            .ok_or(ShareError::GrantExpired)?;
+        ensure!(now < deadline, ShareError::GrantExpired);
+        Ok(Self { reply, deadline })
+    }
+
+    fn from_reply(reply: super::ActivateGrantReply, request_started: Instant) -> Result<Self> {
+        Self::from_reply_at(reply, request_started, Instant::now())
+    }
+
+    /// Returns the remaining monotonic lifetime without exposing wall-clock
+    /// expiry or allowing a late response to extend this lease.
+    pub fn remaining(&self) -> Duration {
+        self.deadline.saturating_duration_since(Instant::now())
+    }
+
+    /// Whether this local activation lease can still admit provider work.
+    pub fn is_active(&self) -> bool {
+        Instant::now() < self.deadline
+    }
+}
 
 /// One device-wide persistent endpoint. Clone its endpoint for all outbound shares;
 /// legacy per-folder identities remain separate and are never rebound here.
@@ -871,7 +919,7 @@ impl ShareSession {
     /// monotonic start is captured before the control exchange; the owner
     /// applies its own receive-side deadline and never extends this lease from
     /// a wall-clock expiry.
-    pub async fn activate_grant(&self, grant: &ShareGrant) -> Result<super::ActivateGrantReply> {
+    pub async fn activate_grant(&self, grant: &ShareGrant) -> Result<ActivationLease> {
         ensure!(
             grant.provider == self.membership.endpoint,
             ShareError::EndpointMismatch
@@ -899,11 +947,8 @@ impl ShareSession {
             reply.provider == self.membership.endpoint,
             ShareError::EndpointMismatch
         );
-        ensure!(
-            reply.nonce == grant.nonce && reply.accepted,
-            ShareError::GrantReplay
-        );
-        Ok(reply)
+        ensure!(reply.nonce == grant.nonce, ShareError::GrantReplay);
+        ActivationLease::from_reply(reply, started)
     }
 
     /// Sends one authenticated endpoint drain acknowledgement for an active
@@ -1443,6 +1488,64 @@ mod tests {
         result
     }
 
+    #[test]
+    fn activation_lease_keeps_request_start_deadline_and_reports_reduced_time() {
+        let owner = SecretKey::generate();
+        let provider = SecretKey::generate();
+        let reply = super::super::authority::ActivateGrantReply::sign(
+            &owner,
+            ShareId([0x31; 32]),
+            provider.public(),
+            [0x32; 32],
+            [0x33; 16],
+            true,
+            10,
+        )
+        .unwrap();
+        let request_started = Instant::now();
+        let reply_received = request_started + Duration::from_secs(4);
+        let lease = ActivationLease::from_reply_at(reply, request_started, reply_received).unwrap();
+
+        assert_eq!(
+            lease.deadline,
+            request_started + Duration::from_secs(10),
+            "the response must not start a fresh activation lease"
+        );
+        assert_eq!(
+            lease.deadline.saturating_duration_since(reply_received),
+            Duration::from_secs(6),
+            "a delayed response must retain only the remaining request lifetime"
+        );
+    }
+
+    #[test]
+    fn activation_lease_rejects_a_reply_that_arrived_after_request_deadline() {
+        let owner = SecretKey::generate();
+        let provider = SecretKey::generate();
+        let reply = super::super::authority::ActivateGrantReply::sign(
+            &owner,
+            ShareId([0x41; 32]),
+            provider.public(),
+            [0x42; 32],
+            [0x43; 16],
+            true,
+            15,
+        )
+        .unwrap();
+        let request_started = Instant::now();
+        let error = ActivationLease::from_reply_at(
+            reply,
+            request_started,
+            request_started + Duration::from_secs(16),
+        )
+        .expect_err("a delayed activation reply must not be revived");
+
+        assert_eq!(
+            error.downcast_ref::<ShareError>(),
+            Some(&ShareError::GrantExpired)
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn authenticated_roster_heartbeat_updates_address_and_rejects_replay() {
         let name = "share::service::tests::authenticated_roster_heartbeat_updates_address_and_rejects_replay";
@@ -1801,7 +1904,7 @@ mod tests {
         owner_share.pause().await;
 
         consumer_session
-            .grant_drained(&grant, activation.activation_id)
+            .grant_drained(&grant, activation.reply.activation_id)
             .await
             .unwrap();
         assert!(matches!(
@@ -1812,7 +1915,7 @@ mod tests {
             super::super::RevocationReceipt::Pending { blockers: 1, .. }
         ));
         provider_session
-            .grant_drained(&grant, activation.activation_id)
+            .grant_drained(&grant, activation.reply.activation_id)
             .await
             .unwrap();
         assert!(matches!(
