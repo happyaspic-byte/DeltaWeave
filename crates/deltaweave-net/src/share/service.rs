@@ -1527,7 +1527,17 @@ impl Handler {
     }
 
     async fn wait_closed_bounded(connection: &Connection) {
-        let _ = tokio::time::timeout(CONTROL_DEADLINE, connection.closed()).await;
+        if tokio::time::timeout(CONTROL_DEADLINE, connection.closed())
+            .await
+            .is_err()
+        {
+            // A retained Connection clone can keep the QUIC transport alive
+            // after the admission task releases its permit. Explicitly close
+            // on the bounded-wait path so the peer and any clone observe the
+            // admission boundary; relying on the final handle's implicit
+            // close would make this guarantee depend on hidden ownership.
+            connection.close(0u8.into(), b"share control deadline");
+        }
     }
 
     /// Handles the owner-authoritative v1 swarm control records.  Each branch
@@ -2015,6 +2025,12 @@ mod tests {
             1,
             "silent peer did not release the bounded admission slot"
         );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), silent_connection.closed())
+                .await
+                .is_ok(),
+            "silent peer connection was not explicitly closed after admission timeout"
+        );
         silent_connection.close(0u8.into(), b"silent admission complete");
         silent_peer.close().await;
 
@@ -2049,11 +2065,68 @@ mod tests {
             1,
             "preview connection close wait was not bounded"
         );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), preview_connection.closed())
+                .await
+                .is_ok(),
+            "preview connection was not explicitly closed after admission timeout"
+        );
         preview_connection.close(0u8.into(), b"preview admission complete");
         preview_peer.close().await;
 
         member.shutdown().await.unwrap();
         owner.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expired_session_admission_does_not_send_hello() {
+        let server = Endpoint::builder(presets::Minimal)
+            .alpns(vec![ALPN_V3.to_vec()])
+            .clear_ip_transports()
+            .bind_addr("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let server_socket = server
+            .bound_sockets()
+            .into_iter()
+            .find(|socket| socket.is_ipv4())
+            .expect("test server must expose an IPv4 socket");
+        let server_address =
+            EndpointAddr::from_parts(server.id(), [TransportAddr::Ip(server_socket)]);
+        let server_task = tokio::spawn({
+            let server = server.clone();
+            async move {
+                let incoming = server.accept().await.expect("client connection");
+                let connection = incoming.await.expect("completed client handshake");
+                tokio::time::timeout(Duration::from_secs(1), connection.accept_bi()).await
+            }
+        });
+
+        let client = Endpoint::builder(presets::Minimal).bind().await.unwrap();
+        let connection = client.connect(server_address, ALPN_V3).await.unwrap();
+        let result = wire::open_session_until(
+            &connection,
+            ShareId([0; 32]),
+            Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
+        )
+        .await;
+        assert!(
+            result.as_ref().err().is_some_and(
+                |error| error.downcast_ref::<ShareError>() == Some(&ShareError::Offline)
+            ),
+            "an expired session admission must fail before exchange"
+        );
+
+        let server_stream_result = server_task.await.unwrap();
+        assert!(
+            server_stream_result.is_err(),
+            "an expired session admission must not open a control stream"
+        );
+        connection.close(0u8.into(), b"expired admission test complete");
+        client.close().await;
+        server.close().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

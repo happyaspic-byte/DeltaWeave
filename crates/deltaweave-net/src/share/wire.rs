@@ -123,6 +123,11 @@ pub(crate) async fn open_session_until(
     deadline: Instant,
 ) -> Result<()> {
     let remaining = deadline.saturating_duration_since(Instant::now());
+    // `tokio::time::timeout(Duration::ZERO, future)` may poll a ready future
+    // once. Do the expiry check before constructing/polling `exchange`, so a
+    // caller whose session deadline has elapsed cannot open a stream or send
+    // a Session hello as a side effect of a failed admission.
+    ensure!(!remaining.is_zero(), ShareError::Offline);
     let reply = tokio::time::timeout(
         remaining,
         exchange(
