@@ -462,7 +462,8 @@ if ($repair) {
 
 try { $item = Get-Item -LiteralPath $path -Force } catch { Exit-WithDiagnostic 'post_get_item' 42 $_ }
 if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { exit 33 }
-try { $acl = Get-Acl -LiteralPath $path } catch { Exit-WithDiagnostic 'get_acl' 43 $_ }
+$sections = [System.Security.AccessControl.AccessControlSections]::Access -bor [System.Security.AccessControl.AccessControlSections]::Owner
+try { $acl = [System.IO.Directory]::GetAccessControl($path, $sections) } catch { Exit-WithDiagnostic 'get_acl' 43 $_ }
 if (-not $acl.AreAccessRulesProtected) { exit 34 }
 try { $owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value } catch { Exit-WithDiagnostic 'get_owner' 44 $_ }
 if ($owner -notin $sids) { exit 37 }
@@ -656,7 +657,8 @@ mod tests {
             path,
             r#"
 $ErrorActionPreference = 'Stop'
-$acl = Get-Acl -LiteralPath $env:DELTAWEAVE_PRIVATE_ACL_PATH
+$sections = [System.Security.AccessControl.AccessControlSections]::Access -bor [System.Security.AccessControl.AccessControlSections]::Owner
+$acl = [System.IO.Directory]::GetAccessControl($env:DELTAWEAVE_PRIVATE_ACL_PATH, $sections)
 $rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) |
     ForEach-Object { '{0}|{1}|{2}|{3}|{4}|{5}' -f $_.IdentityReference.Value, $_.AccessControlType, $_.FileSystemRights, $_.InheritanceFlags, $_.PropagationFlags, $_.IsInherited } |
     Sort-Object
@@ -675,7 +677,8 @@ $hash = [System.Security.Cryptography.SHA256]::Create().ComputeHash($bytes)
             r#"
 $ErrorActionPreference = 'Stop'
 $path = $env:DELTAWEAVE_PRIVATE_ACL_PATH
-$acl = Get-Acl -LiteralPath $path
+$sections = [System.Security.AccessControl.AccessControlSections]::Access -bor [System.Security.AccessControl.AccessControlSections]::Owner
+$acl = [System.IO.Directory]::GetAccessControl($path, $sections)
 $identity = New-Object System.Security.Principal.NTAccount('Everyone')
 $rights = [System.Security.AccessControl.FileSystemRights]::ReadAndExecute
 $inheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
