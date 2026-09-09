@@ -252,3 +252,9 @@ self-test`를 사용한다. 이 수정으로 시작한 run `34324974244`는 sour
 native artifact, ACL probe가 모두 success로 완료됐고, `qsync-three-host-bootstrap`
 job은 `execute_ro=false`로 skipped였다. 따라서 이 run은 전체 CI/네이티브 artifact
 검증의 success이지 외부 3-host F 실행이나 full F 판정이 아니다.
+해당 run의 Windows native artifact manifest도 재다운로드해 SHA-256
+`36011de777b1523d82e886964f19c39220c3b44ee0558d4e95d66aebc4e31227`, 크기
+`34,064,896` bytes, target `x86_64-pc-windows-msvc`, source
+`860b03f2ed151754551f781e6c12947425256bce`로 바이너리와 manifest가 일치함을
+확인했다. 이는 retry12에서 사용한 이전 source
+`2f44d9fbfbe1c4779bd59f78fe9cc4ff27f41cd6` artifact와 별도다.
