@@ -169,6 +169,8 @@ struct ManagedStageIdentity {
     file: u64,
 }
 
+type ManagedStageMarker = dyn Fn(&Path, Option<ManagedStageIdentity>) -> Result<()> + Send + Sync;
+
 fn managed_stage_identity(path: &Path) -> Option<ManagedStageIdentity> {
     let metadata = fs::symlink_metadata(path).ok()?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -215,7 +217,7 @@ static MANAGED_STAGE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 /// Exact owner admission retained across a process restart.  This is a
 /// local journal record; the signed permit remains the authority and the
 /// operation id prevents a retry from creating a second owner row.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct ManagedApplyJournal {
     pub(crate) permit: deltaweave_net::share::ApplyPermit,
     pub(crate) operation_id: [u8; 16],
@@ -282,36 +284,50 @@ impl ManagedRwJournal {
 }
 
 fn decode_managed_rw_journal(bytes: &[u8]) -> Result<ManagedRwJournal> {
-    match postcard::from_bytes::<ManagedRwJournal>(bytes) {
-        Ok(journal) => Ok(journal),
-        Err(_) => match postcard::from_bytes::<LegacyManagedRwJournalV1>(bytes) {
-            Ok(legacy) => {
-                ensure!(legacy.version == 1, ShareError::StateUnavailable);
-                Ok(ManagedRwJournal {
-                    version: MANAGED_RW_JOURNAL_VERSION,
-                    owner: legacy.owner,
-                    share: legacy.share,
-                    stage_identities: vec![None; legacy.stage_roots.len()],
-                    stage_roots: legacy.stage_roots,
-                    apply: legacy.apply,
-                })
-            }
-            Err(_) => {
-                let legacy: LegacyManagedRwJournal =
-                    postcard::from_bytes(bytes).context(ShareError::StateUnavailable)?;
-                ensure!(legacy.version == 1, ShareError::StateUnavailable);
-                let stage_roots = legacy.stage_root.into_iter().collect::<Vec<_>>();
-                Ok(ManagedRwJournal {
-                    version: MANAGED_RW_JOURNAL_VERSION,
-                    owner: legacy.owner,
-                    share: legacy.share,
-                    stage_identities: vec![None; stage_roots.len()],
-                    stage_roots,
-                    apply: legacy.apply,
-                })
-            }
-        },
+    if let Ok(journal) = decode_exact_postcard::<ManagedRwJournal>(bytes)
+        && journal.version == MANAGED_RW_JOURNAL_VERSION
+    {
+        return Ok(journal);
     }
+    if let Ok(legacy) = decode_exact_postcard::<LegacyManagedRwJournalV1>(bytes)
+        && legacy.version == 1
+    {
+        return Ok(ManagedRwJournal {
+            version: MANAGED_RW_JOURNAL_VERSION,
+            owner: legacy.owner,
+            share: legacy.share,
+            stage_identities: vec![None; legacy.stage_roots.len()],
+            stage_roots: legacy.stage_roots,
+            apply: legacy.apply,
+        });
+    }
+    if let Ok(legacy) = decode_exact_postcard::<LegacyManagedRwJournal>(bytes)
+        && legacy.version == 1
+    {
+        let stage_roots = legacy.stage_root.into_iter().collect::<Vec<_>>();
+        return Ok(ManagedRwJournal {
+            version: MANAGED_RW_JOURNAL_VERSION,
+            owner: legacy.owner,
+            share: legacy.share,
+            stage_identities: vec![None; stage_roots.len()],
+            stage_roots,
+            apply: legacy.apply,
+        });
+    }
+    Err(ShareError::StateUnavailable.into())
+}
+
+/// Postcard's ordinary `from_bytes` intentionally accepts a valid value with
+/// trailing bytes. Managed journal variants are positional migrations, so a
+/// trailing field must never be silently interpreted as a different version.
+fn decode_exact_postcard<T>(bytes: &[u8]) -> Result<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let (value, remaining) = postcard::take_from_bytes(bytes)
+        .map_err(|_| anyhow::Error::new(ShareError::StateUnavailable))?;
+    ensure!(remaining.is_empty(), ShareError::StateUnavailable);
+    Ok(value)
 }
 
 #[derive(Default)]
@@ -480,13 +496,68 @@ fn retain_existing_stage_roots(journal: &mut ManagedRwJournal) {
         .drain(..)
         .zip(journal.stage_identities.drain(..))
     {
-        if fs::symlink_metadata(&root).is_ok() {
-            roots.push(root);
-            identities.push(identity);
+        match fs::symlink_metadata(&root) {
+            Ok(_) => {
+                roots.push(root);
+                identities.push(identity);
+            }
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                // PermissionDenied, NotADirectory, and transient filesystem
+                // failures do not prove that the run-owned directory is gone.
+                // Dropping the journal reference here would make an uncertain
+                // replacement uncollectable and could permit a later retry to
+                // treat it as fresh local state.
+                roots.push(root);
+                identities.push(identity);
+            }
+            Err(_) => {}
         }
     }
     journal.stage_roots = roots;
     journal.stage_identities = identities;
+}
+
+/// Adds a stage root to the durable managed journal before any CAS transfer
+/// or private materialization begins. Existing uncertain roots remain part of
+/// the bounded recovery set; a new round may never silently replace that
+/// reference with only its newest stage.
+fn record_managed_stage_root(
+    journal: &mut ManagedRwJournal,
+    root: &Path,
+    identity: Option<ManagedStageIdentity>,
+) -> Result<()> {
+    ensure!(
+        journal.stage_roots.len() == journal.stage_identities.len(),
+        ShareError::StateUnavailable
+    );
+    if let Some(index) = journal
+        .stage_roots
+        .iter()
+        .position(|existing| existing == root)
+    {
+        if journal.stage_identities[index].is_none() {
+            journal.stage_identities[index] = identity;
+        }
+    } else {
+        ensure!(
+            journal.stage_roots.len() < MAX_MANAGED_OWNER_ROUNDS.saturating_add(1),
+            ShareError::StateUnavailable
+        );
+        journal.stage_roots.push(root.to_path_buf());
+        journal.stage_identities.push(identity);
+    }
+    Ok(())
+}
+
+fn merge_managed_stage_roots(journal: &mut ManagedRwJournal, stages: &ManagedStages) -> Result<()> {
+    ensure!(
+        journal.stage_roots.len() == journal.stage_identities.len(),
+        ShareError::StateUnavailable
+    );
+    for root in &stages.roots {
+        record_managed_stage_root(journal, root, stages.identities.get(root).copied())?;
+    }
+    Ok(())
 }
 
 impl Drop for ManagedStages {
@@ -1236,18 +1307,42 @@ impl ReplicaState {
                         .checked_add(bytes)
                         .context("managed pending materialization byte count overflow")
                 })?;
-            let (round_staged, round_stats) = self
-                .stage_managed_files(
-                    session,
-                    &required_files,
-                    &local_records,
-                    &owner_snapshot.records,
-                    pending_local_bytes,
-                    &owner_snapshot,
-                    true,
-                    observer,
-                )
-                .await?;
+            let (round_staged, round_stats, marked_journal) = {
+                // The stage function is awaited inside an owned managed task,
+                // so its marker must be owned too.  The cell is only locked
+                // for the synchronous metadata write and is extracted after
+                // the stage task returns.
+                let journal_cell = Arc::new(std::sync::Mutex::new(journal.clone()));
+                let marker_cell = Arc::clone(&journal_cell);
+                let index = Arc::clone(&self.index);
+                let stage_marker: Arc<ManagedStageMarker> = Arc::new(move |root, identity| {
+                    let mut marked = marker_cell
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("managed journal lock poisoned"))?;
+                    record_managed_stage_root(&mut marked, root, identity)?;
+                    index.set_share_metadata(&postcard::to_stdvec(&*marked)?)
+                });
+                let result = self
+                    .stage_managed_files(
+                        session,
+                        &required_files,
+                        &local_records,
+                        &owner_snapshot.records,
+                        pending_local_bytes,
+                        &owner_snapshot,
+                        true,
+                        observer,
+                        Some(stage_marker.clone()),
+                    )
+                    .await?;
+                drop(stage_marker);
+                let marked_journal = Arc::try_unwrap(journal_cell)
+                    .map_err(|_| anyhow::anyhow!("managed journal marker still active"))?
+                    .into_inner()
+                    .map_err(|_| anyhow::anyhow!("managed journal lock poisoned"))?;
+                (result.0, result.1, marked_journal)
+            };
+            journal = marked_journal;
             staged.merge(round_staged);
             stage_stats.local_files = stage_stats
                 .local_files
@@ -1310,12 +1405,11 @@ impl ReplicaState {
             let deadline = admission_started + MANAGED_APPLY_TTL;
             ensure_managed_deadline(deadline)?;
             let operation = managed_operation_id(b"managed-local-apply", &owner_snapshot.token, 0);
-            journal.stage_roots = staged.roots.clone();
-            journal.stage_identities = staged
-                .roots
-                .iter()
-                .map(|root| staged.identities.get(root).copied())
-                .collect();
+            // Keep any earlier stage whose ownership could not be proven
+            // after restart. Replacing the journal with only this round's
+            // roots would turn an uncertain path into an untracked private
+            // namespace on the next successful cycle.
+            merge_managed_stage_roots(&mut journal, &staged)?;
             journal.apply = Some(ManagedApplyJournal {
                 permit: permit.clone(),
                 operation_id: operation,
@@ -1706,6 +1800,7 @@ impl ReplicaState {
         snapshot: &AuthoritativeSnapshot,
         prefer_local: bool,
         observer: &Option<TransferObserver>,
+        stage_marker: Option<Arc<ManagedStageMarker>>,
     ) -> Result<(ManagedStages, StageStats)> {
         let local_sources = live_file_sources(local);
         let remote_sources = live_file_sources(remote);
@@ -1735,6 +1830,12 @@ impl ReplicaState {
             .join(format!(".managed-stage-{stage_name}-{stage_sequence}"));
         let stage_root = root_admission::reserve_private(&requested_root)?;
         let mut stage_guard = ManagedStageGuard::new(stage_root.clone(), self.store.state_root());
+        if let Some(marker) = stage_marker {
+            // Record the owner/path identity before the first provider request
+            // or CAS materialization. A process crash after reserve_private
+            // must leave a durable reference for the next recovery round.
+            marker(&stage_root, managed_stage_identity(&stage_root))?;
+        }
         let stage_budget_bytes = required_sizes.values().try_fold(0_u64, |total, size| {
             total
                 .checked_add(*size)
@@ -4060,6 +4161,9 @@ mod tests {
         assert_eq!(decoded.version, MANAGED_RW_JOURNAL_VERSION);
         assert_eq!(decoded.stage_roots, legacy.stage_roots);
         assert_eq!(decoded.stage_identities, vec![None]);
+        let mut trailing = bytes;
+        trailing.push(0xa5);
+        assert!(decode_managed_rw_journal(&trailing).is_err());
         assert!(decoded.apply.is_none());
 
         let first = LegacyManagedRwJournal {
@@ -4076,5 +4180,95 @@ mod tests {
             first.stage_root.into_iter().collect::<Vec<_>>()
         );
         assert_eq!(decoded.stage_identities, vec![None]);
+    }
+
+    #[test]
+    fn managed_rw_journal_v1_apply_some_uses_legacy_shape() {
+        let owner = SecretKey::generate();
+        let consumer = SecretKey::generate().public();
+        let permit = ApplyPermit {
+            version: 1,
+            owner: owner.public(),
+            share: ShareId([3; 32]),
+            consumer,
+            epoch: 1,
+            snapshot: [4; 32],
+            root_hash: Hash32::digest(b"legacy-apply"),
+            issued_at: 1,
+            expires_at: 2,
+            nonce: [5; 32],
+            signature: iroh::Signature::from_bytes(&[0; 64]),
+        };
+        let legacy = LegacyManagedRwJournalV1 {
+            version: 1,
+            owner: [6; 32],
+            share: [7; 32],
+            stage_roots: vec![PathBuf::from("state/.managed-stage-apply")],
+            apply: Some(ManagedApplyJournal {
+                permit,
+                operation_id: [8; 16],
+                committed: true,
+            }),
+        };
+        let bytes = postcard::to_stdvec(&legacy).expect("legacy apply journal encoding");
+        let decoded = decode_managed_rw_journal(&bytes).expect("legacy apply journal decoding");
+        assert_eq!(decoded.version, MANAGED_RW_JOURNAL_VERSION);
+        assert_eq!(decoded.stage_roots, legacy.stage_roots);
+        assert_eq!(decoded.stage_identities, vec![None]);
+        assert_eq!(decoded.apply, legacy.apply);
+
+        let mut trailing = bytes;
+        trailing.push(0x5a);
+        assert!(decode_managed_rw_journal(&trailing).is_err());
+    }
+
+    #[test]
+    fn managed_stage_reference_drops_only_explicit_not_found() {
+        let temp = tempfile::tempdir().expect("stage retention root");
+        let state_root = temp.path().join("state");
+        std::fs::create_dir_all(&state_root).expect("state root created");
+        let blocking_parent = state_root.join("blocking-file");
+        std::fs::write(&blocking_parent, b"not a directory").expect("blocking parent created");
+        let not_a_directory = blocking_parent.join("child");
+        let missing = state_root.join(".managed-stage-missing");
+        let mut journal = ManagedRwJournal {
+            version: MANAGED_RW_JOURNAL_VERSION,
+            owner: [1; 32],
+            share: [2; 32],
+            stage_roots: vec![not_a_directory.clone(), missing],
+            stage_identities: vec![None, None],
+            apply: None,
+        };
+
+        retain_existing_stage_roots(&mut journal);
+
+        assert_eq!(journal.stage_roots, vec![not_a_directory]);
+        assert_eq!(journal.stage_identities, vec![None]);
+    }
+
+    #[test]
+    fn managed_stage_merge_preserves_uncertain_previous_reference() {
+        let mut journal = ManagedRwJournal {
+            version: MANAGED_RW_JOURNAL_VERSION,
+            owner: [1; 32],
+            share: [2; 32],
+            stage_roots: vec![PathBuf::from("state/.managed-stage-uncertain")],
+            stage_identities: vec![None],
+            apply: None,
+        };
+        let current_root = PathBuf::from("state/.managed-stage-current");
+        let mut stages = ManagedStages::default();
+        stages.roots.push(current_root.clone());
+
+        merge_managed_stage_roots(&mut journal, &stages).expect("stage roots merge");
+
+        assert_eq!(
+            journal.stage_roots,
+            vec![
+                PathBuf::from("state/.managed-stage-uncertain"),
+                current_root
+            ]
+        );
+        assert_eq!(journal.stage_identities, vec![None, None]);
     }
 }
