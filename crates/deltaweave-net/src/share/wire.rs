@@ -1,8 +1,9 @@
 use super::{
     ActivateGrantReply, ActivateGrantRequest, ActivationCancel, ActivationReceipt,
-    ActivationStatusQuery, ApplyDrained, ApplyPermit, ApplyStart, AuthoritativeSnapshot,
-    GrantNonce, LegacyProof, ManifestAttestation, Membership, RosterHeartbeat, ShareError,
-    ShareGrant, ShareId, ShareTicket, SignedRoster, SnapshotToken, TicketPreview,
+    ActivationStatusQuery, ApplyCancel, ApplyDrained, ApplyPermit, ApplyReceipt, ApplyStart,
+    ApplyStatusQuery, AuthoritativeSnapshot, GrantNonce, LegacyProof, ManifestAttestation,
+    Membership, RosterHeartbeat, ShareError, ShareGrant, ShareId, ShareTicket, SignedRoster,
+    SnapshotToken, TicketPreview,
 };
 use crate::{read_frame, write_frame};
 use anyhow::{Result, ensure};
@@ -69,6 +70,10 @@ pub(crate) enum Operation {
     /// Atomically cancels an Issued activation, or returns the existing
     /// Active/terminal receipt when activation won the race.
     ActivationCancel(ActivationCancel),
+    /// Queries the owner's durable apply journal without extending its lease.
+    ApplyStatus(ApplyStatusQuery),
+    /// Atomically cancels a Prepared apply; active writer rows remain blockers.
+    ApplyCancel(ApplyCancel),
 }
 #[derive(Serialize, Deserialize)]
 pub(crate) enum Reply {
@@ -102,6 +107,39 @@ pub(crate) enum Reply {
     GrantDrained,
     /// Owner-authenticated durable activation state for status and cancel.
     ActivationReceipt(ActivationReceipt),
+    /// Owner-authenticated durable apply state for status and recovery.
+    ApplyReceipt(ApplyReceipt),
+}
+
+/// The grant-gated data stream is deliberately separate from the legacy
+/// sync/3 CAS protocol.  The signed grant and manifest are sent on every
+/// stream so a provider never authorizes a connection from an address hint or
+/// a caller-selected role.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) enum SwarmRequest {
+    Grant {
+        grant: super::ShareGrant,
+        snapshot: super::SnapshotToken,
+        record: deltaweave_core::SyncRecord,
+        manifest: super::ManifestAttestation,
+        hashes: Vec<deltaweave_core::Hash32>,
+        operation_id: [u8; 16],
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) enum SwarmResponse {
+    Ready(super::ActivationReceipt),
+    Chunks {
+        present: Vec<deltaweave_core::Hash32>,
+        missing: Vec<deltaweave_core::Hash32>,
+    },
+    ChunkHeader {
+        hash: deltaweave_core::Hash32,
+        length: u32,
+    },
+    Finished(super::SwarmTransferReceipt),
+    Error(ShareError),
 }
 
 pub(crate) async fn read_hello(receive: &mut RecvStream) -> Result<Hello> {

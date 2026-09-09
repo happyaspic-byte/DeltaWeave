@@ -1572,6 +1572,18 @@ impl SyncSession {
         self.connect_raw_until(share::ALPN_V3, deadline).await
     }
 
+    /// Opens one additional authenticated ALPN on this already-bound device
+    /// endpoint. Share-swarm uses this narrow hook so it can reuse the same
+    /// endpoint-ID fallback and monotonic deadline as share/3 without opening
+    /// a second endpoint or transport identity.
+    pub(crate) async fn connect_alpn_until(
+        &self,
+        alpn: &[u8],
+        deadline: Instant,
+    ) -> Result<Connection> {
+        self.connect_raw_until(alpn, deadline).await
+    }
+
     async fn connect(&self) -> Result<OperationConnection> {
         let alpn = if self.share.is_some() {
             share::ALPN_V3

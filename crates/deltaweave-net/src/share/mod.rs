@@ -8,9 +8,10 @@ mod ticket;
 pub(crate) mod wire;
 pub use authority::{
     ActivateGrantReply, ActivateGrantRequest, ActivationBinding, ActivationCancel,
-    ActivationReceipt, ActivationStateView, ActivationStatusQuery, ApplyDrained, ApplyPermit,
-    ApplyStart, AuthoritativeSnapshot, ManifestAttestation, RevocationReceipt, ShareGrant,
-    SnapshotToken,
+    ActivationReceipt, ActivationStateView, ActivationStatusQuery, ApplyCancel, ApplyDrained,
+    ApplyPermit, ApplyReceipt, ApplyStart, ApplyStateView, ApplyStatusQuery, AuthoritativeSnapshot,
+    ClientIntentPhase, ClientIntentRow, ClientSide, ManifestAttestation, RevocationReceipt,
+    ShareGrant, SnapshotToken, SwarmTransferReceipt,
 };
 pub use registry::{Invitation, MemberRelationship, Membership, OwnedShareConfig};
 pub use roster::{
@@ -19,7 +20,10 @@ pub use roster::{
 };
 pub(crate) use runtime::Authorization;
 pub use runtime::{MutationProvenance, OwnerShare};
-pub use service::{ActivationLease, ShareService, ShareSession};
+pub use service::{
+    ActivationLease, LocalIoDrainProof, ManagedAdmissionLease, ShareService, ShareSession,
+    SupplierRegistrationGuard,
+};
 
 pub const ALPN_V3: &[u8] = b"deltaweave/share/3";
 /// Separate grant-gated data protocol.  D2 registers the endpoint and
