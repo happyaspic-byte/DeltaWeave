@@ -23,7 +23,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::{
-    sync::{Mutex as AsyncMutex, RwLock, oneshot},
+    sync::{Mutex as AsyncMutex, Notify, RwLock, oneshot},
     task::JoinHandle,
 };
 use worker::Worker;
@@ -377,6 +377,165 @@ impl Runtime {
         }
     }
 }
+
+fn error_summary_matches(left: &Option<ErrorSummary>, right: &Option<ErrorSummary>) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => left.code == right.code && left.message == right.message,
+        _ => false,
+    }
+}
+
+fn connected_devices_match(left: &[ConnectedDeviceView], right: &[ConnectedDeviceView]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            left.member_id == right.member_id
+                && left.permission == right.permission
+                && left.active_operations == right.active_operations
+                && left.last_seen_at == right.last_seen_at
+        })
+}
+
+/// Preserves fields written by the non-async observer/failure callbacks when a
+/// durable full-config snapshot was taken before those callbacks ran.  Durable
+/// membership, request, and tombstone fields intentionally remain owned by the
+/// snapshot mutation itself; only the callback-owned view/status fields merge.
+fn merge_managed_observations(
+    target: &mut [config::ManagedShareRecord],
+    baseline: &[config::ManagedShareRecord],
+    current: &[config::ManagedShareRecord],
+) -> bool {
+    let mut changed = false;
+    for current_record in current {
+        let Some(baseline_record) = baseline
+            .iter()
+            .find(|record| record.share_id == current_record.share_id)
+        else {
+            continue;
+        };
+        let Some(target_record) = target
+            .iter_mut()
+            .find(|record| record.share_id == current_record.share_id)
+        else {
+            // A concurrent remove owns the durable row.  Never resurrect it
+            // merely because an old observer callback is still in flight.
+            continue;
+        };
+
+        let current_is_terminal = matches!(
+            current_record.status,
+            ManagedStatus::Paused | ManagedStatus::Revoked
+        );
+        let target_was_terminal = matches!(
+            target_record.status,
+            ManagedStatus::Paused | ManagedStatus::Revoked
+        );
+        let current_status_changed = current_record.status != baseline_record.status;
+        let target_status_changed = target_record.status != baseline_record.status;
+        if !target_was_terminal
+            && current_status_changed
+            && target_record.status != current_record.status
+        {
+            target_record.status = current_record.status;
+            changed = true;
+        }
+        let target_is_terminal = matches!(
+            target_record.status,
+            ManagedStatus::Paused | ManagedStatus::Revoked
+        );
+        let allow_current_observation = !target_status_changed || current_status_changed;
+        let copy_status_observation = current_status_changed
+            && (!target_is_terminal || (current_is_terminal && !target_was_terminal));
+        let copy_observation_view = copy_status_observation
+            || (allow_current_observation
+                && current_record.phase != baseline_record.phase
+                && !target_is_terminal);
+
+        // Pause/revoke has lifecycle priority over a late observer event.  A
+        // direct failure update, however, must retain its terminal/error view
+        // fields even when the durable snapshot changed unrelated settings.
+        if copy_observation_view {
+            if target_record.phase != current_record.phase {
+                target_record.phase = current_record.phase.clone();
+                changed = true;
+            }
+            if target_record.retry_at != current_record.retry_at {
+                target_record.retry_at = current_record.retry_at;
+                changed = true;
+            }
+            if !error_summary_matches(&target_record.last_error, &current_record.last_error) {
+                target_record.last_error = current_record.last_error.clone();
+                changed = true;
+            }
+        } else if allow_current_observation && !target_is_terminal {
+            if target_record.retry_at != current_record.retry_at {
+                target_record.retry_at = current_record.retry_at;
+                changed = true;
+            }
+            if !error_summary_matches(&target_record.last_error, &current_record.last_error) {
+                target_record.last_error = current_record.last_error.clone();
+                changed = true;
+            }
+        }
+
+        if allow_current_observation
+            && current_record.transferred_bytes != baseline_record.transferred_bytes
+        {
+            let transferred = target_record
+                .transferred_bytes
+                .max(current_record.transferred_bytes);
+            if target_record.transferred_bytes != transferred {
+                target_record.transferred_bytes = transferred;
+                changed = true;
+            }
+        }
+        if allow_current_observation
+            && current_record.speed_bps != baseline_record.speed_bps
+            && target_record.speed_bps != current_record.speed_bps
+        {
+            target_record.speed_bps = current_record.speed_bps;
+            changed = true;
+        }
+        if allow_current_observation
+            && current_record.active_peer_count != baseline_record.active_peer_count
+            && target_record.active_peer_count != current_record.active_peer_count
+        {
+            target_record.active_peer_count = current_record.active_peer_count;
+            changed = true;
+        }
+        if allow_current_observation
+            && !connected_devices_match(
+                &current_record.connected_devices,
+                &baseline_record.connected_devices,
+            )
+            && !connected_devices_match(
+                &target_record.connected_devices,
+                &current_record.connected_devices,
+            )
+        {
+            target_record.connected_devices = current_record.connected_devices.clone();
+            changed = true;
+        }
+        if target_is_terminal {
+            // A pause/revoke transition closes admission and must not publish
+            // a stale active-peer view from a callback that raced the save.
+            if target_record.speed_bps != 0 {
+                target_record.speed_bps = 0;
+                changed = true;
+            }
+            if target_record.active_peer_count != 0 {
+                target_record.active_peer_count = 0;
+                changed = true;
+            }
+            if !target_record.connected_devices.is_empty() {
+                target_record.connected_devices.clear();
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
 struct Slot {
     operation: AsyncMutex<Option<Worker>>,
 }
@@ -438,6 +597,75 @@ const MANAGED_REQUEST_CAPACITY: usize = 1024;
 const MANAGED_PENDING_MAX_SECONDS: u64 = 7 * 24 * 60 * 60;
 const MANAGED_KEY_RESPONSE_SECONDS: u64 = 5 * 60;
 const MANAGED_TICK_SECONDS: u64 = 2;
+// Observer callbacks are memory-only updates and may continue while a
+// durable snapshot is being written.  A save may coalesce a bounded number of
+// generations, but it must never wait forever for a quiet observer stream.
+const MANAGED_OBSERVATION_RESAVE_LIMIT: usize = 2;
+
+#[cfg(test)]
+#[derive(Default)]
+struct TestPersistGate {
+    next: Mutex<Vec<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+}
+
+#[cfg(test)]
+impl TestPersistGate {
+    fn arm(&self) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered_sender, entered_receiver) = std::sync::mpsc::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        self.next
+            .lock()
+            .expect("persist test gate mutex")
+            .push((entered_sender, release_receiver));
+        (entered_receiver, release_sender)
+    }
+
+    fn wait(&self) {
+        let pending = {
+            let mut next = self.next.lock().expect("persist test gate mutex");
+            if next.is_empty() {
+                None
+            } else {
+                Some(next.remove(0))
+            }
+        };
+        if let Some((entered, release)) = pending {
+            let _ = entered.send(());
+            let _ = release.recv();
+        }
+    }
+}
+
+struct ShutdownCompletion {
+    result: Mutex<Option<Result<(), ErrorSummary>>>,
+    notify: Notify,
+}
+
+impl ShutdownCompletion {
+    fn new() -> Self {
+        Self {
+            result: Mutex::new(None),
+            notify: Notify::new(),
+        }
+    }
+
+    fn publish(&self, result: Result<(), ErrorSummary>) {
+        *self.result.lock().expect("shutdown result mutex") = Some(result);
+        self.notify.notify_waiters();
+    }
+
+    async fn wait(&self) -> Result<()> {
+        loop {
+            let notified = self.notify.notified();
+            if let Some(result) = self.result.lock().expect("shutdown result mutex").clone() {
+                return result
+                    .map_err(|summary| anyhow::anyhow!("{}: {}", summary.code, summary.message));
+            }
+            notified.await;
+        }
+    }
+}
+
 /// Owns local configuration and one serialized worker for each managed root.
 /// Snapshot locks protect only in-memory copies; engine and filesystem work run outside them.
 pub struct Manager {
@@ -454,11 +682,20 @@ pub struct Manager {
     /// The writer guard is moved into the non-cancellable save task so a
     /// caller abort cannot release serialization while `config::save` runs.
     persistence: Arc<AsyncMutex<()>>,
+    /// In-memory managed observer/failure updates can arrive while a durable
+    /// snapshot is being written.  The writer retries publication when this
+    /// generation changes, preserving those fields without merging durable
+    /// membership or request-journal state.
+    managed_observation_revision: Arc<AtomicU64>,
     /// Managed join/retry tasks outlive an HTTP caller that drops its response
     /// future.  Shutdown drains this list before releasing managed ownership.
     managed_operations: AsyncMutex<Vec<JoinHandle<()>>>,
     operation_lifecycle: AsyncMutex<()>,
-    shutdown_lifecycle: AsyncMutex<()>,
+    /// The shutdown worker is manager-owned so cancellation of one caller only
+    /// drops its waiter. Every later caller observes the same drain result.
+    shutdown_completion: AsyncMutex<Option<Arc<ShutdownCompletion>>>,
+    #[cfg(test)]
+    test_persist_gate: Arc<TestPersistGate>,
     lifecycle: RwLock<()>,
     ownership: Mutex<Option<File>>,
     stopped: AtomicBool,
@@ -566,9 +803,12 @@ impl Manager {
             revocation_tasks: AsyncMutex::new(Vec::new()),
             managed_options,
             persistence: Arc::new(AsyncMutex::new(())),
+            managed_observation_revision: Arc::new(AtomicU64::new(0)),
             managed_operations: AsyncMutex::new(Vec::new()),
             operation_lifecycle: AsyncMutex::new(()),
-            shutdown_lifecycle: AsyncMutex::new(()),
+            shutdown_completion: AsyncMutex::new(None),
+            #[cfg(test)]
+            test_persist_gate: Arc::new(TestPersistGate::default()),
             lifecycle: RwLock::new(()),
             ownership: Mutex::new(Some(ownership)),
             stopped: AtomicBool::new(false),
@@ -781,21 +1021,26 @@ impl Manager {
         F: FnOnce(Arc<Self>) -> Fut + Send + 'static,
         Fut: Future<Output = Result<JoinResult>> + Send + 'static,
     {
-        let _operation_lifecycle = self.operation_lifecycle.lock().await;
-        ensure!(
-            !self.closing.load(Ordering::Acquire) && !self.stopped.load(Ordering::Acquire),
-            ManagedError::new(ManagedErrorKind::ShuttingDown)
-        );
-        let (sender, receiver) = oneshot::channel();
-        let manager = Arc::clone(self);
-        let task = tokio::spawn(async move {
-            let result = operation(manager).await;
-            let _ = sender.send(result);
-        });
-        let mut operations = self.managed_operations.lock().await;
-        operations.retain(|task| !task.is_finished());
-        operations.push(task);
-        drop(operations);
+        let receiver = {
+            // Serialize admission with shutdown only through task registration.
+            // The lock must not span the response await: otherwise a caller
+            // holding a dropped HTTP response can block shutdown's drain list.
+            let _operation_lifecycle = self.operation_lifecycle.lock().await;
+            ensure!(
+                !self.closing.load(Ordering::Acquire) && !self.stopped.load(Ordering::Acquire),
+                ManagedError::new(ManagedErrorKind::ShuttingDown)
+            );
+            let (sender, receiver) = oneshot::channel();
+            let manager = Arc::clone(self);
+            let task = tokio::spawn(async move {
+                let result = operation(manager).await;
+                let _ = sender.send(result);
+            });
+            let mut operations = self.managed_operations.lock().await;
+            operations.retain(|task| !task.is_finished());
+            operations.push(task);
+            receiver
+        };
         receiver
             .await
             .context("managed operation stopped before publishing its result")?
@@ -811,7 +1056,7 @@ impl Manager {
     }
     async fn persist(&self, mutate: impl FnOnce(&mut config::Config) -> Result<()>) -> Result<()> {
         let writer = self.persistence.clone().lock_owned().await;
-        let mut config = {
+        let (mut config, observation_revision, observation_baseline) = {
             let state = self.shared.lock().expect("snapshot mutex");
             let mut config = state.config.clone();
             for saved in &mut config.folders {
@@ -824,7 +1069,12 @@ impl Manager {
             }
             config.activities = state.activities.clone();
             config.history = state.history.clone();
-            config
+            let observation_baseline = config.managed.shares.clone();
+            (
+                config,
+                self.managed_observation_revision.load(Ordering::Acquire),
+                observation_baseline,
+            )
         };
         let before = serde_json::to_value(&config)?;
         let before_managed = serde_json::to_value(&config.managed)?;
@@ -841,20 +1091,58 @@ impl Manager {
         let changed = serde_json::to_value(&config)? != before;
         let dir = self.data_dir.clone();
         let shared = Arc::clone(&self.shared);
+        let observation_counter = Arc::clone(&self.managed_observation_revision);
+        #[cfg(test)]
+        let test_persist_gate = Arc::clone(&self.test_persist_gate);
         tokio::task::spawn_blocking(move || -> Result<()> {
             // Once this task starts, both the durable save and the in-memory
             // publication run while the owned writer guard is still held.
             // Tokio cannot abort a started blocking task, so a dropped caller
             // cannot expose a second writer to an unfinished replacement.
-            config::save(&dir, &config)?;
-            let mut state = shared.lock().expect("snapshot mutex");
-            state.config = config;
-            state.trim();
-            if changed {
-                state.revision += 1;
+            #[cfg(test)]
+            test_persist_gate.wait();
+            let mut saved_observation_revision = observation_revision;
+            let mut observation_resaves = 0;
+            let mut changed = changed;
+            loop {
+                config::save(&dir, &config)?;
+                let mut state = shared.lock().expect("snapshot mutex");
+                let current_observation_revision = observation_counter.load(Ordering::Acquire);
+                if current_observation_revision == saved_observation_revision {
+                    state.config = config;
+                    state.trim();
+                    if changed {
+                        state.revision += 1;
+                    }
+                    drop(writer);
+                    return Ok(());
+                }
+                let current_shares = state.config.managed.shares.clone();
+                changed |= merge_managed_observations(
+                    &mut config.managed.shares,
+                    &observation_baseline,
+                    &current_shares,
+                );
+                drop(state);
+
+                if observation_resaves >= MANAGED_OBSERVATION_RESAVE_LIMIT {
+                    // Publish the latest coalesced observation after a bounded
+                    // final save.  A callback arriving after this snapshot is
+                    // applied to the newly published in-memory state and its
+                    // generation remains dirty for the next persistence pass.
+                    config::save(&dir, &config)?;
+                    let mut state = shared.lock().expect("snapshot mutex");
+                    state.config = config;
+                    state.trim();
+                    if changed {
+                        state.revision += 1;
+                    }
+                    drop(writer);
+                    return Ok(());
+                }
+                saved_observation_revision = current_observation_revision;
+                observation_resaves += 1;
             }
-            drop(writer);
-            Ok(())
         })
         .await??;
         Ok(())
@@ -1570,7 +1858,7 @@ impl Manager {
         let summary = classify_managed_error(error);
         let id = share_id_string(share);
         let mut state = self.shared.lock().expect("snapshot mutex");
-        if let Some(record) = state
+        let updated = if let Some(record) = state
             .config
             .managed
             .shares
@@ -1597,7 +1885,15 @@ impl Manager {
             };
             record.last_error = Some(summary);
             state.revision += 1;
+            true
+        } else {
+            false
+        };
+        if updated {
+            self.managed_observation_revision
+                .fetch_add(1, Ordering::AcqRel);
         }
+        drop(state);
     }
 
     fn managed_record(&self, share: ShareId) -> Result<config::ManagedShareRecord> {
@@ -2050,18 +2346,31 @@ impl Manager {
 
     fn clear_managed_observation_id(&self, id: &str) {
         let mut state = self.shared.lock().expect("snapshot mutex");
-        if let Some(record) = state
+        let updated = if let Some(record) = state
             .config
             .managed
             .shares
             .iter_mut()
             .find(|record| record.share_id == id)
         {
+            let updated = record.active_peer_count != 0
+                || !record.connected_devices.is_empty()
+                || record.speed_bps != 0;
             record.active_peer_count = 0;
             record.connected_devices.clear();
             record.speed_bps = 0;
-            state.revision += 1;
+            if updated {
+                state.revision += 1;
+            }
+            updated
+        } else {
+            false
+        };
+        if updated {
+            self.managed_observation_revision
+                .fetch_add(1, Ordering::AcqRel);
         }
+        drop(state);
     }
 
     fn managed_observer(
@@ -2072,6 +2381,7 @@ impl Manager {
         let shared = Arc::downgrade(&self.shared);
         let id = share_id_string(share);
         let timing = Arc::new(Mutex::new(ManagedObserverState { last_event_at: 0 }));
+        let observation_counter = Arc::clone(&self.managed_observation_revision);
         deltaweave_net::TransferObserver::new(move |event| {
             let Some(shared) = shared.upgrade() else {
                 return;
@@ -2118,6 +2428,7 @@ impl Manager {
                     }
                 }
                 state.revision += 1;
+                observation_counter.fetch_add(1, Ordering::AcqRel);
             }
         })
     }
@@ -5389,8 +5700,33 @@ impl Manager {
         .await?;
         Ok(settings)
     }
-    pub async fn shutdown(&self) -> Result<()> {
-        let _shutdown_lifecycle = self.shutdown_lifecycle.lock().await;
+    /// Completes shutdown in a manager-owned task.  A cancelled caller only
+    /// loses its waiter; the single cleanup task continues through worker and
+    /// service drain, the final durable save, and ownership release.
+    pub async fn shutdown(self: &Arc<Self>) -> Result<()> {
+        let completion = {
+            let mut state = self.shutdown_completion.lock().await;
+            if let Some(completion) = state.as_ref() {
+                Arc::clone(completion)
+            } else {
+                let completion = Arc::new(ShutdownCompletion::new());
+                *state = Some(Arc::clone(&completion));
+                let manager = Arc::clone(self);
+                let task_completion = Arc::clone(&completion);
+                tokio::spawn(async move {
+                    let result = manager
+                        .shutdown_inner()
+                        .await
+                        .map_err(|error| classify_managed_error(&error));
+                    task_completion.publish(result);
+                });
+                completion
+            }
+        };
+        completion.wait().await
+    }
+
+    async fn shutdown_inner(&self) -> Result<()> {
         if self.stopped.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -5417,9 +5753,6 @@ impl Manager {
         // persistence work.  A started blocking save remains serialized by
         // `persistence`; dropping its caller cannot let another save race it.
         let _exclusive = self.lifecycle.write().await;
-        if self.stopped.swap(true, Ordering::AcqRel) {
-            return error.map_or(Ok(()), Err);
-        }
         let background = std::mem::take(&mut *self.background.lock().await);
         for task in background {
             task.abort();
@@ -5495,6 +5828,10 @@ impl Manager {
             error = Some(failure);
         }
         self.ownership.lock().expect("ownership mutex").take();
+        // Publish stopped only after every owned resource and the final save
+        // have completed.  The manager-owned wrapper then makes this state
+        // observable to all waiters as one completed shutdown.
+        self.stopped.store(true, Ordering::Release);
         if let Some(error) = error {
             return Err(error);
         }
@@ -5575,6 +5912,75 @@ mod managed_error_tests {
         assert_eq!(summary.code, "member_revoked");
         assert_eq!(summary.message, "membership revoked");
         assert!(!summary.message.contains("secret"));
+    }
+
+    fn observation_record(status: ManagedStatus, phase: &str) -> config::ManagedShareRecord {
+        config::ManagedShareRecord {
+            share_id: "00".repeat(32),
+            role: ShareRole::Owner,
+            permission: None,
+            name: "observation precedence".into(),
+            root: "managed-root".into(),
+            state_root: "managed-state".into(),
+            owner: "owner".into(),
+            min_free_space_bytes: 0,
+            owner_address: None,
+            member_id: None,
+            replica: None,
+            enrolled_at: None,
+            membership_epoch: None,
+            revocation_pending: false,
+            status,
+            phase: Some(phase.into()),
+            last_sync_at: None,
+            retry_at: None,
+            files_count: 0,
+            total_bytes: 0,
+            transferred_bytes: 0,
+            speed_bps: 0,
+            active_peer_count: 0,
+            connected_devices: Vec::new(),
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn observation_merge_preserves_resume_and_revocation_lifecycle_order() {
+        // A save that started while paused can observe the old paused row after
+        // a successful resume.  The target mutation owns the newer lifecycle
+        // status, so the stale callback must not put the share back in Paused.
+        let baseline = observation_record(ManagedStatus::Paused, "paused");
+        let current = baseline.clone();
+        let mut target = observation_record(ManagedStatus::Waiting, "waiting");
+        merge_managed_observations(
+            std::slice::from_mut(&mut target),
+            std::slice::from_ref(&baseline),
+            std::slice::from_ref(&current),
+        );
+        assert_eq!(target.status, ManagedStatus::Waiting);
+        assert_eq!(target.phase.as_deref(), Some("waiting"));
+
+        // A late memory failure must not overwrite an explicit revoke that was
+        // committed by the save mutation.  Revoked also closes the live-peer
+        // observation fields.
+        let baseline = observation_record(ManagedStatus::Complete, "complete");
+        let mut current = observation_record(ManagedStatus::Error, "error");
+        current.last_error = Some(ErrorSummary {
+            code: "member_error".into(),
+            message: "member operation failed".into(),
+        });
+        current.active_peer_count = 2;
+        let mut target = observation_record(ManagedStatus::Revoked, "revoked");
+        target.active_peer_count = 1;
+        merge_managed_observations(
+            std::slice::from_mut(&mut target),
+            std::slice::from_ref(&baseline),
+            std::slice::from_ref(&current),
+        );
+        assert_eq!(target.status, ManagedStatus::Revoked);
+        assert_eq!(target.phase.as_deref(), Some("revoked"));
+        assert_eq!(target.active_peer_count, 0);
+        assert!(target.last_error.is_none());
     }
 
     #[test]
@@ -5920,6 +6326,509 @@ mod managed_error_tests {
             release.notify_one();
             manager.shutdown().await.unwrap();
             assert!(completed.load(Ordering::Acquire));
+        });
+    }
+
+    #[test]
+    fn aborted_public_join_keeps_pending_save_and_lease() {
+        let name = "managed_error_tests::aborted_public_join_keeps_pending_save_and_lease";
+        if std::env::var("DELTAWEAVE_ABORTED_JOIN_CHILD")
+            .ok()
+            .as_deref()
+            != Some(name)
+        {
+            let home = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture"])
+                .env("DELTAWEAVE_ABORTED_JOIN_CHILD", name)
+                .env("HOME", home.path())
+                .env("USERPROFILE", home.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let options = ManagerOptions {
+                managed_network: NetworkMode::DirectOnly,
+                managed_bind: None,
+            };
+            let owner_options = ManagerOptions {
+                managed_bind: Some(
+                    std::net::UdpSocket::bind("127.0.0.1:0")
+                        .unwrap()
+                        .local_addr()
+                        .unwrap(),
+                ),
+                ..options
+            };
+            let owner_data = temp.path().join("owner-admin");
+            let owner_root = temp.path().join("owner-root");
+            std::fs::create_dir_all(&owner_root).unwrap();
+            let owner = Manager::open_with_options(owner_data, owner_options)
+                .await
+                .unwrap();
+            let share_view = owner
+                .create_share(CreateShareInput {
+                    request_id: "abort-join-create".into(),
+                    name: "Abort Join".into(),
+                    root: owner_root,
+                    min_free_space_mib: Some(0),
+                })
+                .await
+                .unwrap();
+            let share = parse_share_id(&share_view.share_id).unwrap();
+            let key = owner
+                .issue_key(IssueKeyInput {
+                    request_id: "abort-join-key".into(),
+                    share,
+                    permission: Permission::ReadWrite,
+                    expires_at: None,
+                })
+                .await
+                .unwrap();
+            owner.shutdown().await.unwrap();
+
+            let member_data = temp.path().join("member-admin");
+            let member_root = temp.path().join("member-root");
+            let member = Manager::open_with_options(member_data.clone(), options)
+                .await
+                .unwrap();
+            let encoded_key = key.key;
+            let owner_id = ShareTicket::parse(&encoded_key).unwrap().preview().owner;
+            let join_input = JoinShareInput {
+                request_id: "abort-join".into(),
+                encoded_key,
+                destination_root: member_root.clone(),
+            };
+            let state_root = member_data
+                .join("managed")
+                .join("member-state")
+                .join(request_hash("join_share", &join_input).unwrap());
+            let (entered, release) = member.test_persist_gate.arm();
+            let caller_manager = Arc::clone(&member);
+            let caller = tokio::spawn(async move { caller_manager.join_share(join_input).await });
+            tokio::task::spawn_blocking(move || {
+                entered
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("join must reach its durable pending save");
+            })
+            .await
+            .unwrap();
+            assert!(
+                root_admission::acquire_with_private(
+                    &member_root,
+                    RootUse::Managed {
+                        share: share.0,
+                        owner: *owner_id.as_bytes(),
+                    },
+                    std::slice::from_ref(&state_root),
+                )
+                .is_err(),
+                "the join task must retain the exact public/private admission lease"
+            );
+            caller.abort();
+            release.send(()).unwrap();
+            member
+                .shutdown()
+                .await
+                .expect("shutdown must drain the owned join task");
+            let reopened = Manager::open_with_options(member_data, options)
+                .await
+                .unwrap();
+            let snapshot = reopened.snapshot().await;
+            assert_eq!(snapshot.pending.len(), 1);
+            assert_eq!(snapshot.pending[0].request_id, "abort-join");
+            reopened.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn aborted_public_retry_keeps_membership_transition_durable() {
+        let name = "managed_error_tests::aborted_public_retry_keeps_membership_transition_durable";
+        if std::env::var("DELTAWEAVE_ABORTED_RETRY_CHILD")
+            .ok()
+            .as_deref()
+            != Some(name)
+        {
+            let home = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture"])
+                .env("DELTAWEAVE_ABORTED_RETRY_CHILD", name)
+                .env("HOME", home.path())
+                .env("USERPROFILE", home.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let member_options = ManagerOptions {
+                managed_network: NetworkMode::DirectOnly,
+                managed_bind: None,
+            };
+            let owner_options = ManagerOptions {
+                managed_bind: Some(
+                    std::net::UdpSocket::bind("127.0.0.1:0")
+                        .unwrap()
+                        .local_addr()
+                        .unwrap(),
+                ),
+                ..member_options
+            };
+            let owner_data = temp.path().join("owner-admin");
+            let owner_root = temp.path().join("owner-root");
+            std::fs::create_dir_all(&owner_root).unwrap();
+            let owner = Manager::open_with_options(owner_data.clone(), owner_options)
+                .await
+                .unwrap();
+            let share_view = owner
+                .create_share(CreateShareInput {
+                    request_id: "abort-retry-create".into(),
+                    name: "Abort Retry".into(),
+                    root: owner_root,
+                    min_free_space_mib: Some(0),
+                })
+                .await
+                .unwrap();
+            let share = parse_share_id(&share_view.share_id).unwrap();
+            let key = owner
+                .issue_key(IssueKeyInput {
+                    request_id: "abort-retry-key".into(),
+                    share,
+                    permission: Permission::ReadOnly,
+                    expires_at: None,
+                })
+                .await
+                .unwrap();
+            let encoded_key = key.key;
+            let owner_id = ShareTicket::parse(&encoded_key).unwrap().preview().owner;
+            owner.shutdown().await.unwrap();
+
+            let member_data = temp.path().join("member-admin");
+            let member_root = temp.path().join("member-root");
+            let member = Manager::open_with_options(member_data.clone(), member_options)
+                .await
+                .unwrap();
+            let join_input = JoinShareInput {
+                request_id: "abort-retry".into(),
+                encoded_key,
+                destination_root: member_root.clone(),
+            };
+            let state_root = member_data
+                .join("managed")
+                .join("member-state")
+                .join(request_hash("join_share", &join_input).unwrap());
+            let waiting = member.join_share(join_input).await.unwrap();
+            assert_eq!(waiting.enrollment, EnrollmentState::Waiting);
+            member.shutdown().await.unwrap();
+
+            let owner = Manager::open_with_options(owner_data, owner_options)
+                .await
+                .unwrap();
+            let member = Manager::open_with_options(member_data.clone(), member_options)
+                .await
+                .unwrap();
+            let (entered, release) = member.test_persist_gate.arm();
+            let caller_manager = Arc::clone(&member);
+            let caller = tokio::spawn(async move {
+                caller_manager
+                    .retry_pending_join(RetryPendingJoinInput {
+                        request_id: "abort-retry".into(),
+                        share,
+                    })
+                    .await
+            });
+            tokio::task::spawn_blocking(move || {
+                entered
+                    .recv_timeout(std::time::Duration::from_secs(15))
+                    .expect("retry must reach its durable membership save");
+            })
+            .await
+            .unwrap();
+            assert!(
+                root_admission::acquire_with_private(
+                    &member_root,
+                    RootUse::Managed {
+                        share: share.0,
+                        owner: *owner_id.as_bytes(),
+                    },
+                    std::slice::from_ref(&state_root),
+                )
+                .is_err(),
+                "the retry task must retain the exact public/private admission lease"
+            );
+            caller.abort();
+            release.send(()).unwrap();
+            member
+                .shutdown()
+                .await
+                .expect("shutdown must drain the owned retry task");
+
+            assert_eq!(owner.list_members(share).await.unwrap().len(), 1);
+            let reopened = Manager::open_with_options(member_data, member_options)
+                .await
+                .unwrap();
+            let snapshot = reopened.snapshot().await;
+            assert!(snapshot.pending.is_empty());
+            assert_eq!(snapshot.shares.len(), 1);
+            let replay = reopened
+                .retry_pending_join(RetryPendingJoinInput {
+                    request_id: "abort-retry".into(),
+                    share,
+                })
+                .await
+                .unwrap();
+            let replay_again = reopened
+                .retry_pending_join(RetryPendingJoinInput {
+                    request_id: "abort-retry".into(),
+                    share,
+                })
+                .await
+                .unwrap();
+            assert!(replay.member_id.is_some());
+            assert_eq!(replay.member_id, replay_again.member_id);
+            assert_eq!(replay.permission, Some(Permission::ReadOnly));
+            reopened.shutdown().await.unwrap();
+            owner.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn aborted_save_keeps_writer_until_publication_and_shutdown_is_serial() {
+        let name = "managed_error_tests::aborted_save_keeps_writer_until_publication_and_shutdown_is_serial";
+        if std::env::var("DELTAWEAVE_ABORTED_SAVE_CHILD")
+            .ok()
+            .as_deref()
+            != Some(name)
+        {
+            let home = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture"])
+                .env("DELTAWEAVE_ABORTED_SAVE_CHILD", name)
+                .env("HOME", home.path())
+                .env("USERPROFILE", home.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let options = ManagerOptions {
+                managed_network: NetworkMode::DirectOnly,
+                managed_bind: None,
+            };
+            let data_dir = temp.path().join("admin");
+            let manager = Manager::open_with_options(data_dir.clone(), options)
+                .await
+                .unwrap();
+            let (first_entered, first_release) = manager.test_persist_gate.arm();
+            let (second_entered, second_release) = manager.test_persist_gate.arm();
+            let first_manager = Arc::clone(&manager);
+            let first = tokio::spawn(async move {
+                first_manager
+                    .update_settings(Settings {
+                        node_name: "aborted save".into(),
+                        poll_interval_seconds: 31,
+                        history_limit: 301,
+                    })
+                    .await
+            });
+            tokio::task::spawn_blocking(move || {
+                first_entered
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("first save must enter the non-cancellable writer");
+            })
+            .await
+            .unwrap();
+            first.abort();
+
+            let second_manager = Arc::clone(&manager);
+            let second = tokio::spawn(async move {
+                second_manager
+                    .update_settings(Settings {
+                        node_name: "second save".into(),
+                        poll_interval_seconds: 32,
+                        history_limit: 302,
+                    })
+                    .await
+            });
+            tokio::task::yield_now().await;
+            assert!(second_entered.try_recv().is_err());
+            first_release.send(()).unwrap();
+            tokio::task::spawn_blocking(move || {
+                second_entered
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("second save must run after the first writer exits");
+            })
+            .await
+            .unwrap();
+            second_release.send(()).unwrap();
+            assert!(second.await.unwrap().is_ok());
+            manager.shutdown().await.unwrap();
+
+            let reopened = Manager::open_with_options(data_dir, options).await.unwrap();
+            assert_eq!(reopened.snapshot().await.settings.node_name, "second save");
+            reopened.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn blocked_save_preserves_observer_and_terminal_failure_publication() {
+        let name =
+            "managed_error_tests::blocked_save_preserves_observer_and_terminal_failure_publication";
+        if std::env::var("DELTAWEAVE_OBSERVATION_SAVE_CHILD")
+            .ok()
+            .as_deref()
+            != Some(name)
+        {
+            let home = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture"])
+                .env("DELTAWEAVE_OBSERVATION_SAVE_CHILD", name)
+                .env("HOME", home.path())
+                .env("USERPROFILE", home.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let data_dir = temp.path().join("admin");
+            let owner_root = temp.path().join("owner-root");
+            std::fs::create_dir_all(&owner_root).unwrap();
+            let options = ManagerOptions {
+                managed_network: NetworkMode::DirectOnly,
+                managed_bind: None,
+            };
+            let manager = Manager::open_with_options(data_dir.clone(), options)
+                .await
+                .unwrap();
+            let share = parse_share_id(
+                &manager
+                    .create_share(CreateShareInput {
+                        request_id: "observer-save-create".into(),
+                        name: "Observer Save".into(),
+                        root: owner_root,
+                        min_free_space_mib: Some(0),
+                    })
+                    .await
+                    .unwrap()
+                    .share_id,
+            )
+            .unwrap();
+
+            let (entered, release) = manager.test_persist_gate.arm();
+            let update_manager = Arc::clone(&manager);
+            let update = tokio::spawn(async move {
+                update_manager
+                    .update_settings(Settings {
+                        node_name: "observer save update".into(),
+                        poll_interval_seconds: 31,
+                        history_limit: 301,
+                    })
+                    .await
+            });
+            tokio::task::spawn_blocking(move || {
+                entered
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("save must reach the deterministic writer barrier");
+            })
+            .await
+            .unwrap();
+
+            let observer = manager.managed_observer(share, BTreeMap::new());
+            observer.emit(deltaweave_net::TransferEvent {
+                phase: "syncing".into(),
+                path: None,
+                direction: Some("push".into()),
+                bytes: 7,
+                peer: None,
+            });
+            manager
+                .mark_managed_memory_failure(share, &anyhow::Error::new(ShareError::MemberRevoked));
+            release.send(()).unwrap();
+            update.await.unwrap().unwrap();
+            manager.shutdown().await.unwrap();
+
+            let reopened = Manager::open_with_options(data_dir, options).await.unwrap();
+            let record = reopened
+                .snapshot()
+                .await
+                .shares
+                .into_iter()
+                .find(|record| record.share_id == share_id_string(share))
+                .expect("managed record survives reopen");
+            assert_eq!(record.status, ManagedStatus::Revoked);
+            assert_eq!(record.phase.as_deref(), Some("revoked"));
+            assert!(record.transferred_bytes >= 7);
+            assert_eq!(
+                record.last_error.as_ref().map(|error| error.code.as_str()),
+                Some("member_revoked")
+            );
+            reopened.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn concurrent_shutdown_waits_for_the_first_shutdown_save() {
+        let name = "managed_error_tests::concurrent_shutdown_waits_for_the_first_shutdown_save";
+        if std::env::var("DELTAWEAVE_CONCURRENT_SHUTDOWN_CHILD")
+            .ok()
+            .as_deref()
+            != Some(name)
+        {
+            let home = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture"])
+                .env("DELTAWEAVE_CONCURRENT_SHUTDOWN_CHILD", name)
+                .env("HOME", home.path())
+                .env("USERPROFILE", home.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let options = ManagerOptions {
+                managed_network: NetworkMode::DirectOnly,
+                managed_bind: None,
+            };
+            let data_dir = temp.path().join("admin");
+            let manager = Manager::open_with_options(data_dir.clone(), options)
+                .await
+                .unwrap();
+            let (entered, release) = manager.test_persist_gate.arm();
+            let first_manager = Arc::clone(&manager);
+            let first = tokio::spawn(async move { first_manager.shutdown().await });
+            tokio::task::spawn_blocking(move || {
+                entered
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("first shutdown must reach its final durable save");
+            })
+            .await
+            .unwrap();
+            first.abort();
+            let second_manager = Arc::clone(&manager);
+            let second = tokio::spawn(async move { second_manager.shutdown().await });
+            tokio::task::yield_now().await;
+            assert!(!second.is_finished());
+            release.send(()).unwrap();
+            second.await.unwrap().unwrap();
+            assert!(first.await.is_err(), "the first caller was cancelled");
+
+            // The manager-owned shutdown task must have released the lock
+            // before publishing completion to the second caller.
+            let reopened = Manager::open_with_options(data_dir, options)
+                .await
+                .expect("shutdown completion must release manager ownership");
+            reopened.shutdown().await.unwrap();
         });
     }
 }
