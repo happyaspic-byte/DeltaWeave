@@ -60,35 +60,22 @@ fn query_event_id(sequence: &AtomicU64, share: ShareId, peer: EndpointId, tag: &
     operation_id
 }
 
-fn emit_share_event(
-    observer: &Arc<Mutex<Option<ShareTransferObserver>>>,
-    event: ShareTransferEvent,
-) {
-    let observer = observer.lock().ok().and_then(|observer| observer.clone());
-    if let Some(observer) = observer {
-        observer.emit(event);
-    }
-}
-
 /// Owns the event lifetime after a control frame has reached the authenticated
 /// handler. A transport failure before a reply creates no guard and therefore
 /// no active-peer event. If the caller is cancelled after admission but before
 /// synchronous reply validation completes, dropping this guard emits Reject so
 /// the operation cannot remain active forever.
 struct ShareEventGuard {
-    observer: Arc<Mutex<Option<ShareTransferObserver>>>,
+    events: Arc<ShareEventState>,
     event: ShareTransferEvent,
     finished: bool,
 }
 
 impl ShareEventGuard {
-    fn admitted(
-        observer: &Arc<Mutex<Option<ShareTransferObserver>>>,
-        event: ShareTransferEvent,
-    ) -> Self {
-        emit_share_event(observer, event.clone());
+    fn admitted(events: &Arc<ShareEventState>, event: ShareTransferEvent) -> Self {
+        events.emit(event.clone());
         Self {
-            observer: observer.clone(),
+            events: events.clone(),
             event,
             finished: false,
         }
@@ -99,7 +86,7 @@ impl ShareEventGuard {
         self.event.phase = phase;
         self.event.provider_epoch = provider_epoch;
         self.event.grant = grant;
-        emit_share_event(&self.observer, self.event.clone());
+        self.events.emit(self.event.clone());
     }
 }
 
@@ -110,8 +97,47 @@ impl Drop for ShareEventGuard {
             self.event.bytes = 0;
             self.event.provider_epoch = None;
             self.event.grant = None;
-            emit_share_event(&self.observer, self.event.clone());
+            self.events.emit(self.event.clone());
         }
+    }
+}
+
+/// Shared observer state for one already-bound endpoint. Keeping the callback
+/// and operation sequence together lets every session and inbound handler use
+/// the same operation-ID namespace without widening constructors.
+#[derive(Debug)]
+struct ShareEventState {
+    observer: Mutex<Option<ShareTransferObserver>>,
+    sequence: AtomicU64,
+}
+
+impl ShareEventState {
+    fn new() -> Self {
+        Self {
+            observer: Mutex::new(None),
+            sequence: AtomicU64::new(1),
+        }
+    }
+
+    fn set_observer(&self, observer: Option<ShareTransferObserver>) {
+        if let Ok(mut current) = self.observer.lock() {
+            *current = observer;
+        }
+    }
+
+    fn emit(&self, event: ShareTransferEvent) {
+        let observer = self
+            .observer
+            .lock()
+            .ok()
+            .and_then(|observer| observer.clone());
+        if let Some(observer) = observer {
+            observer.emit(event);
+        }
+    }
+
+    fn next_query_id(&self, share: ShareId, peer: EndpointId, tag: &[u8]) -> [u8; 16] {
+        query_event_id(&self.sequence, share, peer, tag)
     }
 }
 
@@ -684,8 +710,7 @@ pub struct ShareService {
     suppliers: SupplierMap,
     supplier_lifecycle: Arc<SupplierLifecycle>,
     swarm_tasks: Arc<SwarmTaskRegistry>,
-    share_observer: Arc<Mutex<Option<ShareTransferObserver>>>,
-    share_event_sequence: Arc<AtomicU64>,
+    share_events: Arc<ShareEventState>,
     /// Rotates bounded recovery batches so a slow first row cannot starve
     /// later endpoint-local intents across managed ticks.
     intent_recovery_cursor: AtomicUsize,
@@ -1001,8 +1026,7 @@ impl ShareService {
             max_connections.saturating_mul(2).max(1),
         ));
         let swarm_inflight = Arc::new(Mutex::new(BTreeSet::new()));
-        let share_observer = Arc::new(Mutex::new(None));
-        let share_event_sequence = Arc::new(AtomicU64::new(1));
+        let share_events = Arc::new(ShareEventState::new());
         #[cfg(test)]
         let admission_limit = limit.clone();
         let endpoint_for_swarm = endpoint.clone();
@@ -1028,8 +1052,7 @@ impl ShareService {
                     tasks: swarm_tasks.clone(),
                     streams: swarm_streams.clone(),
                     inflight: swarm_inflight.clone(),
-                    share_observer: share_observer.clone(),
-                    share_event_sequence: share_event_sequence.clone(),
+                    share_events: share_events.clone(),
                 },
             )
             .spawn();
@@ -1044,8 +1067,7 @@ impl ShareService {
             suppliers,
             supplier_lifecycle,
             swarm_tasks,
-            share_observer,
-            share_event_sequence,
+            share_events,
             intent_recovery_cursor: AtomicUsize::new(0),
             #[cfg(test)]
             admission_limit,
@@ -1059,9 +1081,7 @@ impl ShareService {
     /// endpoint. Existing sessions and both inbound protocol handlers see the
     /// same callback through the shared service state.
     pub fn set_share_observer(&self, observer: Option<ShareTransferObserver>) {
-        if let Ok(mut current) = self.share_observer.lock() {
-            *current = observer;
-        }
+        self.share_events.set_observer(observer);
     }
     #[cfg(test)]
     fn available_admission_slots(&self) -> usize {
@@ -1538,10 +1558,11 @@ impl ShareService {
             self.router.endpoint().clone(),
             self.mode,
             relationship,
-            self.active.clone(),
-            self.swarm_tasks.clone(),
-            self.share_observer.clone(),
-            self.share_event_sequence.clone(),
+            ShareSessionResources {
+                active: self.active.clone(),
+                tasks: self.swarm_tasks.clone(),
+                share_events: self.share_events.clone(),
+            },
         ))
     }
 
@@ -1602,8 +1623,7 @@ impl ShareService {
             tasks: self.swarm_tasks.clone(),
             streams: Arc::new(tokio::sync::Semaphore::new(1)),
             inflight: Arc::new(Mutex::new(BTreeSet::new())),
-            share_observer: self.share_observer.clone(),
-            share_event_sequence: self.share_event_sequence.clone(),
+            share_events: self.share_events.clone(),
         };
         let rows = self.registry.client_intents()?;
         if rows.is_empty() {
@@ -1973,8 +1993,14 @@ struct ShareSessionState {
     roster: Mutex<RosterCache>,
     roster_gate: tokio::sync::Mutex<()>,
     transport: SyncSession,
-    share_observer: Arc<Mutex<Option<ShareTransferObserver>>>,
-    share_event_sequence: Arc<AtomicU64>,
+    share_events: Arc<ShareEventState>,
+}
+
+#[derive(Clone)]
+struct ShareSessionResources {
+    active: Arc<tokio::sync::RwLock<()>>,
+    tasks: Arc<SwarmTaskRegistry>,
+    share_events: Arc<ShareEventState>,
 }
 
 /// A control connection closes even when its awaiting operation is cancelled.
@@ -2007,10 +2033,7 @@ impl ShareSession {
         endpoint: crate::Endpoint,
         mode: NetworkMode,
         relationship: MemberRelationship,
-        active: Arc<tokio::sync::RwLock<()>>,
-        tasks: Arc<SwarmTaskRegistry>,
-        share_observer: Arc<Mutex<Option<ShareTransferObserver>>>,
-        share_event_sequence: Arc<AtomicU64>,
+        resources: ShareSessionResources,
     ) -> Self {
         let owner = relationship.membership.owner;
         let share = relationship.membership.share_id;
@@ -2019,8 +2042,8 @@ impl ShareSession {
             state: Arc::new(ShareSessionState {
                 registry,
                 membership: relationship.membership,
-                active,
-                tasks,
+                active: resources.active,
+                tasks: resources.tasks,
                 roster_challenge: Mutex::new(None),
                 roster: Mutex::new(RosterCache::default()),
                 roster_gate: tokio::sync::Mutex::new(()),
@@ -2037,8 +2060,7 @@ impl ShareSession {
                     observation: Arc::new(std::sync::RwLock::new(None)),
                     n0_lookup: Arc::new(std::sync::RwLock::new(None)),
                 },
-                share_observer,
-                share_event_sequence,
+                share_events: resources.share_events,
             }),
         }
     }
@@ -2058,22 +2080,17 @@ impl ShareSession {
     /// Replaces the observer for this session without opening another
     /// endpoint or changing the authenticated membership binding.
     pub fn set_share_observer(&self, observer: Option<ShareTransferObserver>) {
-        if let Ok(mut current) = self.state.share_observer.lock() {
-            *current = observer;
-        }
+        self.state.share_events.set_observer(observer);
     }
 
     fn emit_share_event(&self, event: ShareTransferEvent) {
-        emit_share_event(&self.state.share_observer, event);
+        self.state.share_events.emit(event);
     }
 
     fn next_query_event_id(&self, peer: EndpointId, tag: &[u8]) -> [u8; 16] {
-        query_event_id(
-            &self.state.share_event_sequence,
-            self.state.membership.share_id,
-            peer,
-            tag,
-        )
+        self.state
+            .share_events
+            .next_query_id(self.state.membership.share_id, peer, tag)
     }
 
     /// Proves that this session's exact grant operation has no remaining
@@ -2372,7 +2389,7 @@ impl ShareSession {
             .refresh_transport_observation(&connection);
         let reply = result.map_err(|_| anyhow::Error::new(ShareError::Offline))??;
         let guard = ShareEventGuard::admitted(
-            &self.state.share_observer,
+            &self.state.share_events,
             ShareTransferEvent {
                 operation_id,
                 share: self.state.membership.share_id,
@@ -3839,8 +3856,7 @@ struct SwarmAdmissionHandler {
     tasks: Arc<SwarmTaskRegistry>,
     streams: Arc<tokio::sync::Semaphore>,
     inflight: Arc<Mutex<BTreeSet<GrantNonce>>>,
-    share_observer: Arc<Mutex<Option<ShareTransferObserver>>>,
-    share_event_sequence: Arc<AtomicU64>,
+    share_events: Arc<ShareEventState>,
 }
 
 impl ProtocolHandler for SwarmAdmissionHandler {
@@ -3880,7 +3896,7 @@ impl ProtocolHandler for SwarmAdmissionHandler {
 
 impl SwarmAdmissionHandler {
     fn emit_share_event(&self, event: ShareTransferEvent) {
-        emit_share_event(&self.share_observer, event);
+        self.share_events.emit(event);
     }
 
     async fn run(&self, connection: Connection) -> Result<()> {
@@ -4448,10 +4464,11 @@ impl SwarmAdmissionHandler {
                 self.endpoint.clone(),
                 self.mode,
                 relationship,
-                self.active.clone(),
-                self.tasks.clone(),
-                self.share_observer.clone(),
-                self.share_event_sequence.clone(),
+                ShareSessionResources {
+                    active: self.active.clone(),
+                    tasks: self.tasks.clone(),
+                    share_events: self.share_events.clone(),
+                },
             );
             let lease = session.activate_grant(grant).await?;
             let activation_id = lease.reply.activation_id;
@@ -4525,10 +4542,11 @@ impl SwarmAdmissionHandler {
                 self.endpoint.clone(),
                 self.mode,
                 relationship,
-                self.active.clone(),
-                self.tasks.clone(),
-                self.share_observer.clone(),
-                self.share_event_sequence.clone(),
+                ShareSessionResources {
+                    active: self.active.clone(),
+                    tasks: self.tasks.clone(),
+                    share_events: self.share_events.clone(),
+                },
             );
             session
                 .activation_status_until(grant, Some(activation_id), deadline)
@@ -4555,10 +4573,11 @@ impl SwarmAdmissionHandler {
                 self.endpoint.clone(),
                 self.mode,
                 relationship,
-                self.active.clone(),
-                self.tasks.clone(),
-                self.share_observer.clone(),
-                self.share_event_sequence.clone(),
+                ShareSessionResources {
+                    active: self.active.clone(),
+                    tasks: self.tasks.clone(),
+                    share_events: self.share_events.clone(),
+                },
             );
             session.grant_drained(grant, activation_id).await
         }
@@ -4583,10 +4602,11 @@ impl SwarmAdmissionHandler {
             self.endpoint.clone(),
             self.mode,
             relationship,
-            self.active.clone(),
-            self.tasks.clone(),
-            self.share_observer.clone(),
-            self.share_event_sequence.clone(),
+            ShareSessionResources {
+                active: self.active.clone(),
+                tasks: self.tasks.clone(),
+                share_events: self.share_events.clone(),
+            },
         );
         session
             .cancel_activation(grant, activation_id, operation_id)
@@ -4815,10 +4835,11 @@ impl SwarmAdmissionHandler {
             self.endpoint.clone(),
             self.mode,
             relationship,
-            self.active.clone(),
-            self.tasks.clone(),
-            self.share_observer.clone(),
-            self.share_event_sequence.clone(),
+            ShareSessionResources {
+                active: self.active.clone(),
+                tasks: self.tasks.clone(),
+                share_events: self.share_events.clone(),
+            },
         );
         session
             .activation_status_until(grant, activation_id, deadline)
@@ -6227,8 +6248,7 @@ mod tests {
                     observation: Arc::new(std::sync::RwLock::new(None)),
                     n0_lookup: Arc::new(std::sync::RwLock::new(None)),
                 },
-                share_observer: Arc::new(Mutex::new(None)),
-                share_event_sequence: Arc::new(AtomicU64::new(1)),
+                share_events: Arc::new(ShareEventState::new()),
             }),
         };
         assert_eq!(
@@ -6754,18 +6774,20 @@ mod tests {
             revoked_error.downcast_ref::<ShareError>(),
             Some(&ShareError::MemberRevoked)
         );
-        let revoked_events = observed_events.lock().expect("share event mutex");
-        assert!(
-            revoked_events[revoked_event_start..]
+        let has_revoked_query = {
+            let events = observed_events.lock().expect("share event mutex");
+            events[revoked_event_start..]
                 .iter()
                 .any(|event| event.phase == SharePhase::Query)
-        );
-        assert!(
-            revoked_events[revoked_event_start..]
+        };
+        let has_revoked_reject = {
+            let events = observed_events.lock().expect("share event mutex");
+            events[revoked_event_start..]
                 .iter()
                 .any(|event| event.phase == SharePhase::Reject)
-        );
-        drop(revoked_events);
+        };
+        assert!(has_revoked_query);
+        assert!(has_revoked_reject);
 
         // Once the owner endpoint is closed, cancelling an in-flight control
         // query must not leave an active-peer event behind.  The timeout is
@@ -7144,13 +7166,15 @@ mod tests {
         provider: &ShareService,
         consumer_session: &ShareSession,
         snapshot: &AuthoritativeSnapshot,
-        _record: &SyncRecord,
         manifest: &ManifestAttestation,
         hashes: &[Hash32],
-        supplier: &SupplierRegistrationGuard,
-        leases: &BTreeMap<ShareId, ManagedAdmissionLease>,
+        storage: (
+            &SupplierRegistrationGuard,
+            &BTreeMap<ShareId, ManagedAdmissionLease>,
+        ),
         operation_id: [u8; 16],
     ) -> Result<ClientIntentRow> {
+        let (supplier, leases) = storage;
         let grant = consumer_session
             .request_swarm_grant(provider.endpoint_id(), &snapshot.token, manifest, hashes)
             .await?;
@@ -7353,11 +7377,9 @@ mod tests {
             &provider,
             &consumer_session,
             &snapshot,
-            &record,
             &manifest,
             &hashes,
-            &direct_guard,
-            &direct_leases,
+            (&direct_guard, &direct_leases),
             [0xe1; 16],
         )
         .await
@@ -7412,11 +7434,9 @@ mod tests {
             &provider,
             &consumer_session,
             &snapshot,
-            &record,
             &manifest,
             &hashes,
-            &nested_guard,
-            &nested_leases,
+            (&nested_guard, &nested_leases),
             [0xe2; 16],
         )
         .await
