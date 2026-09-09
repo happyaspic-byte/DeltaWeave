@@ -247,3 +247,24 @@ control path를 확인했고, owner 재시작·주소변경·offline/back resume
 실험은 E의 verified-CAS 다중 provider payload 또는 세 기기 검증을 주장하지 않는다.
 durable late activation receipt/ACK, provider/consumer 양쪽 drain, Windows 3-host 및
 F release 검증은 여전히 E/F 순차 범위다.
+
+## D3 bounded admission follow-up (`e437b85`)
+
+- `wait_closed_bounded`는 bounded close-wait가 만료되면 retained `Connection` clone에
+  의존하지 않고 명시적으로 connection close를 전송한다. silent/preview admission
+  회귀는 peer close 관측과 slot 회수를 함께 확인한다.
+- `open_session_until`은 deadline이 이미 만료된 경우 `exchange`를 poll하기 전에
+  `Offline`을 반환한다. 따라서 zero-duration timeout이 Session BI stream이나 Hello를
+  생성하는 부작용을 낼 수 없다. 이 변경은 wire ordinal/정상 deadline 경로를 바꾸지
+  않는다.
+
+| 검사 | 결과 | 증거 |
+| --- | --- | --- |
+| expired session no-Hello | outer `1 passed`, exit `0`, 1.05s | `2026-09-09/d3/availability/expired-session-no-hello-20260909.log`; 06:14:59Z–06:15:18Z, pre-commit HEAD `87d6687` plus the source diff committed as `e437b85` |
+| silent/preview timeout close | outer `1 passed`, exit `0`, 30.53s; nested child는 중복 집계하지 않음 | `2026-09-09/d3/availability/admission-close-regression-20260909.log`; 06:15:32Z–06:16:03Z |
+| net all-target check | exit `0` | `2026-09-09/d3/availability/net-check-availability-20260909.log`; source 변경 적용 후 check |
+| net strict clippy (`-D warnings`) | exit `0` | `2026-09-09/d3/availability/net-clippy-availability-20260909.log`; source 변경 적용 후 clippy |
+
+CI dispatch `34317854588`는 integration ref `63cb43c4142e0d28931dd5f81decb5506aa5d948`
+에서 실행됐으며, 이 후속 로컬 commit은 해당 실행에 포함되지 않는다. 실제 integration
+CI 결과와 이 후속 source 검사는 별도 근거로 집계한다.
