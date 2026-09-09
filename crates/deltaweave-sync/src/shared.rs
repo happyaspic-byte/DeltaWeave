@@ -406,6 +406,26 @@ impl ManagedSyncEngine {
         Inventory::from_index(&self.inner.local.index)
     }
 
+    /// Returns the exact managed public/private admission held by this
+    /// engine. Controllers use it only for recovery-only provider status and
+    /// drain queries after reopening the same device state; it never opens a
+    /// second index, store, or root lease.
+    pub fn managed_admission_lease(&self) -> Result<deltaweave_net::share::ManagedAdmissionLease> {
+        let state_root = self
+            .inner
+            .local
+            .store
+            .state_root()
+            .parent()
+            .context(ShareError::StateUnavailable)?
+            .to_path_buf();
+        deltaweave_net::share::ManagedAdmissionLease::new(
+            Arc::clone(&self.inner.local._root_lease),
+            self.inner.local.root.clone(),
+            state_root,
+        )
+    }
+
     /// Lists durable recovery objects; incoming staging is never included.
     pub fn preserved_changes(&self) -> Result<Vec<PreservedLocalChange>> {
         read_only::preserved(&self.inner.local)
