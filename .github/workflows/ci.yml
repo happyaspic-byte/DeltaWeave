@@ -140,7 +140,6 @@ jobs:
           }
           Write-Output 'managed private ACL parser: error_count=0'
       - name: Probe managed private ACL boundary
-        continue-on-error: true
         shell: pwsh
         run: |
           $probe = Join-Path $env:RUNNER_TEMP 'deltaweave-private-acl-probe.exe'
