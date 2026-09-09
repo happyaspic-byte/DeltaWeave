@@ -1726,6 +1726,29 @@ impl ShareService {
                 admission.state_root(),
             )
         {
+            // A provider-side lease alone does not prove that its registered
+            // Store/index generation has stopped using the root.  The
+            // supplier counter is the exact local writer boundary; require
+            // it even when the controller also supplied a matching lease.
+            if row.grant.provider == self.endpoint_id() && row.grant.owner != self.endpoint_id() {
+                return self
+                    .suppliers
+                    .read()
+                    .ok()
+                    .and_then(|suppliers| {
+                        suppliers.get(&(row.grant.owner, row.grant.share)).cloned()
+                    })
+                    .is_some_and(|supplier| {
+                        supplier.inflight.load(Ordering::Acquire) == 0
+                            && ShareService::lease_matches_intent(
+                                &supplier.root_lease,
+                                &row.grant,
+                                admission.root(),
+                                &supplier.private_root,
+                            )
+                            && close_operation().unwrap_or(false)
+                    });
+            }
             return close_operation().unwrap_or(false);
         }
         if row.grant.provider != self.endpoint_id() {
@@ -1755,7 +1778,8 @@ impl ShareService {
                     &row.grant,
                     supplier.index.root(),
                     &supplier.private_root,
-                ) && close_operation().unwrap_or(false)
+                ) && supplier.inflight.load(Ordering::Acquire) == 0
+                    && close_operation().unwrap_or(false)
             })
     }
 
@@ -6612,6 +6636,303 @@ mod tests {
             )
             .unwrap();
         replacement.drain().await.unwrap();
+
+        consumer_session.close().await;
+        provider_session.close().await;
+        drop(owner_share);
+        provider.shutdown().await.unwrap();
+        consumer.shutdown().await.unwrap();
+        owner.shutdown().await.unwrap();
+    }
+
+    async fn stage_unknown_provider_intent_and_recover(
+        provider: &ShareService,
+        consumer_session: &ShareSession,
+        snapshot: &AuthoritativeSnapshot,
+        _record: &SyncRecord,
+        manifest: &ManifestAttestation,
+        hashes: &[Hash32],
+        supplier: &SupplierRegistrationGuard,
+        leases: &BTreeMap<ShareId, ManagedAdmissionLease>,
+        operation_id: [u8; 16],
+    ) -> Result<ClientIntentRow> {
+        let grant = consumer_session
+            .request_swarm_grant(provider.endpoint_id(), &snapshot.token, manifest, hashes)
+            .await?;
+        let row =
+            provider
+                .registry
+                .prepare_client_intent(&grant, ClientSide::Provider, operation_id)?;
+        provider.registry.transition_client_intent(
+            &grant,
+            ClientSide::Provider,
+            operation_id,
+            ClientIntentPhase::Unknown,
+            None,
+        )?;
+
+        let key = (grant.nonce, operation_id);
+        // A dropped operation without an explicit drain marker must remain
+        // unsafe for same-boot recovery, even though no active task remains.
+        let unmarked = provider.swarm_tasks.begin_operation(key)?;
+        drop(unmarked);
+        assert!(
+            !provider.local_io_drain_is_proven(&row, leases),
+            "an unmarked transport/task exit cannot prove provider drain"
+        );
+
+        // A completed marker is still insufficient while the supplier guard
+        // owns an accepted storage operation. This models a provider stream
+        // whose transport failed while its CAS writer is still running.
+        let mut marked = provider.swarm_tasks.begin_operation(key)?;
+        let supplier_operation = supplier.begin_operation()?;
+        SwarmTaskRegistry::mark_operation_drained(&mut marked, true);
+        drop(marked);
+        assert!(
+            !provider.local_io_drain_is_proven(&row, leases),
+            "a completed transport marker cannot bypass an active supplier writer"
+        );
+        drop(supplier_operation);
+        assert!(
+            provider.local_io_drain_is_proven(&row, leases),
+            "same-boot recovery needs both the marker and an idle exact supplier"
+        );
+
+        let recovered = provider
+            .recover_client_intents_with_budget_and_leases(Duration::from_secs(5), leases)
+            .await?;
+        let recovered = recovered
+            .into_iter()
+            .find(|candidate| candidate.operation_id == operation_id)
+            .ok_or(ShareError::StateUnavailable)?;
+        assert!(
+            matches!(
+                recovered.phase,
+                ClientIntentPhase::Cancelled | ClientIntentPhase::Drained
+            ),
+            "an owner-confirmed terminal receipt should close the exact provider intent"
+        );
+        Ok(recovered)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn same_boot_provider_recovery_checks_direct_and_nested_store_roots() {
+        let name = "share::service::tests::same_boot_provider_recovery_checks_direct_and_nested_store_roots";
+        if std::env::var("DW_PROVIDER_RECOVERY_ROOTS_CHILD")
+            .ok()
+            .as_deref()
+            != Some(name)
+        {
+            let profile = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture"])
+                .env("DW_PROVIDER_RECOVERY_ROOTS_CHILD", name)
+                .env("HOME", profile.path())
+                .env("USERPROFILE", profile.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let owner = ShareService::open(
+            temp.path().join("owner-service"),
+            NetworkMode::DirectOnly,
+            None,
+        )
+        .await
+        .unwrap();
+        let consumer = ShareService::open(
+            temp.path().join("consumer-service"),
+            NetworkMode::DirectOnly,
+            None,
+        )
+        .await
+        .unwrap();
+        let provider = ShareService::open(
+            temp.path().join("provider-service"),
+            NetworkMode::DirectOnly,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let owner_root = temp.path().join("owner-root");
+        std::fs::create_dir_all(&owner_root).unwrap();
+        std::fs::write(owner_root.join("recovery.txt"), b"recovery payload").unwrap();
+        let owner_share = owner
+            .create_owned_share(
+                "Provider recovery roots".into(),
+                owner_root,
+                temp.path().join("owner-state"),
+                None,
+                0,
+            )
+            .await
+            .unwrap();
+        let share = owner_share.config().share_id;
+        let consumer_ticket = owner_share
+            .issue_key(Permission::ReadWrite, None, owner.endpoint_addr())
+            .unwrap();
+        let provider_ticket = owner_share
+            .issue_key(Permission::ReadOnly, None, owner.endpoint_addr())
+            .unwrap();
+        let _consumer_membership = consumer.enroll(&consumer_ticket, None).await.unwrap();
+        let provider_membership = provider.enroll(&provider_ticket, None).await.unwrap();
+
+        let provider_root = temp.path().join("provider-root");
+        let provider_state =
+            root_admission::reserve_private(temp.path().join("provider-state")).unwrap();
+        let (provider_root, provider_state) =
+            prepare_server_roots(&provider_root, &provider_state).unwrap();
+        let provider_lease = Arc::new(
+            root_admission::acquire_with_private(
+                &provider_root,
+                RootUse::Managed {
+                    share: share.0,
+                    owner: *owner.endpoint_id().as_bytes(),
+                },
+                std::slice::from_ref(&provider_state),
+            )
+            .unwrap(),
+        );
+        let provider_index = Arc::new(
+            LocalIndex::open(
+                &provider_root,
+                provider_state.join("index.redb"),
+                provider_membership.replica,
+                IndexOptions::default(),
+            )
+            .unwrap(),
+        );
+        let direct_store = Arc::new(
+            Store::open_with_recovery_reserver(&provider_state, |path| {
+                root_admission::reserve_private(path)
+            })
+            .unwrap(),
+        );
+        let direct_guard = provider
+            .register_supplier_storage(
+                owner.endpoint_id(),
+                share,
+                &provider_membership,
+                &provider_root,
+                provider_lease,
+                provider_index,
+                direct_store.clone(),
+            )
+            .unwrap();
+        let canonical_state = fs::canonicalize(&provider_state).unwrap();
+        assert_eq!(direct_guard.private_root(), canonical_state.as_path());
+
+        let consumer_session = consumer.open_session(owner.endpoint_id(), share).unwrap();
+        let provider_session = provider.open_session(owner.endpoint_id(), share).unwrap();
+        provider_session.refresh_roster().await.unwrap();
+        let challenge = provider_session.roster_challenge().unwrap();
+        provider_session.heartbeat(challenge).await.unwrap();
+        let empty = MerkleTree::from_records(Vec::new()).unwrap();
+        let snapshot = consumer_session
+            .fetch_authoritative_snapshot(&empty)
+            .await
+            .unwrap();
+        let record = snapshot.records.first().cloned().unwrap();
+        let manifest = consumer_session
+            .request_manifest(&snapshot.token, &record)
+            .await
+            .unwrap();
+        let hashes: Vec<_> = manifest
+            .manifest
+            .chunks
+            .iter()
+            .map(|chunk| chunk.hash)
+            .collect();
+
+        let direct_lease = ManagedAdmissionLease::new(
+            direct_guard.root_lease().clone(),
+            provider_root.clone(),
+            provider_state.clone(),
+        )
+        .unwrap();
+        let mut direct_leases = BTreeMap::new();
+        direct_leases.insert(share, direct_lease);
+        let direct_row = stage_unknown_provider_intent_and_recover(
+            &provider,
+            &consumer_session,
+            &snapshot,
+            &record,
+            &manifest,
+            &hashes,
+            &direct_guard,
+            &direct_leases,
+            [0xe1; 16],
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            direct_row.phase,
+            ClientIntentPhase::Cancelled | ClientIntentPhase::Drained
+        ));
+
+        // The nested production layout uses the same admitted public root,
+        // index, and RootLease while Store::state_root is <private>/store.
+        // This must use the same canonical private reservation in recovery;
+        // a direct equality check against Store::state_root would reject it.
+        direct_guard.drain().await.unwrap();
+        let nested_state = provider_state.join("store");
+        let nested_store = Arc::new(
+            Store::open_with_recovery_reserver(&nested_state, |path| {
+                root_admission::reserve_private(path)
+            })
+            .unwrap(),
+        );
+        let nested_guard = provider
+            .register_supplier_storage(
+                owner.endpoint_id(),
+                share,
+                &provider_membership,
+                &provider_root,
+                direct_guard.root_lease().clone(),
+                direct_guard.index().clone(),
+                nested_store,
+            )
+            .unwrap();
+        assert_eq!(
+            nested_guard.private_root(),
+            canonical_state.as_path(),
+            "nested Store placement must retain the outer private reservation"
+        );
+        assert!(Arc::ptr_eq(
+            nested_guard.root_lease(),
+            direct_guard.root_lease()
+        ));
+        assert!(Arc::ptr_eq(nested_guard.index(), direct_guard.index()));
+        let nested_lease = ManagedAdmissionLease::new(
+            nested_guard.root_lease().clone(),
+            provider_root,
+            provider_state,
+        )
+        .unwrap();
+        let mut nested_leases = BTreeMap::new();
+        nested_leases.insert(share, nested_lease);
+        let nested_row = stage_unknown_provider_intent_and_recover(
+            &provider,
+            &consumer_session,
+            &snapshot,
+            &record,
+            &manifest,
+            &hashes,
+            &nested_guard,
+            &nested_leases,
+            [0xe2; 16],
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            nested_row.phase,
+            ClientIntentPhase::Cancelled | ClientIntentPhase::Drained
+        ));
+        nested_guard.drain().await.unwrap();
 
         consumer_session.close().await;
         provider_session.close().await;
