@@ -42,7 +42,7 @@ function Emit-Diagnostic {
         'keepalive_enter', 'keepalive_done',
         'artifact_download_enter', 'artifact_download_done', 'artifact_hash_done',
         'ctrlc_sent', 'exit_wait_enter', 'exit_observed', 'streams_drained',
-        'console_released', 'stop_ctrlc_failed', 'stop_exit_timeout',
+        'console_released', 'stop_ctrlc_failed', 'stop_exit_probe', 'stop_exit_probe_timeout', 'stop_exit_code', 'stop_exit_timeout',
         'stop_stream_timeout', 'stop_release_failed', 'stop_done',
         'console_test_enter', 'console_test_not_owned', 'console_test_missing',
         'console_test_exited', 'console_test_ready', 'console_test_mismatch',
@@ -563,7 +563,15 @@ function Stop-WebProcess {
         }
         Emit-Diagnostic 'ctrlc_sent'
         Emit-Diagnostic 'exit_wait_enter'
-        if (-not $Process.WaitForExit(30000)) {
+        $exitObserved = $false
+        $waitTicks = 0
+        while ($waitTicks -lt 30 -and -not $exitObserved) {
+            $waitTicks++
+            $exitObserved = $Process.WaitForExit(1000)
+        }
+        Emit-Diagnostic 'stop_exit_probe' -Count $waitTicks
+        if (-not $exitObserved) {
+            Emit-Diagnostic 'stop_exit_probe_timeout' -Count $waitTicks
             $script:LastStopErrorClass = 'timeout'
             Emit-Diagnostic 'stop_exit_timeout'
             $script:ForcedTermination = $true
@@ -584,6 +592,7 @@ function Stop-WebProcess {
         }
         Emit-Diagnostic 'exit_observed'
         $exitCode = $Process.ExitCode
+        Emit-Diagnostic 'stop_exit_code' -Count $exitCode
         if ($exitCode -ne 0) { $script:LastStopErrorClass = 'process_exited' }
         $streamsDrained = Wait-DiscardProcessStreams $Process 5000
         if ($streamsDrained) { Emit-Diagnostic 'streams_drained' } else {

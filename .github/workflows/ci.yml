@@ -12,10 +12,20 @@ on:
         default: false
         type: boolean
       qsync_three_host_execute:
-        description: 'Use the supplied owner/key secrets for the hosted RO role'
+        description: 'Run the hosted RO role with a controller handoff and per-run key'
         required: false
         default: false
         type: boolean
+      qsync_three_host_coordination_id:
+        description: 'Controller-generated numeric ID shared by the RW evidence and hosted RO run'
+        required: false
+        default: ''
+        type: string
+      qsync_three_host_ro_secret_name:
+        description: 'Per-run secret name mapped to the reusable RO key slot'
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -175,12 +185,7 @@ jobs:
       native_artifact_run_id: ${{ github.run_id }}
       expected_file_hash: 8b666f88f7b033f647f9b5ae66d668b7bb88376630dbecfb0fba757f4f84334c
       execute_ro: ${{ inputs.qsync_three_host_execute }}
+      coordination_run_id: ${{ inputs.qsync_three_host_coordination_id || github.run_id }}
+      ro_share_key_secret_name: ${{ inputs.qsync_three_host_ro_secret_name }}
     secrets:
-      QSYNC_F_RO_SHARE_KEY: ${{ secrets.QSYNC_F_RO_SHARE_KEY }}
-      QSYNC_F_RW_SHARE_KEY: ${{ secrets.QSYNC_F_RW_SHARE_KEY }}
-      QSYNC_F_OWNER_API_URL: ${{ secrets.QSYNC_F_OWNER_API_URL }}
-      QSYNC_F_ARTIFACT_PUBLIC_HOST: ${{ secrets.QSYNC_F_ARTIFACT_PUBLIC_HOST }}
-      QSYNC_F_WINRM_HOST: ${{ secrets.QSYNC_F_WINRM_HOST }}
-      QSYNC_F_WINRM_DESTINATION: ${{ secrets.QSYNC_F_WINRM_DESTINATION }}
-      QSYNC_F_WINRM_USERNAME: ${{ secrets.QSYNC_F_WINRM_USERNAME }}
-      QSYNC_F_WINRM_PASSWORD: ${{ secrets.QSYNC_F_WINRM_PASSWORD }}
+      QSYNC_F_RO_SHARE_KEY: ${{ secrets[inputs.qsync_three_host_ro_secret_name] }}

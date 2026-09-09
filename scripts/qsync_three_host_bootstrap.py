@@ -39,6 +39,7 @@ from typing import Any, Callable, Iterable, Mapping, NoReturn
 
 SOURCE_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+RUN_ID_RE = re.compile(r"^[0-9]{1,20}$")
 ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 ROLE_NAMES = ("owner", "rw_provider", "ro_consumer")
@@ -164,6 +165,12 @@ def require_sha256(value: Any, error_class: str = "config_invalid") -> str:
 def require_source_sha(value: Any) -> str:
     value = require_string(value)
     if not SOURCE_SHA_RE.fullmatch(value):
+        fail("config_invalid")
+    return value
+
+
+def require_run_id(value: Any) -> str:
+    if not isinstance(value, str) or not RUN_ID_RE.fullmatch(value):
         fail("config_invalid")
     return value
 
@@ -992,6 +999,8 @@ REMOTE_TRACE_STAGES = {
     "reopen_membership_enter",
     "reopen_membership_done",
     "reopen_checks",
+    "keepalive_enter",
+    "keepalive_done",
     "artifact_download_enter",
     "artifact_download_done",
     "artifact_hash_done",
@@ -1001,6 +1010,9 @@ REMOTE_TRACE_STAGES = {
     "streams_drained",
     "console_released",
     "stop_ctrlc_failed",
+    "stop_exit_probe",
+    "stop_exit_probe_timeout",
+    "stop_exit_code",
     "stop_exit_timeout",
     "stop_stream_timeout",
     "stop_release_failed",

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Run the Windows RW provider while a hosted RO job is in flight.
+"""Run the Windows RW provider from the local controller during an RO run.
 
 The controller keeps the owner and ticket outside this process.  It supplies
-one RW share key and the WinRM/artifact transport values through the workflow's
-environment only.  The script writes fixed phase evidence and never records
-those values.  A keepalive window is a concurrency aid; it is not a revoke or
-share-swarm acknowledgement.
+one RW share key and the WinRM/artifact transport values through its short-lived
+environment only.  The script writes fixed phase evidence for a later Actions
+artifact handoff and never records those values.  A keepalive window is a
+concurrency aid; it is not a revoke or share-swarm acknowledgement.
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ import qsync_three_host_bootstrap as bootstrap  # noqa: E402
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description="qSync Windows RW keepalive runner")
     root.add_argument("--source-sha", required=True)
+    root.add_argument("--run-id", required=True)
     root.add_argument("--native-manifest", required=True, type=Path)
     root.add_argument("--windows-binary", required=True, type=Path)
     root.add_argument("--expected-file-hash", required=True)
@@ -75,6 +76,11 @@ def keepalive_observed(remote: bootstrap.RemoteRun | None, requested: int) -> bo
 def write_result(
     evidence: bootstrap.SafeEvidence,
     *,
+    run_id: str,
+    run_started_utc: str,
+    run_finished_utc: str,
+    remote_command_started_utc: str | None,
+    remote_command_finished_utc: str | None,
     source_sha: str,
     artifact: dict[str, Any] | None,
     expected_file_hash: str,
@@ -89,11 +95,24 @@ def write_result(
         "record_type": "qsync_f_windows_rw_keepalive",
         "scope": "windows_rw_concurrent_keepalive",
         "status": status,
+        "run_id": run_id,
+        "run_started_utc": run_started_utc,
+        "run_finished_utc": run_finished_utc,
+        "remote_command_started_utc": remote_command_started_utc,
+        "remote_command_finished_utc": remote_command_finished_utc,
         "source_sha": source_sha,
         "windows_binary_sha256": artifact.get("sha256") if artifact else None,
         "windows_binary_size_bytes": artifact.get("size_bytes") if artifact else None,
         "keepalive_requested_seconds": requested,
         "keepalive_observed": keepalive_observed(remote, requested),
+        "keepalive_trace_enter_elapsed_ms": (
+            remote.diagnostic_elapsed_ms.get("keepalive_enter") if remote is not None else None
+        ),
+        "keepalive_trace_done_elapsed_ms": (
+            remote.diagnostic_elapsed_ms.get("keepalive_done") if remote is not None else None
+        ),
+        "expected_file_hash": expected_file_hash,
+        "expected_file_size_bytes": bootstrap.FIXTURE_A_SIZE_BYTES,
         "remote_status_code": remote.status_code if remote is not None else None,
         "remote_phase_count": len(phases),
         "remote_contract_valid": bool(
@@ -128,15 +147,20 @@ def write_result(
 
 def run(args: argparse.Namespace) -> int:
     vault = bootstrap.SecretVault()
+    run_started_utc = bootstrap.utc_now()
+    run_id = ""
     evidence: bootstrap.SafeEvidence | None = None
     artifact: dict[str, Any] | None = None
     remote: bootstrap.RemoteRun | None = None
     run_root: Path | None = None
+    remote_command_started_utc: str | None = None
+    remote_command_finished_utc: str | None = None
     run_owned_copy_removed = False
     status = "failed"
     error_class = "unexpected"
     result_code = 1
     try:
+        run_id = bootstrap.require_run_id(args.run_id)
         source_sha = bootstrap.require_source_sha(args.source_sha)
         expected_file_hash = bootstrap.require_sha256(args.expected_file_hash)
         if not isinstance(args.keepalive_seconds, int) or not 1 <= args.keepalive_seconds <= 900:
@@ -178,6 +202,7 @@ def run(args: argparse.Namespace) -> int:
         share_key = vault.hold(share_key_raw)
         public_host = bootstrap.validate_host(public_host_raw)
         destination = bootstrap.fresh_winrm_destination(spec)
+        remote_command_started_utc = bootstrap.utc_now()
         remote = bootstrap.run_winrm_member(
             spec,
             staged_binary,
@@ -191,6 +216,7 @@ def run(args: argparse.Namespace) -> int:
             vault,
             keepalive_seconds=args.keepalive_seconds,
         )
+        remote_command_finished_utc = bootstrap.utc_now()
         if keepalive_observed(remote, args.keepalive_seconds) and bootstrap.remote_contract_is_complete(
             remote,
             artifact["sha256"],
@@ -217,6 +243,7 @@ def run(args: argparse.Namespace) -> int:
         error_class = "unexpected"
         result_code = 1
     finally:
+        run_finished_utc = bootstrap.utc_now()
         if run_root is not None:
             can_remove = remote is None or (
                 remote.transport_cleanup_completed
@@ -234,6 +261,11 @@ def run(args: argparse.Namespace) -> int:
             try:
                 write_result(
                     evidence,
+                    run_id=run_id,
+                    run_started_utc=run_started_utc,
+                    run_finished_utc=run_finished_utc,
+                    remote_command_started_utc=remote_command_started_utc,
+                    remote_command_finished_utc=remote_command_finished_utc,
                     source_sha=str(args.source_sha),
                     artifact=artifact,
                     expected_file_hash=expected_file_hash if "expected_file_hash" in locals() else "",

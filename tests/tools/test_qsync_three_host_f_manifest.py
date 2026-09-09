@@ -106,6 +106,24 @@ class QsyncRoleManifestTests(unittest.TestCase):
         self.assertIn("bootstrap.stage_role_binary", runner)
         self.assertIn("run_owned_copy_removed", runner)
         self.assertIn("keepalive_observed(remote, args.keepalive_seconds)", runner)
+        self.assertIn('"file_hash_started_utc": file_hash_started_utc', (ROOT / "scripts" / "qsync_three_host_role.py").read_text(encoding="utf-8"))
+        self.assertIn('root.add_argument("--run-id", required=True)', runner)
+        self.assertIn("--run-id \"$COORDINATION_RUN_ID\"", workflow)
+        self.assertIn("hosted-ro-consumer", workflow)
+        self.assertIn("controller\n# downloads its redacted result", workflow)
+        self.assertNotIn("concurrent-role-gate", workflow)
+        self.assertIn("ro_share_key_secret_name", workflow)
+        self.assertNotIn("windows-rw-provider", workflow)
+        for forbidden in (
+            "QSYNC_F_WINRM_USERNAME",
+            "QSYNC_F_WINRM_PASSWORD",
+            "QSYNC_F_WINRM_HOST",
+            "QSYNC_F_WINRM_DESTINATION",
+            "QSYNC_F_OWNER_API_URL",
+            "QSYNC_F_ARTIFACT_PUBLIC_HOST",
+            "QSYNC_F_RW_SHARE_KEY",
+        ):
+            self.assertNotIn(forbidden, workflow)
         self.assertNotRegex(workflow, r"mkdir[^\n]*qsync-f-rw-evidence")
         self.assertNotRegex(workflow, r"mkdir[^\n]*qsync-f-evidence")
 
@@ -168,6 +186,47 @@ class QsyncRoleManifestTests(unittest.TestCase):
         remote.phases.pop(2)
         remote.transport_error_class = None
         self.assertFalse(BOOTSTRAP.remote_contract_is_complete(remote, expected_binary, 123, expected_file, 256))
+
+    def test_remote_parser_retains_keepalive_trace_for_gate(self) -> None:
+        expected_binary = "d" * 64
+        expected_file = "e" * 64
+        lines = []
+        for phase in BOOTSTRAP.REMOTE_REQUIRED_PHASES:
+            if phase == "binary_verification":
+                lines.append(f"FROLE|phase={phase}|ok=true|hash={expected_binary}|size=123")
+            elif phase in {"file_hash", "member_reopen_membership"}:
+                lines.append(f"FROLE|phase={phase}|ok=true|hash={expected_file}|size=256")
+            elif phase == "cleanup":
+                lines.append(f"FROLE|phase={phase}|ok=true|signal=ctrl_c")
+            else:
+                lines.append(f"FROLE|phase={phase}|ok=true")
+        lines.extend(
+            [
+                "FTRACE|stage=reopen_login_enter|elapsed_ms=10",
+                "FTRACE|stage=reopen_login_done|count=200|elapsed_ms=11",
+                "FTRACE|stage=reopen_membership_enter|elapsed_ms=12",
+                "FTRACE|stage=reopen_membership_done|count=200|elapsed_ms=13",
+                "FTRACE|stage=reopen_checks|count=63|elapsed_ms=14",
+                "FTRACE|stage=keepalive_enter|count=300|elapsed_ms=15",
+                "FTRACE|stage=keepalive_done|count=300|elapsed_ms=315",
+            ]
+        )
+        remote = BOOTSTRAP.parse_remote_output("\n".join(lines), expected_binary, 123)
+        remote.status_code = 0
+        remote.transport_cleanup_completed = True
+        remote.graceful_signal = True
+        self.assertEqual(remote.diagnostic_counts["keepalive_enter"], 300)
+        self.assertEqual(remote.diagnostic_counts["keepalive_done"], 300)
+        self.assertTrue(
+            BOOTSTRAP.remote_contract_is_complete(
+                remote,
+                expected_binary,
+                123,
+                expected_file,
+                256,
+                require_keepalive=True,
+            )
+        )
 
     def test_platform_hashes_may_differ_when_source_matches(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -392,6 +451,10 @@ class QsyncRoleManifestTests(unittest.TestCase):
         self.assertIn("for ($attempt = 0; $attempt -lt 20; $attempt++)", script)
         self.assertIn("if ($Process.HasExited) { return $false }", script)
         self.assertIn("if (Test-OwnedConsoleProcess $Process)", script)
+        self.assertIn("while ($waitTicks -lt 30 -and -not $exitObserved)", script)
+        self.assertIn("Emit-Diagnostic 'stop_exit_probe' -Count $waitTicks", script)
+        self.assertIn("Emit-Diagnostic 'stop_exit_probe_timeout' -Count $waitTicks", script)
+        self.assertIn("Emit-Diagnostic 'stop_exit_code' -Count $exitCode", script)
 
     def test_winrm_direct_protocol_bypasses_command_shell_and_closes_handles(self) -> None:
         class FakeProtocol:

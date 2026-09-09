@@ -14,11 +14,14 @@ import argparse
 import json
 import re
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 SOURCE_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+RUN_ID_RE = re.compile(r"^[0-9]{1,20}$")
+UTC_SECONDS_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
 
 
 class CoordinationError(Exception):
@@ -51,9 +54,56 @@ def require_hash(value: Any) -> str:
     return value
 
 
-def verify(source_sha: str, keepalive_seconds: int, rw: dict[str, Any], ro: dict[str, Any]) -> None:
+def require_run_id(value: Any) -> str:
+    if not isinstance(value, str) or not RUN_ID_RE.fullmatch(value):
+        raise CoordinationError("run_mismatch")
+    return value
+
+
+def parse_utc_seconds(value: Any) -> datetime:
+    if not isinstance(value, str) or not UTC_SECONDS_RE.fullmatch(value):
+        raise CoordinationError("time_window_missing")
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        raise CoordinationError("time_window_missing") from None
+
+
+def interval(result: dict[str, Any], start_key: str, finish_key: str) -> tuple[datetime, datetime]:
+    started = parse_utc_seconds(result.get(start_key))
+    finished = parse_utc_seconds(result.get(finish_key))
+    if finished <= started:
+        raise CoordinationError("time_window_missing")
+    return started, finished
+
+
+def intervals_overlap(left: tuple[datetime, datetime], right: tuple[datetime, datetime]) -> bool:
+    return max(left[0], right[0]) < min(left[1], right[1])
+
+
+def elapsed_window(
+    remote_window: tuple[datetime, datetime], enter_elapsed_ms: Any, done_elapsed_ms: Any, keepalive_seconds: int
+) -> tuple[datetime, datetime]:
+    if (
+        not isinstance(enter_elapsed_ms, int)
+        or enter_elapsed_ms < 0
+        or not isinstance(done_elapsed_ms, int)
+        or done_elapsed_ms < enter_elapsed_ms
+        or done_elapsed_ms - enter_elapsed_ms < keepalive_seconds * 1000
+    ):
+        raise CoordinationError("keepalive_missing")
+    started = remote_window[0] + timedelta(milliseconds=enter_elapsed_ms)
+    finished = remote_window[0] + timedelta(milliseconds=done_elapsed_ms)
+    if started < remote_window[0] or finished > remote_window[1]:
+        raise CoordinationError("time_window_missing")
+    return started, finished
+
+
+def verify(run_id: str, source_sha: str, keepalive_seconds: int, rw: dict[str, Any], ro: dict[str, Any]) -> None:
     if rw.get("status") != "pass" or ro.get("status") != "pass":
         raise CoordinationError("role_not_pass")
+    if require_run_id(rw.get("run_id")) != run_id or require_run_id(ro.get("run_id")) != run_id:
+        raise CoordinationError("run_mismatch")
     if require_source(rw.get("source_sha")) != source_sha or require_source(ro.get("source_sha")) != source_sha:
         raise CoordinationError("source_mismatch")
     if not isinstance(rw.get("windows_binary_size_bytes"), int) or rw["windows_binary_size_bytes"] <= 0:
@@ -67,13 +117,38 @@ def verify(source_sha: str, keepalive_seconds: int, rw: dict[str, Any], ro: dict
     if not isinstance(ro_file, dict) or not isinstance(ro_file.get("ro_consumer"), dict):
         raise CoordinationError("file_hash_missing")
     ro_file = ro_file["ro_consumer"]
-    require_hash(ro_file.get("sha256"))
+    ro_file_hash = require_hash(ro_file.get("sha256"))
     if not isinstance(ro_file.get("size_bytes"), int) or ro_file["size_bytes"] <= 0:
         raise CoordinationError("file_hash_missing")
+    rw_expected_hash = require_hash(rw.get("expected_file_hash"))
+    ro_expected_hash = require_hash(ro.get("expected_file_hash"))
+    if rw_expected_hash != ro_expected_hash or ro_file_hash != rw_expected_hash:
+        raise CoordinationError("fixture_mismatch")
+    rw_expected_size = rw.get("expected_file_size_bytes")
+    ro_expected_size = ro.get("expected_file_size_bytes")
+    if (
+        not isinstance(rw_expected_size, int)
+        or rw_expected_size <= 0
+        or not isinstance(ro_expected_size, int)
+        or ro_expected_size != rw_expected_size
+        or ro_file["size_bytes"] != rw_expected_size
+    ):
+        raise CoordinationError("fixture_mismatch")
     if rw.get("remote_contract_valid") is not True or ro.get("raw_output_retained") is not False:
         raise CoordinationError("role_contract_invalid")
     if rw.get("keepalive_requested_seconds") != keepalive_seconds or rw.get("keepalive_observed") is not True:
         raise CoordinationError("keepalive_missing")
+    rw_window = interval(rw, "remote_command_started_utc", "remote_command_finished_utc")
+    ro_window = interval(ro, "join_started_utc", "join_finished_utc")
+    ro_file_window = interval(ro, "file_hash_started_utc", "file_hash_finished_utc")
+    keepalive_window = elapsed_window(
+        rw_window,
+        rw.get("keepalive_trace_enter_elapsed_ms"),
+        rw.get("keepalive_trace_done_elapsed_ms"),
+        keepalive_seconds,
+    )
+    if not intervals_overlap(keepalive_window, ro_window) or not intervals_overlap(keepalive_window, ro_file_window):
+        raise CoordinationError("time_window_missing")
     if rw.get("managed_bilateral_drain_ack") != "unverified":
         raise CoordinationError("evidence_invalid")
     if rw.get("state_retained_after_unknown") is not False:
@@ -87,17 +162,19 @@ def verify(source_sha: str, keepalive_seconds: int, rw: dict[str, Any], ro: dict
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="verify concurrent qSync role evidence")
     parser.add_argument("--source-sha", required=True)
+    parser.add_argument("--run-id", required=True)
     parser.add_argument("--keepalive-seconds", required=True, type=int)
     parser.add_argument("--rw-evidence", required=True, type=Path)
     parser.add_argument("--ro-evidence", required=True, type=Path)
     args = parser.parse_args(argv)
     try:
+        run_id = require_run_id(args.run_id)
         source_sha = require_source(args.source_sha)
         if not 1 <= args.keepalive_seconds <= 900:
             raise CoordinationError("config_invalid")
         rw = load_result(args.rw_evidence)
         ro = load_result(args.ro_evidence)
-        verify(source_sha, args.keepalive_seconds, rw, ro)
+        verify(run_id, source_sha, args.keepalive_seconds, rw, ro)
     except CoordinationError as error:
         print(f"QSYNC_F_COORDINATION|ok=false|error_class={error.error_class}")
         return 1

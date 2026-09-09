@@ -33,6 +33,7 @@ import qsync_three_host_bootstrap as bootstrap  # noqa: E402
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description="qSync hosted Ubuntu read-only role")
     root.add_argument("--source-sha", required=True)
+    root.add_argument("--run-id", required=True)
     root.add_argument("--manifest", required=True, type=Path)
     root.add_argument("--binary", required=True, type=Path)
     root.add_argument("--run-parent", required=True, type=Path)
@@ -85,9 +86,21 @@ def load_artifact(source_sha: str, manifest_path: Path, binary: Path) -> dict[st
     }
 
 
+def phase_window(phases: list[dict[str, Any]], phase_name: str) -> tuple[str | None, str | None]:
+    for phase in phases:
+        if phase.get("phase") == phase_name and phase.get("status") == "pass":
+            started = phase.get("started")
+            finished = phase.get("finished")
+            if isinstance(started, str) and isinstance(finished, str):
+                return started, finished
+    return None, None
+
+
 def _run(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     vault = bootstrap.SecretVault()
+    run_started_utc = bootstrap.utc_now()
+    run_id = ""
     recorder = bootstrap.PhaseRecorder()
     process: bootstrap.LocalWebProcess | None = None
     run_root: Path | None = None
@@ -103,6 +116,7 @@ def _run(argv: list[str] | None = None) -> int:
         "preexisting_protected_state_unchanged": "unverified",
     }
     try:
+        run_id = bootstrap.require_run_id(args.run_id)
         evidence = bootstrap.SafeEvidence(args.evidence_dir, vault)
         bootstrap.require_source_sha(args.source_sha)
         expected_hash = bootstrap.require_sha256(args.expected_file_hash)
@@ -267,6 +281,7 @@ def _run(argv: list[str] | None = None) -> int:
         result_code = 1
         return result_code
     finally:
+        run_finished_utc = bootstrap.utc_now()
         if process is not None:
             started_once = process.started_once
             try:
@@ -319,10 +334,19 @@ def _run(argv: list[str] | None = None) -> int:
                 final_status = "blocked"
             elif result_code != 0 and final_status == "pass":
                 final_status = "failed"
+            join_started_utc, join_finished_utc = phase_window(recorder.phases, "member_join")
+            file_hash_started_utc, file_hash_finished_utc = phase_window(recorder.phases, "file_hash")
             manifest = {
                 "scope": "three_host_transport_smoke_subset",
                 "harness_version": "qsync-f-ro-1",
                 "status": final_status,
+                "run_id": run_id,
+                "run_started_utc": run_started_utc,
+                "run_finished_utc": run_finished_utc,
+                "join_started_utc": join_started_utc,
+                "join_finished_utc": join_finished_utc,
+                "file_hash_started_utc": file_hash_started_utc,
+                "file_hash_finished_utc": file_hash_finished_utc,
                 "source_sha": args.source_sha,
                 "binary_sha256": binary_hashes,
                 "topology": [{"role": "ro_consumer", "label": "hosted-ubuntu-ro", "runner": "local"}],
@@ -331,6 +355,17 @@ def _run(argv: list[str] | None = None) -> int:
                     {"role": "rw-provider", "epoch": None, "verified_chunks": 0, "verified_bytes": 0},
                 ],
                 "file_hash_verified": file_hash_verified,
+                "expected_file_hash": expected_hash if "expected_hash" in locals() else None,
+                "expected_file_size_bytes": (
+                    next(
+                        (
+                            value.get("size_bytes")
+                            for value in file_hash_verified.values()
+                            if isinstance(value, dict) and isinstance(value.get("size_bytes"), int)
+                        ),
+                        None,
+                    )
+                ),
                 "phases": recorder.phases,
                 "cleanup": cleanup,
                 "full_f_claim": False,
