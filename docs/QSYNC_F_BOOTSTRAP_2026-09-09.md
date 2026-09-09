@@ -63,6 +63,17 @@ CLI argument는 로그·evidence·artifact에 쓰지 않는다. GitHub reusable 
 `QSYNC_F_OWNER_API_URL`, `QSYNC_F_WINRM_USERNAME`, `QSYNC_F_WINRM_PASSWORD`로
 주입한다. hosted RO job에는 owner 관리자 credential을 전달하지 않는다.
 
+WinRM은 `Session.run_ps`를 사용하지 않는다. pywinrm의 해당 편의 메서드는
+`powershell -encodedcommand ...`를 Windows command shell로 보내므로, wrapper의
+UTF-16LE/Base64 payload를 메모리에서 만들고 `Protocol.run_command`에
+`skip_cmd_shell=True`를 지정해 `powershell.exe`를 직접 실행한다. `open_shell`,
+`get_command_output`, `cleanup_command`, `close_shell`을 모두 같은 호출에서 정리하며,
+정리 실패나 512 KiB를 넘는 encoded argument는 고정 오류로 실패시킨다. 길이 검사는
+payload를 기록하지 않고 숫자만 산출한다. 비밀 없는 대표 config에서 wrapper는 6,374 bytes,
+encoded payload는 17,000 bytes, 기존 run_ps command는 17,027 bytes,
+직접 WinRS command는 17,090 bytes였고 command-shell 8,191-byte 경계를 넘었으므로
+이 경로가 필수임을 확인했다.
+
 ## 실행 순서와 판정
 
 ```text

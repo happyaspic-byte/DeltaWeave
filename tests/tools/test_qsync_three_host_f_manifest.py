@@ -211,6 +211,74 @@ class QsyncRoleManifestTests(unittest.TestCase):
         self.assertIn("$script:GracefulDrainProven", script)
         self.assertIn("$script:GracefulDrainProven -and -not $script:ForcedTermination", script)
 
+    def test_winrm_direct_protocol_bypasses_command_shell_and_closes_handles(self) -> None:
+        class FakeProtocol:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, object]] = []
+
+            def open_shell(self) -> str:
+                self.calls.append(("open_shell", None))
+                return "shell"
+
+            def run_command(self, shell_id: str, command: str, arguments: object, **options: object) -> str:
+                self.calls.append(("run_command", (shell_id, command, arguments, options)))
+                return "command"
+
+            def get_command_output(self, shell_id: str, command_id: str) -> tuple[bytes, bytes, int]:
+                self.calls.append(("get_command_output", (shell_id, command_id)))
+                return b"FROLE|phase=self_test|ok=true\n", b"", 0
+
+            def cleanup_command(self, shell_id: str, command_id: str) -> None:
+                self.calls.append(("cleanup_command", (shell_id, command_id)))
+
+            def close_shell(self, shell_id: str) -> None:
+                self.calls.append(("close_shell", shell_id))
+
+        class FakeSession:
+            def __init__(self) -> None:
+                self.protocol = FakeProtocol()
+
+            def run_ps(self, _command: str) -> None:
+                raise AssertionError("Session.run_ps must not be used")
+
+        session = FakeSession()
+        result = BOOTSTRAP._run_winrm_powershell(session, "Write-Output FROLE")
+        self.assertEqual(result.status_code, 0)
+        self.assertEqual(result.std_err, b"")
+        run_call = next(call for call in session.protocol.calls if call[0] == "run_command")
+        _, details = run_call
+        assert isinstance(details, tuple)
+        self.assertEqual(details[1], "powershell.exe")
+        self.assertIn("-EncodedCommand", details[2])
+        self.assertTrue(details[3]["skip_cmd_shell"])
+        self.assertFalse(details[3]["console_mode_stdin"])
+        self.assertEqual(
+            [call[0] for call in session.protocol.calls],
+            ["open_shell", "run_command", "get_command_output", "cleanup_command", "close_shell"],
+        )
+
+    def test_winrm_command_length_measurement_is_numeric_and_bounded(self) -> None:
+        script = (ROOT / "scripts" / "qsync_three_host_winrm_member.ps1").read_text(encoding="utf-8")
+        wrapper = BOOTSTRAP._winrm_wrapper(
+            script,
+            {
+                "artifact_url": "https://example.invalid/a",
+                "artifact_sha256": "a" * 64,
+                "artifact_size": "33190912",
+                "owner_base_uri": "https://owner.invalid",
+                "share_key": "b" * 256,
+                "destination_root": r"C:\DeltaWeave-QSync-F-opaque\member-files",
+                "expected_file_hash": "c" * 64,
+                "expected_file_name": "fixture-a.bin",
+            },
+        )
+        lengths = BOOTSTRAP._winrm_command_lengths(wrapper)
+        self.assertGreater(lengths["wrapper_bytes"], 0)
+        self.assertGreater(lengths["encoded_command_bytes"], lengths["wrapper_bytes"])
+        self.assertGreater(lengths["legacy_run_ps_command_bytes"], BOOTSTRAP.WINRM_CMD_SHELL_LIMIT_BYTES)
+        self.assertGreater(lengths["direct_skip_cmd_shell_command_bytes"], BOOTSTRAP.WINRM_CMD_SHELL_LIMIT_BYTES)
+        self.assertLessEqual(lengths["encoded_command_bytes"], BOOTSTRAP.WINRM_MAX_ENCODED_COMMAND_BYTES)
+
 
 if __name__ == "__main__":
     unittest.main()

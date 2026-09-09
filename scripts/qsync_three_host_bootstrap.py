@@ -771,6 +771,15 @@ REMOTE_PHASES = {
     "cleanup",
 }
 
+# pywinrm's Session.run_ps builds a `powershell -encodedcommand ...` command
+# and sends it through the Windows command shell.  The command shell has an
+# approximately 8 KiB command-line limit.  The direct WinRS path below keeps
+# the same UTF-16LE/Base64 PowerShell payload but sets WINRS_SKIP_CMD_SHELL so
+# cmd.exe is not involved.  The upper bound is a fail-closed guard for the
+# WinRS argument itself; it is never reported with payload contents.
+WINRM_CMD_SHELL_LIMIT_BYTES = 8191
+WINRM_MAX_ENCODED_COMMAND_BYTES = 512 * 1024
+
 
 @dataclass
 class RemoteRun:
@@ -780,6 +789,13 @@ class RemoteRun:
     binary_size: int | None = None
     forced_termination: bool = False
     status_code: int = 1
+
+
+@dataclass(frozen=True)
+class WinRMResult:
+    std_out: bytes
+    std_err: bytes
+    status_code: int
 
 
 def parse_remote_output(stdout: bytes | str, expected_hash: str, expected_size: int | None = None) -> RemoteRun:
@@ -863,6 +879,82 @@ def _winrm_wrapper(script: str, config: Mapping[str, str]) -> str:
     )
 
 
+def _winrm_encoded_command(command: str) -> str:
+    """Encode a PowerShell command without exposing its payload."""
+
+    if not isinstance(command, str) or not command:
+        fail("config_invalid")
+    encoded = base64.b64encode(command.encode("utf-16-le")).decode("ascii")
+    if len(encoded.encode("ascii")) > WINRM_MAX_ENCODED_COMMAND_BYTES:
+        fail("api_response_invalid")
+    return encoded
+
+
+def _winrm_command_lengths(command: str) -> dict[str, int]:
+    """Return numeric transport lengths for a non-secret diagnostic/test."""
+
+    encoded = _winrm_encoded_command(command)
+    legacy_command = "powershell -encodedcommand " + encoded
+    direct_command = (
+        "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand "
+        + encoded
+    )
+    return {
+        "wrapper_bytes": len(command.encode("utf-8")),
+        "encoded_command_bytes": len(encoded.encode("ascii")),
+        "legacy_run_ps_command_bytes": len(legacy_command.encode("ascii")),
+        "direct_skip_cmd_shell_command_bytes": len(direct_command.encode("ascii")),
+    }
+
+
+def _run_winrm_powershell(session: Any, command: str) -> WinRMResult:
+    """Run PowerShell through WinRS directly, bypassing cmd.exe."""
+
+    protocol = getattr(session, "protocol", None)
+    if protocol is None:
+        fail("external_unavailable", "blocked")
+    encoded = _winrm_encoded_command(command)
+    shell_id: Any = None
+    command_id: Any = None
+    cleanup_failed = False
+    try:
+        shell_id = protocol.open_shell()
+        command_id = protocol.run_command(
+            shell_id,
+            "powershell.exe",
+            (
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-EncodedCommand",
+                encoded,
+            ),
+            console_mode_stdin=False,
+            skip_cmd_shell=True,
+        )
+        std_out, std_err, status_code = protocol.get_command_output(shell_id, command_id)
+    except HarnessError:
+        raise
+    except Exception:
+        fail("external_unavailable", "blocked")
+    finally:
+        if shell_id is not None and command_id is not None:
+            try:
+                protocol.cleanup_command(shell_id, command_id)
+            except Exception:
+                cleanup_failed = True
+        if shell_id is not None:
+            try:
+                protocol.close_shell(shell_id)
+            except Exception:
+                cleanup_failed = True
+    if cleanup_failed:
+        fail("external_unavailable", "blocked")
+    return WinRMResult(bytes(std_out), bytes(std_err), int(status_code))
+
+
 def run_winrm_member(
     spec: RoleSpec,
     artifact: Path,
@@ -921,7 +1013,7 @@ def run_winrm_member(
                 operation_timeout_sec=45,
                 read_timeout_sec=60,
             )
-            result = session.run_ps(wrapper)
+            result = _run_winrm_powershell(session, wrapper)
         except ImportError:
             fail("external_unavailable", "blocked")
         except Exception:
