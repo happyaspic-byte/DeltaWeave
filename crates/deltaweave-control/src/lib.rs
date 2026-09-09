@@ -14,6 +14,7 @@ use deltaweave_sync::{ManagedSyncConfig, ManagedSyncEngine, ManagedSyncReport};
 use std::{
     collections::BTreeMap,
     fs::{File, OpenOptions},
+    future::Future,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -22,7 +23,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::{
-    sync::{Mutex as AsyncMutex, RwLock},
+    sync::{Mutex as AsyncMutex, RwLock, oneshot},
     task::JoinHandle,
 };
 use worker::Worker;
@@ -450,10 +451,18 @@ pub struct Manager {
     background: AsyncMutex<Vec<JoinHandle<()>>>,
     revocation_tasks: AsyncMutex<Vec<RevocationTask>>,
     managed_options: ManagerOptions,
-    persistence: AsyncMutex<()>,
+    /// The writer guard is moved into the non-cancellable save task so a
+    /// caller abort cannot release serialization while `config::save` runs.
+    persistence: Arc<AsyncMutex<()>>,
+    /// Managed join/retry tasks outlive an HTTP caller that drops its response
+    /// future.  Shutdown drains this list before releasing managed ownership.
+    managed_operations: AsyncMutex<Vec<JoinHandle<()>>>,
+    operation_lifecycle: AsyncMutex<()>,
+    shutdown_lifecycle: AsyncMutex<()>,
     lifecycle: RwLock<()>,
     ownership: Mutex<Option<File>>,
     stopped: AtomicBool,
+    closing: AtomicBool,
     started_at: u64,
 }
 impl Manager {
@@ -556,10 +565,14 @@ impl Manager {
             background: AsyncMutex::new(Vec::new()),
             revocation_tasks: AsyncMutex::new(Vec::new()),
             managed_options,
-            persistence: AsyncMutex::new(()),
+            persistence: Arc::new(AsyncMutex::new(())),
+            managed_operations: AsyncMutex::new(Vec::new()),
+            operation_lifecycle: AsyncMutex::new(()),
+            shutdown_lifecycle: AsyncMutex::new(()),
             lifecycle: RwLock::new(()),
             ownership: Mutex::new(Some(ownership)),
             stopped: AtomicBool::new(false),
+            closing: AtomicBool::new(false),
             started_at: now(),
         });
         let startup = async {
@@ -757,6 +770,36 @@ impl Manager {
         );
         Ok(())
     }
+
+    /// Runs a managed mutation in a manager-owned task.  The HTTP/UI caller
+    /// receives the result through a one-shot channel; dropping that receiver
+    /// detaches the task instead of aborting a transition which may already
+    /// own a root lease or have started a durable save.  The task handle is
+    /// retained until completion and drained by shutdown.
+    async fn spawn_managed_operation<F, Fut>(self: &Arc<Self>, operation: F) -> Result<JoinResult>
+    where
+        F: FnOnce(Arc<Self>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<JoinResult>> + Send + 'static,
+    {
+        let _operation_lifecycle = self.operation_lifecycle.lock().await;
+        ensure!(
+            !self.closing.load(Ordering::Acquire) && !self.stopped.load(Ordering::Acquire),
+            ManagedError::new(ManagedErrorKind::ShuttingDown)
+        );
+        let (sender, receiver) = oneshot::channel();
+        let manager = Arc::clone(self);
+        let task = tokio::spawn(async move {
+            let result = operation(manager).await;
+            let _ = sender.send(result);
+        });
+        let mut operations = self.managed_operations.lock().await;
+        operations.retain(|task| !task.is_finished());
+        operations.push(task);
+        drop(operations);
+        receiver
+            .await
+            .context("managed operation stopped before publishing its result")?
+    }
     fn slot(&self, id: &str) -> Result<Arc<Slot>> {
         self.running()?;
         self.slots
@@ -767,7 +810,7 @@ impl Manager {
             .context("folder not found")
     }
     async fn persist(&self, mutate: impl FnOnce(&mut config::Config) -> Result<()>) -> Result<()> {
-        let _writer = self.persistence.lock().await;
+        let writer = self.persistence.clone().lock_owned().await;
         let mut config = {
             let state = self.shared.lock().expect("snapshot mutex");
             let mut config = state.config.clone();
@@ -797,14 +840,23 @@ impl Manager {
         }
         let changed = serde_json::to_value(&config)? != before;
         let dir = self.data_dir.clone();
-        let saved = config.clone();
-        tokio::task::spawn_blocking(move || config::save(&dir, &saved)).await??;
-        let mut state = self.shared.lock().expect("snapshot mutex");
-        state.config = config;
-        state.trim();
-        if changed {
-            state.revision += 1;
-        }
+        let shared = Arc::clone(&self.shared);
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            // Once this task starts, both the durable save and the in-memory
+            // publication run while the owned writer guard is still held.
+            // Tokio cannot abort a started blocking task, so a dropped caller
+            // cannot expose a second writer to an unfinished replacement.
+            config::save(&dir, &config)?;
+            let mut state = shared.lock().expect("snapshot mutex");
+            state.config = config;
+            state.trim();
+            if changed {
+                state.revision += 1;
+            }
+            drop(writer);
+            Ok(())
+        })
+        .await??;
         Ok(())
     }
 
@@ -2616,7 +2668,17 @@ impl Manager {
     /// bearer is read from the private pending-ticket file by
     /// `retry_pending`; callers never submit it again and a retry never
     /// allocates a new replica or invitation.
-    pub async fn retry_pending_join(&self, input: RetryPendingJoinInput) -> Result<JoinResult> {
+    pub async fn retry_pending_join(
+        self: &Arc<Self>,
+        input: RetryPendingJoinInput,
+    ) -> Result<JoinResult> {
+        self.spawn_managed_operation(|manager| async move {
+            manager.retry_pending_join_inner(input).await
+        })
+        .await
+    }
+
+    async fn retry_pending_join_inner(&self, input: RetryPendingJoinInput) -> Result<JoinResult> {
         let _active = self.lifecycle.read().await;
         self.running()?;
         validate_request_id(&input.request_id)?;
@@ -3585,7 +3647,12 @@ impl Manager {
         Ok(())
     }
 
-    pub async fn join_share(&self, input: JoinShareInput) -> Result<JoinResult> {
+    pub async fn join_share(self: &Arc<Self>, input: JoinShareInput) -> Result<JoinResult> {
+        self.spawn_managed_operation(|manager| async move { manager.join_share_inner(input).await })
+            .await
+    }
+
+    async fn join_share_inner(&self, input: JoinShareInput) -> Result<JoinResult> {
         let _active = self.lifecycle.read().await;
         self.running()?;
         validate_request_id(&input.request_id)?;
@@ -5323,12 +5390,37 @@ impl Manager {
         Ok(settings)
     }
     pub async fn shutdown(&self) -> Result<()> {
-        let _exclusive = self.lifecycle.write().await;
-        if self.stopped.swap(true, Ordering::AcqRel) {
+        let _shutdown_lifecycle = self.shutdown_lifecycle.lock().await;
+        if self.stopped.load(Ordering::Acquire) {
             return Ok(());
         }
-        let background = std::mem::take(&mut *self.background.lock().await);
+        // Stop accepting new manager-owned mutations first.  Existing managed
+        // tasks are allowed to finish while the lifecycle read guard remains
+        // available; taking the lifecycle writer before this drain could
+        // strand a task which had not yet acquired its read guard.
+        self.closing.store(true, Ordering::Release);
+        let managed_operations = {
+            let _operation_lifecycle = self.operation_lifecycle.lock().await;
+            std::mem::take(&mut *self.managed_operations.lock().await)
+        };
         let mut error = None;
+        for task in managed_operations {
+            if let Err(failure) = task.await
+                && !failure.is_cancelled()
+            {
+                error = Some(anyhow::anyhow!("managed operation task failed"));
+            }
+        }
+
+        // Wait for all public/background calls which already hold the
+        // lifecycle read guard before setting `stopped` or aborting their
+        // persistence work.  A started blocking save remains serialized by
+        // `persistence`; dropping its caller cannot let another save race it.
+        let _exclusive = self.lifecycle.write().await;
+        if self.stopped.swap(true, Ordering::AcqRel) {
+            return error.map_or(Ok(()), Err);
+        }
+        let background = std::mem::take(&mut *self.background.lock().await);
         for task in background {
             task.abort();
             if let Err(failure) = task.await
@@ -5797,6 +5889,37 @@ mod managed_error_tests {
             assert!(unrecognized.is_file());
             assert!(!generated.exists());
             manager.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn dropped_managed_response_does_not_cancel_owned_operation() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let manager = Manager::open(temp.path().join("admin")).await.unwrap();
+            let started = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let completed = Arc::new(AtomicBool::new(false));
+            let caller_manager = Arc::clone(&manager);
+            let started_for_operation = Arc::clone(&started);
+            let release_for_operation = Arc::clone(&release);
+            let completed_for_operation = Arc::clone(&completed);
+            let caller = tokio::spawn(async move {
+                caller_manager
+                    .spawn_managed_operation(|manager| async move {
+                        started_for_operation.notify_one();
+                        release_for_operation.notified().await;
+                        manager.persist(|_| Ok(())).await?;
+                        completed_for_operation.store(true, Ordering::Release);
+                        Err(ManagedError::new(ManagedErrorKind::Busy).into())
+                    })
+                    .await
+            });
+            started.notified().await;
+            caller.abort();
+            release.notify_one();
+            manager.shutdown().await.unwrap();
+            assert!(completed.load(Ordering::Acquire));
         });
     }
 }
