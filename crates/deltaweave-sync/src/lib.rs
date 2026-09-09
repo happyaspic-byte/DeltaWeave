@@ -6,7 +6,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -19,12 +22,20 @@ use deltaweave_net::{
     SyncClient, SyncSession, TransferEvent, TransferObserver, is_swarm_local_storage_error,
     swarm_partial_fill,
 };
+use deltaweave_net::{
+    root_admission,
+    share::{
+        ApplyPermit, ApplyStateView, AuthoritativeSnapshot, ClientIntentPhase, ManifestAttestation,
+        ShareError, ShareGrant, ShareId, ShareSession, SnapshotToken, SwarmTransferReceipt,
+    },
+};
 use deltaweave_reconcile::{
     ApplyAction, ConflictRecord, MerkleTree, actions_to_reach, merge_snapshots,
 };
 use deltaweave_store::Store;
 use iroh::{EndpointAddr, EndpointId};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod read_only;
 mod shared;
@@ -131,6 +142,474 @@ struct StageStats {
 struct RemoteStats {
     pushed_bytes: u64,
     reused_extents: usize,
+}
+
+/// One bounded, grant-specific swarm assignment.  The grant is retained by
+/// the parent while the fetch task runs so a panic or transport failure still
+/// has an exact receipt/intent binding available for recovery.
+struct ManagedSwarmAssignment {
+    provider: EndpointId,
+    grant: ShareGrant,
+    operation_id: [u8; 16],
+    hashes: Vec<Hash32>,
+}
+
+struct ManagedSwarmOutcome {
+    assignment: usize,
+    result: Result<SwarmTransferReceipt>,
+}
+
+/// Filesystem identity captured while a stage directory is owned by this
+/// process.  If a persisted stage has no captured identity (for example, an
+/// older journal format), cleanup deliberately preserves the directory rather
+/// than risking deletion after a same-name replacement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ManagedStageIdentity {
+    volume: u64,
+    file: u64,
+}
+
+fn managed_stage_identity(path: &Path) -> Option<ManagedStageIdentity> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(ManagedStageIdentity {
+            volume: metadata.dev(),
+            file: metadata.ino(),
+        })
+    }
+    #[cfg(windows)]
+    {
+        // Keep the same stable handle identity used by Store.  The nightly
+        // std::os::windows::fs::MetadataExt file-index methods are not
+        // available on the repository's Windows toolchain, and a path-only
+        // check would permit same-name replacement deletion.
+        let handle = winapi_util::Handle::from_path_any(path).ok()?;
+        let information = winapi_util::file::information(&handle).ok()?;
+        (information.file_index() != 0).then_some(ManagedStageIdentity {
+            volume: information.volume_serial_number(),
+            file: information.file_index(),
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = metadata;
+        None
+    }
+}
+
+/// The owner permit is an admission window, not a cancellation deadline for
+/// filesystem calls that have already started.  Keep this value aligned with
+/// the D authority contract; a later check stops new work and leaves the
+/// operation pending when the owner cannot accept the drain acknowledgement.
+const MANAGED_APPLY_TTL: Duration = Duration::from_secs(10);
+const MAX_MANAGED_OWNER_ROUNDS: usize = 2;
+const MAX_MANAGED_SWARM_PROVIDERS: usize = 8;
+const MAX_MANAGED_SWARM_HASHES: usize = 64;
+static MANAGED_STAGE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+/// Exact owner admission retained across a process restart.  This is a
+/// local journal record; the signed permit remains the authority and the
+/// operation id prevents a retry from creating a second owner row.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct ManagedApplyJournal {
+    pub(crate) permit: deltaweave_net::share::ApplyPermit,
+    pub(crate) operation_id: [u8; 16],
+    /// Intended owner-side result.  This is written before sending the drain
+    /// acknowledgement so a response loss cannot turn a committed apply into
+    /// a later negative replay.
+    #[serde(default)]
+    pub(crate) committed: bool,
+}
+
+/// RW engines use the index share-metadata slot for this versioned envelope.
+/// RO engines have a different envelope in `read_only.rs`; neither path
+/// silently overwrites an unknown metadata value.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ManagedRwJournal {
+    version: u8,
+    owner: [u8; 32],
+    share: [u8; 32],
+    #[serde(default)]
+    stage_roots: Vec<PathBuf>,
+    #[serde(default)]
+    apply: Option<ManagedApplyJournal>,
+}
+
+/// The first E3 checkpoint stored one optional stage root.  Postcard is
+/// positional, so decode that shape explicitly before accepting a newer list
+/// of round roots.  A missing/invalid envelope remains StateUnavailable.
+#[derive(Clone, Debug, Deserialize)]
+struct LegacyManagedRwJournal {
+    version: u8,
+    owner: [u8; 32],
+    share: [u8; 32],
+    stage_root: Option<PathBuf>,
+    apply: Option<ManagedApplyJournal>,
+}
+
+impl ManagedRwJournal {
+    fn new(owner: EndpointId, share: ShareId) -> Self {
+        Self {
+            version: 1,
+            owner: *owner.as_bytes(),
+            share: share.0,
+            stage_roots: Vec::new(),
+            apply: None,
+        }
+    }
+}
+
+#[derive(Default)]
+struct ManagedStages {
+    roots: Vec<PathBuf>,
+    identities: BTreeMap<PathBuf, ManagedStageIdentity>,
+    manifests: BTreeMap<Hash32, FileManifest>,
+    sources: BTreeMap<Hash32, PathBuf>,
+    /// While a round is in flight, dropping this value cleans only its
+    /// run-owned stage roots.  The explicit success cleanup disarms it before
+    /// an attacker can replace a just-removed name.
+    cleanup_state_root: Option<PathBuf>,
+    cleanup_armed: bool,
+}
+
+/// Cleans a newly reserved stage if staging is interrupted before its caller
+/// can persist the stage root in the managed journal.  The cleanup delegates
+/// to the same no-follow, exact-parent checks used after a successful round;
+/// an uncertain replacement is intentionally retained for recovery review.
+struct ManagedStageGuard {
+    root: PathBuf,
+    state_root: PathBuf,
+    identity: Option<ManagedStageIdentity>,
+    armed: bool,
+}
+
+impl ManagedStageGuard {
+    fn new(root: PathBuf, state_root: &Path) -> Self {
+        let identity = managed_stage_identity(&root);
+        Self {
+            root,
+            state_root: state_root.to_path_buf(),
+            identity,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ManagedStageGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let mut stages = ManagedStages::for_root_with_identity(
+                self.root.clone(),
+                self.identity,
+                &self.state_root,
+            );
+            stages.cleanup_owned(&self.state_root);
+        }
+    }
+}
+
+impl ManagedStages {
+    fn for_root(root: PathBuf, state_root: &Path) -> Self {
+        Self::for_root_with_identity(root.clone(), managed_stage_identity(&root), state_root)
+    }
+
+    fn for_root_with_identity(
+        root: PathBuf,
+        identity: Option<ManagedStageIdentity>,
+        state_root: &Path,
+    ) -> Self {
+        let mut stages = Self::default();
+        if let Some(identity) = identity {
+            stages.identities.insert(root.clone(), identity);
+        }
+        stages.roots.push(root);
+        stages.cleanup_state_root = Some(state_root.to_path_buf());
+        stages.cleanup_armed = true;
+        stages
+    }
+
+    /// Reconstructs a path from a persisted journal without claiming current
+    /// filesystem ownership.  A post-restart same-name replacement is left in
+    /// place until a future journal with an identity can prove it is ours.
+    fn for_recovery_root(root: PathBuf, state_root: &Path) -> Self {
+        let mut stages = Self::default();
+        stages.roots.push(root);
+        stages.cleanup_state_root = Some(state_root.to_path_buf());
+        stages.cleanup_armed = true;
+        stages
+    }
+
+    fn merge(&mut self, mut other: ManagedStages) {
+        self.roots.append(&mut other.roots);
+        self.identities
+            .extend(std::mem::take(&mut other.identities));
+        self.manifests.extend(std::mem::take(&mut other.manifests));
+        self.sources.extend(std::mem::take(&mut other.sources));
+        if self.cleanup_state_root.is_none() {
+            self.cleanup_state_root = other.cleanup_state_root.take();
+        }
+        self.cleanup_armed |= other.cleanup_armed;
+        other.cleanup_armed = false;
+    }
+
+    fn cleanup(&self, state_root: &Path) {
+        let Ok(state_root) = fs::canonicalize(state_root) else {
+            return;
+        };
+        for root in &self.roots {
+            let Some(expected_identity) = self.identities.get(root) else {
+                // A path reconstructed from an old/restarted journal has no
+                // ownership proof.  Keep it for explicit recovery rather than
+                // deleting a directory that may have replaced the old name.
+                continue;
+            };
+            let Ok(metadata) = fs::symlink_metadata(root) else {
+                continue;
+            };
+            // Never canonicalize a caller-owned path during cleanup: an
+            // attacker replacing the stage directory with a symlink must not
+            // redirect deletion into another private namespace.  Stages are
+            // created directly below the canonical state root and carry a
+            // unique prefix, so this lexical + no-follow check is sufficient.
+            let Ok(canonical_root) = fs::canonicalize(root) else {
+                continue;
+            };
+            if metadata.is_dir()
+                && !metadata.file_type().is_symlink()
+                // A Windows junction can report as a directory without the
+                // portable symlink bit.  Refuse cleanup unless the resolved
+                // directory is exactly the recorded lexical directory; a
+                // harmless leaked stage is preferable to deleting a foreign
+                // namespace after replacement.
+                && canonical_root == *root
+                && root.parent() == Some(state_root.as_path())
+                && root
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(".managed-stage-"))
+                && managed_stage_identity(root).is_some_and(|actual| actual == *expected_identity)
+            {
+                let _ = fs::remove_dir_all(root);
+            }
+        }
+    }
+
+    fn cleanup_owned(&mut self, state_root: &Path) {
+        if self.cleanup_armed {
+            self.cleanup(state_root);
+            self.cleanup_armed = false;
+            self.roots.clear();
+        }
+    }
+}
+
+impl Drop for ManagedStages {
+    fn drop(&mut self) {
+        if self.cleanup_armed {
+            if let Some(state_root) = self.cleanup_state_root.clone() {
+                self.cleanup(&state_root);
+            }
+            self.cleanup_armed = false;
+        }
+    }
+}
+
+fn managed_operation_id(prefix: &[u8], snapshot: &SnapshotToken, round: usize) -> [u8; 16] {
+    let mut bytes = prefix.to_vec();
+    bytes.extend_from_slice(&snapshot.snapshot);
+    bytes.extend_from_slice(snapshot.root_hash.as_bytes());
+    bytes.extend_from_slice(&(round as u64).to_le_bytes());
+    let digest = Hash32::digest(&bytes);
+    let mut operation = [0_u8; 16];
+    operation.copy_from_slice(&digest.as_bytes()[..16]);
+    operation
+}
+
+fn ensure_managed_deadline(deadline: Instant) -> Result<()> {
+    ensure!(
+        Instant::now() < deadline,
+        deltaweave_net::share::ShareError::GrantExpired
+    );
+    Ok(())
+}
+
+fn managed_swarm_error_can_fallback(class: ShareError) -> bool {
+    matches!(
+        class,
+        ShareError::Offline
+            | ShareError::TransferFailed
+            | ShareError::Busy
+            | ShareError::RosterStale
+            | ShareError::GrantExpired
+    )
+}
+
+/// Replays one exact owner apply journal after a process restart or a lost
+/// response.  The owner-side status is the only source of truth: a Prepared
+/// row is atomically cancelled, while a Started/Restarted row is closed only
+/// with the same committed value after this newly opened managed engine has
+/// no caller-owned writer task left.  Unknown/transport failures remain
+/// errors, so callers retain the journal instead of publishing a false drain.
+pub(crate) async fn recover_managed_apply(
+    session: &ShareSession,
+    apply: &ManagedApplyJournal,
+) -> Result<()> {
+    let receipt = session
+        .apply_status(&apply.permit, Some(apply.operation_id))
+        .await?;
+    match receipt.state {
+        ApplyStateView::Prepared => {
+            let cancelled = session
+                .cancel_apply(&apply.permit, apply.operation_id)
+                .await?;
+            match cancelled.state {
+                ApplyStateView::Denied | ApplyStateView::Expired => Ok(()),
+                ApplyStateView::Drained => {
+                    ensure!(
+                        cancelled.committed == apply.committed,
+                        ShareError::GrantReplay
+                    );
+                    Ok(())
+                }
+                ApplyStateView::Prepared | ApplyStateView::Started | ApplyStateView::Restarted => {
+                    Err(ShareError::RevocationPending.into())
+                }
+            }
+        }
+        ApplyStateView::Drained => {
+            ensure!(
+                receipt.committed == apply.committed,
+                ShareError::GrantReplay
+            );
+            Ok(())
+        }
+        ApplyStateView::Denied | ApplyStateView::Expired => Ok(()),
+        ApplyStateView::Started | ApplyStateView::Restarted => {
+            // The prior task cannot still be running after a process restart:
+            // this function is called under the new engine's serialized gate.
+            // Reuse the exact operation and intended result; never mint a new
+            // permit or turn an old row into success merely because its TTL
+            // elapsed.
+            session
+                .apply_drained(&apply.permit, apply.operation_id, apply.committed)
+                .await
+        }
+    }
+}
+
+fn managed_wall_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn managed_swarm_operation_id(
+    snapshot: &SnapshotToken,
+    record: &SyncRecord,
+    provider: EndpointId,
+    hashes: &[Hash32],
+    batch: usize,
+) -> Result<[u8; 16]> {
+    let mut bytes = b"managed-swarm-fetch-v1".to_vec();
+    bytes.extend_from_slice(&snapshot.snapshot);
+    bytes.extend_from_slice(snapshot.root_hash.as_bytes());
+    bytes.extend_from_slice(record.logical_hash().as_bytes());
+    bytes.extend_from_slice(provider.as_bytes());
+    bytes.extend_from_slice(&(batch as u64).to_le_bytes());
+    bytes.extend_from_slice(&postcard::to_stdvec(hashes)?);
+    let digest = Hash32::digest(&bytes);
+    let mut operation = [0_u8; 16];
+    operation.copy_from_slice(&digest.as_bytes()[..16]);
+    Ok(operation)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_managed_swarm_assignment(
+    assignment: usize,
+    session: ShareSession,
+    store: Arc<Store>,
+    grant: ShareGrant,
+    snapshot: SnapshotToken,
+    record: SyncRecord,
+    manifest: ManifestAttestation,
+    operation_id: [u8; 16],
+    hashes: Vec<Hash32>,
+    observer: Option<TransferObserver>,
+    start_gate: Arc<tokio::sync::Barrier>,
+) -> ManagedSwarmOutcome {
+    if let Some(observer) = &observer {
+        observer.emit(TransferEvent {
+            phase: "swarm_provider_started".into(),
+            path: Some(record.path.as_str().into()),
+            direction: Some("pull".into()),
+            bytes: 0,
+            peer: Some(grant.provider.to_string()),
+        });
+    }
+    // The barrier makes the scheduler's concurrency contract observable: all
+    // accepted provider assignments enter the fetch before any one task can
+    // complete.  It is bounded by the number of assignments in this batch.
+    start_gate.wait().await;
+    let result = session
+        .fetch_swarm_chunks(
+            store,
+            &grant,
+            &snapshot,
+            &record,
+            &manifest,
+            &hashes,
+            operation_id,
+        )
+        .await;
+    if let (Some(observer), Ok(receipt)) = (&observer, &result) {
+        observer.emit(TransferEvent {
+            phase: "swarm_provider_verified".into(),
+            path: Some(record.path.as_str().into()),
+            direction: Some("pull".into()),
+            bytes: receipt.transferred_bytes,
+            peer: Some(grant.provider.to_string()),
+        });
+    }
+    ManagedSwarmOutcome { assignment, result }
+}
+
+/// Converts a completed managed swarm attempt into typed drain evidence before
+/// the owner-side receipt is allowed to terminalize the durable intent.  The
+/// public Store points at `<state_root>/store`; the admission lease binds its
+/// parent private root, so pass the exact lease root rather than the nested
+/// CAS directory.
+async fn recover_managed_swarm_assignment(
+    local: &ReplicaState,
+    session: &ShareSession,
+    assignment: &ManagedSwarmAssignment,
+) -> Result<deltaweave_net::share::ClientIntentRow> {
+    let state_root = local
+        .store
+        .state_root()
+        .parent()
+        .context(ShareError::StateUnavailable)?
+        .to_path_buf();
+    let proof = session
+        .prove_local_io_drained(
+            &assignment.grant,
+            assignment.operation_id,
+            Arc::clone(&local._root_lease),
+            &local.root,
+            state_root,
+        )
+        .await?;
+    session
+        .recover_swarm_intent_with_proof(&assignment.grant, assignment.operation_id, &proof)
+        .await
 }
 
 impl SyncEngine {
@@ -263,12 +742,614 @@ impl ReplicaState {
         deltaweave_net::recover_causal_index(&self.store, &self.index, &self.root)
     }
 
-    fn causal_binding(&self, record: &SyncRecord) -> Result<deltaweave_store::CausalBinding> {
+    fn load_managed_rw_journal(&self, session: &ShareSession) -> Result<ManagedRwJournal> {
+        let membership = session.membership();
+        let Some(bytes) = self.index.share_metadata()? else {
+            return Ok(ManagedRwJournal::new(membership.owner, membership.share_id));
+        };
+        let journal = match postcard::from_bytes::<ManagedRwJournal>(&bytes) {
+            Ok(journal) => journal,
+            Err(_) => {
+                let legacy: LegacyManagedRwJournal = postcard::from_bytes(&bytes)
+                    .context(deltaweave_net::share::ShareError::StateUnavailable)?;
+                ManagedRwJournal {
+                    version: legacy.version,
+                    owner: legacy.owner,
+                    share: legacy.share,
+                    stage_roots: legacy.stage_root.into_iter().collect(),
+                    apply: legacy.apply,
+                }
+            }
+        };
+        ensure!(
+            journal.version == 1
+                && journal.owner == *membership.owner.as_bytes()
+                && journal.share == membership.share_id.0,
+            deltaweave_net::share::ShareError::StateUnavailable
+        );
+        ensure!(
+            journal.stage_roots.len() <= MAX_MANAGED_OWNER_ROUNDS.saturating_add(1),
+            deltaweave_net::share::ShareError::StateUnavailable
+        );
+        Ok(journal)
+    }
+
+    fn save_managed_rw_journal(&self, journal: &ManagedRwJournal) -> Result<()> {
+        self.index
+            .set_share_metadata(&postcard::to_stdvec(journal)?)
+    }
+
+    /// Closes an owner apply row from a previous process lifetime using its
+    /// exact nonce and operation.  A successful, exact owner receipt is
+    /// required before clearing the local journal; a replay/unknown response
+    /// is retained because it does not prove that the blocking writers
+    /// drained.
+    async fn recover_managed_rw_apply(
+        &self,
+        session: &ShareSession,
+        journal: &mut ManagedRwJournal,
+    ) -> Result<()> {
+        let Some(apply) = journal.apply.clone() else {
+            return Ok(());
+        };
+        let membership = session.membership();
+        ensure!(
+            apply.permit.owner == membership.owner
+                && apply.permit.share == membership.share_id
+                && apply.permit.consumer == membership.endpoint,
+            deltaweave_net::share::ShareError::StateUnavailable
+        );
+        recover_managed_apply(session, &apply).await?;
+        journal.apply = None;
+        journal.stage_roots.clear();
+        self.save_managed_rw_journal(journal)
+    }
+
+    /// Recovers only a durable managed ApplyStart before roster liveness or
+    /// fresh owner admission is checked.  Paused/revoked owners may reject a
+    /// heartbeat while still accepting exact status/cancel/drain recovery.
+    pub(crate) async fn recover_managed_apply_before_liveness(
+        &self,
+        session: &ShareSession,
+    ) -> Result<()> {
+        match session.membership().permission {
+            deltaweave_net::share::Permission::ReadWrite => {
+                let mut journal = self.load_managed_rw_journal(session)?;
+                self.recover_managed_rw_apply(session, &mut journal).await
+            }
+            deltaweave_net::share::Permission::ReadOnly => {
+                read_only::recover_managed_apply_before_liveness(self, session).await
+            }
+        }
+    }
+
+    async fn finish_managed_rw_apply(
+        &self,
+        session: &ShareSession,
+        journal: &mut ManagedRwJournal,
+        permit: &deltaweave_net::share::ApplyPermit,
+        operation_id: [u8; 16],
+        committed: bool,
+    ) -> Result<()> {
+        // Persist the intended outcome before the network acknowledgement.
+        // GrantReplay is deliberately retained by the caller: without an
+        // exact owner receipt it is not proof that the prior drain completed.
+        if let Some(apply) = journal.apply.as_mut() {
+            ensure!(
+                apply.operation_id == operation_id && apply.permit == *permit,
+                deltaweave_net::share::ShareError::GrantReplay
+            );
+            apply.committed = committed;
+        } else {
+            journal.apply = Some(ManagedApplyJournal {
+                permit: permit.clone(),
+                operation_id,
+                committed,
+            });
+        }
+        self.save_managed_rw_journal(journal)?;
+        session
+            .apply_drained(permit, operation_id, committed)
+            .await?;
+        journal.apply = None;
+        journal.stage_roots.clear();
+        self.save_managed_rw_journal(journal)
+    }
+
+    /// Reconciles causal path journals left between Store materialization and
+    /// LocalIndex adoption.  The legacy recovery helper is intentionally not
+    /// used here: a managed member must have a fresh owner snapshot and a
+    /// fresh ApplyPermit before any public or index mutation is resumed.
+    async fn recover_managed_causal_changes(
+        &self,
+        session: &ShareSession,
+        snapshot: &SnapshotToken,
+        owner_records: &[SyncRecord],
+        journal: &mut ManagedRwJournal,
+    ) -> Result<()> {
+        let pending: Vec<_> = self
+            .store
+            .path_changes()?
+            .into_iter()
+            .filter(|change| {
+                change.root == self.root
+                    && change.causal.is_some()
+                    && matches!(
+                        change.state,
+                        deltaweave_store::PathChangeState::Prepared
+                            | deltaweave_store::PathChangeState::Preserved
+                            | deltaweave_store::PathChangeState::Materialized
+                            | deltaweave_store::PathChangeState::RollingBack
+                    )
+            })
+            .collect();
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        // Compare the durable index precondition before opening ApplyStart.
+        // A scan must not have a chance to promote the materialized target
+        // as a new local edit, and an unrelated local edit must not be
+        // overwritten by a later resume attempt.
+        let mut plan = Vec::with_capacity(pending.len());
+        for change in pending {
+            let binding = change
+                .causal
+                .as_ref()
+                .context(deltaweave_net::share::ShareError::StateUnavailable)?;
+            // Store intentionally treats authorization as opaque.  A matching
+            // owner record alone is therefore insufficient to prove that a
+            // retained causal attempt was created for this managed share.
+            // Validate the signed, immutable permit before considering the
+            // record for recovery; an old epoch/root is allowed to become a
+            // stale attempt and roll back under the fresh permit below.
+            let authorization = Self::validate_managed_causal_authorization(session, binding)?;
+            let owner_record = owner_records
+                .iter()
+                .find(|record| record.path == binding.record.path);
+            // The owner may have advanced or tombstoned this path since the
+            // interrupted attempt.  Keep the old causal object as a stale
+            // attempt and roll it back under the fresh owner permit; waiting
+            // forever on ManifestMismatch would otherwise block every later
+            // owner round.  An already-adopted target is retained and merely
+            // finalized below, since rolling it back would discard an index
+            // transition that already happened before the crash.
+            let stale_owner = owner_record.is_none_or(|record| record != &binding.record)
+                || authorization.epoch > session.membership().epoch
+                || authorization.root_hash != snapshot.root_hash;
+            let indexed = self
+                .index
+                .get(&change.path)?
+                .map(|record| record.to_sync_record());
+            let target_indexed = indexed.as_ref() == Some(&binding.record);
+            let precondition_indexed = indexed == binding.precondition;
+            ensure!(
+                target_indexed || precondition_indexed,
+                deltaweave_store::PreservationError::LocalChanged
+            );
+            plan.push((change, target_indexed, stale_owner));
+        }
+
+        let started = Instant::now();
+        let permit = session.revalidate_before_apply(snapshot).await?;
+        let deadline = started + MANAGED_APPLY_TTL;
+        ensure_managed_deadline(deadline)?;
+        let operation = managed_operation_id(b"managed-causal-recovery", snapshot, 0);
+        journal.apply = Some(ManagedApplyJournal {
+            permit: permit.clone(),
+            operation_id: operation,
+            committed: false,
+        });
+        self.save_managed_rw_journal(journal)?;
+        session.apply_start(&permit, operation).await?;
+
+        let recovery = (|| -> Result<()> {
+            for (mut change, target_indexed, stale_owner) in plan {
+                ensure_managed_deadline(deadline)?;
+                let binding = change
+                    .causal
+                    .as_ref()
+                    .context(deltaweave_net::share::ShareError::StateUnavailable)?;
+                if target_indexed {
+                    ensure!(
+                        change.state == deltaweave_store::PathChangeState::Materialized,
+                        deltaweave_net::share::ShareError::StateUnavailable
+                    );
+                    // The filesystem/index transition succeeded before the
+                    // final Store journal write. This is index-only recovery
+                    // under the fresh permit, and never rematerializes bytes.
+                    self.store.mark_path_change_indexed(&change.id)?;
+                    continue;
+                }
+                if stale_owner {
+                    // Owner deletion/version advance invalidates the old
+                    // target, but the local precondition and any captured
+                    // user object remain recoverable.  This path performs no
+                    // index promotion and lets the next owner round plan the
+                    // current target from a fresh snapshot.
+                    self.store.rollback_causal_change(&mut change)?;
+                    ensure!(
+                        change.state == deltaweave_store::PathChangeState::RolledBack,
+                        deltaweave_net::share::ShareError::StateUnavailable
+                    );
+                    continue;
+                }
+                let owner_record = owner_records
+                    .iter()
+                    .find(|record| record.path == binding.record.path)
+                    .context(deltaweave_net::share::ShareError::StateUnavailable)?;
+                if change.state == deltaweave_store::PathChangeState::RollingBack {
+                    // A previous stale-owner recovery reached its write-ahead
+                    // phase.  Finish that idempotent rollback before planning
+                    // any new target, even if the owner currently advertises
+                    // the old record again.
+                    self.store.rollback_causal_change(&mut change)?;
+                    ensure!(
+                        change.state == deltaweave_store::PathChangeState::RolledBack,
+                        deltaweave_net::share::ShareError::StateUnavailable
+                    );
+                    continue;
+                }
+                ensure!(
+                    matches!(
+                        change.state,
+                        deltaweave_store::PathChangeState::Prepared
+                            | deltaweave_store::PathChangeState::Preserved
+                            | deltaweave_store::PathChangeState::Materialized
+                            | deltaweave_store::PathChangeState::RollingBack
+                    ),
+                    deltaweave_net::share::ShareError::StateUnavailable
+                );
+                self.store.resume_path_change(&mut change)?;
+                ensure!(
+                    change.state == deltaweave_store::PathChangeState::Materialized,
+                    deltaweave_net::share::ShareError::StateUnavailable
+                );
+                if matches!(&change.target, deltaweave_store::PathTarget::File(_)) {
+                    let observation = self.store.observe_path_change(&change)?;
+                    self.index
+                        .adopt_materialized_record(owner_record, &observation)?;
+                } else {
+                    self.index.adopt_verified_record(owner_record)?;
+                }
+                self.store.mark_path_change_indexed(&change.id)?;
+            }
+            Ok(())
+        })();
+
+        match recovery {
+            Ok(()) => {
+                self.finish_managed_rw_apply(session, journal, &permit, operation, true)
+                    .await
+            }
+            Err(error) => match self
+                .finish_managed_rw_apply(session, journal, &permit, operation, false)
+                .await
+            {
+                Ok(()) => Err(error),
+                Err(drain_error) => Err(drain_error),
+            },
+        }
+    }
+
+    /// Validates the opaque Store authorization attached to a managed causal
+    /// journal.  The permit is checked at its own issue time so restart recovery
+    /// can authenticate an expired historical signature without treating it as a
+    /// fresh admission.  Fresh epoch/root authorization is still required before
+    /// any resumed public/index mutation; a historical mismatch is handled as a
+    /// stale attempt and rolled back rather than adopted.
+    fn validate_managed_causal_authorization(
+        session: &ShareSession,
+        binding: &deltaweave_store::CausalBinding,
+    ) -> Result<ApplyPermit> {
+        let bytes = binding
+            .authorization
+            .as_deref()
+            .context(ShareError::StateUnavailable)?;
+        let permit: ApplyPermit = postcard::from_bytes(bytes)
+            .map_err(|_| anyhow::Error::new(ShareError::StateUnavailable))?;
+        let membership = session.membership();
+        permit
+            .verify_for(
+                membership.owner,
+                membership.share_id,
+                membership.endpoint,
+                permit.issued_at,
+            )
+            .map_err(|_| anyhow::Error::new(ShareError::StateUnavailable))?;
+        ensure!(
+            permit.epoch > 0 && permit.epoch <= membership.epoch,
+            ShareError::StateUnavailable
+        );
+        Ok(permit)
+    }
+
+    /// Runs the managed RW algorithm.  This deliberately lives beside the
+    /// legacy implementation so the latter keeps its existing recovery and
+    /// share/3 semantics.  Managed callers first establish an authenticated
+    /// owner snapshot, then use private/CAS sources for owner proposals, and
+    /// only enter the public journal after D's apply admission succeeds.
+    pub(crate) async fn sync_managed_rw(
+        &self,
+        session: &ShareSession,
+        observer: &Option<TransferObserver>,
+    ) -> Result<SyncReport> {
+        self.observe(observer, "comparing", None, None, 0);
+        let empty = MerkleTree::from_records(Vec::new())?;
+        let mut journal = self.load_managed_rw_journal(session)?;
+        let previous_stages = journal.stage_roots.clone();
+        // Recover the previous exact ApplyStart before asking for a new owner
+        // snapshot.  Revoked/paused owners may correctly reject new snapshot
+        // admission while still allowing an exact drain/status recovery.
+        self.recover_managed_rw_apply(session, &mut journal).await?;
+        for stage_root in previous_stages {
+            let mut previous =
+                ManagedStages::for_recovery_root(stage_root, self.store.state_root());
+            previous.cleanup_owned(self.store.state_root());
+        }
+
+        let mut owner_snapshot = session.fetch_authoritative_snapshot(&empty).await?;
+
+        // This must precede scan_index: scanning a materialized-but-unadopted
+        // causal attempt can publish it as a fresh local edit and destroy the
+        // original precondition needed for managed recovery.
+        self.recover_managed_causal_changes(
+            session,
+            &owner_snapshot.token,
+            &owner_snapshot.records,
+            &mut journal,
+        )
+        .await?;
+
+        let local_scan = scan_index(Arc::clone(&self.index)).await?;
+        ensure_scan_is_safe(&local_scan, "managed local")?;
+        let local_records = read_records(Arc::clone(&self.index)).await?;
+        let local_tree = MerkleTree::from_records(local_records.clone())?;
+        let local_counter = self.index.replica_counter()?;
+        ensure!(
+            owner_snapshot
+                .records
+                .iter()
+                .all(|record| record.version.get(self.index.replica()) <= local_counter),
+            deltaweave_net::share::ShareError::InvalidRecord
+        );
+        self.observe(observer, "peer_seen", None, None, 0);
+
+        let mut staged = ManagedStages::default();
+        let mut stage_stats = StageStats::default();
+        let mut remote_stats = RemoteStats::default();
+        let mut remote_action_count = 0_usize;
+        let mut managed_conflicts = BTreeMap::new();
+        let mut final_plan = None;
+
+        // A bounded proposal loop handles the normal owner-root change caused
+        // by an accepted member proposal.  A third change is a retryable
+        // owner race; it must not fall through to public mutation under an
+        // old permit.
+        for _round in 0..MAX_MANAGED_OWNER_ROUNDS {
+            let owner_tree = MerkleTree::from_records(owner_snapshot.records.clone())?;
+            let merged = merge_snapshots(&local_tree, &owner_tree)?;
+            for conflict in &merged.conflicts {
+                managed_conflicts
+                    .entry(conflict.path.clone())
+                    .or_insert_with(|| conflict.clone());
+            }
+            validate_materializable_namespace(&merged.records)?;
+            let local_actions = actions_to_reach(&local_tree, &merged)?;
+            let remote_actions = actions_to_reach(&owner_tree, &merged)?;
+            remote_action_count = remote_action_count.saturating_add(remote_actions.len());
+            let required_files: Vec<_> = local_actions
+                .iter()
+                .chain(&remote_actions)
+                .filter_map(|action| match action {
+                    ApplyAction::Materialize { record } if record.kind == SyncEntryKind::File => {
+                        Some(record.clone())
+                    }
+                    ApplyAction::Delete { .. } | ApplyAction::Materialize { .. } => None,
+                })
+                .collect();
+            let pending_local_bytes = local_actions
+                .iter()
+                .filter_map(|action| match action {
+                    ApplyAction::Materialize { record }
+                        if !record.tombstone && record.kind == SyncEntryKind::File =>
+                    {
+                        Some(record.size)
+                    }
+                    ApplyAction::Delete { .. } | ApplyAction::Materialize { .. } => None,
+                })
+                .try_fold(0_u64, |total, bytes| {
+                    total
+                        .checked_add(bytes)
+                        .context("managed pending materialization byte count overflow")
+                })?;
+            let (round_staged, round_stats) = self
+                .stage_managed_files(
+                    session,
+                    &required_files,
+                    &local_records,
+                    &owner_snapshot.records,
+                    pending_local_bytes,
+                    &owner_snapshot,
+                    true,
+                    observer,
+                )
+                .await?;
+            staged.merge(round_staged);
+            stage_stats.local_files = stage_stats
+                .local_files
+                .saturating_add(round_stats.local_files);
+            stage_stats.remote_files = stage_stats
+                .remote_files
+                .saturating_add(round_stats.remote_files);
+            stage_stats.pulled_bytes = stage_stats
+                .pulled_bytes
+                .checked_add(round_stats.pulled_bytes)
+                .context("managed pulled-byte counter overflow")?;
+            stage_stats.reused_extents = stage_stats
+                .reused_extents
+                .saturating_add(round_stats.reused_extents);
+            stage_stats
+                .swarm_source_ids
+                .extend(round_stats.swarm_source_ids);
+
+            if remote_actions.is_empty() {
+                final_plan = Some((owner_tree, merged, local_actions));
+                break;
+            }
+            let proposal = self
+                .apply_remote_managed(
+                    session,
+                    &remote_actions,
+                    &staged,
+                    observer,
+                    Instant::now() + MANAGED_APPLY_TTL,
+                )
+                .await;
+            let proposal = match proposal {
+                Ok(proposal) => proposal,
+                Err(error) => return Err(error),
+            };
+            remote_stats.pushed_bytes = remote_stats
+                .pushed_bytes
+                .checked_add(proposal.pushed_bytes)
+                .context("managed pushed-byte counter overflow")?;
+            remote_stats.reused_extents = remote_stats
+                .reused_extents
+                .saturating_add(proposal.reused_extents);
+            owner_snapshot = session.fetch_authoritative_snapshot(&empty).await?;
+        }
+
+        let (owner_tree, merged, local_actions) =
+            final_plan.context(deltaweave_net::share::ShareError::Busy)?;
+        let desired_tree = merged.tree()?;
+
+        self.observe(observer, "applying", None, None, 0);
+        let mut local_operation = None;
+        if !local_actions.is_empty() {
+            // Start the monotonic admission window before any network round;
+            // a delayed Revalidate reply may consume the whole ten-second
+            // budget and must never renew it by starting a new local timer.
+            let admission_started = Instant::now();
+            let permit = session
+                .revalidate_before_apply(&owner_snapshot.token)
+                .await?;
+            let deadline = admission_started + MANAGED_APPLY_TTL;
+            ensure_managed_deadline(deadline)?;
+            let operation = managed_operation_id(b"managed-local-apply", &owner_snapshot.token, 0);
+            journal.stage_roots = staged.roots.clone();
+            journal.apply = Some(ManagedApplyJournal {
+                permit: permit.clone(),
+                operation_id: operation,
+                committed: false,
+            });
+            // The signed permit, operation id, and exact staged-attempt root
+            // are durable before the owner sees ApplyStart.  A restart can
+            // therefore close this precise owner row without minting a new
+            // operation under an old local state.
+            self.save_managed_rw_journal(&journal)?;
+            session.apply_start(&permit, operation).await?;
+            if let Err(error) = self
+                .apply_local_with_deadline(
+                    &local_tree,
+                    &local_actions,
+                    &staged.manifests,
+                    Some(deadline),
+                    Some(&permit),
+                )
+                .await
+            {
+                return match self
+                    .finish_managed_rw_apply(session, &mut journal, &permit, operation, false)
+                    .await
+                {
+                    Ok(()) => Err(error),
+                    Err(drain_error) => Err(drain_error),
+                };
+            }
+            local_operation = Some((permit, operation));
+        }
+
+        self.observe(observer, "verifying", None, None, 0);
+        let verification_scan = scan_index(Arc::clone(&self.index)).await?;
+        ensure_scan_is_safe(&verification_scan, "managed verified local")?;
+        let verified_local =
+            MerkleTree::from_records(read_records(Arc::clone(&self.index)).await?)?;
+        ensure!(
+            verified_local.root_hash() == desired_tree.root_hash()
+                && verified_local.len() == desired_tree.len(),
+            deltaweave_net::share::ShareError::ManifestMismatch
+        );
+        let fresh_owner = session.fetch_authoritative_snapshot(&empty).await?;
+        if fresh_owner.token.root_hash != desired_tree.root_hash()
+            || fresh_owner.records.len() != desired_tree.len()
+        {
+            if let Some((permit, operation)) = &local_operation {
+                let _ = self
+                    .finish_managed_rw_apply(session, &mut journal, permit, *operation, false)
+                    .await;
+            }
+            bail!(deltaweave_net::share::ShareError::ManifestMismatch);
+        }
+        if let Some((permit, operation)) = local_operation {
+            self.finish_managed_rw_apply(session, &mut journal, &permit, operation, true)
+                .await?;
+        }
+        staged.cleanup_owned(self.store.state_root());
+        Ok(SyncReport {
+            status: "pass",
+            local_before_root: local_tree.root_hash(),
+            remote_before_root: owner_tree.root_hash(),
+            desired_root: desired_tree.root_hash(),
+            verified_local_root: verified_local.root_hash(),
+            verified_remote_root: fresh_owner.token.root_hash,
+            merkle_queries: 0,
+            local_actions: local_actions.len(),
+            remote_actions: remote_action_count,
+            staged_local_files: stage_stats.local_files,
+            pulled_remote_files: stage_stats.remote_files,
+            pulled_bytes: stage_stats.pulled_bytes,
+            pushed_bytes: remote_stats.pushed_bytes,
+            reused_extents: stage_stats
+                .reused_extents
+                .saturating_add(remote_stats.reused_extents),
+            swarm_sources_used: stage_stats.swarm_source_ids.len(),
+            conflicts: managed_conflicts.into_values().collect(),
+        })
+    }
+
+    fn causal_binding(
+        &self,
+        record: &SyncRecord,
+        permit: Option<&deltaweave_net::share::ApplyPermit>,
+    ) -> Result<deltaweave_store::CausalBinding> {
         Ok(deltaweave_store::CausalBinding {
             record: record.clone(),
             precondition: self.index.get(&record.path)?.map(|r| r.to_sync_record()),
-            authorization: None,
+            authorization: permit.map(postcard::to_stdvec).transpose()?,
         })
+    }
+
+    /// Selects at most eight fresh roster providers, always trying the
+    /// authenticated owner first.  Roster addresses are transport hints;
+    /// every resulting grant is still issued and checked by the owner for the
+    /// exact consumer, provider epoch, snapshot, manifest, and hash subset.
+    async fn managed_swarm_providers(&self, session: &ShareSession) -> Vec<EndpointId> {
+        let membership = session.membership();
+        let mut providers = vec![membership.owner];
+        let Ok(roster) = session.ensure_roster_heartbeat().await else {
+            return providers;
+        };
+        for entry in roster.fresh_members(managed_wall_now()) {
+            if entry.member == membership.endpoint || providers.contains(&entry.member) {
+                continue;
+            }
+            providers.push(entry.member);
+            if providers.len() == MAX_MANAGED_SWARM_PROVIDERS {
+                break;
+            }
+        }
+        providers
     }
     fn observe(
         &self,
@@ -528,6 +1609,520 @@ impl ReplicaState {
         Ok((manifests, stats))
     }
 
+    /// Stages managed content in a reserved private namespace.  Grant-gated
+    /// share-swarm/1 fills verified CAS chunks from the owner/fresh roster
+    /// providers first.  The existing share/3 pull is only an authenticated
+    /// CAS fallback: it never receives a public destination and its returned
+    /// manifest is compared with the owner attestation before private
+    /// materialization.
+    #[allow(clippy::too_many_arguments)]
+    async fn stage_managed_files(
+        &self,
+        session: &ShareSession,
+        desired: &[SyncRecord],
+        local: &[SyncRecord],
+        remote: &[SyncRecord],
+        pending_local_bytes: u64,
+        snapshot: &AuthoritativeSnapshot,
+        prefer_local: bool,
+        observer: &Option<TransferObserver>,
+    ) -> Result<(ManagedStages, StageStats)> {
+        let local_sources = live_file_sources(local);
+        let remote_sources = live_file_sources(remote);
+        let mut required = BTreeSet::new();
+        let mut required_sizes = BTreeMap::new();
+        for record in desired
+            .iter()
+            .filter(|record| !record.tombstone && record.kind == SyncEntryKind::File)
+        {
+            let hash = record
+                .content_hash
+                .context("managed live file unexpectedly lacks a hash")?;
+            if let Some(previous) = required_sizes.insert(hash, record.size) {
+                ensure!(previous == record.size, ShareError::ManifestMismatch);
+            }
+            required.insert(hash);
+        }
+        if required.is_empty() {
+            return Ok((ManagedStages::default(), StageStats::default()));
+        }
+
+        let stage_name = Hash32::from_bytes(snapshot.token.snapshot).to_hex();
+        let stage_sequence = MANAGED_STAGE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let requested_root = self
+            .store
+            .state_root()
+            .join(format!(".managed-stage-{stage_name}-{stage_sequence}"));
+        let stage_root = root_admission::reserve_private(&requested_root)?;
+        let mut stage_guard = ManagedStageGuard::new(stage_root.clone(), self.store.state_root());
+        let stage_budget_bytes = required_sizes.values().try_fold(0_u64, |total, size| {
+            total
+                .checked_add(*size)
+                .context("managed private-stage byte count overflow")
+        })?;
+        let mut stages = ManagedStages::for_root(stage_root.clone(), self.store.state_root());
+        let mut stats = StageStats::default();
+        // Reserve the public destination budget independently from the state
+        // volume used by the CAS and private stage.  The actual public apply
+        // repeats this check immediately before each filesystem mutation.
+        DiskAdmission::new(
+            self.store.state_root().to_path_buf(),
+            self.root.clone(),
+            self.min_free_space_bytes,
+            pending_local_bytes,
+        )
+        .check_materialization(pending_local_bytes)?;
+
+        for hash in required {
+            let (manifest, transferred_bytes, reused_extents, source_path, swarm_source_ids) =
+                if prefer_local && let Some(source) = local_sources.get(&hash) {
+                    let source_path = local_path(&self.root, &source.path);
+                    let admission = DiskAdmission::new(
+                        self.store.state_root().to_path_buf(),
+                        self.store.state_root().to_path_buf(),
+                        self.min_free_space_bytes,
+                        stage_budget_bytes,
+                    );
+                    let store = Arc::clone(&self.store);
+                    let profile = self.profile;
+                    let manifest = tokio::task::spawn_blocking(move || {
+                        store.ingest_file_with_admission(source_path, profile, |bytes| {
+                            admission.check_state(bytes)
+                        })
+                    })
+                    .await
+                    .context("managed local ingestion task failed")??;
+                    ensure!(
+                        manifest.file_hash == hash,
+                        deltaweave_store::PreservationError::LocalChanged
+                    );
+                    (manifest, 0, 0, Some(source.path.clone()), BTreeSet::new())
+                } else {
+                    let source = remote_sources.get(&hash).with_context(|| {
+                        format!("owner has no source for managed content {hash}")
+                    })?;
+                    self.observe(observer, "pulling", Some(&source.path), Some("pull"), 0);
+                    let attestation = session.request_manifest(&snapshot.token, source).await?;
+                    ensure!(
+                        attestation.manifest.file_hash == hash
+                            && attestation.manifest.size == source.size,
+                        ShareError::ManifestMismatch
+                    );
+                    self.observe(
+                        observer,
+                        "swarm_manifest_ok",
+                        Some(&source.path),
+                        Some("pull"),
+                        0,
+                    );
+                    let mut missing =
+                        missing_chunks(Arc::clone(&self.store), attestation.manifest.clone())
+                            .await?;
+                    // The manifest preserves file order, while the owner
+                    // grant binds a strictly sorted subset.  Keep the local
+                    // CAS inventory deterministic before issuing any grant.
+                    missing.sort();
+                    let initial_missing_count = missing.len();
+                    let providers = self.managed_swarm_providers(session).await;
+                    let mut transferred_bytes = 0_u64;
+                    let mut swarm_source_ids = BTreeSet::new();
+                    let mut batch = 0_usize;
+                    while !missing.is_empty() {
+                        let missing_before = missing.len();
+                        let batch_hashes: Vec<Hash32> = missing
+                            .iter()
+                            .take(MAX_MANAGED_SWARM_HASHES)
+                            .copied()
+                            .collect();
+                        let batch_bytes = attestation
+                            .manifest
+                            .chunks
+                            .iter()
+                            .filter(|descriptor| batch_hashes.contains(&descriptor.hash))
+                            .try_fold(0_u64, |total, descriptor| {
+                                total
+                                    .checked_add(u64::from(descriptor.length))
+                                    .context("managed swarm byte count overflow")
+                            })?;
+                        // The swarm API writes only CAS. Keep private stage
+                        // bytes in the state-volume budget and public apply
+                        // bytes in the destination-volume budget separately.
+                        DiskAdmission::new(
+                            self.store.state_root().to_path_buf(),
+                            self.store.state_root().to_path_buf(),
+                            self.min_free_space_bytes,
+                            stage_budget_bytes,
+                        )
+                        .check_state(batch_bytes)?;
+                        // Request one distinct grant per provider subset first,
+                        // then run all accepted assignments concurrently.  A
+                        // provider roster is only a candidate list: an entry
+                        // whose process has no supplier registration is skipped
+                        // before any payload task is started.
+                        let provider_count = providers.len().min(batch_hashes.len());
+                        let mut assignments = Vec::new();
+                        if provider_count > 0 {
+                            for (provider_index, provider) in
+                                providers.iter().take(provider_count).enumerate()
+                            {
+                                let assigned: Vec<Hash32> = batch_hashes
+                                    .iter()
+                                    .enumerate()
+                                    .filter_map(|(index, hash)| {
+                                        (index % provider_count == provider_index).then_some(*hash)
+                                    })
+                                    .collect();
+                                if assigned.is_empty() {
+                                    continue;
+                                }
+                                let grant = match session
+                                    .request_swarm_grant(
+                                        *provider,
+                                        &snapshot.token,
+                                        &attestation,
+                                        &assigned,
+                                    )
+                                    .await
+                                {
+                                    Ok(grant) => grant,
+                                    Err(error)
+                                        if ShareError::classify(&error)
+                                            == ShareError::NotMember =>
+                                    {
+                                        continue;
+                                    }
+                                    Err(error) => {
+                                        self.observe(
+                                            observer,
+                                            "swarm_grant_error",
+                                            Some(&source.path),
+                                            Some("pull"),
+                                            0,
+                                        );
+                                        return Err(error);
+                                    }
+                                };
+                                self.observe(
+                                    observer,
+                                    "swarm_grant_ok",
+                                    Some(&source.path),
+                                    Some("pull"),
+                                    0,
+                                );
+                                let operation = managed_swarm_operation_id(
+                                    &snapshot.token,
+                                    source,
+                                    *provider,
+                                    &assigned,
+                                    batch
+                                        .saturating_mul(MAX_MANAGED_SWARM_PROVIDERS)
+                                        .saturating_add(provider_index),
+                                )?;
+                                assignments.push(ManagedSwarmAssignment {
+                                    provider: *provider,
+                                    grant,
+                                    operation_id: operation,
+                                    hashes: assigned,
+                                });
+                            }
+                        }
+
+                        if assignments.is_empty() {
+                            // No authenticated supplier accepted this subset;
+                            // leave the missing CAS set for the authenticated
+                            // share/3 fallback below.  In particular, do not
+                            // spin forever when the roster is empty or every
+                            // candidate is a metadata-only member.
+                            break;
+                        }
+
+                        let mut fetches = tokio::task::JoinSet::new();
+                        let start_gate = Arc::new(tokio::sync::Barrier::new(assignments.len()));
+                        for (assignment, item) in assignments.iter().enumerate() {
+                            fetches.spawn(run_managed_swarm_assignment(
+                                assignment,
+                                session.clone(),
+                                Arc::clone(&self.store),
+                                item.grant.clone(),
+                                snapshot.token.clone(),
+                                (*source).clone(),
+                                attestation.clone(),
+                                item.operation_id,
+                                item.hashes.clone(),
+                                observer.clone(),
+                                Arc::clone(&start_gate),
+                            ));
+                        }
+                        let mut outcomes: Vec<Option<Result<SwarmTransferReceipt>>> =
+                            (0..assignments.len()).map(|_| None).collect();
+                        let mut join_failed = false;
+                        while let Some(joined) = fetches.join_next().await {
+                            match joined {
+                                Ok(outcome) => {
+                                    if outcome.assignment < outcomes.len() {
+                                        outcomes[outcome.assignment] = Some(outcome.result);
+                                    } else {
+                                        join_failed = true;
+                                    }
+                                }
+                                Err(_) => join_failed = true,
+                            }
+                        }
+                        if join_failed {
+                            for outcome in &mut outcomes {
+                                if outcome.is_none() {
+                                    *outcome = Some(Err(anyhow::anyhow!(
+                                        "managed swarm assignment task failed"
+                                    )));
+                                }
+                            }
+                        }
+
+                        let mut pending_drain = false;
+                        let mut first_error = None;
+                        for (index, outcome) in outcomes.into_iter().enumerate() {
+                            let result = outcome.context("managed swarm assignment missing")?;
+                            match result {
+                                Ok(receipt) => {
+                                    // A successful byte receipt can still be
+                                    // pending the owner's bilateral drain
+                                    // confirmation.  Keep the exact intent
+                                    // recoverable and stop this batch: trying
+                                    // another provider or the share/3 fallback
+                                    // would create a second live activation.
+                                    pending_drain |= receipt.drain_pending;
+                                    transferred_bytes = transferred_bytes
+                                        .checked_add(receipt.transferred_bytes)
+                                        .context("managed swarm byte count overflow")?;
+                                    if receipt.transferred_chunks > 0 {
+                                        swarm_source_ids.insert(assignments[index].provider);
+                                    }
+                                }
+                                Err(error) => {
+                                    // A roster entry is membership metadata,
+                                    // not proof that this process has
+                                    // registered its Store as a supplier.
+                                    // NotMember is the only safe pre-activation
+                                    // skip.  Every other failure must recover
+                                    // its exact intent before this round can
+                                    // return; no second provider or share/3
+                                    // fallback may hide an active blocker.
+                                    let class = ShareError::classify(&error);
+                                    if class == ShareError::NotMember {
+                                        let cancelled = session
+                                            .cancel_activation(
+                                                &assignments[index].grant,
+                                                None,
+                                                assignments[index].operation_id,
+                                            )
+                                            .await?;
+                                        ensure!(
+                                            matches!(
+                                                cancelled.state,
+                                                deltaweave_net::share::ActivationStateView::Denied
+                                                    | deltaweave_net::share::ActivationStateView::Expired
+                                            ),
+                                            ShareError::RevocationPending
+                                        );
+                                        let recovered = recover_managed_swarm_assignment(
+                                            self,
+                                            session,
+                                            &assignments[index],
+                                        )
+                                        .await?;
+                                        ensure!(
+                                            matches!(
+                                                recovered.phase,
+                                                ClientIntentPhase::Cancelled
+                                                    | ClientIntentPhase::Drained
+                                            ),
+                                            ShareError::RevocationPending
+                                        );
+                                    } else {
+                                        // The exact grant remains durable even
+                                        // when the fetch task failed or
+                                        // panicked.  Recovery may itself stay
+                                        // pending while the owner is offline;
+                                        // either result is safer than starting
+                                        // another grant under a stale round.
+                                        let recovered = recover_managed_swarm_assignment(
+                                            self,
+                                            session,
+                                            &assignments[index],
+                                        )
+                                        .await?;
+                                        ensure!(
+                                            matches!(
+                                                recovered.phase,
+                                                ClientIntentPhase::Cancelled
+                                                    | ClientIntentPhase::Drained
+                                            ),
+                                            ShareError::RevocationPending
+                                        );
+                                        if !managed_swarm_error_can_fallback(class) {
+                                            first_error.get_or_insert(error);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if pending_drain {
+                            return Err(ShareError::RevocationPending.into());
+                        }
+                        if let Some(error) = first_error {
+                            return Err(error);
+                        }
+                        missing =
+                            missing_chunks(Arc::clone(&self.store), attestation.manifest.clone())
+                                .await?;
+                        missing.sort();
+                        if missing.is_empty() {
+                            break;
+                        }
+                        if missing.len() >= missing_before {
+                            // All assignments in this round were rejected or
+                            // returned no new CAS bytes.  Retry through the
+                            // authenticated legacy CAS path instead of
+                            // repeatedly issuing the same grant set.
+                            break;
+                        }
+                        batch = batch.saturating_add(1);
+                    }
+                    let receipt = if missing.is_empty() {
+                        PullReceipt {
+                            record: (*source).clone(),
+                            manifest: attestation.manifest.clone(),
+                            transferred_bytes,
+                            reused_extents: attestation
+                                .manifest
+                                .chunks
+                                .len()
+                                .saturating_sub(initial_missing_count),
+                        }
+                    } else {
+                        // share/3 remains an authenticated CAS-only fallback;
+                        // it never receives the public destination path. Its
+                        // returned record/manifest must match the owner
+                        // attestation before private materialization.
+                        let mut receipt = session
+                            .pull_record_to_with_budget(
+                                (*source).clone(),
+                                Arc::clone(&self.store),
+                                self.root.clone(),
+                                self.min_free_space_bytes,
+                                pending_local_bytes,
+                            )
+                            .await?;
+                        receipt.transferred_bytes = receipt
+                            .transferred_bytes
+                            .checked_add(transferred_bytes)
+                            .context("managed pulled-byte counter overflow")?;
+                        receipt
+                    };
+                    ensure!(receipt.record == **source, ShareError::ManifestMismatch);
+                    ensure!(
+                        receipt.manifest == attestation.manifest,
+                        ShareError::ManifestMismatch
+                    );
+                    self.observe(
+                        observer,
+                        "file_received",
+                        Some(&source.path),
+                        Some("pull"),
+                        receipt.transferred_bytes,
+                    );
+                    (
+                        receipt.manifest,
+                        receipt.transferred_bytes,
+                        receipt.reused_extents,
+                        None,
+                        swarm_source_ids,
+                    )
+                };
+            let stage_path = WirePath::new(format!("files/{hash}.bin"))?;
+            DiskAdmission::new(
+                self.store.state_root().to_path_buf(),
+                self.store.state_root().to_path_buf(),
+                self.min_free_space_bytes,
+                stage_budget_bytes,
+            )
+            .check_materialization(manifest.size)?;
+            let private_path =
+                self.store
+                    .materialize_private_verified(&manifest, &stage_root, &stage_path)?;
+            stages.manifests.insert(hash, manifest);
+            stages.sources.insert(hash, private_path);
+            if source_path.is_some() {
+                stats.local_files = stats.local_files.saturating_add(1);
+            } else {
+                stats.remote_files = stats.remote_files.saturating_add(1);
+                stats.pulled_bytes = stats
+                    .pulled_bytes
+                    .checked_add(transferred_bytes)
+                    .context("managed pulled-byte counter overflow")?;
+                stats.reused_extents = stats.reused_extents.saturating_add(reused_extents);
+            }
+            stats.swarm_source_ids.extend(swarm_source_ids);
+        }
+        stage_guard.disarm();
+        Ok((stages, stats))
+    }
+
+    async fn apply_remote_managed(
+        &self,
+        session: &ShareSession,
+        actions: &[ApplyAction],
+        stages: &ManagedStages,
+        observer: &Option<TransferObserver>,
+        deadline: Instant,
+    ) -> Result<RemoteStats> {
+        let mut stats = RemoteStats::default();
+        let mut deletions = action_records(actions, true, None);
+        deletions.sort_by_key(|record| std::cmp::Reverse(path_depth(&record.path)));
+        for record in deletions {
+            ensure_managed_deadline(deadline)?;
+            session.apply_metadata(record.clone()).await?;
+        }
+        let mut directories = action_records(actions, false, Some(SyncEntryKind::Directory));
+        directories.sort_by_key(|record| path_depth(&record.path));
+        for record in directories {
+            ensure_managed_deadline(deadline)?;
+            session.apply_metadata(record.clone()).await?;
+        }
+        let mut files = action_records(actions, false, Some(SyncEntryKind::File));
+        files.sort_by(|left, right| left.path.cmp(&right.path));
+        for record in files {
+            ensure_managed_deadline(deadline)?;
+            let hash = record
+                .content_hash
+                .context("managed remote file has no content hash")?;
+            let source = stages
+                .sources
+                .get(&hash)
+                .with_context(|| format!("managed source for {hash} was not staged"))?;
+            let receipt = session
+                .push_record(source, record.clone(), self.profile)
+                .await?;
+            ensure!(
+                receipt.record_hash == record.logical_hash(),
+                ShareError::ManifestMismatch
+            );
+            self.observe(
+                observer,
+                "file_sent",
+                Some(&record.path),
+                Some("push"),
+                receipt.transferred_bytes,
+            );
+            stats.pushed_bytes = stats
+                .pushed_bytes
+                .checked_add(receipt.transferred_bytes)
+                .context("managed pushed-byte counter overflow")?;
+            stats.reused_extents = stats.reused_extents.saturating_add(receipt.reused_extents);
+        }
+        Ok(stats)
+    }
+
     async fn stage_remote_file(
         &self,
         session: &SyncSession,
@@ -623,6 +2218,21 @@ impl ReplicaState {
         actions: &[ApplyAction],
         manifests: &BTreeMap<Hash32, FileManifest>,
     ) -> Result<()> {
+        self.apply_local_with_deadline(current, actions, manifests, None, None)
+            .await
+    }
+
+    async fn apply_local_with_deadline(
+        &self,
+        current: &MerkleTree,
+        actions: &[ApplyAction],
+        manifests: &BTreeMap<Hash32, FileManifest>,
+        deadline: Option<Instant>,
+        permit: Option<&deltaweave_net::share::ApplyPermit>,
+    ) -> Result<()> {
+        if let Some(deadline) = deadline {
+            ensure_managed_deadline(deadline)?;
+        }
         let scan = scan_index(Arc::clone(&self.index)).await?;
         ensure_scan_is_safe(&scan, "local before apply")?;
         let fresh = MerkleTree::from_records(read_records(Arc::clone(&self.index)).await?)?;
@@ -634,8 +2244,14 @@ impl ReplicaState {
         let mut deletions = action_records(actions, true, None);
         deletions.sort_by_key(|record| std::cmp::Reverse(path_depth(&record.path)));
         for record in deletions {
-            self.store
-                .apply_causal_record(&self.root, self.causal_binding(record)?, None)?;
+            if let Some(deadline) = deadline {
+                ensure_managed_deadline(deadline)?;
+            }
+            self.store.apply_causal_record(
+                &self.root,
+                self.causal_binding(record, permit)?,
+                None,
+            )?;
             self.index.adopt_verified_record(record)?;
             self.store.mark_record_indexed(&self.root, record)?;
         }
@@ -643,8 +2259,14 @@ impl ReplicaState {
         let mut directories = action_records(actions, false, Some(SyncEntryKind::Directory));
         directories.sort_by_key(|record| path_depth(&record.path));
         for record in directories {
-            self.store
-                .apply_causal_record(&self.root, self.causal_binding(record)?, None)?;
+            if let Some(deadline) = deadline {
+                ensure_managed_deadline(deadline)?;
+            }
+            self.store.apply_causal_record(
+                &self.root,
+                self.causal_binding(record, permit)?,
+                None,
+            )?;
             self.store
                 .set_readonly(&self.root, &record.path, record.readonly)?;
             self.index.adopt_verified_record(record)?;
@@ -654,6 +2276,9 @@ impl ReplicaState {
         let mut files = action_records(actions, false, Some(SyncEntryKind::File));
         files.sort_by(|left, right| left.path.cmp(&right.path));
         for record in files {
+            if let Some(deadline) = deadline {
+                ensure_managed_deadline(deadline)?;
+            }
             let hash = record
                 .content_hash
                 .context("validated live file unexpectedly lacks a hash")?;
@@ -669,7 +2294,7 @@ impl ReplicaState {
             .check_materialization(manifest.size)?;
             let change = self.store.apply_causal_record(
                 &self.root,
-                self.causal_binding(record)?,
+                self.causal_binding(record, permit)?,
                 Some(manifest),
             )?;
             let observation = self
@@ -848,6 +2473,7 @@ mod tests {
     use std::{collections::HashSet, fs};
 
     use deltaweave_core::{SYNC_RECORD_SCHEMA_V1, VersionVector};
+    use deltaweave_net::share::{Permission, ShareService};
     use deltaweave_net::{
         NetworkMode, PeerPolicy, ServerConfig, start_server, start_server_observed,
     };
@@ -895,6 +2521,127 @@ mod tests {
             .expect("inventory helper completes");
 
         assert_eq!(missing, vec![first, second]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn managed_causal_authorization_rejects_missing_and_cross_share_permits() {
+        let base = TempDir::new().expect("share test root can be created");
+        let owner = ShareService::open(
+            base.path().join("owner-device"),
+            NetworkMode::DirectOnly,
+            None,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("owner service opens: {error:#}"));
+        let member = ShareService::open(
+            base.path().join("member-device"),
+            NetworkMode::DirectOnly,
+            None,
+        )
+        .await
+        .expect("member service opens");
+        let first = owner
+            .create_owned_share(
+                "first".into(),
+                base.path().join("first-root"),
+                base.path().join("first-state"),
+                None,
+                0,
+            )
+            .await
+            .expect("first share opens");
+        let second = owner
+            .create_owned_share(
+                "second".into(),
+                base.path().join("second-root"),
+                base.path().join("second-state"),
+                None,
+                0,
+            )
+            .await
+            .expect("second share opens");
+        let first_grant = member
+            .enroll(
+                &first
+                    .issue_key(Permission::ReadWrite, None, owner.endpoint_addr())
+                    .expect("first ticket issues"),
+                None,
+            )
+            .await
+            .expect("first membership enrolls");
+        let second_grant = member
+            .enroll(
+                &second
+                    .issue_key(Permission::ReadWrite, None, owner.endpoint_addr())
+                    .expect("second ticket issues"),
+                None,
+            )
+            .await
+            .expect("second membership enrolls");
+        let first_session = member
+            .open_session(first_grant.owner, first_grant.share_id)
+            .expect("first session opens");
+        let second_session = member
+            .open_session(second_grant.owner, second_grant.share_id)
+            .expect("second session opens");
+        let empty = MerkleTree::from_records(Vec::new()).expect("empty tree builds");
+        let first_snapshot = first_session
+            .fetch_authoritative_snapshot(&empty)
+            .await
+            .expect("first snapshot fetches");
+        let first_permit = first_session
+            .revalidate_before_apply(&first_snapshot.token)
+            .await
+            .expect("first permit issues");
+        let second_snapshot = second_session
+            .fetch_authoritative_snapshot(&empty)
+            .await
+            .expect("second snapshot fetches");
+        let second_permit = second_session
+            .revalidate_before_apply(&second_snapshot.token)
+            .await
+            .expect("second permit issues");
+        let record = SyncRecord {
+            schema_version: SYNC_RECORD_SCHEMA_V1,
+            path: WirePath::new("retained.bin").expect("record path validates"),
+            kind: SyncEntryKind::File,
+            size: 0,
+            content_hash: Some(Hash32::digest(&[])),
+            readonly: false,
+            version: VersionVector::default(),
+            tombstone: false,
+        };
+        let binding = |authorization| deltaweave_store::CausalBinding {
+            record: record.clone(),
+            precondition: None,
+            authorization,
+        };
+
+        assert!(
+            ReplicaState::validate_managed_causal_authorization(&first_session, &binding(None),)
+                .is_err(),
+            "missing opaque authorization must not become a managed recovery"
+        );
+        assert!(
+            ReplicaState::validate_managed_causal_authorization(
+                &first_session,
+                &binding(Some(postcard::to_stdvec(&second_permit).unwrap())),
+            )
+            .is_err(),
+            "a valid permit from another share must not authorize this journal"
+        );
+        assert!(
+            ReplicaState::validate_managed_causal_authorization(
+                &first_session,
+                &binding(Some(postcard::to_stdvec(&first_permit).unwrap())),
+            )
+            .is_ok(),
+            "the exact owner/share/consumer permit must authenticate"
+        );
+        first_session.close().await;
+        second_session.close().await;
+        member.shutdown().await.expect("member shuts down");
+        owner.shutdown().await.expect("owner shuts down");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2175,5 +3922,30 @@ mod tests {
             .shutdown()
             .await
             .expect("swarm source shut down");
+    }
+
+    #[test]
+    fn managed_stage_cleanup_keeps_same_name_replacement() {
+        let temp = tempfile::tempdir().expect("stage test root");
+        let state_root = temp.path().join("state");
+        let stage = state_root.join(".managed-stage-test");
+        std::fs::create_dir_all(&stage).expect("stage created");
+        let mut stages = ManagedStages::for_root(stage.clone(), &state_root);
+        if managed_stage_identity(&stage).is_none() {
+            return;
+        }
+
+        let original = state_root.join(".managed-stage-original");
+        std::fs::rename(&stage, &original).expect("original moved");
+        std::fs::create_dir_all(&stage).expect("replacement created");
+        std::fs::write(stage.join("foreign"), b"preserve").expect("replacement populated");
+
+        stages.cleanup_owned(&state_root);
+        assert!(
+            stage.join("foreign").is_file(),
+            "same-name replacement must not be removed"
+        );
+        std::fs::remove_dir_all(&stage).expect("replacement removed by test");
+        std::fs::remove_dir_all(original).expect("original removed by test");
     }
 }

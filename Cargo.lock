@@ -796,6 +796,7 @@ dependencies = [
  "serde",
  "tempfile",
  "tokio",
+ "winapi-util",
 ]
 
 [[package]]
