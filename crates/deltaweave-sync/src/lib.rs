@@ -17,17 +17,14 @@ use deltaweave_core::{
     ChunkingProfile, FileManifest, Hash32, ReplicaId, SyncEntryKind, SyncRecord, WirePath,
 };
 use deltaweave_index::{IndexOptions, LocalIndex, ScanReport, collision_key};
+use deltaweave_net::share::{
+    ApplyPermit, ApplyStateView, AuthoritativeSnapshot, ClientIntentPhase, ManifestAttestation,
+    ShareError, ShareGrant, ShareId, ShareSession, SnapshotToken, SwarmTransferReceipt,
+};
 use deltaweave_net::{
     DiskAdmission, Inventory, PullManifestReceipt, PullReceipt, SwarmSources, SyncApplyReceipt,
     SyncClient, SyncSession, TransferEvent, TransferObserver, is_swarm_local_storage_error,
     swarm_partial_fill,
-};
-use deltaweave_net::{
-    root_admission,
-    share::{
-        ApplyPermit, ApplyStateView, AuthoritativeSnapshot, ClientIntentPhase, ManifestAttestation,
-        ShareError, ShareGrant, ShareId, ShareSession, SnapshotToken, SwarmTransferReceipt,
-    },
 };
 use deltaweave_reconcile::{
     ApplyAction, ConflictRecord, MerkleTree, actions_to_reach, merge_snapshots,
@@ -186,6 +183,16 @@ fn managed_stage_identity(path: &Path) -> Option<ManagedStageIdentity> {
     }
     #[cfg(windows)]
     {
+        // `Handle::from_path_any` opens with backup semantics and follows a
+        // junction/reparse point.  Reject the reparse attribute from the
+        // no-follow metadata probe before asking the OS for a stable identity;
+        // otherwise a replaced stage could inherit the target's identity and
+        // become eligible for cleanup.
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return None;
+        }
         // Keep the same stable handle identity used by Store.  The nightly
         // std::os::windows::fs::MetadataExt file-index methods are not
         // available on the repository's Windows toolchain, and a path-only
@@ -381,6 +388,75 @@ impl Drop for ManagedStageGuard {
             stages.cleanup_owned(&self.state_root);
         }
     }
+}
+
+/// Chooses a fresh child of the already-admitted private state root.  The
+/// state root is covered by the engine's `RootLease`, so registering every
+/// short-lived stage in the host-wide permanent private catalog would only
+/// grow that catalog without adding a new exclusion boundary.  A stage gets a
+/// process/sequence-qualified name and an existing name is never reused.
+fn managed_stage_path(state_root: &Path, stage_name: &str) -> Result<PathBuf> {
+    let state_root = fs::canonicalize(state_root)?;
+    let metadata = fs::symlink_metadata(&state_root)?;
+    ensure!(metadata.is_dir() && !metadata.file_type().is_symlink());
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        ensure!(
+            metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+            ShareError::StateUnavailable
+        );
+    }
+    for _ in 0..64 {
+        let sequence = MANAGED_STAGE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let candidate = state_root.join(format!(
+            ".managed-stage-{stage_name}-{}-{sequence}",
+            std::process::id()
+        ));
+        match fs::symlink_metadata(&candidate) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(candidate);
+            }
+            Ok(_) => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    bail!(ShareError::StateUnavailable)
+}
+
+/// Creates one selected stage child without a second host-wide reservation.
+/// The caller durably records the selected path before invoking this helper;
+/// if a crash occurs after creation, the retained path is still a conservative
+/// recovery reference rather than an untracked directory.
+fn create_managed_stage_directory(path: &Path) -> Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)?;
+    let metadata = fs::symlink_metadata(path)?;
+    ensure!(metadata.is_dir() && !metadata.file_type().is_symlink());
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        ensure!(
+            metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+            ShareError::StateUnavailable
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        ensure!(
+            metadata.permissions().mode() & 0o077 == 0,
+            ShareError::StateUnavailable
+        );
+    }
+    Ok(())
 }
 
 impl ManagedStages {
@@ -1823,17 +1899,19 @@ impl ReplicaState {
         }
 
         let stage_name = Hash32::from_bytes(snapshot.token.snapshot).to_hex();
-        let stage_sequence = MANAGED_STAGE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let requested_root = self
-            .store
-            .state_root()
-            .join(format!(".managed-stage-{stage_name}-{stage_sequence}"));
-        let stage_root = root_admission::reserve_private(&requested_root)?;
+        let requested_root = managed_stage_path(self.store.state_root(), &stage_name)?;
+        if let Some(marker) = stage_marker.as_ref() {
+            // Record the selected path before mkdir.  A crash in the narrow
+            // create window leaves a harmless absent reference; a crash after
+            // mkdir still leaves a durable path for exact recovery.
+            marker(&requested_root, None)?;
+        }
+        create_managed_stage_directory(&requested_root)?;
+        let stage_root = requested_root;
         let mut stage_guard = ManagedStageGuard::new(stage_root.clone(), self.store.state_root());
-        if let Some(marker) = stage_marker {
-            // Record the owner/path identity before the first provider request
-            // or CAS materialization. A process crash after reserve_private
-            // must leave a durable reference for the next recovery round.
+        if let Some(marker) = stage_marker.as_ref() {
+            // Upgrade the pre-creation marker with the identity captured from
+            // the no-follow directory now that creation has succeeded.
             marker(&stage_root, managed_stage_identity(&stage_root))?;
         }
         let stage_budget_bytes = required_sizes.values().try_fold(0_u64, |total, size| {
@@ -4145,6 +4223,21 @@ mod tests {
         );
         std::fs::remove_dir_all(&stage).expect("replacement removed by test");
         std::fs::remove_dir_all(original).expect("original removed by test");
+    }
+
+    #[test]
+    fn managed_stage_path_skips_existing_child_without_reusing_it() {
+        let temp = tempfile::tempdir().expect("stage path test root");
+        let state_root = temp.path().join("state");
+        std::fs::create_dir_all(&state_root).expect("state root created");
+
+        let first = managed_stage_path(&state_root, "unit").expect("first stage path");
+        std::fs::create_dir(&first).expect("first stage created");
+        let second = managed_stage_path(&state_root, "unit").expect("second stage path");
+        assert_ne!(first, second, "an existing stage must never be reused");
+        create_managed_stage_directory(&second).expect("second stage created");
+        assert!(first.is_dir());
+        assert!(second.is_dir());
     }
 
     #[test]

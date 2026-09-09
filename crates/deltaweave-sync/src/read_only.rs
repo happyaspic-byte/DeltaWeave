@@ -664,9 +664,18 @@ pub(crate) async fn sync(
                 .pending
                 .as_mut()
                 .context(ShareError::StateUnavailable)?;
-            ensure!(pending.stage_root.is_none(), ShareError::StateUnavailable);
-            pending.stage_root = Some(root.to_path_buf());
-            pending.stage_identity = identity;
+            if let Some(existing) = &pending.stage_root {
+                // The stage helper records the selected path before mkdir and
+                // upgrades that same row with the post-mkdir identity. A
+                // different path would indicate a corrupted/reused journal.
+                ensure!(existing == root, ShareError::StateUnavailable);
+                if identity.is_some() {
+                    pending.stage_identity = identity;
+                }
+            } else {
+                pending.stage_root = Some(root.to_path_buf());
+                pending.stage_identity = identity;
+            }
             index.set_share_metadata(&postcard::to_stdvec(&*marked)?)
         });
         let result = local
