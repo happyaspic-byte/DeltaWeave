@@ -68,6 +68,10 @@ python3 scripts/qsync_three_host_controller.py run \
 
 RW keepalive의 남은 시간만 hosted job 대기에 사용하며 전체 상한은 900초다. WinRM handle이 종료되지 않거나 owner 종료의 managed drain을 증명하지 못하면 state는 `pending`으로 남고 runtime을 삭제하지 않는다. 강제 종료와 unknown cleanup은 성공으로 승격하지 않는다. `run`의 live attestation은 외부 `rw-ready.json`보다 우선하며, 이전 `execute` 명령의 ready file은 handoff 호환성용으로만 남아 있다.
 
+로컬 Linux owner의 `LocalWebProcess.stop()`은 controller가 보유한 해당 `Popen` 핸들에만 SIGTERM을 보내고, 30초 안에 종료를 관찰한 뒤 exit code를 저장한다. 신호를 실제로 보냈고 exit code가 0이며 강제 종료가 없을 때만 `graceful_drain_proven=true`로 기록한다. 이미 종료된 프로세스, 비정상 exit, 신호·대기·reap 실패는 프로세스 핸들을 잃지 않고 `pending` 경계로 남긴다. Windows RW의 console Ctrl+C 증거는 별도 WinRM helper가 담당하며, 이 POSIX local-process 판정으로 대체하지 않는다.
+
+2026-09-09T11:06:48Z에 source `2f44d9fbfbe1c4779bd59f78fe9cc4ff27f41cd6`에서 빌드된 기존 Linux binary(SHA-256 `621d880c447a155c193eef9a8f2c4b11afcdf994a31c9b392d5c11d07bedefe1`, 32,322,600 bytes)를 새 run-owned copy로 고정해 local owner web start와 SIGTERM 종료를 실행했다. exit code 0, 비강제 종료, Popen 핸들 해제, owned 경로 제거가 확인됐다. 이 실행은 현재 통합 source의 provenance나 managed drain ACK를 검증하지 않으므로 `managed_drain_ack=unverified`, 3-host 주장은 false로 기록했다. 상세 결과는 `f-bootstrap/local-linux-owner-shutdown-20260909.json`이다.
+
 이 live 경로의 `file_hash`는 가입 후 파일 내용과 크기를 확인하는 readiness 관측이며 공급자별 조각 payload나 CAS 기여를 측정하지 않는다. owner/RW 양쪽 CAS와 두 공급자의 실제 payload는 E2/E3 실행에서 별도 계측·판정해야 한다.
 
 ## 정리와 판정
