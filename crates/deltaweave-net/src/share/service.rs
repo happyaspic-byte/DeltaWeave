@@ -66,6 +66,7 @@ type SwarmOperationKey = (GrantNonce, [u8; 16]);
 struct SwarmOperationState {
     active: BTreeSet<SwarmOperationKey>,
     closed: BTreeSet<SwarmOperationKey>,
+    completed: BTreeSet<SwarmOperationKey>,
 }
 
 /// A process-local admission token for one exact grant nonce/operation pair.
@@ -76,6 +77,7 @@ struct SwarmOperationState {
 struct SwarmOperationGuard {
     registry: Weak<SwarmTaskRegistry>,
     key: SwarmOperationKey,
+    drained: bool,
 }
 
 impl Drop for SwarmOperationGuard {
@@ -85,6 +87,9 @@ impl Drop for SwarmOperationGuard {
         };
         if let Ok(mut state) = registry.operations.lock() {
             state.active.remove(&self.key);
+            if self.drained && state.completed.len() < MAX_SWARM_OPERATION_KEYS {
+                state.completed.insert(self.key);
+            }
         }
         registry.operation_notify.notify_waiters();
     }
@@ -168,6 +173,10 @@ impl SwarmTaskRegistry {
             ShareError::Busy
         );
         ensure!(
+            !state.completed.iter().any(|(nonce, _)| nonce == &key.0),
+            ShareError::Busy
+        );
+        ensure!(
             state.closed.len() < MAX_SWARM_OPERATION_KEYS || state.closed.contains(&key),
             ShareError::Busy
         );
@@ -176,7 +185,17 @@ impl SwarmTaskRegistry {
         Ok(SwarmOperationGuard {
             registry: Arc::downgrade(self),
             key,
+            drained: false,
         })
+    }
+
+    /// Marks an accepted operation's stream/storage boundary as drained.
+    /// This is intentionally separate from dropping the admission guard:
+    /// cancellation or a bounded transport timeout may end the handler while
+    /// a retained connection still owns bytes, and that must not become local
+    /// drain evidence for current-boot recovery.
+    fn mark_operation_drained(guard: &mut SwarmOperationGuard, drained: bool) {
+        guard.drained = drained;
     }
 
     /// Closes one operation's admission and waits for the exact accepted
@@ -195,6 +214,13 @@ impl SwarmTaskRegistry {
                     .map_err(|_| ShareError::StateUnavailable)?;
                 if state.closed.iter().any(|(nonce, closed_operation)| {
                     nonce == &key.0 && (*nonce, *closed_operation) != key
+                }) {
+                    return Err(ShareError::GrantReplay.into());
+                }
+                if state.active.iter().any(|(nonce, active_operation)| {
+                    nonce == &key.0 && (*nonce, *active_operation) != key
+                }) || state.completed.iter().any(|(nonce, completed_operation)| {
+                    nonce == &key.0 && (*nonce, *completed_operation) != key
                 }) {
                     return Err(ShareError::GrantReplay.into());
                 }
@@ -229,6 +255,16 @@ impl SwarmTaskRegistry {
         {
             return Err(ShareError::GrantReplay.into());
         }
+        if state
+            .active
+            .iter()
+            .any(|(nonce, active_operation)| nonce == &key.0 && (*nonce, *active_operation) != key)
+            || state.completed.iter().any(|(nonce, completed_operation)| {
+                nonce == &key.0 && (*nonce, *completed_operation) != key
+            })
+        {
+            return Err(ShareError::GrantReplay.into());
+        }
         if !state.closed.contains(&key) {
             ensure!(
                 state.closed.len() < MAX_SWARM_OPERATION_KEYS,
@@ -239,12 +275,47 @@ impl SwarmTaskRegistry {
         Ok(!state.active.iter().any(|(nonce, _)| nonce == &key.0))
     }
 
+    /// Current-process recovery may claim local IO drain only for an exact
+    /// operation that was admitted and explicitly marked drained.  A durable
+    /// row with no previous boot marker is otherwise indistinguishable from a
+    /// fabricated journal entry, so this method fails closed without closing
+    /// a new operation's admission.
+    fn try_close_completed_operation(&self, key: SwarmOperationKey) -> Result<bool> {
+        let mut state = self
+            .operations
+            .lock()
+            .map_err(|_| ShareError::StateUnavailable)?;
+        if state
+            .closed
+            .iter()
+            .any(|(nonce, closed_operation)| nonce == &key.0 && (*nonce, *closed_operation) != key)
+            || state.active.iter().any(|(nonce, active_operation)| {
+                nonce == &key.0 && (*nonce, *active_operation) != key
+            })
+            || state.completed.iter().any(|(nonce, completed_operation)| {
+                nonce == &key.0 && (*nonce, *completed_operation) != key
+            })
+        {
+            return Err(ShareError::GrantReplay.into());
+        }
+        if !state.completed.contains(&key) {
+            return Ok(false);
+        }
+        ensure!(
+            state.closed.contains(&key) || state.closed.len() < MAX_SWARM_OPERATION_KEYS,
+            ShareError::Busy
+        );
+        state.closed.insert(key);
+        Ok(!state.active.iter().any(|(nonce, _)| nonce == &key.0))
+    }
+
     fn release_closed_operation(&self, key: SwarmOperationKey) -> Result<()> {
         let mut state = self
             .operations
             .lock()
             .map_err(|_| ShareError::StateUnavailable)?;
         state.closed.remove(&key);
+        state.completed.remove(&key);
         Ok(())
     }
 
@@ -508,6 +579,28 @@ mod swarm_task_registry_tests {
         assert!(registry.begin_operation((nonce, [0x95; 16])).is_err());
         drop(first);
     }
+
+    #[test]
+    fn current_boot_recovery_requires_an_explicit_drain_marker() {
+        let registry = Arc::new(SwarmTaskRegistry::default());
+        let key = ([0x96; 32], [0x97; 16]);
+        let guard = registry.begin_operation(key).expect("operation admission");
+        drop(guard);
+        assert!(
+            !registry
+                .try_close_completed_operation(key)
+                .expect("unmarked operation query")
+        );
+
+        let mut guard = registry.begin_operation(key).expect("retry admission");
+        SwarmTaskRegistry::mark_operation_drained(&mut guard, true);
+        drop(guard);
+        assert!(
+            registry
+                .try_close_completed_operation(key)
+                .expect("marked operation query")
+        );
+    }
 }
 
 /// One device-wide persistent endpoint. Clone its endpoint for all outbound shares;
@@ -561,6 +654,7 @@ pub struct SupplierRegistrationGuard {
     share: ShareId,
     membership: Membership,
     root_lease: Arc<RootLease>,
+    private_root: PathBuf,
     index: Arc<LocalIndex>,
     store: Arc<Store>,
     drained: Arc<std::sync::atomic::AtomicBool>,
@@ -681,6 +775,10 @@ impl SupplierRegistrationGuard {
     #[allow(dead_code)]
     pub(crate) fn root_lease(&self) -> &Arc<RootLease> {
         &self.root_lease
+    }
+    #[allow(dead_code)]
+    pub(crate) fn private_root(&self) -> &Path {
+        &self.private_root
     }
     #[allow(dead_code)]
     pub(crate) fn index(&self) -> &Arc<LocalIndex> {
@@ -1081,18 +1179,19 @@ impl ShareService {
             ShareError::StateUnavailable
         );
         let store_state = fs::canonicalize(store.state_root())?;
-        ensure!(
-            root_lease
-                .private_roots()
-                .iter()
-                .any(|private| store_state.starts_with(private)),
-            ShareError::StateUnavailable
-        );
+        let private_root = root_lease
+            .private_roots()
+            .iter()
+            .filter(|private| store_state.starts_with(private))
+            .max_by_key(|private| private.components().count())
+            .cloned()
+            .ok_or(ShareError::StateUnavailable)?;
         let guard = SupplierRegistrationGuard {
             owner,
             share,
             membership: persisted.membership,
             root_lease,
+            private_root,
             index,
             store,
             drained: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1610,9 +1709,15 @@ impl ShareService {
         row: &ClientIntentRow,
         leases: &BTreeMap<ShareId, ManagedAdmissionLease>,
     ) -> bool {
-        if row.previous_boot_id.is_none() {
-            return false;
-        }
+        let close_operation = || {
+            if row.previous_boot_id.is_some() {
+                self.swarm_tasks
+                    .try_close_operation((row.grant.nonce, row.operation_id))
+            } else {
+                self.swarm_tasks
+                    .try_close_completed_operation((row.grant.nonce, row.operation_id))
+            }
+        };
         if let Some(admission) = leases.get(&row.grant.share)
             && Self::lease_matches_intent(
                 admission.lease(),
@@ -1621,10 +1726,7 @@ impl ShareService {
                 admission.state_root(),
             )
         {
-            return self
-                .swarm_tasks
-                .try_close_operation((row.grant.nonce, row.operation_id))
-                .unwrap_or(false);
+            return close_operation().unwrap_or(false);
         }
         if row.grant.provider != self.endpoint_id() {
             return false;
@@ -1641,10 +1743,7 @@ impl ShareService {
                 &row.grant,
                 &runtime.config.root,
                 &runtime.config.state_root,
-            ) && self
-                .swarm_tasks
-                .try_close_operation((row.grant.nonce, row.operation_id))
-                .unwrap_or(false);
+            ) && close_operation().unwrap_or(false);
         }
         self.suppliers
             .read()
@@ -1655,11 +1754,8 @@ impl ShareService {
                     &supplier.root_lease,
                     &row.grant,
                     supplier.index.root(),
-                    supplier.store.state_root(),
-                ) && self
-                    .swarm_tasks
-                    .try_close_operation((row.grant.nonce, row.operation_id))
-                    .unwrap_or(false)
+                    &supplier.private_root,
+                ) && close_operation().unwrap_or(false)
             })
     }
 
@@ -3482,16 +3578,9 @@ impl SwarmAdmissionHandler {
                 .await
             }
         };
-        if let Err(ref error) = result {
-            let _ = write_frame(&mut send, &wire::SwarmResponse::Error(safe_error(error))).await;
+        if result.is_err() {
+            connection.close(0u8.into(), b"share swarm operation failed");
         }
-        let _ = send.finish();
-        // Do not tear down the connection while the Finished/Error frame is
-        // still in flight.  The consumer closes after it has received the
-        // frame and recorded its owner-side drain acknowledgement.  A
-        // bounded wait keeps a silent peer from retaining this admission
-        // forever while preserving queued QUIC bytes for a live peer.
-        Handler::wait_closed_bounded(&connection).await;
         result
     }
 
@@ -3507,6 +3596,22 @@ impl SwarmAdmissionHandler {
         hashes: Vec<Hash32>,
         operation_id: [u8; 16],
     ) -> Result<()> {
+        // Hold the exact operation admission through the final error frame,
+        // stream finish, and bounded connection close in this method.  The
+        // caller may cancel a recovery future while a provider has already
+        // queued bytes; dropping this guard at the inner `?` boundary would
+        // let an exact local drain proof race that queued response.
+        let mut operation_guard = match self.tasks.begin_operation((grant.nonce, operation_id)) {
+            Ok(guard) => guard,
+            Err(error) => {
+                let _ = write_frame(send, &wire::SwarmResponse::Error(safe_error(&error))).await;
+                let _ = send.finish();
+                Handler::wait_closed_bounded(connection).await;
+                return Err(error);
+            }
+        };
+        let mut supplier_operation = None;
+        let mut inflight = None;
         let result = self
             .handle_grant_inner(
                 connection,
@@ -3517,6 +3622,8 @@ impl SwarmAdmissionHandler {
                 manifest,
                 hashes,
                 operation_id,
+                &mut supplier_operation,
+                &mut inflight,
             )
             .await;
         if result.is_err() {
@@ -3532,7 +3639,40 @@ impl SwarmAdmissionHandler {
                 ClientIntentPhase::Unknown,
                 None,
             );
+            let _ = write_frame(
+                send,
+                &wire::SwarmResponse::Error(safe_error(
+                    result.as_ref().expect_err("result is an error"),
+                )),
+            )
+            .await;
         }
+        let _ = send.finish();
+        // Keep all operation/supplier guards alive until the response frame
+        // has been enqueued and the connection has had its bounded close
+        // opportunity.  Shutdown/recovery therefore cannot observe a proof
+        // while this handler still owns stream bytes or storage admission.
+        let transport_drained = Handler::wait_closed_bounded(connection).await;
+        let retain_recovery_evidence = self
+            .registry
+            .client_intent(&grant)
+            .ok()
+            .flatten()
+            .is_some_and(|row| {
+                row.side == ClientSide::Provider
+                    && row.operation_id == operation_id
+                    && matches!(
+                        row.phase,
+                        ClientIntentPhase::Unknown | ClientIntentPhase::Draining
+                    )
+            });
+        SwarmTaskRegistry::mark_operation_drained(
+            &mut operation_guard,
+            transport_drained && retain_recovery_evidence,
+        );
+        drop(inflight);
+        drop(supplier_operation);
+        drop(operation_guard);
         result
     }
 
@@ -3547,11 +3687,9 @@ impl SwarmAdmissionHandler {
         manifest: ManifestAttestation,
         hashes: Vec<Hash32>,
         operation_id: [u8; 16],
+        supplier_operation: &mut Option<SupplierOperation>,
+        inflight: &mut Option<InflightNonce>,
     ) -> Result<()> {
-        // The request is now keyed by its signed grant.  Close/recovery and
-        // this admission take the same operation mutex, so a response-loss
-        // proof cannot pass between grant parsing and provider validation.
-        let _operation_guard = self.tasks.begin_operation((grant.nonce, operation_id))?;
         let remote_consumer = connection.remote_id();
         let source = self.validate_grant(
             &grant,
@@ -3565,8 +3703,8 @@ impl SwarmAdmissionHandler {
         // payload reads, stream finish, and the provider drain/status exchange.
         // SupplierRegistrationGuard::drain waits on this exact operation
         // rather than taking the endpoint-wide control gate.
-        let _supplier_operation = source.begin_operation()?;
-        let _inflight = InflightNonce::acquire(self.inflight.clone(), grant.nonce)?;
+        *supplier_operation = source.begin_operation()?;
+        *inflight = Some(InflightNonce::acquire(self.inflight.clone(), grant.nonce)?);
         let intent =
             self.registry
                 .prepare_client_intent(&grant, ClientSide::Provider, operation_id)?;
@@ -4497,7 +4635,7 @@ impl Handler {
         Ok(())
     }
 
-    async fn wait_closed_bounded(connection: &Connection) {
+    async fn wait_closed_bounded(connection: &Connection) -> bool {
         if tokio::time::timeout(CONTROL_DEADLINE, connection.closed())
             .await
             .is_err()
@@ -4508,6 +4646,9 @@ impl Handler {
             // admission boundary; relying on the final handle's implicit
             // close would make this guarantee depend on hidden ownership.
             connection.close(0u8.into(), b"share control deadline");
+            false
+        } else {
+            true
         }
     }
 
@@ -6278,6 +6419,10 @@ mod tests {
                 provider_store.clone(),
             )
             .unwrap();
+        assert_eq!(
+            provider_guard.private_root(),
+            fs::canonicalize(&provider_state).unwrap().as_path()
+        );
 
         let consumer_session = consumer.open_session(owner.endpoint_id(), share).unwrap();
         let provider_session = provider.open_session(owner.endpoint_id(), share).unwrap();
