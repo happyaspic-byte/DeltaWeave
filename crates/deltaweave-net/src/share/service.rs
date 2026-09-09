@@ -97,6 +97,8 @@ pub struct ShareService {
     lifecycle: tokio::sync::Mutex<()>,
     mode: NetworkMode,
     active: Arc<tokio::sync::RwLock<()>>,
+    #[cfg(test)]
+    admission_limit: Arc<tokio::sync::Semaphore>,
 }
 
 /// Opaque ownership proof for the already-bound device endpoint.  It exposes
@@ -189,13 +191,27 @@ impl ShareService {
         mode: NetworkMode,
         endpoint: crate::Endpoint,
     ) -> Self {
+        Self::from_bound_endpoint_with_limit(key, registry, mode, endpoint, 64)
+    }
+
+    fn from_bound_endpoint_with_limit(
+        key: SecretKey,
+        registry: Arc<Registry>,
+        mode: NetworkMode,
+        endpoint: crate::Endpoint,
+        max_connections: usize,
+    ) -> Self {
+        assert!(max_connections > 0, "test endpoint limit must be positive");
         let runtimes = Arc::new(RwLock::new(BTreeMap::new()));
         let active = Arc::new(tokio::sync::RwLock::new(()));
+        let limit = Arc::new(tokio::sync::Semaphore::new(max_connections));
+        #[cfg(test)]
+        let admission_limit = limit.clone();
         let handler = Handler {
             registry: registry.clone(),
             key: key.clone(),
             runtimes: runtimes.clone(),
-            limit: Arc::new(tokio::sync::Semaphore::new(64)),
+            limit,
             active: active.clone(),
         };
         let router = Router::builder(endpoint)
@@ -210,10 +226,16 @@ impl ShareService {
             lifecycle: tokio::sync::Mutex::new(()),
             mode,
             active,
+            #[cfg(test)]
+            admission_limit,
         }
     }
     pub fn endpoint_id(&self) -> EndpointId {
         self.key.public()
+    }
+    #[cfg(test)]
+    fn available_admission_slots(&self) -> usize {
+        self.admission_limit.available_permits()
     }
     #[allow(dead_code)]
     pub(crate) fn endpoint_ownership(&self) -> ShareEndpointOwnership {
@@ -1336,8 +1358,15 @@ impl ProtocolHandler for Handler {
 }
 impl Handler {
     async fn run(&self, connection: Connection) -> Result<()> {
-        let (mut send, mut receive) = connection.accept_bi().await?;
-        let hello = wire::read_hello(&mut receive).await?;
+        let handshake_deadline = Instant::now() + CONTROL_DEADLINE;
+        let remaining = handshake_deadline.saturating_duration_since(Instant::now());
+        let (mut send, mut receive) = tokio::time::timeout(remaining, connection.accept_bi())
+            .await
+            .map_err(|_| anyhow::Error::new(ShareError::Offline))??;
+        let remaining = handshake_deadline.saturating_duration_since(Instant::now());
+        let hello = tokio::time::timeout(remaining, wire::read_hello(&mut receive))
+            .await
+            .map_err(|_| anyhow::Error::new(ShareError::Offline))??;
         let runtime = self
             .runtimes
             .read()
@@ -1347,7 +1376,7 @@ impl Handler {
         let Some(runtime) = runtime else {
             write_frame(&mut send, &Reply::Error(ShareError::UnknownShare)).await?;
             send.finish()?;
-            connection.closed().await;
+            Self::wait_closed_bounded(&connection).await;
             return Ok(());
         };
         let peer = connection.remote_id();
@@ -1428,7 +1457,7 @@ impl Handler {
         write_frame(&mut send, &reply).await?;
         send.finish()?;
         if !session {
-            connection.closed().await;
+            Self::wait_closed_bounded(&connection).await;
             return Ok(());
         }
         let member = self.registry.authorize(hello.share_id, peer, false)?;
@@ -1453,10 +1482,19 @@ impl Handler {
             state_root: runtime.config.state_root.clone(),
             receive_admission_lock: runtime.receive_gate.clone(),
         };
-        let (mut send, mut receive) = connection.accept_bi().await?;
+        let session_admission_deadline = Instant::now() + CONTROL_DEADLINE;
+        let remaining = session_admission_deadline.saturating_duration_since(Instant::now());
+        let (mut send, mut receive) = tokio::time::timeout(remaining, connection.accept_bi())
+            .await
+            .map_err(|_| anyhow::Error::new(ShareError::Offline))??;
         let result = async {
             auth.check(false)?;
-            match read_frame::<SyncWireRequest>(&mut receive).await? {
+            let remaining = session_admission_deadline.saturating_duration_since(Instant::now());
+            let request =
+                tokio::time::timeout(remaining, read_frame::<SyncWireRequest>(&mut receive))
+                    .await
+                    .map_err(|_| anyhow::Error::new(ShareError::Offline))??;
+            match request {
                 request @ SyncWireRequest::QueryNode { .. } => {
                     handler
                         .handle_query_session(request, &mut send, &mut receive)
@@ -1484,8 +1522,12 @@ impl Handler {
         }
         let _ = send.finish();
         // All disk/chunk work has completed before the tracked guard can disappear.
-        connection.closed().await;
+        Self::wait_closed_bounded(&connection).await;
         Ok(())
+    }
+
+    async fn wait_closed_bounded(connection: &Connection) {
+        let _ = tokio::time::timeout(CONTROL_DEADLINE, connection.closed()).await;
     }
 
     /// Handles the owner-authoritative v1 swarm control records.  Each branch
@@ -1674,13 +1716,26 @@ mod tests {
         mode: NetworkMode,
         endpoint: Endpoint,
     ) -> Result<ShareService> {
+        open_with_bound_test_endpoint_with_limit(state, mode, endpoint, 64).await
+    }
+
+    async fn open_with_bound_test_endpoint_with_limit(
+        state: impl AsRef<Path>,
+        mode: NetworkMode,
+        endpoint: Endpoint,
+        max_connections: usize,
+    ) -> Result<ShareService> {
         let state = root_admission::reserve_private(state)?;
         root_admission::private_directory(&state)?;
         let key = load_or_create_identity(state.join("device.key"))?.secret_key;
         ensure!(key.public() == endpoint.id(), ShareError::OwnerMismatch);
         let registry = Arc::new(Registry::open(&state, key.public())?);
-        Ok(ShareService::from_bound_endpoint(
-            key, registry, mode, endpoint,
+        Ok(ShareService::from_bound_endpoint_with_limit(
+            key,
+            registry,
+            mode,
+            endpoint,
+            max_connections,
         ))
     }
 
@@ -1890,6 +1945,115 @@ mod tests {
             path_event_count: event_count,
             roster_binding_valid,
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn silent_and_preview_connections_are_bounded_and_admission_recovers() {
+        let test_name = "share::service::tests::silent_and_preview_connections_are_bounded_and_admission_recovers";
+        if std::env::var("DW_ADMISSION_TIMEOUT_CHILD").ok().as_deref() != Some(test_name) {
+            let profile = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test_name, "--nocapture"])
+                .env("DW_ADMISSION_TIMEOUT_CHILD", test_name)
+                .env("HOME", profile.path())
+                .env("USERPROFILE", profile.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let owner_state = temp.path().join("owner");
+        let prepared = root_admission::reserve_private(&owner_state).unwrap();
+        root_admission::private_directory(&prepared).unwrap();
+        let identity = load_or_create_identity(prepared.join("device.key")).unwrap();
+        let endpoint = Endpoint::builder(presets::Minimal)
+            .secret_key(identity.secret_key)
+            .alpns(vec![ALPN_V3.to_vec(), ALPN_SWARM_V1.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        let owner = open_with_bound_test_endpoint_with_limit(
+            &owner_state,
+            NetworkMode::DirectOnly,
+            endpoint,
+            1,
+        )
+        .await
+        .unwrap();
+        let share = owner
+            .create_owned_share(
+                "bounded admission".into(),
+                temp.path().join("owner-root"),
+                temp.path().join("owner-state"),
+                None,
+                0,
+            )
+            .await
+            .unwrap();
+        let ticket = share
+            .issue_key(Permission::ReadWrite, None, owner.endpoint_addr())
+            .unwrap();
+
+        let silent_peer = Endpoint::builder(presets::Minimal).bind().await.unwrap();
+        let silent_connection = silent_peer
+            .connect(owner.endpoint_addr(), ALPN_V3)
+            .await
+            .unwrap();
+        let occupied_deadline = Instant::now() + Duration::from_secs(2);
+        while owner.available_admission_slots() != 0 && Instant::now() < occupied_deadline {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(owner.available_admission_slots(), 0);
+
+        let reclaim_deadline = Instant::now() + CONTROL_DEADLINE + Duration::from_secs(2);
+        while owner.available_admission_slots() == 0 && Instant::now() < reclaim_deadline {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            owner.available_admission_slots(),
+            1,
+            "silent peer did not release the bounded admission slot"
+        );
+        silent_connection.close(0u8.into(), b"silent admission complete");
+        silent_peer.close().await;
+
+        let member = ShareService::open(temp.path().join("member"), NetworkMode::DirectOnly, None)
+            .await
+            .unwrap();
+        let enrolled = member.enroll(&ticket, None).await.unwrap();
+        assert_eq!(enrolled.permission, Permission::ReadWrite);
+
+        let preview_peer = Endpoint::builder(presets::Minimal).bind().await.unwrap();
+        let preview_connection = preview_peer
+            .connect(owner.endpoint_addr(), ALPN_V3)
+            .await
+            .unwrap();
+        let preview_reply = wire::exchange(
+            &preview_connection,
+            Hello {
+                version: 3,
+                share_id: share.config().share_id,
+                operation: Operation::Validate(ticket),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(preview_reply, Reply::Validated(_)));
+        let preview_deadline = Instant::now() + CONTROL_DEADLINE + Duration::from_secs(2);
+        while owner.available_admission_slots() == 0 && Instant::now() < preview_deadline {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            owner.available_admission_slots(),
+            1,
+            "preview connection close wait was not bounded"
+        );
+        preview_connection.close(0u8.into(), b"preview admission complete");
+        preview_peer.close().await;
+
+        member.shutdown().await.unwrap();
+        owner.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

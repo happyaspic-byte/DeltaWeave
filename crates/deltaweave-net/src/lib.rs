@@ -1578,9 +1578,10 @@ impl SyncSession {
         } else {
             ALPN_V2
         };
-        let connection = OperationConnection(self.connect_raw(alpn).await?);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let connection = OperationConnection(self.connect_raw_until(alpn, deadline).await?);
         if let Some(share_id) = self.share {
-            share::wire::open_session(&connection, share_id).await?;
+            share::wire::open_session_until(&connection, share_id, deadline).await?;
         }
         Ok(connection)
     }
