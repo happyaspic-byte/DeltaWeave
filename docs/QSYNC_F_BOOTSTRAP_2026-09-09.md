@@ -24,7 +24,11 @@ RO reusable workflow는 선택한 commit을 checkout하고 Linux binary를 새�
 `qsync_three_host_role.py`를 실행한다. role driver는 새 runner 임시 namespace와 private
 profile을 만들고 local preview, key가 가리키는 owner의 online validate, join, 파일
 hash, 종료 후 같은 state의 membership 재조회를 수행한다. workflow artifact에는 고정
-phase와 hash·크기만 남긴다.
+phase와 hash·크기만 남긴다. RW는 hosted runner에서 WinRM으로 실행하지 않는다. local
+controller가 승인 Windows에서 `qsync_three_host_winrm_keepalive.py`를 실행한 상태로
+같은 source/ref의 workflow를 dispatch하고, workflow가 올린
+`qsync-f-ro-evidence-<github_run_id>`만 내려받아 local gate에서 RW evidence와 비교한다.
+RO 결과가 없어도, RW가 먼저 끝나도, gate는 3-host 성공으로 승격하지 않는다.
 
 ## 입력과 비밀 경계
 
@@ -57,11 +61,12 @@ config는 다음과 같은 environment-name만 받는다.
 실제 비밀 값은 환경에만 잠시 존재하고 `SecretVault`에서 API/WinRM 요청 중에만
 참조한다. 앱 자식에는 allowlist 된 runtime 변수와 새 `HOME`, `USERPROFILE`, XDG,
 `TMP` profile만 전달한다. raw key, bearer, URL, credential, PowerShell stdout/stderr,
-CLI argument는 로그·evidence·artifact에 쓰지 않는다. GitHub reusable workflow가
-참조하는 새 run 전용 secret은 `QSYNC_F_RO_SHARE_KEY`이며 값을 만들거나 기존 secret을
-덮어쓰지 않는다. WinRM controller의 owner URL과 계정은 controller 환경에서만
+CLI argument는 로그·evidence·artifact에 쓰지 않는다. reusable workflow caller는
+`ro_share_key_secret_name`에 매 실행마다 만든 secret 이름을 지정하고, 그 값을 호출
+workflow의 `QSYNC_F_RO_SHARE_KEY` 별칭에만 매핑한다. workflow는 secret을 만들거나
+덮어쓰거나 삭제하지 않는다. WinRM controller의 owner URL과 계정은 controller 환경에서만
 `QSYNC_F_OWNER_API_URL`, `QSYNC_F_WINRM_USERNAME`, `QSYNC_F_WINRM_PASSWORD`로
-주입한다. hosted RO job에는 owner 관리자 credential을 전달하지 않는다.
+주입한다. hosted RO job에는 owner 관리자·WinRM credential을 전달하지 않는다.
 
 WinRM은 `Session.run_ps`를 사용하지 않는다. pywinrm의 해당 편의 메서드는
 `powershell -encodedcommand ...`를 Windows command shell로 보내므로, wrapper의
@@ -146,9 +151,8 @@ drain ACK adapter가 없어 smoke namespace는 보존하고 `drain_ack=unverifie
 다음은 이 checkpoint에서 실행하는 로컬 비밀 없는 검사다.
 
 ```text
-python3 -m py_compile scripts/qsync_three_host_bootstrap.py scripts/qsync_three_host_role.py scripts/qsync_make_role_manifest.py
-python3 -m unittest discover -s tests/tools -p 'test_qsync_three_host_bootstrap.py' -v
-python3 -m unittest discover -s tests/tools -p 'test_qsync_three_host_f_manifest.py' -v
+python3 -m py_compile scripts/qsync_three_host_bootstrap.py scripts/qsync_three_host_coordination.py scripts/qsync_three_host_role.py scripts/qsync_three_host_winrm_keepalive.py tests/tools/test_qsync_three_host_bootstrap.py tests/tools/test_qsync_three_host_coordination.py tests/tools/test_qsync_three_host_f_manifest.py
+python3 -m unittest discover -s tests/tools -p 'test_qsync_three_host*.py' -v
 ```
 
 GitHub reusable workflow dispatch, 새 encrypted secret 생성, 외부 3-host 실행, 실제
@@ -192,7 +196,90 @@ failed evidence로 보존했다. retry9 상세 고정 evidence는
 `f-bootstrap/windows-local-graceful-2f-retry9/` 아래에 있다.
 
 retry9의 transport/phase 기록은 최종 binary/fixture 독립 gate 보정 전 생성된 실행
-기록이므로, 현재 checkpoint의 complete 결과로 재해석하지 않는다. 현재 gate와 28개
+기록이므로, 현재 checkpoint의 complete 결과로 재해석하지 않는다. 당시 gate와 28개
 회귀 결과는 commit `df0ba52a058c97523ea119aa5f6296656fe44dd7`에서 다시 확인했고,
 정확한 source hash와 명령 시각은 `f-bootstrap/winrm-bounded-contract-final/`
 검증 ledger에 보존했다.
+
+## 현재 bounded/reopen 및 동시 역할 checkpoint
+
+위의 retry9와 28개 회귀 기록은 과거 checkpoint다. 현재 도구는 reopen HTTP 응답과
+membership의 `share_id`, `role`, `permission`, 재조회 파일의 hash·크기를 함께
+확인하고, `reopen_checks=63` 및 각 reopen trace의 정확히 한 번의 관측을 요구한다.
+성공 phase에 오류 필드가 없으면 parser는 `error_class=none`으로 기록한다. RW
+runner도 원본 Windows binary를 바로 전송하지 않고 run-owned 0700 복사본을 해시
+검증한 뒤 사용한다. 정상적으로 원격 정리가 확인된 경우에만 그 복사본을 지우며,
+timeout·forced·불명확한 상태에서는 `run_owned_copy_removed=false`와 상태 보존을
+기록한다. coordination gate는 이 조건을 만족하지 않으면 pass를 만들지 않는다.
+
+2026-09-09의 retry10은 source `2f44d9fbfbe1c4779bd59f78fe9cc4ff27f41cd6`, Windows
+artifact SHA `186b9e177d8b3a8246ceb994d00402b827fb8481b26642edf4ce62983988453a`,
+크기 `33488896` bytes를 사용했다. owner/member preview·validate·join과 최초
+fixture hash `8b666f88f7b033f647f9b5ae66d668b7bb88376630dbecfb0fba757f4f84334c`,
+`262144` bytes는 통과했지만 reopen membership의 HTTP status가 0이고 checks가
+9로 끝나 전체 결과는 `pending`이었다. 별도 read-only process probe는
+`authenticated=true`, `deltaweave_process_count=0`, `web_ready=false`였다.
+bodyless GET 수정 뒤의 retry11은 reopen 전에 test-owned console에 분류할 수 없는
+추가 process가 남아 `console_control_failed`로 안전하게 중단됐다. 전체 결과는
+`pending`, transport cleanup은 true, 별도 probe는 동일하게 orphan 0이었다. 따라서
+retry10/11 어느 것도 graceful reopen pass나 3-host pass를 증명하지 않는다.
+
+콘솔 소유권을 짧게 재표본화하고 정확히 owner+target일 때만 Ctrl+C를 보내도록 한
+retry12(07:53:30Z~07:54:35Z)는 member 재시작 뒤 membership과 fixture file hash,
+`reopen_checks=63`을 통과했다. 마지막 재시작 member가 `stop_exit_timeout`에 걸려
+강제 정리로 끝났으므로 전체 결과는 여전히 `pending`이며 graceful cleanup 증거가
+아니다. 직후 읽기 전용 process probe(07:58:30Z)는 인증·조회에 성공했고
+`deltaweave=0`, `web=0`, orphan 0을 확인했다. 이 결과는 남은 종료 제어 경계를
+분리해 보여주며 3-host F 또는 E bilateral drain ACK를 증명하지 않는다.
+
+`qsync_three_host_winrm_keepalive.py`는 local controller에서 실행하며,
+`provenance-and-linux-build` 뒤 hosted Ubuntu RO job과 겹치는 keepalive 구간을 안전한
+evidence로 남긴다. controller는 workflow run을 찾을 때 head/source SHA와 dispatch 시각을
+대조하고, 해당 run의 RO artifact를 bounded poll로 내려받은 뒤 local coordination gate를
+호출해야 한다. 이 저장소 checkpoint에는 role driver와 hosted RO workflow, 그리고 gate
+계약만 포함되며 그 dispatch/download controller는 아직 구현·실행하지 않았다. gate는
+RO의 `run_id`, RW의 `run_id`, source SHA, fixture hash·크기, 실제
+keepalive 구간이 같은 실행을 가리키는지 확인한다. Linux/Windows executable hash는 달라도
+되며 각 role의 `source_sha`, `workflow_sha`, `target`, hash, 크기를 따로 검증한다.
+WinRM remote trace의 elapsed 값은 요청한 keepalive 지속시간만 검증하고 controller 시각에
+더하지 않는다. controller가 고정 trace를 실제로 받은 시각을 별도 기록해 keepalive가
+RO join 및 파일 검증 phase와 실제로 겹치는지 확인하며, 이 수신 구간이 없거나 겹치지 않으면
+실패한다. workflow는
+evidence 디렉터리를 runner에 미리 만들지 않고 각 driver가 0700으로 단독 생성하게 한다.
+hosted runner에는 RO key만 per-run 별칭으로 주입하고 owner API, RW key, WinRM credential은
+주입하지 않는다. controller, RO key, owner endpoint 중 하나라도 준비되지 않으면 역할은
+`blocked`/`pending`이다. 이는 실행 가능한 handoff 경로를 제공하지만 이 환경에서 3 host,
+bilateral drain ACK, E share-swarm provider payload의 성공을 주장하지 않는다.
+
+현재 로컬 검증은 `py_compile` exit 0, `python3 -m unittest discover -s tests/tools
+-p 'test_qsync_three_host*.py' -v` 39 tests exit 0, 두 workflow YAML parse exit 0,
+`git diff --check` exit 0이다. `actionlint`는 이 실행 환경에 설치되어 있지 않아
+사용하지 못했다. CI의 caller는 reusable workflow에 job-level `contents:read`와
+`actions:read`만 전달하도록 수정됐고, Linux/Windows web test는 `npm --prefix web
+test -- --run`, CLI self-test는 `cargo run --locked --all-features -p deltaweave --
+self-test`를 사용한다. 이 수정으로 시작한 run `34324974244`는 source
+`860b03f2ed151754551f781e6c12947425256bce`에서 Linux quality, Windows tests,
+native artifact, ACL probe가 모두 success로 완료됐고, `qsync-three-host-bootstrap`
+job은 `execute_ro=false`로 skipped였다. 따라서 이 run은 전체 CI/네이티브 artifact
+검증의 success이지 외부 3-host F 실행이나 full F 판정이 아니다.
+해당 run의 Windows native artifact manifest도 재다운로드해 SHA-256
+`36011de777b1523d82e886964f19c39220c3b44ee0558d4e95d66aebc4e31227`, 크기
+`34,064,896` bytes, target `x86_64-pc-windows-msvc`, source
+`860b03f2ed151754551f781e6c12947425256bce`로 바이너리와 manifest가 일치함을
+확인했다. 이는 retry12에서 사용한 이전 source
+`2f44d9fbfbe1c4779bd59f78fe9cc4ff27f41cd6` artifact와 별도다.
+
+같은 source의 test-owned Windows local retry17은
+`2026-09-09T08:25:28Z`~`08:26:04Z`에 위 Windows artifact로 실행했다. 실행기
+`runtime-tmp-windows-local-graceful-retry17.py`의 evidence 기록 SHA는
+`08e4bd774fc3ad963e34aa1cc1c84f077ced604c9d065defa8dcb36e5c553272`이다. artifact
+SHA/크기, owner create와 key/preview/validate/join, 실제 fixture 파일 hash/크기,
+owner-online 상태에서의 member 재조회, 세 번의 소유 console Ctrl+C, child exit 0,
+stream drain 및 console release가 모두 고정 phase로 확인됐고 `reopen_checks=63`,
+remote status 0이었다. 파일과 재조회 파일은
+`8b666f88f7b033f647f9b5ae66d668b7bb88376630dbecfb0fba757f4f84334c`/
+`262144` bytes였다. 이 결과는 local Windows owner/member의 관리형 정상 종료와
+동일 membership 재오픈을 증명하는 `pass`이며, evidence의
+`managed_bilateral_drain_ack=unverified`를 유지한다. 따라서 3-host 동시 실행,
+offline-owner drain, E `share-swarm/1` provider payload, full F는 증명하지 않는다.
+이전 source의 retry13 owner-offline 결과는 별도 `pending`으로 보존한다.

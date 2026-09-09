@@ -33,12 +33,14 @@ import qsync_three_host_bootstrap as bootstrap  # noqa: E402
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description="qSync hosted Ubuntu read-only role")
     root.add_argument("--source-sha", required=True)
+    root.add_argument("--run-id", required=True)
     root.add_argument("--manifest", required=True, type=Path)
     root.add_argument("--binary", required=True, type=Path)
     root.add_argument("--run-parent", required=True, type=Path)
     root.add_argument("--evidence-dir", required=True, type=Path)
     root.add_argument("--share-key-env", required=True)
     root.add_argument("--expected-file-hash", required=True)
+    root.add_argument("--expected-file-size", required=True, type=int)
     root.add_argument("--expected-file-name", default="fixture-a.bin")
     return root
 
@@ -85,9 +87,21 @@ def load_artifact(source_sha: str, manifest_path: Path, binary: Path) -> dict[st
     }
 
 
+def phase_window(phases: list[dict[str, Any]], phase_name: str) -> tuple[str | None, str | None]:
+    for phase in phases:
+        if phase.get("phase") == phase_name and phase.get("status") == "pass":
+            started = phase.get("started_utc")
+            finished = phase.get("finished_utc")
+            if isinstance(started, str) and isinstance(finished, str):
+                return started, finished
+    return None, None
+
+
 def _run(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     vault = bootstrap.SecretVault()
+    run_started_utc = bootstrap.utc_now_precise()
+    run_id = ""
     recorder = bootstrap.PhaseRecorder()
     process: bootstrap.LocalWebProcess | None = None
     run_root: Path | None = None
@@ -103,9 +117,12 @@ def _run(argv: list[str] | None = None) -> int:
         "preexisting_protected_state_unchanged": "unverified",
     }
     try:
+        run_id = bootstrap.require_run_id(args.run_id)
         evidence = bootstrap.SafeEvidence(args.evidence_dir, vault)
         bootstrap.require_source_sha(args.source_sha)
         expected_hash = bootstrap.require_sha256(args.expected_file_hash)
+        if type(args.expected_file_size) is not int or not 1 <= args.expected_file_size <= 128 * 1024 * 1024:
+            bootstrap.fail("config_invalid")
         if not args.expected_file_name or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", args.expected_file_name):
             bootstrap.fail("config_invalid")
         share_key_env = safe_env(args.share_key_env)
@@ -200,8 +217,9 @@ def _run(argv: list[str] | None = None) -> int:
             while time.monotonic() < deadline:
                 if target.is_file():
                     actual = bootstrap.file_sha256(target)
-                    if actual == expected_hash:
-                        return {"sha256": actual, "size_bytes": target.stat().st_size, "observed": True}
+                    size = target.stat().st_size
+                    if actual == expected_hash and size == args.expected_file_size:
+                        return {"sha256": actual, "size_bytes": size, "observed": True}
                 time.sleep(0.5)
             bootstrap.fail("hash_mismatch")
 
@@ -221,8 +239,8 @@ def _run(argv: list[str] | None = None) -> int:
                 role="ro_consumer",
                 command_id="ro.reopen.precondition",
                 status="failed",
-                started=bootstrap.utc_now(),
-                finished=bootstrap.utc_now(),
+                started=bootstrap.utc_now_precise(),
+                finished=bootstrap.utc_now_precise(),
                 elapsed_ms=0,
                 error_class="cleanup_incomplete",
             )
@@ -236,14 +254,23 @@ def _run(argv: list[str] | None = None) -> int:
         reopened_client: bootstrap.ApiClient = reopened_login.value
         membership = reopened_client._call("GET", f"/api/v1/shares/{share_id}")
         reopened_hash = bootstrap.file_sha256(target) if target.is_file() else ""
-        reopen_ok = membership[0] == 200 and reopened_hash == expected_hash
+        membership_value = membership[1] if isinstance(membership, tuple) and len(membership) == 2 else None
+        membership_ok = (
+            membership[0] == 200
+            and isinstance(membership_value, dict)
+            and membership_value.get("share_id") == share_id
+            and membership_value.get("role") == "member"
+            and membership_value.get("permission") == "read_only"
+        )
+        reopened_size = target.stat().st_size if target.is_file() else None
+        reopen_ok = membership_ok and reopened_hash == expected_hash and reopened_size == checked.value["size_bytes"]
         recorder.add(
             phase="member_reopen_membership",
             role="ro_consumer",
             command_id="ro.managed.reopen.membership",
             status="pass" if reopen_ok else "failed",
-            started=bootstrap.utc_now(),
-            finished=bootstrap.utc_now(),
+            started=bootstrap.utc_now_precise(),
+            finished=bootstrap.utc_now_precise(),
             elapsed_ms=0,
             error_class="none" if reopen_ok else "hash_mismatch",
         )
@@ -258,6 +285,7 @@ def _run(argv: list[str] | None = None) -> int:
         result_code = 1
         return result_code
     finally:
+        run_finished_utc = bootstrap.utc_now_precise()
         if process is not None:
             started_once = process.started_once
             try:
@@ -295,8 +323,8 @@ def _run(argv: list[str] | None = None) -> int:
                 role="controller",
                 command_id="ro.cleanup.run_owned_only",
                 status=cleanup_status,
-                started=bootstrap.utc_now(),
-                finished=bootstrap.utc_now(),
+                started=bootstrap.utc_now_precise(),
+                finished=bootstrap.utc_now_precise(),
                 elapsed_ms=0,
                 error_class="none" if cleanup_status == "pass" else "cleanup_incomplete",
             )
@@ -310,10 +338,19 @@ def _run(argv: list[str] | None = None) -> int:
                 final_status = "blocked"
             elif result_code != 0 and final_status == "pass":
                 final_status = "failed"
+            join_started_utc, join_finished_utc = phase_window(recorder.phases, "member_join")
+            file_hash_started_utc, file_hash_finished_utc = phase_window(recorder.phases, "file_hash")
             manifest = {
                 "scope": "three_host_transport_smoke_subset",
                 "harness_version": "qsync-f-ro-1",
                 "status": final_status,
+                "run_id": run_id,
+                "run_started_utc": run_started_utc,
+                "run_finished_utc": run_finished_utc,
+                "join_started_utc": join_started_utc,
+                "join_finished_utc": join_finished_utc,
+                "file_hash_started_utc": file_hash_started_utc,
+                "file_hash_finished_utc": file_hash_finished_utc,
                 "source_sha": args.source_sha,
                 "binary_sha256": binary_hashes,
                 "topology": [{"role": "ro_consumer", "label": "hosted-ubuntu-ro", "runner": "local"}],
@@ -322,6 +359,10 @@ def _run(argv: list[str] | None = None) -> int:
                     {"role": "rw-provider", "epoch": None, "verified_chunks": 0, "verified_bytes": 0},
                 ],
                 "file_hash_verified": file_hash_verified,
+                "expected_file_hash": expected_hash if "expected_hash" in locals() else None,
+                "expected_file_size_bytes": (
+                    args.expected_file_size if isinstance(getattr(args, "expected_file_size", None), int) else None
+                ),
                 "phases": recorder.phases,
                 "cleanup": cleanup,
                 "full_f_claim": False,

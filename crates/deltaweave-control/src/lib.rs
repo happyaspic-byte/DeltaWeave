@@ -16,7 +16,7 @@ use deltaweave_net::{
 use deltaweave_sync::{ManagedSyncConfig, ManagedSyncEngine, ManagedSyncReport};
 use std::{
     collections::BTreeMap,
-    fs::{File, OpenOptions},
+    fs::{self, File, OpenOptions},
     future::Future,
     path::{Component, Path, PathBuf},
     sync::{
@@ -45,6 +45,20 @@ fn reserve_prepared_private_directory(path: &Path) -> Result<PathBuf> {
         }
         Ok(())
     })
+}
+
+/// Returns the canonical form of an already-existing managed directory.
+/// Restart recovery must never turn a missing or replaced configured path into
+/// a new directory merely because it is trying to recover a durable row.  The
+/// component preflight runs before canonicalization so symlink/reparse aliases
+/// are rejected rather than followed.
+fn existing_managed_directory(path: &Path) -> Option<PathBuf> {
+    private::validate_directory_path(path).ok()?;
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return None;
+    }
+    fs::canonicalize(path).ok()
 }
 
 /// Stable, credential-free errors emitted by managed control operations.
@@ -656,16 +670,17 @@ const MANAGED_TICK_SECONDS: u64 = 2;
 const MANAGED_OBSERVATION_RESAVE_LIMIT: usize = 2;
 
 #[cfg(test)]
+type PendingJoinGateEntry = (
+    String,
+    std::sync::mpsc::Sender<()>,
+    std::sync::mpsc::Receiver<()>,
+);
+
+#[cfg(test)]
 #[derive(Default)]
 struct TestPersistGate {
     next: Mutex<Vec<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
-    pending_join: Mutex<
-        Vec<(
-            String,
-            std::sync::mpsc::Sender<()>,
-            std::sync::mpsc::Receiver<()>,
-        )>,
-    >,
+    pending_join: Mutex<Vec<PendingJoinGateEntry>>,
     resave: Mutex<Vec<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
     final_save: Mutex<Vec<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
     after_save: Mutex<Vec<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
@@ -1352,9 +1367,14 @@ impl Manager {
             let Ok(owner) = endpoint_id(&record.owner) else {
                 continue;
             };
-            let state_root = PathBuf::from(&record.state_root);
+            let Some(root) = existing_managed_directory(Path::new(&record.root)) else {
+                continue;
+            };
+            let Some(state_root) = existing_managed_directory(Path::new(&record.state_root)) else {
+                continue;
+            };
             let lease = root_admission::acquire_with_private(
-                Path::new(&record.root),
+                &root,
                 RootUse::Managed {
                     share: share.0,
                     owner: *owner.as_bytes(),
@@ -1362,11 +1382,7 @@ impl Manager {
                 std::slice::from_ref(&state_root),
             );
             if let Ok(lease) = lease
-                && let Ok(lease) = ManagedAdmissionLease::new(
-                    Arc::new(lease),
-                    PathBuf::from(&record.root),
-                    state_root,
-                )
+                && let Ok(lease) = ManagedAdmissionLease::new(Arc::new(lease), root, state_root)
             {
                 leases.insert(share, lease);
             }
@@ -6443,6 +6459,23 @@ mod managed_error_tests {
                 .unwrap();
             reopened.shutdown().await.unwrap();
         });
+    }
+
+    #[test]
+    fn managed_recovery_directory_probe_never_creates_missing_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing-managed-root");
+        assert!(existing_managed_directory(&missing).is_none());
+        assert!(
+            !missing.exists(),
+            "recovery probing must not create a missing managed root"
+        );
+
+        std::fs::create_dir_all(&missing).unwrap();
+        assert_eq!(
+            existing_managed_directory(&missing).as_deref(),
+            std::fs::canonicalize(&missing).ok().as_deref()
+        );
     }
 
     #[test]

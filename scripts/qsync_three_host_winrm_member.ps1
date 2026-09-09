@@ -37,9 +37,12 @@ function Emit-Diagnostic {
         'owner_issue_enter', 'owner_issue_done', 'console_release_enter',
         'console_release_done', 'member_web_start_enter', 'member_stop_enter',
         'owner_attach_enter', 'owner_stop_enter', 'member_reopen_enter',
+        'reopen_login_enter', 'reopen_login_done', 'reopen_membership_enter',
+        'reopen_membership_done', 'reopen_checks',
+        'keepalive_enter', 'keepalive_done',
         'artifact_download_enter', 'artifact_download_done', 'artifact_hash_done',
         'ctrlc_sent', 'exit_wait_enter', 'exit_observed', 'streams_drained',
-        'console_released', 'stop_ctrlc_failed', 'stop_exit_timeout',
+        'console_released', 'stop_ctrlc_failed', 'stop_exit_probe', 'stop_exit_probe_timeout', 'stop_exit_code', 'stop_exit_timeout',
         'stop_stream_timeout', 'stop_release_failed', 'stop_done',
         'console_test_enter', 'console_test_not_owned', 'console_test_missing',
         'console_test_exited', 'console_test_ready', 'console_test_mismatch',
@@ -107,7 +110,7 @@ function Decode-Config {
 
 function Assert-Config {
     param($Value)
-    $required = @('artifact_url', 'artifact_sha256', 'artifact_size', 'owner_base_uri', 'share_key', 'destination_root', 'expected_file_hash', 'expected_file_name')
+    $required = @('artifact_url', 'artifact_sha256', 'artifact_size', 'owner_base_uri', 'share_key', 'destination_root', 'expected_file_hash', 'expected_file_size', 'expected_file_name', 'expected_permission')
     foreach ($name in $required) {
         $item = [string]$Value.$name
         if ([string]::IsNullOrWhiteSpace($item)) { throw 'config' }
@@ -115,8 +118,12 @@ function Assert-Config {
     if ([string]$Value.artifact_sha256 -notmatch '^[0-9a-f]{64}$') { throw 'config' }
     if ([string]$Value.artifact_size -notmatch '^[1-9][0-9]*$') { throw 'config' }
     if ([string]$Value.expected_file_hash -notmatch '^[0-9a-f]{64}$') { throw 'config' }
+    if ([string]$Value.expected_file_size -notmatch '^[1-9][0-9]{0,8}$') { throw 'config' }
     if ([string]$Value.destination_root -notmatch '^[A-Za-z]:\\[^\x00\r\n]+$') { throw 'config' }
     if ([string]$Value.expected_file_name -notmatch '^[A-Za-z0-9._-]{1,128}$') { throw 'config' }
+    if ([string]$Value.expected_permission -notmatch '^(read_only|read_write)$') { throw 'config' }
+    if ($null -eq $Value.keepalive_seconds) { $Value | Add-Member -NotePropertyName keepalive_seconds -NotePropertyValue 0 }
+    if ([string]$Value.keepalive_seconds -notmatch '^[0-9]{1,3}$' -or [int]$Value.keepalive_seconds -gt 900) { throw 'config' }
     if ([string]$Value.owner_base_uri -notmatch '^https?://[^\s/]+(?::[0-9]{1,5})?$') { throw 'config' }
     if ([string]$Value.artifact_url -notmatch '^https?://[^\s/]+(?::[0-9]{1,5})?/qsync-f-[A-Za-z0-9_-]+$') { throw 'config' }
 }
@@ -340,16 +347,17 @@ function Send-OwnedCtrlC {
             return [QsyncOwnedConsole]::GenerateConsoleCtrlEvent(0, 0)
         } catch { return $false }
     }
-    # A short-lived, test-owned system PowerShell ACL helper may remain on the
-    # console after the child is ready.  Wait only for that verified class to
-    # disappear; an unknown process is never broadcast to.
-    if (-not $script:LastConsoleExtraTrusted) { return $false }
+    # A short-lived helper, or a process that cannot be classified during a
+    # transient process-list race, may remain on the console after the child
+    # is ready.  Resample for a short fixed budget.  An unknown process is
+    # never included in a broadcast; only Test-OwnedConsoleProcess returning
+    # true permits the signal.
     for ($attempt = 0; $attempt -lt 20; $attempt++) {
         Start-Sleep -Milliseconds 50
+        if ($Process.HasExited) { return $false }
         if (Test-OwnedConsoleProcess $Process) {
             try { return [QsyncOwnedConsole]::GenerateConsoleCtrlEvent(0, 0) } catch { return $false }
         }
-        if (-not $script:LastConsoleExtraTrusted) { return $false }
     }
     return $false
 }
@@ -556,7 +564,15 @@ function Stop-WebProcess {
         }
         Emit-Diagnostic 'ctrlc_sent'
         Emit-Diagnostic 'exit_wait_enter'
-        if (-not $Process.WaitForExit(30000)) {
+        $exitObserved = $false
+        $waitTicks = 0
+        while ($waitTicks -lt 30 -and -not $exitObserved) {
+            $waitTicks++
+            $exitObserved = $Process.WaitForExit(1000)
+        }
+        Emit-Diagnostic 'stop_exit_probe' -Count $waitTicks
+        if (-not $exitObserved) {
+            Emit-Diagnostic 'stop_exit_probe_timeout' -Count $waitTicks
             $script:LastStopErrorClass = 'timeout'
             Emit-Diagnostic 'stop_exit_timeout'
             $script:ForcedTermination = $true
@@ -577,6 +593,7 @@ function Stop-WebProcess {
         }
         Emit-Diagnostic 'exit_observed'
         $exitCode = $Process.ExitCode
+        Emit-Diagnostic 'stop_exit_code' -Count $exitCode
         if ($exitCode -ne 0) { $script:LastStopErrorClass = 'process_exited' }
         $streamsDrained = Wait-DiscardProcessStreams $Process 5000
         if ($streamsDrained) { Emit-Diagnostic 'streams_drained' } else {
@@ -639,7 +656,12 @@ function Invoke-JsonApi {
             Headers = $headers
             TimeoutSec = 90
         }
-        if ($null -ne $Body) {
+        # PowerShell binds the optional Body parameter to its empty default
+        # even when a GET caller omits it.  Sending that default as a GET body
+        # can fail before the request reaches the managed membership route.
+        # Only mutation requests may carry the JSON body supplied by the
+        # caller; the reopen membership GET is deliberately bodyless.
+        if ($Method -eq 'Post' -and $PSBoundParameters.ContainsKey('Body') -and $null -ne $Body) {
             $params['ContentType'] = 'application/json'
             $params['Body'] = $Body
         }
@@ -740,14 +762,25 @@ try {
         if (Test-Path -LiteralPath $target -PathType Leaf) {
             try {
                 $fileHash = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash.ToLowerInvariant()
-                if ($fileHash -eq [string]$config.expected_file_hash) { $fileOk = $true; break }
+                $fileSize = (Get-Item -LiteralPath $target -Force).Length
+                if ($fileHash -eq [string]$config.expected_file_hash -and $fileSize -eq [int64]$config.expected_file_size) { $fileOk = $true; break }
             } catch { }
         }
         Start-Sleep -Milliseconds 500
     }
-    $fileSize = if ($fileOk) { (Get-Item -LiteralPath $target).Length } else { -1 }
+    $fileSize = if ($fileOk) { (Get-Item -LiteralPath $target -Force).Length } else { -1 }
     Emit-Phase 'file_hash' $fileOk $fileHash $fileSize
     if (-not $fileOk) { throw 'file_hash' }
+
+    $keepAliveSeconds = [int]$config.keepalive_seconds
+    if ($keepAliveSeconds -gt 0) {
+        Emit-Diagnostic 'keepalive_enter' -Count $keepAliveSeconds
+        $keepAliveDeadline = [Diagnostics.Stopwatch]::GetTimestamp() + [int64]($keepAliveSeconds * [Diagnostics.Stopwatch]::Frequency)
+        while ([Diagnostics.Stopwatch]::GetTimestamp() -lt $keepAliveDeadline) {
+            Start-Sleep -Milliseconds 250
+        }
+        Emit-Diagnostic 'keepalive_done' -Count $keepAliveSeconds
+    }
 
     Emit-Diagnostic 'shutdown_enter'
     $stopped = Stop-WebProcess $script:MemberProcess
@@ -759,14 +792,27 @@ try {
     $restartedProcess = Start-WebProcess $artifact $data $memberPort $profile
     if ($null -ne $restartedProcess) { $script:MemberProcess = $restartedProcess }
     $reopened = $null -ne $script:MemberProcess
+    Emit-Diagnostic 'reopen_login_enter'
     $reopenClient = if ($reopened) { New-ApiClient "http://127.0.0.1:$memberPort" $data } else { $null }
+    Emit-Diagnostic 'reopen_login_done' -Count $(if ($null -ne $reopenClient) { $script:LastApiStatus } else { 0 })
+    Emit-Diagnostic 'reopen_membership_enter'
     $membership = if ($null -ne $reopenClient) { Invoke-JsonApi $reopenClient Get "/api/v1/shares/$shareId" } else { $null }
+    Emit-Diagnostic 'reopen_membership_done' -Count $script:LastApiStatus
     $afterHash = ''
     if (Test-Path -LiteralPath $target -PathType Leaf) {
         try { $afterHash = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash.ToLowerInvariant() } catch { }
     }
-    $reopenOk = $reopened -and $null -ne $reopenClient -and $null -ne $membership -and $afterHash -eq [string]$config.expected_file_hash
-    $afterSize = if ($reopenOk) { (Get-Item -LiteralPath $target).Length } else { -1 }
+    $reopenLoginOk = $reopened -and $null -ne $reopenClient
+    $membershipStatusOk = $script:LastApiStatus -eq 200
+    $membershipShareOk = $membershipStatusOk -and $null -ne $membership -and [string]$membership.share_id -eq $shareId
+    $membershipRoleOk = $membershipShareOk -and [string]$membership.role -eq 'member'
+    $membershipPermissionOk = $membershipRoleOk -and [string]$membership.permission -eq [string]$config.expected_permission
+    $afterSize = if (Test-Path -LiteralPath $target -PathType Leaf) { (Get-Item -LiteralPath $target -Force).Length } else { -1 }
+    $fileHashOk = $afterHash -eq [string]$config.expected_file_hash -and $afterSize -eq [int64]$config.expected_file_size
+    $reopenChecks = [int]$reopenLoginOk + (2 * [int]$membershipStatusOk) + (4 * [int]$membershipShareOk) + (8 * [int]$fileHashOk) + (16 * [int]$membershipRoleOk) + (32 * [int]$membershipPermissionOk)
+    Emit-Diagnostic 'reopen_checks' -Count $reopenChecks
+    $reopenOk = $reopenLoginOk -and $membershipPermissionOk -and $fileHashOk
+    $afterSize = if ($reopenOk) { (Get-Item -LiteralPath $target -Force).Length } else { $afterSize }
     Emit-Phase 'member_reopen_membership' $reopenOk $afterHash $afterSize
     if (-not $reopenOk) { throw 'reopen' }
     $script:AllPassed = $true
