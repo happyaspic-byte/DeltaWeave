@@ -28,6 +28,22 @@ use tokio::{
 };
 use worker::Worker;
 
+/// Reserves a managed private directory before creation and hardens every
+/// component created by the admission call.  The lexical path check must run
+/// before admission canonicalizes aliases; the callback receives canonical
+/// paths only so it cannot replace that check.
+fn reserve_prepared_private_directory(path: &Path) -> Result<PathBuf> {
+    private::validate_directory_path(path)?;
+    root_admission::reserve_private_prepared(path, |canonical, created| {
+        if created {
+            private::prepare_directory_created(canonical)?;
+        } else {
+            private::prepare_directory(canonical)?;
+        }
+        Ok(())
+    })
+}
+
 /// Stable, credential-free errors emitted by managed control operations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ManagedErrorKind {
@@ -149,6 +165,40 @@ pub fn classify_managed_error(error: &anyhow::Error) -> ErrorSummary {
             }
             deltaweave_net::share::ShareError::TransferFailed => {
                 ("transfer_failed", "share transfer failed")
+            }
+            deltaweave_net::share::ShareError::HeartbeatExpired => {
+                ("heartbeat_expired", "share heartbeat expired")
+            }
+            deltaweave_net::share::ShareError::HeartbeatReplay => {
+                ("heartbeat_replay", "share heartbeat replayed")
+            }
+            deltaweave_net::share::ShareError::EpochMismatch => {
+                ("epoch_mismatch", "share permission epoch mismatch")
+            }
+            deltaweave_net::share::ShareError::EndpointMismatch => {
+                ("endpoint_mismatch", "share endpoint mismatch")
+            }
+            deltaweave_net::share::ShareError::ClockRollback => (
+                "clock_rollback",
+                "managed clock moved backwards; state is temporarily locked",
+            ),
+            deltaweave_net::share::ShareError::RosterStale => {
+                ("roster_stale", "share roster is stale")
+            }
+            deltaweave_net::share::ShareError::GrantExpired => {
+                ("grant_expired", "share grant expired")
+            }
+            deltaweave_net::share::ShareError::GrantReplay => {
+                ("grant_replay", "share grant replayed")
+            }
+            deltaweave_net::share::ShareError::ManifestMismatch => {
+                ("manifest_mismatch", "share manifest mismatch")
+            }
+            deltaweave_net::share::ShareError::CasUnavailable => {
+                ("cas_unavailable", "share content unavailable")
+            }
+            deltaweave_net::share::ShareError::RevocationPending => {
+                ("revocation_pending", "share revocation is pending")
             }
         };
         return ErrorSummary {
@@ -1226,11 +1276,9 @@ impl Manager {
             return Ok(service.clone());
         }
         let managed_root = self.data_dir.join("managed");
-        root_admission::reserve_private(&managed_root)?;
-        private::prepare_directory(&managed_root)?;
+        reserve_prepared_private_directory(&managed_root)?;
         let state = self.data_dir.join("managed").join("service");
-        root_admission::reserve_private(&state)?;
-        private::prepare_directory(&state)?;
+        reserve_prepared_private_directory(&state)?;
         let opened = ShareService::open(
             state,
             self.managed_options.managed_network,
@@ -1248,8 +1296,7 @@ impl Manager {
             secret
         } else {
             let managed_root = self.data_dir.join("managed");
-            root_admission::reserve_private(&managed_root)?;
-            private::prepare_directory(&managed_root)?;
+            reserve_prepared_private_directory(&managed_root)?;
             let path =
                 root_admission::reserve_private_file(managed_root.join("member-handle.key"))?;
             let secret = if path.exists() {
@@ -1306,8 +1353,7 @@ impl Manager {
         let parent = path
             .parent()
             .context("private file parent is unavailable")?;
-        root_admission::reserve_private(parent)?;
-        private::prepare_directory(parent)?;
+        reserve_prepared_private_directory(parent)?;
         if path.exists() {
             ensure!(
                 !path.is_symlink(),
@@ -3473,8 +3519,7 @@ impl Manager {
             .join("share-state")
             .join(&hash);
         self.managed_paths_conflict(&root, &state_root)?;
-        root_admission::reserve_private(&state_root).context("reserve managed owner state")?;
-        private::prepare_directory(&state_root)?;
+        reserve_prepared_private_directory(&state_root).context("reserve managed owner state")?;
         let min_free_space_bytes = input
             .min_free_space_mib
             .unwrap_or(0)
@@ -4223,8 +4268,7 @@ impl Manager {
                 .join("member-state")
                 .join(&hash);
             self.managed_paths_conflict(&root, &state_root)?;
-            root_admission::reserve_private(&state_root)?;
-            private::prepare_directory(&state_root)?;
+            reserve_prepared_private_directory(&state_root)?;
             let lease = Arc::new(root_admission::acquire_with_private(
                 &root,
                 RootUse::Managed {
@@ -4774,6 +4818,10 @@ impl Manager {
         if staged.is_none() {
             self.ensure_request_capacity(&request_id)?;
             let path = self.private_text_path("responses", &hash, "ticket")?;
+            let parent = path
+                .parent()
+                .context("private response parent is unavailable")?;
+            reserve_prepared_private_directory(parent)?;
             let reserved = root_admission::reserve_private_file(&path)?;
             if let Some(existing) = intent.as_ref() {
                 ensure!(
@@ -4781,10 +4829,6 @@ impl Manager {
                     ManagedError::new(ManagedErrorKind::IdempotencyConflict)
                 );
             }
-            let parent = reserved
-                .parent()
-                .context("private response parent is unavailable")?;
-            private::prepare_directory(parent)?;
             // A crash may leave the deterministic response path without its
             // durable KeyIntent.  Never let write_private_text's existing-file
             // no-op pair a newly generated invitation with that old bytes:
@@ -6042,6 +6086,29 @@ mod managed_error_tests {
     }
 
     #[test]
+    fn newly_added_share_errors_have_stable_safe_codes() {
+        let cases = [
+            (ShareError::HeartbeatExpired, "heartbeat_expired"),
+            (ShareError::HeartbeatReplay, "heartbeat_replay"),
+            (ShareError::EpochMismatch, "epoch_mismatch"),
+            (ShareError::EndpointMismatch, "endpoint_mismatch"),
+            (ShareError::ClockRollback, "clock_rollback"),
+            (ShareError::RosterStale, "roster_stale"),
+            (ShareError::GrantExpired, "grant_expired"),
+            (ShareError::GrantReplay, "grant_replay"),
+            (ShareError::ManifestMismatch, "manifest_mismatch"),
+            (ShareError::CasUnavailable, "cas_unavailable"),
+            (ShareError::RevocationPending, "revocation_pending"),
+        ];
+        for (error, expected_code) in cases {
+            let summary = classify_managed_error(&anyhow::Error::new(error));
+            assert_eq!(summary.code, expected_code);
+            assert!(!summary.message.contains("/"));
+            assert!(!summary.message.contains("key="));
+        }
+    }
+
+    #[test]
     fn manual_only_manager_ignores_stale_managed_clock_high_water() {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let temp = tempfile::tempdir().unwrap();
@@ -6151,8 +6218,7 @@ mod managed_error_tests {
             let member_secret = iroh::SecretKey::generate();
             let owner = owner_secret.public();
             let share = ShareId([1; 32]);
-            root_admission::reserve_private(&state_root).unwrap();
-            private::prepare_directory(&state_root).unwrap();
+            reserve_prepared_private_directory(&state_root).unwrap();
             let lease = Arc::new(
                 root_admission::acquire_with_private(
                     &root,
@@ -6864,8 +6930,7 @@ mod managed_error_tests {
                 .await
                 .unwrap();
             let managed_root = data_dir.join("managed");
-            root_admission::reserve_private(&managed_root).unwrap();
-            private::prepare_directory(&managed_root).unwrap();
+            reserve_prepared_private_directory(&managed_root).unwrap();
 
             // Keep the real persistence task for the automatic-flush
             // assertion, while stopping the managed worker ticker which

@@ -28,34 +28,74 @@ const PRIVATE_PERMISSIONS: &str =
 /// must already exist; this function never creates a path recursively because
 /// doing so would make the security boundary depend on unvalidated parents.
 pub(crate) fn prepare_directory(path: &Path) -> io::Result<()> {
+    prepare_directory_inner(path, false)
+}
+
+/// Validates and hardens a directory that the admission catalog has just
+/// created as the final private leaf.
+///
+/// The admission callback supplies this distinction so Windows can replace
+/// inherited ACLs on a fresh leaf without weakening the fail-closed behavior
+/// for an existing directory.  This function never creates a missing path;
+/// the admission layer owns creation and its global lock.
+pub(crate) fn prepare_directory_created(path: &Path) -> io::Result<()> {
+    prepare_directory_inner(path, true)
+}
+
+/// Checks every original path component before admission canonicalizes a
+/// requested path.  Callers that pass an admission-canonical path to the
+/// preparation callback must run this check on the user-supplied path first so
+/// aliases and reparse points cannot be hidden by canonicalization.
+pub(crate) fn validate_directory_path(path: &Path) -> io::Result<()> {
+    if path.as_os_str().is_empty() {
+        return Err(permission_error(PRIVATE_ERROR));
+    }
+    log_acl_result(reject_reparse_components(path), "pre_reparse")
+}
+
+fn prepare_directory_inner(path: &Path, admission_created: bool) -> io::Result<()> {
     if path.as_os_str().is_empty() {
         return Err(permission_error(PRIVATE_ERROR));
     }
 
-    reject_reparse_components(path)?;
+    validate_directory_path(path)?;
     let existed = match fs::symlink_metadata(path) {
         Ok(metadata) => {
             validate_directory_metadata(&metadata)?;
             true
         }
         Err(error) if error.kind() == ErrorKind::NotFound => false,
-        Err(error) => return Err(safe_io_error(error, PRIVATE_ERROR)),
+        Err(error) => {
+            #[cfg(windows)]
+            log_acl_diagnostic("metadata", None);
+            return Err(safe_io_error(error, PRIVATE_ERROR));
+        }
     };
 
     if !existed {
-        create_private_leaf(path).map_err(|error| {
+        if admission_created {
+            return Err(io::Error::new(ErrorKind::NotFound, PRIVATE_ERROR));
+        }
+        let created = create_private_leaf(path).map_err(|error| {
             if error.kind() == ErrorKind::NotFound {
                 safe_io_error(error, PRIVATE_MISSING_PARENT)
             } else {
                 safe_io_error(error, PRIVATE_ERROR)
             }
-        })?;
+        });
+        log_acl_result(created, "create")?;
         // A concurrent replacement must not turn the chmod/ACL operation into
         // an operation on an attacker-selected link or reparse point.
-        reject_reparse_components(path)?;
-        let metadata =
-            fs::symlink_metadata(path).map_err(|error| safe_io_error(error, PRIVATE_ERROR))?;
-        validate_directory_kind(&metadata)?;
+        log_acl_result(reject_reparse_components(path), "post_create_reparse")?;
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(value) => value,
+            Err(error) => {
+                #[cfg(windows)]
+                log_acl_diagnostic("post_create_metadata", None);
+                return Err(safe_io_error(error, PRIVATE_ERROR));
+            }
+        };
+        log_acl_result(validate_directory_kind(&metadata), "post_create_validate")?;
     }
 
     #[cfg(unix)]
@@ -66,7 +106,7 @@ pub(crate) fn prepare_directory(path: &Path) -> io::Result<()> {
     }
 
     #[cfg(windows)]
-    prepare_windows_acl(path, !existed)?;
+    prepare_windows_acl(path, admission_created || !existed)?;
 
     Ok(())
 }
@@ -77,6 +117,16 @@ fn permission_error(message: &'static str) -> io::Error {
 
 fn safe_io_error(error: io::Error, message: &'static str) -> io::Error {
     io::Error::new(error.kind(), message)
+}
+
+fn log_acl_result<T>(result: io::Result<T>, stage: &'static str) -> io::Result<T> {
+    #[cfg(windows)]
+    if result.is_err() {
+        log_acl_diagnostic(stage, None);
+    }
+    #[cfg(not(windows))]
+    let _ = stage;
+    result
 }
 
 fn validate_directory_metadata(metadata: &fs::Metadata) -> io::Result<()> {
@@ -167,8 +217,14 @@ const fn is_reparse_point(_metadata: &fs::Metadata) -> bool {
 #[cfg(windows)]
 fn prepare_windows_acl(path: &Path, allow_initial_repair: bool) -> io::Result<()> {
     let powershell =
-        trusted_windows_executable(Path::new("WindowsPowerShell\\v1.0\\powershell.exe"))?;
-    let output = std::process::Command::new(powershell)
+        match trusted_windows_executable(Path::new("WindowsPowerShell\\v1.0\\powershell.exe")) {
+            Ok(value) => value,
+            Err(error) => {
+                log_acl_diagnostic("trusted_executable", None);
+                return Err(error);
+            }
+        };
+    let output = match std::process::Command::new(powershell)
         .args([
             "-NoLogo",
             "-NoProfile",
@@ -185,21 +241,133 @@ fn prepare_windows_acl(path: &Path, allow_initial_repair: bool) -> io::Result<()
         )
         .stdin(std::process::Stdio::null())
         .output()
-        .map_err(|error| safe_io_error(error, PRIVATE_ERROR))?;
+    {
+        Ok(value) => value,
+        Err(error) => {
+            log_acl_diagnostic("spawn", None);
+            return Err(safe_io_error(error, PRIVATE_ERROR));
+        }
+    };
 
     if !output.status.success() {
         // Do not return PowerShell's path-bearing or localized output.  The
         // caller only needs a fail-closed security result.
+        log_acl_script_diagnostic("script", output.status.code(), &output.stdout);
         return Err(permission_error(PRIVATE_ERROR));
     }
 
     // Check the leaf again after the external ACL operation.  This does not
     // replace the fixed-path ownership contract, but makes an observed
     // reparse replacement fail before any secret write is attempted.
-    reject_reparse_components(path)?;
-    let metadata =
-        fs::symlink_metadata(path).map_err(|error| safe_io_error(error, PRIVATE_ERROR))?;
-    validate_directory_metadata(&metadata)
+    if let Err(error) = reject_reparse_components(path) {
+        log_acl_diagnostic("post_reparse", None);
+        return Err(error);
+    }
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(value) => value,
+        Err(error) => {
+            log_acl_diagnostic("post_metadata", None);
+            return Err(safe_io_error(error, PRIVATE_ERROR));
+        }
+    };
+    if let Err(error) = validate_directory_metadata(&metadata) {
+        log_acl_diagnostic("post_validate", None);
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn log_acl_diagnostic(stage: &'static str, exit_code: Option<i32>) {
+    if std::env::var("DELTAWEAVE_PRIVATE_ACL_DIAGNOSTICS")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        return;
+    }
+    match exit_code {
+        Some(code) => eprintln!("managed private ACL diagnostic: stage={stage} exit_code={code}"),
+        None => eprintln!("managed private ACL diagnostic: stage={stage}"),
+    }
+}
+
+#[cfg(windows)]
+fn log_acl_script_diagnostic(stage: &'static str, exit_code: Option<i32>, stdout: &[u8]) {
+    log_acl_diagnostic(stage, exit_code);
+    if std::env::var("DELTAWEAVE_PRIVATE_ACL_DIAGNOSTICS")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        return;
+    }
+
+    const STAGES: &[&str] = &[
+        "current_identity",
+        "initial_get_item",
+        "directory_security",
+        "access_rule_protection",
+        "security_identifier",
+        "set_owner",
+        "access_rule",
+        "add_access_rule",
+        "set_acl",
+        "post_get_item",
+        "get_acl",
+        "get_owner",
+        "get_access_rules",
+        "access_rule_validate",
+    ];
+    const CLASSES: &[&str] = &[
+        "unauthorized_access",
+        "security",
+        "argument",
+        "io",
+        "win32",
+        "platform",
+        "invalid_operation",
+        "method_invocation",
+        "runtime",
+        "cmdlet_invocation",
+        "action_preference_stop",
+        "write_error",
+        "provider_invocation",
+        "privilege_not_held",
+        "directory_not_found",
+        "file_not_found",
+        "not_supported",
+        "other",
+    ];
+
+    for line in String::from_utf8_lossy(stdout).lines() {
+        let Some(fields) = line.strip_prefix("DELTAWEAVE_ACL_FAILURE|") else {
+            continue;
+        };
+        let mut fields = fields.split('|');
+        let Some(script_stage) = fields.next().and_then(|field| field.strip_prefix("stage="))
+        else {
+            continue;
+        };
+        let Some(class) = fields.next().and_then(|field| field.strip_prefix("class=")) else {
+            continue;
+        };
+        let Some(hresult) = fields
+            .next()
+            .and_then(|field| field.strip_prefix("hresult="))
+            .and_then(|value| value.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if fields.next().is_some() || !STAGES.contains(&script_stage) || !CLASSES.contains(&class) {
+            continue;
+        }
+        eprintln!(
+            "managed private ACL diagnostic: stage={stage} exit_code={:?} exception_stage={script_stage} exception_class={class} hresult={hresult}",
+            exit_code
+        );
+        break;
+    }
 }
 
 #[cfg(windows)]
@@ -242,47 +410,97 @@ fn trusted_windows_executable(relative_path: &Path) -> io::Result<PathBuf> {
 const WINDOWS_ACL_SCRIPT: &str = r#"
 $ErrorActionPreference = 'Stop'
 $path = $env:DELTAWEAVE_PRIVATE_ACL_PATH
-$userSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $systemSid = 'S-1-5-18'
 $repair = $env:DELTAWEAVE_PRIVATE_ACL_REPAIR -eq '1'
 
+function Exit-WithDiagnostic([string]$stage, [int]$code, $errorRecord) {
+    if ($env:DELTAWEAVE_PRIVATE_ACL_DIAGNOSTICS -eq '1') {
+        $exceptionName = ''
+        $exception = $null
+        try {
+            $exception = $errorRecord.Exception
+            for ($depth = 0; $depth -lt 4 -and $null -ne $exception; $depth++) {
+                $exceptionName = $exception.GetType().Name
+                if (@('UnauthorizedAccessException', 'SecurityException', 'ArgumentException', 'ArgumentNullException', 'IOException', 'Win32Exception', 'PlatformNotSupportedException', 'InvalidOperationException', 'MethodInvocationException', 'RuntimeException', 'CmdletInvocationException', 'ActionPreferenceStopException', 'WriteErrorException', 'CmdletProviderInvocationException', 'ProviderInvocationException', 'PrivilegeNotHeldException', 'DirectoryNotFoundException', 'FileNotFoundException', 'NotSupportedException') -contains $exceptionName) {
+                    break
+                }
+                $exception = $exception.InnerException
+            }
+        } catch {
+            $exceptionName = ''
+        }
+        $class = 'other'
+        if ($exceptionName -eq 'UnauthorizedAccessException') { $class = 'unauthorized_access' }
+        elseif ($exceptionName -eq 'SecurityException') { $class = 'security' }
+        elseif ($exceptionName -eq 'ArgumentException' -or $exceptionName -eq 'ArgumentNullException') { $class = 'argument' }
+        elseif ($exceptionName -eq 'IOException') { $class = 'io' }
+        elseif ($exceptionName -eq 'Win32Exception') { $class = 'win32' }
+        elseif ($exceptionName -eq 'PlatformNotSupportedException') { $class = 'platform' }
+        elseif ($exceptionName -eq 'InvalidOperationException') { $class = 'invalid_operation' }
+        elseif ($exceptionName -eq 'MethodInvocationException') { $class = 'method_invocation' }
+        elseif ($exceptionName -eq 'RuntimeException') { $class = 'runtime' }
+        elseif ($exceptionName -eq 'CmdletInvocationException') { $class = 'cmdlet_invocation' }
+        elseif ($exceptionName -eq 'ActionPreferenceStopException') { $class = 'action_preference_stop' }
+        elseif ($exceptionName -eq 'WriteErrorException') { $class = 'write_error' }
+        elseif ($exceptionName -eq 'CmdletProviderInvocationException' -or $exceptionName -eq 'ProviderInvocationException') { $class = 'provider_invocation' }
+        elseif ($exceptionName -eq 'PrivilegeNotHeldException') { $class = 'privilege_not_held' }
+        elseif ($exceptionName -eq 'DirectoryNotFoundException') { $class = 'directory_not_found' }
+        elseif ($exceptionName -eq 'FileNotFoundException') { $class = 'file_not_found' }
+        elseif ($exceptionName -eq 'NotSupportedException') { $class = 'not_supported' }
+        $hresult = 0
+        try { $hresult = [int64]$exception.HResult } catch { $hresult = 0 }
+        Write-Output ("DELTAWEAVE_ACL_FAILURE|stage={0}|class={1}|hresult={2}" -f $stage, $class, $hresult)
+    }
+    exit $code
+}
+
+try { $userSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value } catch { Exit-WithDiagnostic 'current_identity' 39 $_ }
+
 if ([string]::IsNullOrWhiteSpace($path) -or [string]::IsNullOrWhiteSpace($userSid)) { exit 31 }
-$item = Get-Item -LiteralPath $path -Force
+try { $item = Get-Item -LiteralPath $path -Force } catch { Exit-WithDiagnostic 'initial_get_item' 40 $_ }
 if (-not $item.PSIsContainer -or (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)) { exit 32 }
 
 $sids = @($userSid, $systemSid) | Sort-Object -Unique
 if ($repair) {
-    $acl = New-Object System.Security.AccessControl.DirectorySecurity
-    $acl.SetAccessRuleProtection($true, $false)
-    $userIdentity = New-Object System.Security.Principal.SecurityIdentifier($userSid)
-    $acl.SetOwner($userIdentity)
+    try { $acl = New-Object System.Security.AccessControl.DirectorySecurity } catch { Exit-WithDiagnostic 'directory_security' 41 $_ }
+    try { $acl.SetAccessRuleProtection($true, $false) } catch { Exit-WithDiagnostic 'access_rule_protection' 41 $_ }
+    try { $userIdentity = New-Object System.Security.Principal.SecurityIdentifier($userSid) } catch { Exit-WithDiagnostic 'security_identifier' 41 $_ }
+    try { $acl.SetOwner($userIdentity) } catch { Exit-WithDiagnostic 'set_owner' 41 $_ }
     $rights = [System.Security.AccessControl.FileSystemRights]::FullControl
     $inheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
     $propagation = [System.Security.AccessControl.PropagationFlags]::None
     $allow = [System.Security.AccessControl.AccessControlType]::Allow
     foreach ($sid in $sids) {
-        $identity = New-Object System.Security.Principal.SecurityIdentifier($sid)
-        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($identity, $rights, $inheritance, $propagation, $allow)
-        $acl.AddAccessRule($rule)
+        try { $identity = New-Object System.Security.Principal.SecurityIdentifier($sid) } catch { Exit-WithDiagnostic 'security_identifier' 41 $_ }
+        try { $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($identity, $rights, $inheritance, $propagation, $allow) } catch { Exit-WithDiagnostic 'access_rule' 41 $_ }
+        try { $acl.AddAccessRule($rule) } catch { Exit-WithDiagnostic 'add_access_rule' 41 $_ }
     }
-    Set-Acl -LiteralPath $path -AclObject $acl
+    try {
+        # Set-Acl may request SACL sections that require SeSecurityPrivilege.
+        # Directory.SetAccessControl applies the prepared DACL without that
+        # provider-level audit request.
+        [System.IO.Directory]::SetAccessControl($path, $acl)
+    } catch { Exit-WithDiagnostic 'set_acl' 41 $_ }
 }
 
-$item = Get-Item -LiteralPath $path -Force
+try { $item = Get-Item -LiteralPath $path -Force } catch { Exit-WithDiagnostic 'post_get_item' 42 $_ }
 if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { exit 33 }
-$acl = Get-Acl -LiteralPath $path
+$sections = [System.Security.AccessControl.AccessControlSections]::Access -bor [System.Security.AccessControl.AccessControlSections]::Owner
+try { $acl = [System.IO.Directory]::GetAccessControl($path, $sections) } catch { Exit-WithDiagnostic 'get_acl' 43 $_ }
 if (-not $acl.AreAccessRulesProtected) { exit 34 }
-$owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+try { $owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value } catch { Exit-WithDiagnostic 'get_owner' 44 $_ }
 if ($owner -notin $sids) { exit 37 }
-$rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+try { $rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) } catch { Exit-WithDiagnostic 'get_access_rules' 45 $_ }
 if ($rules.Count -ne $sids.Count) { exit 35 }
 $rights = [System.Security.AccessControl.FileSystemRights]::FullControl
 $inheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
 $propagation = [System.Security.AccessControl.PropagationFlags]::None
 $allow = [System.Security.AccessControl.AccessControlType]::Allow
-foreach ($rule in $rules) {
-    if ($rule.IsInherited -or $rule.IdentityReference.Value -notin $sids -or $rule.AccessControlType -ne $allow -or $rule.FileSystemRights -ne $rights -or $rule.InheritanceFlags -ne $inheritance -or $rule.PropagationFlags -ne $propagation) { exit 36 }
-}
+try {
+    foreach ($rule in $rules) {
+        if ($rule.IsInherited -or $rule.IdentityReference.Value -notin $sids -or $rule.AccessControlType -ne $allow -or $rule.FileSystemRights -ne $rights -or $rule.InheritanceFlags -ne $inheritance -or $rule.PropagationFlags -ne $propagation) { exit 36 }
+    }
+} catch { Exit-WithDiagnostic 'access_rule_validate' 46 $_ }
 exit 0
 "#;
 
@@ -376,6 +594,24 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn admission_created_preparation_requires_an_existing_private_leaf() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = test_directory();
+        let target = root.0.join("managed");
+        assert_eq!(
+            prepare_directory_created(&target)
+                .expect_err("admission-created preparation must not mkdir")
+                .kind(),
+            ErrorKind::NotFound
+        );
+        fs::create_dir(&target).expect("target");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).expect("private mode");
+        prepare_directory_created(&target).expect("existing admission leaf remains valid");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn rejects_symlink_target_and_parent() {
         use std::os::unix::fs::symlink;
 
@@ -415,10 +651,12 @@ mod tests {
         let canonical_parent = fs::canonicalize(&root.0).expect("canonical temp root");
         let target = canonical_parent.join("managed");
 
-        // The first call creates the leaf and validates the real DACL.  A
-        // second call exercises the existing-directory path and proves that a
-        // valid private leaf can be reopened without changing its ACL.
-        prepare_directory(&target).expect("native private directory is prepared");
+        // Simulate admission creating the leaf with inherited permissions,
+        // then use the explicit created-leaf path to apply the initial DACL.
+        fs::create_dir(&target).expect("admission-created target");
+        prepare_directory_created(&target).expect("native private directory is prepared");
+        // A second call exercises the existing-directory path and proves that
+        // a valid private leaf can be reopened without changing its ACL.
         prepare_directory(&target).expect("native preparation is idempotent");
 
         let before = windows_acl_fingerprint(&target).expect("read private ACL");
@@ -462,7 +700,8 @@ mod tests {
             path,
             r#"
 $ErrorActionPreference = 'Stop'
-$acl = Get-Acl -LiteralPath $env:DELTAWEAVE_PRIVATE_ACL_PATH
+$sections = [System.Security.AccessControl.AccessControlSections]::Access -bor [System.Security.AccessControl.AccessControlSections]::Owner
+$acl = [System.IO.Directory]::GetAccessControl($env:DELTAWEAVE_PRIVATE_ACL_PATH, $sections)
 $rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) |
     ForEach-Object { '{0}|{1}|{2}|{3}|{4}|{5}' -f $_.IdentityReference.Value, $_.AccessControlType, $_.FileSystemRights, $_.InheritanceFlags, $_.PropagationFlags, $_.IsInherited } |
     Sort-Object
@@ -481,13 +720,14 @@ $hash = [System.Security.Cryptography.SHA256]::Create().ComputeHash($bytes)
             r#"
 $ErrorActionPreference = 'Stop'
 $path = $env:DELTAWEAVE_PRIVATE_ACL_PATH
-$acl = Get-Acl -LiteralPath $path
+$sections = [System.Security.AccessControl.AccessControlSections]::Access -bor [System.Security.AccessControl.AccessControlSections]::Owner
+$acl = [System.IO.Directory]::GetAccessControl($path, $sections)
 $identity = New-Object System.Security.Principal.NTAccount('Everyone')
 $rights = [System.Security.AccessControl.FileSystemRights]::ReadAndExecute
 $inheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
 $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($identity, $rights, $inheritance, [System.Security.AccessControl.PropagationFlags]::None, [System.Security.AccessControl.AccessControlType]::Allow)
 $acl.AddAccessRule($rule)
-Set-Acl -LiteralPath $path -AclObject $acl
+[System.IO.Directory]::SetAccessControl($path, $acl)
 "#,
         )
         .map(|_| ())

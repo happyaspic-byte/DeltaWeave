@@ -1,6 +1,13 @@
 use super::*;
 use axum::http::Request as HttpRequest;
+use deltaweave_control::{
+    CreateShareInput, EnrollmentState, IssueKeyInput, JoinShareInput, ManagerOptions, NetworkMode,
+    Permission, ShareId,
+};
 use http_body_util::BodyExt;
+use std::net::{SocketAddr, UdpSocket};
+use std::process::Command;
+use std::time::Duration;
 use tower::ServiceExt;
 
 struct Harness {
@@ -12,8 +19,13 @@ struct Harness {
 }
 impl Harness {
     async fn new() -> Self {
+        Self::new_with_options(deltaweave_control::ManagerOptions::default()).await
+    }
+    async fn new_with_options(managed_options: deltaweave_control::ManagerOptions) -> Self {
         let directory = tempfile::TempDir::new().unwrap();
-        let manager = Manager::open(directory.path().to_path_buf()).await.unwrap();
+        let manager = Manager::open_with_options(directory.path().to_path_buf(), managed_options)
+            .await
+            .unwrap();
         let (auth, bootstrap) = Auth::open(directory.path()).unwrap();
         let admin = std::fs::read_to_string(directory.path().join("admin-token"))
             .unwrap()
@@ -129,6 +141,318 @@ async fn protected_data_requires_an_authenticated_session() {
         )
         .await;
     assert_eq!(json_body(response).await, json!({"authenticated": false}));
+    h.state.manager.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn managed_routes_keep_session_host_origin_csrf_and_input_boundaries() {
+    let h = Harness::new().await;
+    let share = "0".repeat(64);
+    let invitation = "1".repeat(64);
+    let member = "2".repeat(64);
+    let anonymous_gets = [
+        "/api/v1/shares",
+        "/api/v1/shares/0000000000000000000000000000000000000000000000000000000000000000",
+        "/api/v1/shares/0000000000000000000000000000000000000000000000000000000000000000/keys",
+        "/api/v1/shares/0000000000000000000000000000000000000000000000000000000000000000/members",
+    ];
+    for uri in anonymous_gets {
+        let response = h
+            .request("GET", uri, Value::Null, None, None, None, "localhost:8390")
+            .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
+    }
+    let anonymous_mutations: Vec<(String, String, Value)> = vec![
+        (
+            "POST".into(),
+            "/api/v1/shares".into(),
+            json!({"request_id":"create"}),
+        ),
+        (
+            "POST".into(),
+            "/api/v1/shares/preview".into(),
+            json!({"request_id":"preview","key":"bad-key"}),
+        ),
+        (
+            "POST".into(),
+            "/api/v1/shares/validate".into(),
+            json!({"request_id":"validate","key":"bad-key"}),
+        ),
+        (
+            "POST".into(),
+            "/api/v1/shares/join".into(),
+            json!({"request_id":"join","key":"bad-key","destination_root":"/tmp"}),
+        ),
+        (
+            "POST".into(),
+            "/api/v1/shares/resume".into(),
+            json!({"request_id":"resume","share_id":share.clone()}),
+        ),
+        (
+            "POST".into(),
+            "/api/v1/shares/pending/retry".into(),
+            json!({"request_id":"pending-retry","share_id":share.clone()}),
+        ),
+        (
+            "POST".into(),
+            format!("/api/v1/shares/{share}/keys"),
+            json!({"request_id":"issue","permission":"read_only"}),
+        ),
+        (
+            "POST".into(),
+            format!("/api/v1/shares/{share}/keys/{invitation}/revoke"),
+            json!({"request_id":"revoke-key"}),
+        ),
+        (
+            "POST".into(),
+            format!("/api/v1/shares/{share}/members/{member}/revoke"),
+            json!({"request_id":"revoke-member"}),
+        ),
+        (
+            "DELETE".into(),
+            format!("/api/v1/shares/{share}"),
+            json!({"request_id":"remove"}),
+        ),
+        (
+            "POST".into(),
+            format!("/api/v1/shares/{share}/sync"),
+            json!({"request_id":"sync"}),
+        ),
+    ];
+    for (method, uri, body) in anonymous_mutations {
+        let response = h
+            .request(
+                &method,
+                &uri,
+                body,
+                None,
+                None,
+                Some("http://localhost:8390"),
+                "localhost:8390",
+            )
+            .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "{method} {uri}"
+        );
+    }
+
+    let (cookie, csrf) = h.login(&h.admin).await;
+    let missing_csrf = h
+        .request(
+            "POST",
+            "/api/v1/shares/preview",
+            json!({"request_id":"preview","key":"bad-key"}),
+            Some(&cookie),
+            None,
+            Some("http://localhost:8390"),
+            "localhost:8390",
+        )
+        .await;
+    assert_eq!(missing_csrf.status(), StatusCode::FORBIDDEN);
+    let hostile_origin = h
+        .request(
+            "POST",
+            "/api/v1/shares/preview",
+            json!({"request_id":"preview","key":"bad-key"}),
+            Some(&cookie),
+            Some(&csrf),
+            Some("http://evil.example:8390"),
+            "localhost:8390",
+        )
+        .await;
+    assert_eq!(hostile_origin.status(), StatusCode::FORBIDDEN);
+    let hostile_host = h
+        .request(
+            "GET",
+            "/api/v1/shares",
+            Value::Null,
+            Some(&cookie),
+            None,
+            None,
+            "evil.example:8390",
+        )
+        .await;
+    assert_eq!(hostile_host.status(), StatusCode::FORBIDDEN);
+
+    let bad_id = h
+        .request(
+            "GET",
+            "/api/v1/shares/not-a-share-id",
+            Value::Null,
+            Some(&cookie),
+            None,
+            None,
+            "localhost:8390",
+        )
+        .await;
+    assert_eq!(bad_id.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let bad_key = h
+        .request(
+            "POST",
+            "/api/v1/shares/preview",
+            json!({"request_id":"preview-invalid","key":"dwshare3:not-hex"}),
+            Some(&cookie),
+            Some(&csrf),
+            Some("http://localhost:8390"),
+            "localhost:8390",
+        )
+        .await;
+    assert_eq!(bad_key.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let bad_key_body = json_body(bad_key).await;
+    assert_eq!(bad_key_body["error_code"], "invalid_ticket");
+    assert!(!bad_key_body.to_string().contains("bad-key"));
+    h.state.manager.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn authenticated_pending_retry_preserves_request_and_replays_enrollment() {
+    const TEST_NAME: &str =
+        "routes::tests::authenticated_pending_retry_preserves_request_and_replays_enrollment";
+    if std::env::var("DELTAWEAVE_WEB_RETRY_TEST").ok().as_deref() != Some(TEST_NAME) {
+        let profile = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env("DELTAWEAVE_WEB_RETRY_TEST", TEST_NAME)
+            .env("HOME", profile.path())
+            .env("USERPROFILE", profile.path())
+            .env("TMPDIR", temporary.path())
+            .env("TMP", temporary.path())
+            .env("TEMP", temporary.path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "isolated pending retry route test failed");
+        return;
+    }
+    let h = Harness::new_with_options(ManagerOptions {
+        managed_network: NetworkMode::DirectOnly,
+        managed_bind: None,
+    })
+    .await;
+    let owner_workspace = tempfile::TempDir::new().unwrap();
+    let owner_port = UdpSocket::bind(("127.0.0.1", 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let owner_options = ManagerOptions {
+        managed_network: NetworkMode::DirectOnly,
+        managed_bind: Some(SocketAddr::from(([127, 0, 0, 1], owner_port))),
+    };
+    let owner_data = owner_workspace.path().join("owner-admin");
+    let owner = Manager::open_with_options(owner_data.clone(), owner_options)
+        .await
+        .unwrap();
+    let active_root = owner_workspace.path().join("active-owner-root");
+    std::fs::create_dir_all(&active_root).unwrap();
+    std::fs::write(active_root.join("seed.txt"), b"active").unwrap();
+    let active_view = owner
+        .create_share(CreateShareInput {
+            request_id: "http-create-active".into(),
+            name: "HTTP active".into(),
+            root: active_root,
+            min_free_space_mib: Some(0),
+        })
+        .await
+        .unwrap();
+    let active_share = ShareId(
+        hex::decode(&active_view.share_id)
+            .unwrap()
+            .try_into()
+            .unwrap(),
+    );
+    let active_key = owner
+        .issue_key(IssueKeyInput {
+            request_id: "http-issue-active".into(),
+            share: active_share,
+            permission: Permission::ReadOnly,
+            expires_at: None,
+        })
+        .await
+        .unwrap();
+
+    owner.shutdown().await.unwrap();
+
+    let active_destination = owner_workspace.path().join("active-member-root");
+    let active_waiting = h
+        .state
+        .manager
+        .join_share(JoinShareInput {
+            request_id: "http-pending-active".into(),
+            encoded_key: active_key.key,
+            destination_root: active_destination,
+        })
+        .await
+        .unwrap();
+    assert_eq!(active_waiting.enrollment, EnrollmentState::Waiting);
+
+    let owner_reopened = Manager::open_with_options(owner_data, owner_options)
+        .await
+        .unwrap();
+    let (cookie, csrf) = h.login(&h.admin).await;
+
+    let wrong_share = h
+        .request(
+            "POST",
+            "/api/v1/shares/pending/retry",
+            json!({
+                "request_id": "http-pending-active",
+                "share_id": "f".repeat(64)
+            }),
+            Some(&cookie),
+            Some(&csrf),
+            Some("http://localhost:8390"),
+            "localhost:8390",
+        )
+        .await;
+    assert_eq!(wrong_share.status(), StatusCode::CONFLICT);
+    let wrong_body = json_body(wrong_share).await;
+    assert_eq!(wrong_body["error_code"], "idempotency_conflict");
+    assert_eq!(wrong_body["request_id"], "http-pending-active");
+
+    let retry = h
+        .request(
+            "POST",
+            "/api/v1/shares/pending/retry",
+            json!({
+                "request_id": "http-pending-active",
+                "share_id": active_view.share_id
+            }),
+            Some(&cookie),
+            Some(&csrf),
+            Some("http://localhost:8390"),
+            "localhost:8390",
+        )
+        .await;
+    assert_eq!(retry.status(), StatusCode::OK);
+    let retry_body = json_body(retry).await;
+    assert_eq!(retry_body["request_id"], "http-pending-active");
+    assert_eq!(retry_body["share_id"], active_view.share_id);
+    assert_eq!(retry_body["enrollment"], "enrolled");
+    let member_id = retry_body["member_id"].clone();
+
+    let replay = h
+        .request(
+            "POST",
+            "/api/v1/shares/pending/retry",
+            json!({
+                "request_id": "http-pending-active",
+                "share_id": active_view.share_id
+            }),
+            Some(&cookie),
+            Some(&csrf),
+            Some("http://localhost:8390"),
+            "localhost:8390",
+        )
+        .await;
+    assert_eq!(replay.status(), StatusCode::OK);
+    let replay_body = json_body(replay).await;
+    assert_eq!(replay_body["enrollment"], "enrolled");
+    assert_eq!(replay_body["member_id"], member_id);
+
+    owner_reopened.shutdown().await.unwrap();
     h.state.manager.shutdown().await.unwrap();
 }
 

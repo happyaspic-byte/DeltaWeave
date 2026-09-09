@@ -27,6 +27,7 @@ import {
   HardDrives,
   Info,
   List,
+  LinkSimple,
   MagnifyingGlass,
   Pause,
   PencilSimple,
@@ -57,6 +58,13 @@ import {
   publicConnection,
 } from "./components";
 import { ago, bytes, date, errorMessage, number, time, uptime } from "./format";
+import {
+  ManagedSharesBoard,
+  ShareCreateFlow,
+  ShareDetailFlow,
+  ShareJoinFlow,
+  ShareRemoveButton,
+} from "./share";
 import type {
   Activity,
   AppSnapshot,
@@ -64,6 +72,7 @@ import type {
   Directory,
   FolderView,
   HistoryPoint,
+  ManagedShareView,
   Settings,
 } from "./types";
 
@@ -75,6 +84,9 @@ type Dialog =
   | { kind: "activity-detail"; activity: Activity }
   | { kind: "remove-folder"; folder: FolderView }
   | { kind: "remove-device"; device: DeviceView }
+  | { kind: "share-create" }
+  | { kind: "share-join" }
+  | { kind: "share-detail"; share: ManagedShareView }
   | null;
 const pages: {
   id: Page;
@@ -329,6 +341,16 @@ export default function App() {
       );
     }
   }
+  const browse = useCallback(
+    (path: string, signal?: AbortSignal) =>
+      api.request<Directory>(
+        path.trim()
+          ? `/browse?path=${encodeURIComponent(path.trim())}`
+          : "/browse",
+        { signal },
+      ),
+    [api],
+  );
   async function command(
     folder: FolderView,
     command: "sync" | "pause" | "resume",
@@ -361,6 +383,25 @@ export default function App() {
     dialog?.kind === "folder-detail"
       ? state?.folders.find((f) => f.id === dialog.id)
       : undefined;
+  const managedShares = state?.shares ?? [];
+  const managedPending = state?.pending ?? [];
+  const hasManagedShares = managedShares.length > 0 || managedPending.length > 0;
+  const managedDetailShare =
+    dialog?.kind === "share-detail"
+      ? managedShares.find((share) => share.share_id === dialog.share.share_id) ??
+        dialog.share
+      : undefined;
+  const managedBoard = (
+    <ManagedSharesBoard
+      shares={managedShares}
+      pending={managedPending}
+      api={api}
+      onCreate={() => setDialog({ kind: "share-create" })}
+      onJoin={() => setDialog({ kind: "share-join" })}
+      onDetail={(share) => setDialog({ kind: "share-detail", share })}
+      onRefresh={reload}
+    />
+  );
   return (
     <div className="app">
       <header className="masthead">
@@ -464,14 +505,39 @@ export default function App() {
                 <span>새로고침</span>
               </button>
               {page === "overview" || page === "folders" ? (
-                <button
-                  className="btn primary"
-                  onClick={() => setDialog({ kind: "folder-form" })}
-                  disabled={!state}
-                >
-                  <Plus size={17} />
-                  폴더 추가
-                </button>
+                <>
+                  <button
+                    type="button"
+                    className="btn primary"
+                    onClick={() => setDialog({ kind: "share-create" })}
+                    disabled={!state}
+                  >
+                    <Plus size={17} />
+                    폴더 공유
+                  </button>
+                  <button
+                    type="button"
+                    className="btn subtle"
+                    onClick={() => setDialog({ kind: "share-join" })}
+                    disabled={!state}
+                  >
+                    <LinkSimple size={17} />
+                    키로 연결
+                  </button>
+                  <div className="advanced-action">
+                    <span>고급 연결</span>
+                    <button
+                      type="button"
+                      className="text-button"
+                      aria-label="폴더 추가"
+                      title="기존 수동 폴더 연결"
+                      onClick={() => setDialog({ kind: "folder-form" })}
+                      disabled={!state}
+                    >
+                      폴더 추가
+                    </button>
+                  </div>
+                </>
               ) : page === "devices" ? (
                 <button
                   className="btn primary"
@@ -544,25 +610,36 @@ export default function App() {
           ) : (
             <>
               {page === "overview" && (
-                <Overview
-                  state={state}
-                  transport={transport}
-                  onAdd={() => setDialog({ kind: "folder-form" })}
-                  onNavigate={navigate}
-                  onDetail={(id) => setDialog({ kind: "folder-detail", id })}
-                  onActivity={(activity) =>
-                    setDialog({ kind: "activity-detail", activity })
-                  }
-                  onCommand={command}
-                />
+                <>
+                  {hasManagedShares && managedBoard}
+                  {(!hasManagedShares || state.folders.length > 0) && (
+                    <Overview
+                      state={state}
+                      transport={transport}
+                      onAdd={() => setDialog({ kind: "share-create" })}
+                      onNavigate={navigate}
+                      onDetail={(id) => setDialog({ kind: "folder-detail", id })}
+                      onActivity={(activity) =>
+                        setDialog({ kind: "activity-detail", activity })
+                      }
+                      onCommand={command}
+                    />
+                  )}
+                  {!hasManagedShares && managedBoard}
+                </>
               )}
               {page === "folders" && (
-                <FoldersPage
-                  state={state}
-                  onAdd={() => setDialog({ kind: "folder-form" })}
-                  onDetail={(id) => setDialog({ kind: "folder-detail", id })}
-                  onCommand={command}
-                />
+                <>
+                  {managedBoard}
+                  {(state.folders.length > 0 || !hasManagedShares) && (
+                    <FoldersPage
+                      state={state}
+                      onAdd={() => setDialog({ kind: "folder-form" })}
+                      onDetail={(id) => setDialog({ kind: "folder-detail", id })}
+                      onCommand={command}
+                    />
+                  )}
+                </>
               )}
               {page === "devices" && (
                 <DevicesPage
@@ -619,13 +696,7 @@ export default function App() {
             folder={dialog.folder}
             devices={state.devices}
             defaultInterval={state.settings.poll_interval_seconds}
-            browse={(path) =>
-              api.request<Directory>(
-                path.trim()
-                  ? `/browse?path=${encodeURIComponent(path)}`
-                  : "/browse",
-              )
-            }
+            browse={browse}
             onSubmit={(input) =>
               mutate(
                 dialog.folder
@@ -642,6 +713,59 @@ export default function App() {
                   : "폴더 연결을 추가했습니다.",
               )
             }
+          />
+        </Modal>
+      )}
+      {dialog?.kind === "share-create" && (
+        <Modal
+          title="폴더 공유"
+          subtitle="이 장치의 폴더를 소유자로 공유하고 안전한 키를 발급합니다."
+          wide
+          onClose={() => setDialog(null)}
+        >
+          <ShareCreateFlow
+            api={api}
+            browse={browse}
+            onClose={() => setDialog(null)}
+            onComplete={reload}
+          />
+        </Modal>
+      )}
+      {dialog?.kind === "share-join" && (
+        <Modal
+          title="키로 연결"
+          subtitle="전달받은 키를 확인하고 이 장치의 저장 폴더를 선택합니다."
+          wide
+          onClose={() => setDialog(null)}
+        >
+          <ShareJoinFlow
+            api={api}
+            browse={browse}
+            onClose={() => setDialog(null)}
+            onComplete={reload}
+          />
+        </Modal>
+      )}
+      {dialog?.kind === "share-detail" && (
+        <Modal
+          title={managedDetailShare?.name ?? dialog.share.name}
+          subtitle="관리형 공유 상태와 권한 관리"
+          drawer
+          onClose={() => setDialog(null)}
+        >
+          <ShareDetailFlow
+            share={managedDetailShare ?? dialog.share}
+            api={api}
+            onClose={() => setDialog(null)}
+            onRefresh={reload}
+          />
+          <ShareRemoveButton
+            share={managedDetailShare ?? dialog.share}
+            api={api}
+            onRemoved={async () => {
+              setDialog(null);
+              await reload();
+            }}
           />
         </Modal>
       )}
@@ -800,7 +924,7 @@ function Overview({
     transport === "offline"
       ? "장치 상태를 다시 확인하고 있습니다"
       : !state.folders.length
-        ? "첫 번째 폴더를 연결해 보세요"
+        ? "첫 폴더를 공유해 보세요"
         : errors
           ? `${errors}개 폴더를 확인해 주세요`
           : syncing
@@ -843,7 +967,7 @@ function Overview({
                 state.folders.length ? onNavigate("folders") : onAdd()
               }
               aria-label={
-                state.folders.length ? "폴더 관리로 이동" : "첫 폴더 연결하기"
+                state.folders.length ? "폴더 관리로 이동" : "첫 폴더 공유하기"
               }
             >
               <ArrowUpRight size={21} />
@@ -895,7 +1019,7 @@ function Overview({
                 <Plus size={20} />
               </div>
               <button className="btn primary" onClick={onAdd}>
-                첫 폴더 연결 <ArrowRight size={16} />
+                첫 폴더 공유 <ArrowRight size={16} />
               </button>
             </div>
           )}
@@ -957,6 +1081,7 @@ function Overview({
           onDetail={onDetail}
           onCommand={onCommand}
           onAdd={onAdd}
+          emptyActionLabel="폴더 공유"
         />
         <div className="panel-foot">
           <Info size={14} />
@@ -1269,6 +1394,7 @@ function FolderTable({
   onDetail,
   onCommand,
   onAdd,
+  emptyActionLabel = "수동 폴더 연결",
 }: {
   folders: FolderView[];
   devices: DeviceView[];
@@ -1278,6 +1404,7 @@ function FolderTable({
     c: "sync" | "pause" | "resume",
   ) => Promise<unknown>;
   onAdd?: () => void;
+  emptyActionLabel?: string;
 }) {
   if (!folders.length)
     return (
@@ -1287,13 +1414,13 @@ function FolderTable({
         }
         description={
           onAdd
-            ? "동기화할 로컬 폴더와 상대 장치를 지정하세요. 기존 상태와 identity 파일도 가져올 수 있습니다."
+            ? "폴더를 공유하거나 고급 연결에서 기존 수동 폴더를 추가하세요."
             : "검색어나 상태 필터를 바꿔 보세요."
         }
         action={
           onAdd ? (
             <button className="btn subtle small" onClick={onAdd}>
-              <Plus size={14} />첫 폴더 연결
+              <Plus size={14} />{emptyActionLabel}
             </button>
           ) : null
         }
@@ -1417,6 +1544,7 @@ function FoldersPage({
           folders={folders}
           devices={state.devices}
           onAdd={!state.folders.length ? onAdd : undefined}
+          emptyActionLabel="수동 폴더 연결"
           onDetail={onDetail}
           onCommand={onCommand}
         />

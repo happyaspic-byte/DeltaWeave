@@ -1,8 +1,13 @@
+use super::roster::{
+    MAX_ROSTER_ENTRIES, MAX_ROSTER_FRAME_BYTES, ROSTER_STALE_AFTER_SECONDS, ROSTER_TTL_SECONDS,
+    ROSTER_VERSION, heartbeat_expiry, random_nonce,
+};
 use super::ticket::random_bytes;
 use super::{InvitationId, LegacyProof, Permission, ShareError, ShareId, ShareTicket, now};
+use super::{RosterEntry, RosterHeartbeat, SignedRoster};
 use anyhow::{Result, ensure};
 use deltaweave_core::{Hash32, ReplicaId};
-use iroh::{EndpointAddr, EndpointId};
+use iroh::{EndpointAddr, EndpointId, SecretKey};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -12,6 +17,8 @@ use std::{
 };
 
 const CATALOG: TableDefinition<u8, &[u8]> = TableDefinition::new("owner_share_catalog_v3");
+const ROSTERS: TableDefinition<&str, &[u8]> = TableDefinition::new("share_roster_v1");
+const HEARTBEATS: TableDefinition<&str, &[u8]> = TableDefinition::new("share_roster_heartbeat_v1");
 const MAX_MEMBERS: usize = 4096;
 pub(crate) const MAX_REPLICAS: usize = 4096;
 
@@ -67,6 +74,18 @@ struct Catalog {
     owner: EndpointId,
     shares: BTreeMap<ShareId, ShareEntry>,
     relationships: BTreeMap<(EndpointId, ShareId), MemberRelationship>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct HeartbeatChallenge {
+    version: u8,
+    owner: EndpointId,
+    share: ShareId,
+    member: EndpointId,
+    challenge: [u8; 32],
+    issued_at: u64,
+    expires_at: u64,
+    used: bool,
 }
 #[derive(Debug)]
 pub(crate) struct Registry {
@@ -525,6 +544,277 @@ impl Registry {
             Ok(())
         })
     }
+
+    /// Issues one owner-authenticated challenge and stores its replay state in
+    /// a separate v1 table.  The challenge does not grant enrollment or
+    /// change the catalog membership.
+    pub(crate) fn issue_roster_challenge(
+        &self,
+        owner_key: &SecretKey,
+        share: ShareId,
+        member: EndpointId,
+    ) -> Result<(SignedRoster, [u8; 32])> {
+        let _serial = self
+            .serial
+            .lock()
+            .map_err(|_| ShareError::StateUnavailable)?;
+        let catalog = self.read()?;
+        ensure!(
+            catalog.owner == owner_key.public(),
+            ShareError::OwnerMismatch
+        );
+        let member_record = catalog
+            .shares
+            .get(&share)
+            .ok_or(ShareError::UnknownShare)?
+            .members
+            .get(&member)
+            .ok_or(ShareError::NotMember)?;
+        ensure!(
+            member_record.revoked_at.is_none(),
+            ShareError::MemberRevoked
+        );
+        let previous = self.read_roster(share)?;
+        let now = now();
+        let roster = self.sign_roster(owner_key, &catalog, share, previous.as_ref(), now)?;
+        let challenge = random_nonce();
+        let record = HeartbeatChallenge {
+            version: ROSTER_VERSION,
+            owner: catalog.owner,
+            share,
+            member,
+            challenge,
+            issued_at: now,
+            expires_at: now.saturating_add(ROSTER_STALE_AFTER_SECONDS),
+            used: false,
+        };
+        self.write_roster_and_challenge(&roster, &record)?;
+        Ok((roster, challenge))
+    }
+
+    /// Accepts a member-signed address update only after checking the
+    /// authenticated QUIC peer, the one-use durable challenge, and the live
+    /// catalog epoch.  Address freshness is liveness metadata; it never
+    /// creates or changes membership.
+    pub(crate) fn accept_roster_heartbeat(
+        &self,
+        owner_key: &SecretKey,
+        heartbeat: &RosterHeartbeat,
+        remote_peer: EndpointId,
+    ) -> Result<SignedRoster> {
+        let _serial = self
+            .serial
+            .lock()
+            .map_err(|_| ShareError::StateUnavailable)?;
+        ensure!(
+            heartbeat.owner == owner_key.public() && heartbeat.member == remote_peer,
+            ShareError::EndpointMismatch
+        );
+        let now = now();
+        heartbeat.verify_at(now)?;
+        let catalog = self.read()?;
+        ensure!(
+            catalog.owner == owner_key.public(),
+            ShareError::OwnerMismatch
+        );
+        let member_record = catalog
+            .shares
+            .get(&heartbeat.share)
+            .ok_or(ShareError::UnknownShare)?
+            .members
+            .get(&heartbeat.member)
+            .ok_or(ShareError::NotMember)?;
+        ensure!(
+            member_record.revoked_at.is_none(),
+            ShareError::MemberRevoked
+        );
+        let mut challenge = self
+            .read_challenge(heartbeat.share, heartbeat.member)?
+            .ok_or(ShareError::HeartbeatReplay)?;
+        ensure!(
+            challenge.version == ROSTER_VERSION
+                && challenge.owner == catalog.owner
+                && challenge.share == heartbeat.share
+                && challenge.member == heartbeat.member
+                && challenge.challenge == heartbeat.challenge
+                && !challenge.used,
+            ShareError::HeartbeatReplay
+        );
+        ensure!(
+            now < challenge.expires_at
+                && heartbeat.sent_at >= challenge.issued_at.saturating_sub(5)
+                && heartbeat.sent_at <= challenge.expires_at,
+            ShareError::HeartbeatExpired
+        );
+        let previous = self.read_roster(heartbeat.share)?;
+        let mut entries = self.roster_entries(&catalog, heartbeat.share, previous.as_ref())?;
+        let entry = entries
+            .iter_mut()
+            .find(|entry| entry.member == heartbeat.member)
+            .ok_or(ShareError::NotMember)?;
+        entry.address = heartbeat.address.clone();
+        // `sent_at` is only a bounded freshness proof. The owner receive
+        // timestamp is authoritative so a delayed heartbeat cannot extend
+        // liveness by claiming a future or otherwise shifted wall time.
+        entry.heartbeat_at = now;
+        entry.heartbeat_expires_at = heartbeat_expiry(now);
+        let roster = SignedRoster::sign(
+            owner_key,
+            heartbeat.share,
+            random_nonce(),
+            entries,
+            now,
+            now.saturating_add(ROSTER_TTL_SECONDS),
+        )?;
+        challenge.used = true;
+        self.write_roster_and_challenge(&roster, &challenge)?;
+        Ok(roster)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stored_roster(&self, share: ShareId) -> Result<Option<SignedRoster>> {
+        self.read_roster(share)
+    }
+
+    fn sign_roster(
+        &self,
+        owner_key: &SecretKey,
+        catalog: &Catalog,
+        share: ShareId,
+        previous: Option<&SignedRoster>,
+        now: u64,
+    ) -> Result<SignedRoster> {
+        let entries = self.roster_entries(catalog, share, previous)?;
+        SignedRoster::sign(
+            owner_key,
+            share,
+            random_nonce(),
+            entries,
+            now,
+            now.saturating_add(ROSTER_TTL_SECONDS),
+        )
+    }
+
+    fn roster_entries(
+        &self,
+        catalog: &Catalog,
+        share: ShareId,
+        previous: Option<&SignedRoster>,
+    ) -> Result<Vec<RosterEntry>> {
+        let share_entry = catalog.shares.get(&share).ok_or(ShareError::UnknownShare)?;
+        if let Some(previous) = previous {
+            ensure!(
+                previous.owner == catalog.owner && previous.share == share,
+                ShareError::StateUnavailable
+            );
+            previous.verify_signature()?;
+        }
+        let mut entries = Vec::new();
+        for member in share_entry.members.values() {
+            if member.revoked_at.is_some() {
+                continue;
+            }
+            let old = previous.and_then(|roster| roster.member(member.endpoint));
+            let (address, heartbeat_at, heartbeat_expires_at) = old
+                .filter(|entry| {
+                    entry.owner == catalog.owner
+                        && entry.share == share
+                        && entry.member == member.endpoint
+                        && entry.address.id == member.endpoint
+                })
+                .map(|entry| {
+                    (
+                        entry.address.clone(),
+                        entry.heartbeat_at,
+                        entry.heartbeat_expires_at,
+                    )
+                })
+                .unwrap_or_else(|| (EndpointAddr::new(member.endpoint), 0, 0));
+            entries.push(RosterEntry {
+                owner: catalog.owner,
+                share,
+                member: member.endpoint,
+                address,
+                permission: member.permission,
+                member_epoch: member.epoch,
+                heartbeat_at,
+                heartbeat_expires_at,
+            });
+        }
+        ensure!(entries.len() <= MAX_ROSTER_ENTRIES, ShareError::Busy);
+        ensure!(
+            postcard::to_stdvec(&entries)?.len() <= MAX_ROSTER_FRAME_BYTES,
+            ShareError::Busy
+        );
+        Ok(entries)
+    }
+
+    fn read_roster(&self, share: ShareId) -> Result<Option<SignedRoster>> {
+        let read = self.db.begin_read()?;
+        let table = match read.open_table(ROSTERS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let key = roster_key(share);
+        let Some(value) = table.get(key.as_str())? else {
+            return Ok(None);
+        };
+        ensure!(
+            value.value().len() <= MAX_ROSTER_FRAME_BYTES,
+            ShareError::StateUnavailable
+        );
+        Ok(Some(postcard::from_bytes(value.value())?))
+    }
+
+    fn read_challenge(
+        &self,
+        share: ShareId,
+        member: EndpointId,
+    ) -> Result<Option<HeartbeatChallenge>> {
+        let read = self.db.begin_read()?;
+        let table = match read.open_table(HEARTBEATS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let key = heartbeat_key(share, member);
+        let Some(value) = table.get(key.as_str())? else {
+            return Ok(None);
+        };
+        ensure!(value.value().len() <= 4096, ShareError::StateUnavailable);
+        Ok(Some(postcard::from_bytes(value.value())?))
+    }
+
+    fn write_roster_and_challenge(
+        &self,
+        roster: &SignedRoster,
+        challenge: &HeartbeatChallenge,
+    ) -> Result<()> {
+        let roster_bytes = postcard::to_stdvec(roster)?;
+        let challenge_bytes = postcard::to_stdvec(challenge)?;
+        ensure!(
+            roster_bytes.len() <= MAX_ROSTER_FRAME_BYTES && challenge_bytes.len() <= 4096,
+            ShareError::StateUnavailable
+        );
+        let roster_key = roster_key(roster.share);
+        let challenge_key = heartbeat_key(roster.share, challenge.member);
+        let tx = self.db.begin_write()?;
+        tx.open_table(ROSTERS)?
+            .insert(roster_key.as_str(), roster_bytes.as_slice())?;
+        tx.open_table(HEARTBEATS)?
+            .insert(challenge_key.as_str(), challenge_bytes.as_slice())?;
+        tx.commit()?;
+        Ok(())
+    }
+}
+
+fn roster_key(share: ShareId) -> String {
+    hex::encode(share.0)
+}
+
+fn heartbeat_key(share: ShareId, member: EndpointId) -> String {
+    format!("{}:{}", roster_key(share), hex::encode(member.as_bytes()))
 }
 
 #[cfg(test)]
