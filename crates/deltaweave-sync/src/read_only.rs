@@ -233,6 +233,26 @@ pub(crate) async fn recover_managed_apply_before_liveness(
     save(local, &state)
 }
 
+/// Test-only accessors used by the managed lifecycle fixture.  They serialize
+/// through the same v2 RO envelope as production; the test must not construct
+/// a second journal format or bypass the index metadata slot.
+#[cfg(test)]
+pub(crate) fn install_apply_journal_for_test(
+    local: &ReplicaState,
+    journal: ManagedApplyJournal,
+) -> Result<()> {
+    let mut state = load(local)?;
+    state.apply = Some(journal);
+    save(local, &state)
+}
+
+#[cfg(test)]
+pub(crate) fn load_apply_journal_for_test(
+    local: &ReplicaState,
+) -> Result<Option<ManagedApplyJournal>> {
+    Ok(load(local)?.apply)
+}
+
 fn validate_checkpoint(before: &[SyncRecord], after: &[SyncRecord]) -> Result<()> {
     let current: BTreeMap<_, _> = after.iter().map(|r| (&r.path, r)).collect();
     ensure!(current.len() == after.len(), ShareError::InvalidRecord);

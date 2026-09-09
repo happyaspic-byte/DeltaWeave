@@ -1113,4 +1113,152 @@ mod tests {
         drop(owned);
         owner.shutdown().await.unwrap();
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recovery_open_drains_persisted_read_only_apply_after_restart_and_revoke() {
+        let name = "shared::tests::recovery_open_drains_persisted_read_only_apply_after_restart_and_revoke";
+        if std::env::var("DW_MANAGED_RO_APPLY_RECOVERY_CHILD")
+            .ok()
+            .as_deref()
+            != Some(name)
+        {
+            let home = tempfile::tempdir().expect("isolated home");
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture"])
+                .env("DW_MANAGED_RO_APPLY_RECOVERY_CHILD", name)
+                .env("HOME", home.path())
+                .env("USERPROFILE", home.path())
+                .status()
+                .expect("run isolated read-only apply recovery test");
+            assert!(status.success());
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("test root");
+        let owner_path = temp.path().join("owner-service");
+        let member_path = temp.path().join("member-service");
+        let owner = ShareService::open(&owner_path, deltaweave_net::NetworkMode::DirectOnly, None)
+            .await
+            .unwrap();
+        let member =
+            ShareService::open(&member_path, deltaweave_net::NetworkMode::DirectOnly, None)
+                .await
+                .unwrap();
+        let owned = owner
+            .create_owned_share(
+                "RO apply recovery".into(),
+                temp.path().join("owner-root"),
+                temp.path().join("owner-state"),
+                None,
+                0,
+            )
+            .await
+            .unwrap();
+        let share = owned.config().share_id;
+        let ro_ticket = owned
+            .issue_key(Permission::ReadOnly, None, owner.endpoint_addr())
+            .unwrap();
+        let ro_membership = member.enroll(&ro_ticket, None).await.unwrap();
+        assert_eq!(ro_membership.permission, Permission::ReadOnly);
+
+        let config = ManagedSyncConfig {
+            root: temp.path().join("member-root"),
+            state_root: temp.path().join("member-state"),
+            profile: ChunkingProfile::DEFAULT,
+            min_free_space_bytes: 0,
+        };
+        let engine =
+            ManagedSyncEngine::open(&member, owner.endpoint_id(), share, config.clone()).unwrap();
+        let session = member.open_session(owner.endpoint_id(), share).unwrap();
+        let empty = MerkleTree::from_records(Vec::new()).unwrap();
+        let snapshot = session.fetch_authoritative_snapshot(&empty).await.unwrap();
+        let permit = session
+            .revalidate_before_apply(&snapshot.token)
+            .await
+            .unwrap();
+        assert_eq!(permit.consumer, ro_membership.endpoint);
+        let operation_id = [0x7b; 16];
+        session.apply_start(&permit, operation_id).await.unwrap();
+        let started = session
+            .apply_status(&permit, Some(operation_id))
+            .await
+            .unwrap();
+        assert!(matches!(started.state, ApplyStateView::Started));
+
+        // Write the actual v2 RO envelope after the owner has accepted
+        // ApplyStart.  This is the response-loss boundary exercised by the
+        // restart below; no RW journal format is substituted for RO state.
+        read_only::install_apply_journal_for_test(
+            &engine.inner.local,
+            ManagedApplyJournal {
+                permit: permit.clone(),
+                operation_id,
+                committed: false,
+            },
+        )
+        .unwrap();
+        assert!(
+            read_only::load_apply_journal_for_test(&engine.inner.local)
+                .unwrap()
+                .is_some()
+        );
+        assert!(engine.inner.heartbeat_task.is_some());
+        assert!(engine.inner.supplier_drain.is_some());
+
+        engine.shutdown().await.unwrap();
+        drop(session);
+
+        let first_revoke = owned
+            .revoke_member_strong(ro_membership.endpoint)
+            .await
+            .unwrap();
+        assert!(matches!(
+            first_revoke,
+            deltaweave_net::share::RevocationReceipt::Pending { blockers, .. }
+                if blockers > 0
+        ));
+        member.shutdown().await.unwrap();
+
+        // Reopen the same persisted public/private roots in recovery-only
+        // mode.  It must not register the revoked member as a supplier or
+        // start heartbeat/liveness before closing the exact owner receipt.
+        let member =
+            ShareService::open(&member_path, deltaweave_net::NetworkMode::DirectOnly, None)
+                .await
+                .unwrap();
+        let recovery =
+            ManagedSyncEngine::open_recovery(&member, owner.endpoint_id(), share, config).unwrap();
+        assert!(recovery.inner.recovery_only);
+        assert!(recovery.inner.heartbeat_task.is_none());
+        assert!(recovery.inner.supplier_drain.is_none());
+        recovery.recover_pending().await.unwrap();
+        assert!(
+            read_only::load_apply_journal_for_test(&recovery.inner.local)
+                .unwrap()
+                .is_none()
+        );
+
+        let reopened_session = member.open_session(owner.endpoint_id(), share).unwrap();
+        let drained = reopened_session
+            .apply_status(&permit, Some(operation_id))
+            .await
+            .unwrap();
+        assert!(matches!(drained.state, ApplyStateView::Drained));
+        assert_eq!(drained.operation_id, Some(operation_id));
+        assert!(!drained.committed);
+        drop(reopened_session);
+        let completed = owned
+            .revoke_member_strong(ro_membership.endpoint)
+            .await
+            .unwrap();
+        assert!(matches!(
+            completed,
+            deltaweave_net::share::RevocationReceipt::Complete { .. }
+        ));
+
+        recovery.shutdown().await.unwrap();
+        member.shutdown().await.unwrap();
+        drop(owned);
+        owner.shutdown().await.unwrap();
+    }
 }
