@@ -47,6 +47,8 @@ use std::{
 const CONTROL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
 const CLOSE_CONFIRM_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);
 const MAX_SWARM_OPERATION_KEYS: usize = 4096;
+const SHARE_PAYLOAD_TRACE_TARGET: &str = "deltaweave_share_payload";
+static SHARE_PAYLOAD_TRACE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 fn query_event_id(sequence: &AtomicU64, share: ShareId, peer: EndpointId, tag: &[u8]) -> [u8; 16] {
     let mut bytes = b"deltaweave/share-event/query/v1\0".to_vec();
@@ -111,6 +113,39 @@ struct ShareEventState {
     sequence: AtomicU64,
 }
 
+/// Emits the optional F collector record for one already-validated payload
+/// chunk. Byte-bearing `Swarm` events are produced only after an outbound
+/// verified Store read and `send.write_all`, or after an inbound hash check
+/// and `put_verified`; this helper deliberately has no path, identity, grant,
+/// or share fields. It is debug-level and target-filtered, so normal runs do
+/// not pay for a payload trace. A faulty subscriber cannot affect transfer
+/// admission, drain, or persistence.
+fn trace_verified_payload(event: &ShareTransferEvent) {
+    if event.phase != SharePhase::Swarm || event.bytes == 0 {
+        return;
+    }
+    let direction = match event.direction {
+        TransferDirection::Inbound => "inbound",
+        TransferDirection::Outbound => "outbound",
+    };
+    let verified_bytes = event.bytes;
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        if !tracing::enabled!(target: SHARE_PAYLOAD_TRACE_TARGET, tracing::Level::DEBUG) {
+            return;
+        }
+        let sequence = SHARE_PAYLOAD_TRACE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(
+            target: SHARE_PAYLOAD_TRACE_TARGET,
+            version = 1u8,
+            protocol = "deltaweave/share-swarm/1",
+            direction = direction,
+            verified_bytes,
+            verified_chunks = 1u8,
+            sequence,
+        );
+    }));
+}
+
 impl ShareEventState {
     fn new() -> Self {
         Self {
@@ -126,6 +161,7 @@ impl ShareEventState {
     }
 
     fn emit(&self, event: ShareTransferEvent) {
+        trace_verified_payload(&event);
         let observer = self
             .observer
             .lock()
@@ -138,6 +174,175 @@ impl ShareEventState {
 
     fn next_query_id(&self, share: ShareId, peer: EndpointId, tag: &[u8]) -> [u8; 16] {
         query_event_id(&self.sequence, share, peer, tag)
+    }
+}
+
+#[cfg(test)]
+mod payload_trace_tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct RecordedEvent {
+        target: String,
+        fields: BTreeMap<String, String>,
+    }
+
+    #[derive(Clone)]
+    struct RecordingSubscriber {
+        events: Arc<Mutex<Vec<RecordedEvent>>>,
+        panic_on_event: bool,
+    }
+
+    impl RecordingSubscriber {
+        fn accepts(metadata: &tracing::Metadata<'_>) -> bool {
+            metadata.target() == SHARE_PAYLOAD_TRACE_TARGET
+                && *metadata.level() == tracing::Level::DEBUG
+        }
+    }
+
+    impl tracing::Subscriber for RecordingSubscriber {
+        fn register_callsite(
+            &self,
+            metadata: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            if Self::accepts(metadata) {
+                tracing::subscriber::Interest::always()
+            } else {
+                tracing::subscriber::Interest::never()
+            }
+        }
+
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            Self::accepts(metadata)
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            if self.panic_on_event {
+                panic!("test payload trace subscriber failure");
+            }
+            let mut visitor = FieldValues::default();
+            event.record(&mut visitor);
+            self.events.lock().unwrap().push(RecordedEvent {
+                target: event.metadata().target().to_owned(),
+                fields: visitor.0,
+            });
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    #[derive(Default)]
+    struct FieldValues(BTreeMap<String, String>);
+
+    impl tracing::field::Visit for FieldValues {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().to_owned(), format!("{value:?}"));
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().to_owned(), value.to_owned());
+        }
+    }
+
+    fn event(phase: SharePhase, direction: TransferDirection, bytes: u64) -> ShareTransferEvent {
+        ShareTransferEvent {
+            operation_id: [0x11; 16],
+            share: ShareId([0x22; 32]),
+            peer: SecretKey::from_bytes(&[0x33; 32]).public(),
+            phase,
+            direction,
+            bytes,
+            epoch: 4,
+            provider_epoch: Some(5),
+            grant: Some([0x44; 32]),
+        }
+    }
+
+    #[test]
+    fn payload_trace_is_opt_in_bounded_and_secret_free() {
+        let state = ShareEventState::new();
+        let no_subscriber =
+            tracing::dispatcher::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        tracing::dispatcher::with_default(&no_subscriber, || {
+            assert!(!tracing::enabled!(
+                target: SHARE_PAYLOAD_TRACE_TARGET,
+                tracing::Level::DEBUG
+            ));
+            state.emit(event(SharePhase::Swarm, TransferDirection::Inbound, 9));
+        });
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = RecordingSubscriber {
+            events: events.clone(),
+            panic_on_event: false,
+        };
+        let dispatch = tracing::dispatcher::Dispatch::new(subscriber);
+        tracing::dispatcher::with_default(&dispatch, || {
+            state.emit(event(SharePhase::Swarm, TransferDirection::Inbound, 9));
+            state.emit(event(SharePhase::Swarm, TransferDirection::Outbound, 13));
+            state.emit(event(SharePhase::Swarm, TransferDirection::Outbound, 0));
+            state.emit(event(SharePhase::Drain, TransferDirection::Outbound, 99));
+        });
+
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|event| {
+            event.target == SHARE_PAYLOAD_TRACE_TARGET
+                && event.fields.len() == 6
+                && event.fields.contains_key("version")
+                && event.fields.contains_key("protocol")
+                && event.fields.contains_key("direction")
+                && event.fields.contains_key("verified_bytes")
+                && event.fields.contains_key("verified_chunks")
+                && event.fields.contains_key("sequence")
+                && !event.fields.contains_key("operation_id")
+                && !event.fields.contains_key("share")
+                && !event.fields.contains_key("peer")
+                && !event.fields.contains_key("grant")
+        }));
+        assert_eq!(events[0].fields.get("version").unwrap(), "1");
+        assert_eq!(
+            events[0].fields.get("protocol").unwrap(),
+            "deltaweave/share-swarm/1"
+        );
+        assert_eq!(events[0].fields.get("direction").unwrap(), "inbound");
+        assert_eq!(events[0].fields.get("verified_bytes").unwrap(), "9");
+        assert_eq!(events[0].fields.get("verified_chunks").unwrap(), "1");
+        assert_eq!(events[1].fields.get("direction").unwrap(), "outbound");
+        assert_eq!(events[1].fields.get("verified_bytes").unwrap(), "13");
+        assert_ne!(
+            events[0].fields.get("sequence"),
+            events[1].fields.get("sequence")
+        );
+    }
+
+    #[test]
+    fn payload_trace_subscriber_failure_does_not_escape_event_emit() {
+        let state = ShareEventState::new();
+        let observer_calls = Arc::new(AtomicUsize::new(0));
+        let observer_calls_clone = observer_calls.clone();
+        state.set_observer(Some(ShareTransferObserver::new(move |_| {
+            observer_calls_clone.fetch_add(1, Ordering::Relaxed);
+        })));
+        let subscriber = RecordingSubscriber {
+            events: Arc::new(Mutex::new(Vec::new())),
+            panic_on_event: true,
+        };
+        let dispatch = tracing::dispatcher::Dispatch::new(subscriber);
+        tracing::dispatcher::with_default(&dispatch, || {
+            state.emit(event(SharePhase::Swarm, TransferDirection::Outbound, 7));
+        });
+        assert_eq!(observer_calls.load(Ordering::Relaxed), 1);
     }
 }
 
