@@ -66,6 +66,7 @@ struct ManagedInner {
     local: Arc<ReplicaState>,
     session: ShareSession,
     gate: tokio::sync::Mutex<()>,
+    recovery_only: bool,
     heartbeat_task: Option<tokio::task::JoinHandle<()>>,
     /// Owns the concrete E2 supplier guard without exposing its net-module
     /// type through this public sync API.  Calling it closes and unregisters
@@ -82,21 +83,22 @@ async fn finish_managed_shutdown(
     supplier_drain: Option<SupplierDrain>,
 ) -> Result<()> {
     let mut first_error = None;
-    if let Some(drain) = supplier_drain {
-        if let Err(error) = drain().await {
-            // Supplier cleanup must not skip heartbeat/session cleanup. Keep
-            // the original error and finish every independent local action.
-            first_error = Some(error);
-        }
+    if let Some(drain) = supplier_drain
+        && let Err(error) = drain().await
+    {
+        // Supplier cleanup must not skip heartbeat/session cleanup. Keep
+        // the original error and finish every independent local action.
+        first_error = Some(error);
     }
     if let Some(task) = heartbeat_task {
         task.abort();
-        if let Err(error) = task.await {
-            if !error.is_cancelled() && first_error.is_none() {
-                first_error = Some(anyhow::anyhow!(
-                    "managed heartbeat task failed during shutdown"
-                ));
-            }
+        if let Err(error) = task.await
+            && !error.is_cancelled()
+            && first_error.is_none()
+        {
+            first_error = Some(anyhow::anyhow!(
+                "managed heartbeat task failed during shutdown"
+            ));
         }
     }
     session.close().await;
@@ -112,7 +114,7 @@ impl ManagedSyncEngine {
         share: ShareId,
         config: ManagedSyncConfig,
     ) -> Result<Self> {
-        Self::open_inner(service, owner, share, config, false, None)
+        Self::open_inner(service, owner, share, config, false, None, false)
     }
 
     /// Opens a newly enrolled member while transferring an already acquired
@@ -126,7 +128,7 @@ impl ManagedSyncEngine {
         config: ManagedSyncConfig,
         lease: Arc<root_admission::RootLease>,
     ) -> Result<Self> {
-        Self::open_inner(service, owner, share, config, false, Some(lease))
+        Self::open_inner(service, owner, share, config, false, Some(lease), false)
     }
 
     /// Resumes an existing member only if both the index and recovery journal still exist.
@@ -137,7 +139,20 @@ impl ManagedSyncEngine {
         share: ShareId,
         config: ManagedSyncConfig,
     ) -> Result<Self> {
-        Self::open_inner(service, owner, share, config, true, None)
+        Self::open_inner(service, owner, share, config, true, None, false)
+    }
+
+    /// Opens only the retained local state for exact ApplyStart/recovery
+    /// queries. This path is valid for paused or revoked memberships: it does
+    /// not register a supplier, start a heartbeat, request a fresh snapshot,
+    /// or permit normal sync/public filesystem work.
+    pub fn open_recovery(
+        service: &ShareService,
+        owner: iroh::EndpointId,
+        share: ShareId,
+        config: ManagedSyncConfig,
+    ) -> Result<Self> {
+        Self::open_inner(service, owner, share, config, true, None, true)
     }
 
     fn open_inner(
@@ -147,7 +162,16 @@ impl ManagedSyncEngine {
         config: ManagedSyncConfig,
         resume: bool,
         transferred_lease: Option<Arc<root_admission::RootLease>>,
+        recovery_only: bool,
     ) -> Result<Self> {
+        if recovery_only {
+            // `acquire_with_private` is intentionally create-on-open for a
+            // first enrollment.  A recovery process must never turn a lost
+            // public namespace into a newly admitted one: the retained index
+            // and journal are only meaningful with the exact old directory.
+            validate_existing_managed_directory(&config.root)?;
+            validate_existing_managed_directory(&config.state_root)?;
+        }
         let index_exists = config.state_root.join("index.redb").is_file();
         let store_exists = config.state_root.join("store/metadata.redb").is_file();
         ensure!(
@@ -211,7 +235,9 @@ impl ManagedSyncEngine {
         // Register the same Arc-backed index/store/lease used by this engine.
         // A member's roster row alone is only a discovery hint; the net
         // handler will serve chunks only while this exact guard is live.
-        let supplier_drain = {
+        let supplier_drain = if recovery_only {
+            None
+        } else {
             let guard = service.register_supplier_storage(
                 owner,
                 share,
@@ -227,14 +253,15 @@ impl ManagedSyncEngine {
                 drain
             }) as SupplierDrain)
         };
-        let heartbeat_task = session.start_heartbeat();
+        let heartbeat_task = (!recovery_only).then(|| session.start_heartbeat());
         Ok(Self {
             pending: std::sync::Mutex::new(Vec::new()),
             inner: Arc::new(ManagedInner {
                 local,
                 session,
                 gate: tokio::sync::Mutex::new(()),
-                heartbeat_task: Some(heartbeat_task),
+                recovery_only,
+                heartbeat_task,
                 supplier_drain,
             }),
         })
@@ -242,6 +269,7 @@ impl ManagedSyncEngine {
 
     /// Runs the member's durable role. Work retains the lease even if this future is cancelled.
     pub async fn sync_once(&self, observer: Option<TransferObserver>) -> Result<ManagedSyncReport> {
+        ensure!(!self.inner.recovery_only, ShareError::PermissionDenied);
         let inner = self.inner.clone();
         let (finished, completion) = tokio::sync::oneshot::channel();
         {
@@ -497,6 +525,53 @@ fn validate_transferred_lease(
         ShareError::StateUnavailable
     );
     Ok(())
+}
+
+/// Validates an already-created managed directory without following an alias
+/// in any component.  Normal enrollment may create missing roots through the
+/// admission layer; recovery uses this stricter preflight so an absent or
+/// replaced public/state directory cannot be silently recreated or rebound.
+fn validate_existing_managed_directory(path: &Path) -> Result<()> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut current = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            std::path::Component::ParentDir => {
+                current.pop();
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::RootDir | std::path::Component::Normal(_) => {
+                current.push(component.as_os_str());
+                let metadata = fs::symlink_metadata(&current)
+                    .map_err(|_| anyhow::Error::new(ShareError::StateUnavailable))?;
+                ensure!(
+                    metadata.is_dir() && !metadata.file_type().is_symlink(),
+                    ShareError::StateUnavailable
+                );
+                #[cfg(windows)]
+                ensure!(
+                    !managed_path_is_reparse_point(&current)?,
+                    ShareError::StateUnavailable
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn managed_path_is_reparse_point(path: &Path) -> Result<bool> {
+    let handle = winapi_util::Handle::from_path_any(path)
+        .map_err(|_| anyhow::Error::new(ShareError::StateUnavailable))?;
+    let information = winapi_util::file::information(&handle)
+        .map_err(|_| anyhow::Error::new(ShareError::StateUnavailable))?;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u64 = 0x0400;
+    Ok(information.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
 }
 
 #[cfg(test)]
@@ -782,10 +857,7 @@ mod tests {
         let result =
             finish_managed_shutdown(session, Some(heartbeat_task), Some(supplier_drain)).await;
         assert!(matches!(
-            result
-                .as_ref()
-                .err()
-                .map(|error| ShareError::classify(error)),
+            result.as_ref().err().map(ShareError::classify),
             Some(ShareError::StateUnavailable)
         ));
         assert!(drain_called.load(std::sync::atomic::Ordering::SeqCst));
@@ -793,6 +865,256 @@ mod tests {
 
         drop(owned);
         member.shutdown().await.unwrap();
+        owner.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recovery_open_skips_supplier_and_heartbeat_for_revoked_member() {
+        let name = "shared::tests::recovery_open_skips_supplier_and_heartbeat_for_revoked_member";
+        if std::env::var("DW_MANAGED_RECOVERY_OPEN_CHILD")
+            .ok()
+            .as_deref()
+            != Some(name)
+        {
+            let home = tempfile::tempdir().expect("isolated home");
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture"])
+                .env("DW_MANAGED_RECOVERY_OPEN_CHILD", name)
+                .env("HOME", home.path())
+                .env("USERPROFILE", home.path())
+                .status()
+                .expect("run isolated recovery-open test");
+            assert!(status.success());
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("test root");
+        let owner = ShareService::open(
+            temp.path().join("owner-service"),
+            deltaweave_net::NetworkMode::DirectOnly,
+            None,
+        )
+        .await
+        .unwrap();
+        let member = ShareService::open(
+            temp.path().join("member-service"),
+            deltaweave_net::NetworkMode::DirectOnly,
+            None,
+        )
+        .await
+        .unwrap();
+        let owned = owner
+            .create_owned_share(
+                "Recovery open".into(),
+                temp.path().join("owner-root"),
+                temp.path().join("owner-state"),
+                None,
+                0,
+            )
+            .await
+            .unwrap();
+        let share = owned.config().share_id;
+        member
+            .enroll(
+                &owned
+                    .issue_key(Permission::ReadWrite, None, owner.endpoint_addr())
+                    .unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+        let config = ManagedSyncConfig {
+            root: temp.path().join("member-root"),
+            state_root: temp.path().join("member-state"),
+            profile: ChunkingProfile::DEFAULT,
+            min_free_space_bytes: 0,
+        };
+        let active =
+            ManagedSyncEngine::open(&member, owner.endpoint_id(), share, config.clone()).unwrap();
+        active.shutdown().await.unwrap();
+        owned
+            .revoke_member_strong(member.endpoint_id())
+            .await
+            .unwrap();
+
+        let normal = ManagedSyncEngine::open(&member, owner.endpoint_id(), share, config.clone())
+            .expect("the retained local relationship can still open before heartbeat refresh");
+        let normal_error = normal
+            .sync_once(None)
+            .await
+            .expect_err("normal sync must fail closed after owner revocation");
+        assert!(matches!(
+            ShareError::classify(&normal_error),
+            ShareError::MemberRevoked | ShareError::Offline | ShareError::Busy
+        ));
+        normal.shutdown().await.unwrap();
+
+        let recovery =
+            ManagedSyncEngine::open_recovery(&member, owner.endpoint_id(), share, config.clone())
+                .expect("recovery open must retain exact local state after revoke");
+        assert!(recovery.recover_pending().await.is_ok());
+        let normal_sync_error = recovery
+            .sync_once(None)
+            .await
+            .expect_err("recovery-only engine must reject normal sync");
+        assert_eq!(
+            ShareError::classify(&normal_sync_error),
+            ShareError::PermissionDenied
+        );
+        recovery.shutdown().await.unwrap();
+
+        // Recovery must not recreate a missing public namespace merely because
+        // the private index and CAS still exist.
+        std::fs::remove_dir_all(&config.root).unwrap();
+        assert!(
+            ManagedSyncEngine::open_recovery(&member, owner.endpoint_id(), share, config).is_err()
+        );
+        assert!(!temp.path().join("member-root").exists());
+
+        drop(owned);
+        member.shutdown().await.unwrap();
+        owner.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recovery_open_drains_persisted_apply_after_restart_and_revoke() {
+        let name = "shared::tests::recovery_open_drains_persisted_apply_after_restart_and_revoke";
+        if std::env::var("DW_MANAGED_APPLY_RECOVERY_CHILD")
+            .ok()
+            .as_deref()
+            != Some(name)
+        {
+            let home = tempfile::tempdir().expect("isolated home");
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture"])
+                .env("DW_MANAGED_APPLY_RECOVERY_CHILD", name)
+                .env("HOME", home.path())
+                .env("USERPROFILE", home.path())
+                .status()
+                .expect("run isolated apply recovery test");
+            assert!(status.success());
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("test root");
+        let owner_path = temp.path().join("owner-service");
+        let member_path = temp.path().join("member-service");
+        let owner = ShareService::open(&owner_path, deltaweave_net::NetworkMode::DirectOnly, None)
+            .await
+            .unwrap();
+        let member =
+            ShareService::open(&member_path, deltaweave_net::NetworkMode::DirectOnly, None)
+                .await
+                .unwrap();
+        let owned = owner
+            .create_owned_share(
+                "Apply recovery".into(),
+                temp.path().join("owner-root"),
+                temp.path().join("owner-state"),
+                None,
+                0,
+            )
+            .await
+            .unwrap();
+        let share = owned.config().share_id;
+        member
+            .enroll(
+                &owned
+                    .issue_key(Permission::ReadWrite, None, owner.endpoint_addr())
+                    .unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let config = ManagedSyncConfig {
+            root: temp.path().join("member-root"),
+            state_root: temp.path().join("member-state"),
+            profile: ChunkingProfile::DEFAULT,
+            min_free_space_bytes: 0,
+        };
+        let engine =
+            ManagedSyncEngine::open(&member, owner.endpoint_id(), share, config.clone()).unwrap();
+        let session = member.open_session(owner.endpoint_id(), share).unwrap();
+        let empty = MerkleTree::from_records(Vec::new()).unwrap();
+        let snapshot = session.fetch_authoritative_snapshot(&empty).await.unwrap();
+        let permit = session
+            .revalidate_before_apply(&snapshot.token)
+            .await
+            .unwrap();
+        let operation_id = [0x6a; 16];
+        session.apply_start(&permit, operation_id).await.unwrap();
+        let started = session
+            .apply_status(&permit, Some(operation_id))
+            .await
+            .unwrap();
+        assert!(matches!(started.state, ApplyStateView::Started));
+
+        // The local journal is written after ApplyStart to model response loss
+        // at the boundary where a managed process has to preserve the exact
+        // permit and operation for its next generation.
+        let mut journal = engine
+            .inner
+            .local
+            .load_managed_rw_journal(&session)
+            .unwrap();
+        journal.apply = Some(ManagedApplyJournal {
+            permit: permit.clone(),
+            operation_id,
+            committed: false,
+        });
+        engine
+            .inner
+            .local
+            .save_managed_rw_journal(&journal)
+            .unwrap();
+        engine.shutdown().await.unwrap();
+        drop(session);
+
+        let first_revoke = owned
+            .revoke_member_strong(member.endpoint_id())
+            .await
+            .unwrap();
+        assert!(matches!(
+            first_revoke,
+            deltaweave_net::share::RevocationReceipt::Pending { blockers, .. }
+                if blockers > 0
+        ));
+        member.shutdown().await.unwrap();
+
+        // Reopen the same service and state paths. Recovery is allowed to use
+        // the old exact status/drain binding despite the now-revoked member;
+        // it must not start a heartbeat, supplier, snapshot, or public write.
+        let member =
+            ShareService::open(&member_path, deltaweave_net::NetworkMode::DirectOnly, None)
+                .await
+                .unwrap();
+        let recovery =
+            ManagedSyncEngine::open_recovery(&member, owner.endpoint_id(), share, config).unwrap();
+        recovery.recover_pending().await.unwrap();
+        let reopened_session = member.open_session(owner.endpoint_id(), share).unwrap();
+        let reopened = recovery
+            .inner
+            .local
+            .load_managed_rw_journal(&reopened_session)
+            .unwrap();
+        assert!(
+            reopened.apply.is_none(),
+            "exact drain must clear the local journal"
+        );
+        drop(reopened_session);
+        let completed = owned
+            .revoke_member_strong(member.endpoint_id())
+            .await
+            .unwrap();
+        assert!(matches!(
+            completed,
+            deltaweave_net::share::RevocationReceipt::Complete { .. }
+        ));
+
+        recovery.shutdown().await.unwrap();
+        member.shutdown().await.unwrap();
+        drop(owned);
         owner.shutdown().await.unwrap();
     }
 }
