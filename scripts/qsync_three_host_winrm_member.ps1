@@ -36,14 +36,28 @@ function Emit-Phase {
 
 function Decode-Config {
     param([string]$Encoded)
+    $compressedStream = $null
+    $gzipStream = $null
+    $decodedStream = $null
     try {
         $bytes = [Convert]::FromBase64String($Encoded)
-        $json = [Text.Encoding]::UTF8.GetString($bytes)
+        $compressedStream = [IO.MemoryStream]::new($bytes)
+        $gzipStream = [IO.Compression.GzipStream]::new(
+            $compressedStream,
+            [IO.Compression.CompressionMode]::Decompress
+        )
+        $decodedStream = [IO.MemoryStream]::new()
+        $gzipStream.CopyTo($decodedStream)
+        $json = [Text.Encoding]::UTF8.GetString($decodedStream.ToArray())
         $value = $json | ConvertFrom-Json
         if ($null -eq $value) { throw 'config' }
         return $value
     } catch {
         throw 'config'
+    } finally {
+        if ($null -ne $gzipStream) { $gzipStream.Dispose() }
+        if ($null -ne $compressedStream) { $compressedStream.Dispose() }
+        if ($null -ne $decodedStream) { $decodedStream.Dispose() }
     }
 }
 

@@ -76,6 +76,14 @@ encoded payload는 17,000 bytes, 기존 run_ps command는 17,027 bytes,
 직접 WinRS command는 17,090 bytes였고 command-shell 8,191-byte 경계를 넘었으므로
 이 경로가 필수임을 확인했다.
 
+wrapper의 `ConfigB64`는 gzip으로 압축한 UTF-8 JSON을 Base64로 감싼 형식이며,
+Windows `Decode-Config`도 같은 순서로 Base64 해제 후 gzip 해제를 수행한다. 승인된
+Windows 서버에서 비밀 없는 fixture를 대상으로 이 decoder를 직접 실행한 read-only
+roundtrip은 2026-09-09T04:52:02Z에 authenticated=true, roundtrip=true로 끝났다.
+원격 파일·서비스·identity 변경은 없었고, 결과의 고정 SHA-256만
+`/home/ubuntu/project/DeltaWeave-qsync-evidence/2026-09-09/f-bootstrap/` 아래에
+보존했다.
+
 ## 실행 순서와 판정
 
 ```text
@@ -110,8 +118,9 @@ member discovery, relay session/payload와 `share-swarm/1` payload hook가 실�
 
 ## 검증 범위
 
-현재 source checkpoint의 Linux release binary로 같은 호스트에서 owner와 한 RO
-member subprocess를 실제 실행한 smoke는 2026-09-09T04:37:46Z~04:37:50Z에
+source `7fdc98b84929c07d7f2a3e26939cb46a6199fa2a`에서 빌드한 Linux release binary로
+같은 호스트에서 owner와 한 RO member subprocess를 실제 실행한 smoke는
+2026-09-09T04:37:46Z~04:37:50Z에
 owner create → RO key 발급 → preview → online validate → join → fixture file
 SHA-256/크기 확인까지 모두 통과했다. binary SHA-256은
 `7df0b2002d2b3b41f09870281f63e834a41c4d41557e241fd448a159d661e503`, 크기는

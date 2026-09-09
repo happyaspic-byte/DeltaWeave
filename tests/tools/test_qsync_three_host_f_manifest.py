@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import base64
+import gzip
 import hashlib
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -292,6 +295,28 @@ class QsyncRoleManifestTests(unittest.TestCase):
         with self.assertRaises(BOOTSTRAP.HarnessError) as error:
             BOOTSTRAP._run_winrm_powershell(NoRunSession(), "x" * 20000)
         self.assertEqual(error.exception.error_class, "api_response_invalid")
+
+    def test_winrm_config_payload_matches_gzip_decoder_contract(self) -> None:
+        script = (ROOT / "scripts" / "qsync_three_host_winrm_member.ps1").read_text(encoding="utf-8")
+        config = {
+            "artifact_url": "https://example.invalid/a",
+            "artifact_sha256": "a" * 64,
+            "artifact_size": "33190912",
+            "owner_base_uri": "https://owner.invalid",
+            "share_key": "b" * 64,
+            "destination_root": r"C:\DeltaWeave-QSync-F-opaque\member-files",
+            "expected_file_hash": "c" * 64,
+            "expected_file_name": "fixture-a.bin",
+        }
+        wrapper = BOOTSTRAP._winrm_wrapper(script, config)
+        encoded_match = re.search(r"-ConfigB64 '([A-Za-z0-9+/=]+)'$", wrapper)
+        self.assertIsNotNone(encoded_match)
+        assert encoded_match is not None
+        decoded = json.loads(gzip.decompress(base64.b64decode(encoded_match.group(1))).decode("utf-8"))
+        self.assertEqual(decoded, config)
+        decoder = script[script.index("function Decode-Config") : script.index("function Assert-Config")]
+        self.assertIn("GzipStream", decoder)
+        self.assertIn("CompressionMode]::Decompress", decoder)
 
 
 if __name__ == "__main__":
