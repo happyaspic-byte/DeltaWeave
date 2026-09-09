@@ -571,6 +571,36 @@ async fn run_managed_swarm_assignment(
     ManagedSwarmOutcome { assignment, result }
 }
 
+/// Converts a completed managed swarm attempt into typed drain evidence before
+/// the owner-side receipt is allowed to terminalize the durable intent.  The
+/// public Store points at `<state_root>/store`; the admission lease binds its
+/// parent private root, so pass the exact lease root rather than the nested
+/// CAS directory.
+async fn recover_managed_swarm_assignment(
+    local: &ReplicaState,
+    session: &ShareSession,
+    assignment: &ManagedSwarmAssignment,
+) -> Result<deltaweave_net::share::ClientIntentRow> {
+    let state_root = local
+        .store
+        .state_root()
+        .parent()
+        .context(ShareError::StateUnavailable)?
+        .to_path_buf();
+    let proof = session
+        .prove_local_io_drained(
+            &assignment.grant,
+            assignment.operation_id,
+            Arc::clone(&local._root_lease),
+            &local.root,
+            state_root,
+        )
+        .await?;
+    session
+        .recover_swarm_intent_with_proof(&assignment.grant, assignment.operation_id, &proof)
+        .await
+}
+
 impl SyncEngine {
     /// Opens durable state after rejecting overlapping public and private roots.
     pub fn open(config: SyncConfig) -> Result<Self> {
@@ -1883,13 +1913,12 @@ impl ReplicaState {
                                             ),
                                             ShareError::RevocationPending
                                         );
-                                        let recovered = session
-                                            .recover_swarm_intent(
-                                                &assignments[index].grant,
-                                                assignments[index].operation_id,
-                                                true,
-                                            )
-                                            .await?;
+                                        let recovered = recover_managed_swarm_assignment(
+                                            self,
+                                            session,
+                                            &assignments[index],
+                                        )
+                                        .await?;
                                         ensure!(
                                             matches!(
                                                 recovered.phase,
@@ -1905,13 +1934,12 @@ impl ReplicaState {
                                         // pending while the owner is offline;
                                         // either result is safer than starting
                                         // another grant under a stale round.
-                                        let recovered = session
-                                            .recover_swarm_intent(
-                                                &assignments[index].grant,
-                                                assignments[index].operation_id,
-                                                true,
-                                            )
-                                            .await?;
+                                        let recovered = recover_managed_swarm_assignment(
+                                            self,
+                                            session,
+                                            &assignments[index],
+                                        )
+                                        .await?;
                                         ensure!(
                                             matches!(
                                                 recovered.phase,

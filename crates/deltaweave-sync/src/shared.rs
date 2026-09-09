@@ -400,8 +400,48 @@ async fn recover_managed_durable_state(inner: &ManagedInner) -> Result<()> {
     // exact activation/receipt state before any local apply journal is
     // considered complete, while still allowing both operations when the
     // owner has paused or revoked new admission.
-    let recovered = inner.session.recover_swarm_intents(true).await?;
-    ensure_managed_swarm_recovery_complete(&recovered)?;
+    let recovered = inner.session.recover_swarm_intents(false).await?;
+    let mut terminal = Vec::with_capacity(recovered.len());
+    for row in recovered {
+        if matches!(
+            row.phase,
+            deltaweave_net::share::ClientIntentPhase::Drained
+                | deltaweave_net::share::ClientIntentPhase::Cancelled
+        ) {
+            terminal.push(row);
+            continue;
+        }
+
+        // The compatibility boolean is intentionally not accepted as drain
+        // evidence.  Close this exact operation in the service-owned task
+        // registry, bind it to the same managed lease, and only then permit
+        // the owner receipt to terminalize the durable row.  A paused or
+        // revoked owner may still answer this recovery query; no heartbeat or
+        // new payload admission is needed here.
+        let state_root = inner
+            .local
+            .store
+            .state_root()
+            .parent()
+            .context(ShareError::StateUnavailable)?
+            .to_path_buf();
+        let proof = inner
+            .session
+            .prove_local_io_drained(
+                &row.grant,
+                row.operation_id,
+                Arc::clone(&inner.local._root_lease),
+                &inner.local.root,
+                state_root,
+            )
+            .await?;
+        let recovered = inner
+            .session
+            .recover_swarm_intent_with_proof(&row.grant, row.operation_id, &proof)
+            .await?;
+        terminal.push(recovered);
+    }
+    ensure_managed_swarm_recovery_complete(&terminal)?;
     // A managed ApplyStart can also be left in the member's private index
     // after response loss.  Recover it before roster liveness: heartbeat is
     // an admission check and may correctly fail for a paused/revoked owner.

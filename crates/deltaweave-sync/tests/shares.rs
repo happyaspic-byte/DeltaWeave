@@ -1,6 +1,6 @@
 use deltaweave_core::ChunkingProfile;
 use deltaweave_net::{NetworkMode, TransferEvent, TransferObserver, share::*};
-use deltaweave_sync::{ManagedSyncConfig, ManagedSyncEngine, ManagedSyncFailure};
+use deltaweave_sync::{ManagedSyncConfig, ManagedSyncEngine};
 use std::collections::BTreeSet;
 use std::fs;
 use std::sync::{Arc, Mutex};
@@ -197,12 +197,10 @@ fn managed_read_only_uses_owner_and_member_suppliers_for_real_chunks() {
                         payload.push((state >> 24) as u8);
                     }
                 }
-                fs::write(base.join("owner-root/payload.bin"), &payload).unwrap();
-                owned.refresh_inventory().await.unwrap();
                 let provider_grant = provider
                     .enroll(
                         &owned
-                            .issue_key(Permission::ReadOnly, None, owner.endpoint_addr())
+                            .issue_key(Permission::ReadWrite, None, owner.endpoint_addr())
                             .unwrap(),
                         None,
                     )
@@ -215,6 +213,14 @@ fn managed_read_only_uses_owner_and_member_suppliers_for_real_chunks() {
                     config(base, "provider"),
                 )
                 .unwrap();
+                fs::write(base.join("provider-root/payload.bin"), &payload).unwrap();
+                let provider_report = provider_engine.sync_read_write(None).await.unwrap();
+                assert!(provider_report.pushed_bytes > 0);
+
+                // The owner's inventory is authoritative, but an owner root
+                // scan alone does not populate its CAS.  Uploading through the
+                // authenticated RW member above makes both selected suppliers
+                // real CAS sources for the subsequent RO transfer.
                 let probe = provider
                     .open_session(provider_grant.owner, provider_grant.share_id)
                     .unwrap();
@@ -242,13 +248,7 @@ fn managed_read_only_uses_owner_and_member_suppliers_for_real_chunks() {
                     .collect();
                 assert!(probe_hashes.len() >= 2);
                 assert!(probe_manifest.manifest.chunks.len() <= 64);
-                let probe_hashes: Vec<_> = probe_manifest
-                    .manifest
-                    .chunks
-                    .iter()
-                    .map(|chunk| chunk.hash)
-                    .collect();
-                let mut probe_hashes = probe_hashes;
+                let mut probe_hashes: Vec<_> = probe_hashes.into_iter().collect();
                 probe_hashes.sort();
                 probe
                     .request_swarm_grant(
@@ -260,27 +260,6 @@ fn managed_read_only_uses_owner_and_member_suppliers_for_real_chunks() {
                     .await
                     .unwrap();
                 probe.close().await;
-                let provider_events = Arc::new(Mutex::new(Vec::<TransferEvent>::new()));
-                let provider_observed = Arc::clone(&provider_events);
-                let provider_observer = TransferObserver::new(move |event| {
-                    provider_observed.lock().expect("observer lock").push(event);
-                });
-                let provider_result = provider_engine
-                    .sync_read_only(Some(provider_observer))
-                    .await;
-                let provider_report = provider_result.unwrap_or_else(|error| {
-                    let phases: Vec<_> = provider_events
-                        .lock()
-                        .expect("observer lock")
-                        .iter()
-                        .map(|event| event.phase.clone())
-                        .collect();
-                    panic!(
-                        "provider sync class={:?} phases={phases:?}",
-                        ManagedSyncFailure::classify(&error)
-                    );
-                });
-                assert!(provider_report.pulled_bytes > 0);
                 let consumer_grant = consumer
                     .enroll(
                         &owned
@@ -330,24 +309,7 @@ fn managed_read_only_uses_owner_and_member_suppliers_for_real_chunks() {
                     .filter_map(|(_, event)| event.peer.as_deref())
                     .collect();
                 assert!(started_peers.len() >= 2);
-                if verified_peers.len() < 2 {
-                    let owner_peer = owner.endpoint_id().to_string();
-                    let summary: Vec<_> = events
-                        .iter()
-                        .map(|event| {
-                            (
-                                event.phase.as_str(),
-                                event.bytes,
-                                match event.peer.as_deref() {
-                                    Some(peer) if peer == owner_peer => "owner",
-                                    Some(_) => "member",
-                                    None => "none",
-                                },
-                            )
-                        })
-                        .collect();
-                    panic!("provider event summary={summary:?}");
-                }
+                assert!(verified_peers.len() >= 2);
                 assert!(starts.len() >= 2);
                 assert!(verified.first().is_some_and(|(first_verified, _)| {
                     starts.iter().all(|(started, _)| started < first_verified)
