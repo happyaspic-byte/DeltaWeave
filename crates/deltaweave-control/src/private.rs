@@ -32,30 +32,57 @@ pub(crate) fn prepare_directory(path: &Path) -> io::Result<()> {
         return Err(permission_error(PRIVATE_ERROR));
     }
 
-    reject_reparse_components(path)?;
+    if let Err(error) = reject_reparse_components(path) {
+        #[cfg(windows)]
+        log_acl_diagnostic("pre_reparse", None);
+        return Err(error);
+    }
     let existed = match fs::symlink_metadata(path) {
         Ok(metadata) => {
             validate_directory_metadata(&metadata)?;
             true
         }
         Err(error) if error.kind() == ErrorKind::NotFound => false,
-        Err(error) => return Err(safe_io_error(error, PRIVATE_ERROR)),
+        Err(error) => {
+            #[cfg(windows)]
+            log_acl_diagnostic("metadata", None);
+            return Err(safe_io_error(error, PRIVATE_ERROR));
+        }
     };
 
     if !existed {
-        create_private_leaf(path).map_err(|error| {
+        let created = create_private_leaf(path).map_err(|error| {
             if error.kind() == ErrorKind::NotFound {
                 safe_io_error(error, PRIVATE_MISSING_PARENT)
             } else {
                 safe_io_error(error, PRIVATE_ERROR)
             }
-        })?;
+        });
+        if let Err(error) = created {
+            #[cfg(windows)]
+            log_acl_diagnostic("create", None);
+            return Err(error);
+        }
         // A concurrent replacement must not turn the chmod/ACL operation into
         // an operation on an attacker-selected link or reparse point.
-        reject_reparse_components(path)?;
-        let metadata =
-            fs::symlink_metadata(path).map_err(|error| safe_io_error(error, PRIVATE_ERROR))?;
-        validate_directory_kind(&metadata)?;
+        if let Err(error) = reject_reparse_components(path) {
+            #[cfg(windows)]
+            log_acl_diagnostic("post_create_reparse", None);
+            return Err(error);
+        }
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(value) => value,
+            Err(error) => {
+                #[cfg(windows)]
+                log_acl_diagnostic("post_create_metadata", None);
+                return Err(safe_io_error(error, PRIVATE_ERROR));
+            }
+        };
+        if let Err(error) = validate_directory_kind(&metadata) {
+            #[cfg(windows)]
+            log_acl_diagnostic("post_create_validate", None);
+            return Err(error);
+        }
     }
 
     #[cfg(unix)]
