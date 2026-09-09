@@ -167,8 +167,14 @@ const fn is_reparse_point(_metadata: &fs::Metadata) -> bool {
 #[cfg(windows)]
 fn prepare_windows_acl(path: &Path, allow_initial_repair: bool) -> io::Result<()> {
     let powershell =
-        trusted_windows_executable(Path::new("WindowsPowerShell\\v1.0\\powershell.exe"))?;
-    let output = std::process::Command::new(powershell)
+        match trusted_windows_executable(Path::new("WindowsPowerShell\\v1.0\\powershell.exe")) {
+            Ok(value) => value,
+            Err(error) => {
+                log_acl_diagnostic("trusted_executable", None);
+                return Err(error);
+            }
+        };
+    let output = match std::process::Command::new(powershell)
         .args([
             "-NoLogo",
             "-NoProfile",
@@ -185,21 +191,55 @@ fn prepare_windows_acl(path: &Path, allow_initial_repair: bool) -> io::Result<()
         )
         .stdin(std::process::Stdio::null())
         .output()
-        .map_err(|error| safe_io_error(error, PRIVATE_ERROR))?;
+    {
+        Ok(value) => value,
+        Err(error) => {
+            log_acl_diagnostic("spawn", None);
+            return Err(safe_io_error(error, PRIVATE_ERROR));
+        }
+    };
 
     if !output.status.success() {
         // Do not return PowerShell's path-bearing or localized output.  The
         // caller only needs a fail-closed security result.
+        log_acl_diagnostic("script", output.status.code());
         return Err(permission_error(PRIVATE_ERROR));
     }
 
     // Check the leaf again after the external ACL operation.  This does not
     // replace the fixed-path ownership contract, but makes an observed
     // reparse replacement fail before any secret write is attempted.
-    reject_reparse_components(path)?;
-    let metadata =
-        fs::symlink_metadata(path).map_err(|error| safe_io_error(error, PRIVATE_ERROR))?;
-    validate_directory_metadata(&metadata)
+    if let Err(error) = reject_reparse_components(path) {
+        log_acl_diagnostic("post_reparse", None);
+        return Err(error);
+    }
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(value) => value,
+        Err(error) => {
+            log_acl_diagnostic("post_metadata", None);
+            return Err(safe_io_error(error, PRIVATE_ERROR));
+        }
+    };
+    if let Err(error) = validate_directory_metadata(&metadata) {
+        log_acl_diagnostic("post_validate", None);
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn log_acl_diagnostic(stage: &'static str, exit_code: Option<i32>) {
+    if std::env::var("DELTAWEAVE_PRIVATE_ACL_DIAGNOSTICS")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        return;
+    }
+    match exit_code {
+        Some(code) => eprintln!("managed private ACL diagnostic: stage={stage} exit_code={code}"),
+        None => eprintln!("managed private ACL diagnostic: stage={stage}"),
+    }
 }
 
 #[cfg(windows)]

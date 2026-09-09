@@ -74,6 +74,7 @@ jobs:
     timeout-minutes: 30
     env:
       DELTAWEAVE_WATCH_DIAGNOSTICS: '1'
+      DELTAWEAVE_PRIVATE_ACL_DIAGNOSTICS: '1'
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: actions/setup-node@v4
