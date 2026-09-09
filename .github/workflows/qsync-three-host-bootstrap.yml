@@ -1,0 +1,183 @@
+name: QSync three-host bootstrap
+
+on:
+  workflow_call:
+    inputs:
+      source_sha:
+        description: 'Exact source commit to verify'
+        required: true
+        type: string
+      native_artifact_run_id:
+        description: 'Workflow run that uploaded the passing Windows native artifact'
+        required: true
+        type: string
+      expected_file_hash:
+        description: 'SHA-256 of the owner fixture selected for this run'
+        required: true
+        type: string
+      execute_ro:
+        description: 'Run the hosted Ubuntu read-only role against the supplied owner'
+        required: false
+        default: false
+        type: boolean
+    secrets:
+      QSYNC_F_RO_SHARE_KEY:
+        required: false
+      QSYNC_F_WINRM_USERNAME:
+        required: false
+      QSYNC_F_WINRM_PASSWORD:
+        required: false
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: 'Exact source commit to verify'
+        required: true
+        type: string
+      native_artifact_run_id:
+        description: 'Workflow run that uploaded the passing Windows native artifact'
+        required: true
+        type: string
+      expected_file_hash:
+        description: 'SHA-256 of the owner fixture selected for this run'
+        required: true
+        type: string
+      execute_ro:
+        description: 'Run the hosted Ubuntu read-only role against the supplied owner'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  provenance-and-linux-build:
+    name: F provenance and Linux role build
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      role_manifest: ${{ steps.role-manifest.outputs.path }}
+    steps:
+      - name: Validate immutable inputs
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          NATIVE_RUN_ID: ${{ inputs.native_artifact_run_id }}
+          EXPECTED_HASH: ${{ inputs.expected_file_hash }}
+        run: |
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$NATIVE_RUN_ID" =~ ^[0-9]+$ ]]
+          [[ "$EXPECTED_HASH" =~ ^[0-9a-f]{64}$ ]]
+      - name: Checkout selected source
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Check checkout SHA
+        env:
+          EXPECTED_SHA: ${{ inputs.source_sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          test "${#EXPECTED_SHA}" -eq 40
+      - name: Download passing Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: qsync-native-windows-${{ inputs.native_artifact_run_id }}
+          path: native-artifact
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.native_artifact_run_id }}
+      - name: Verify Windows artifact
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          python3 scripts/qsync_three_host_bootstrap.py validate-artifact \
+            --source-sha "$SOURCE_SHA" \
+            --manifest "$PWD/native-artifact/native-verification-manifest.json" \
+            --binary "$PWD/native-artifact/deltaweave.exe"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Build dashboard assets
+        run: |
+          npm --prefix web ci
+          npm --prefix web run build
+      - uses: dtolnay/rust-toolchain@1.91.0
+      - name: Build Linux role binary
+        env:
+          DELTAWEAVE_REQUIRE_WEB_ASSETS: '1'
+        run: cargo build --locked --release -p deltaweave
+      - name: Create role-specific manifest
+        id: role-manifest
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          python3 scripts/qsync_make_role_manifest.py \
+            --source-sha "$SOURCE_SHA" \
+            --windows-manifest "$PWD/native-artifact/native-verification-manifest.json" \
+            --windows-binary "$PWD/native-artifact/deltaweave.exe" \
+            --linux-binary "$PWD/target/release/deltaweave" \
+            --output "$PWD/f-role-manifest.json"
+          echo "path=$PWD/f-role-manifest.json" >> "$GITHUB_OUTPUT"
+      - name: Upload F provenance and Linux binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: qsync-f-linux-role-${{ github.run_id }}
+          path: |
+            target/release/deltaweave
+            f-role-manifest.json
+          if-no-files-found: error
+          retention-days: 7
+
+  hosted-ro-consumer:
+    name: F hosted Ubuntu read-only consumer
+    if: ${{ inputs.execute_ro }}
+    needs: provenance-and-linux-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout selected source
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Download Linux role binary and manifest
+        uses: actions/download-artifact@v4
+        with:
+          name: qsync-f-linux-role-${{ github.run_id }}
+          path: f-linux
+      - name: Verify Linux role artifact
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          chmod u+x "$PWD/f-linux/deltaweave"
+          python3 scripts/qsync_three_host_bootstrap.py validate-artifact \
+            --source-sha "$SOURCE_SHA" \
+            --manifest "$PWD/f-linux/f-role-manifest.json" \
+            --binary "$PWD/f-linux/deltaweave" \
+            --role ro_consumer
+      - name: Run hosted read-only role
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          EXPECTED_HASH: ${{ inputs.expected_file_hash }}
+          QSYNC_F_RO_SHARE_KEY: ${{ secrets.QSYNC_F_RO_SHARE_KEY }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/qsync-f-evidence"
+          python3 scripts/qsync_three_host_role.py \
+            --source-sha "$SOURCE_SHA" \
+            --manifest "$PWD/f-linux/f-role-manifest.json" \
+            --binary "$PWD/f-linux/deltaweave" \
+            --run-parent "$RUNNER_TEMP" \
+            --evidence-dir "$RUNNER_TEMP/qsync-f-evidence" \
+            --share-key-env QSYNC_F_RO_SHARE_KEY \
+            --expected-file-hash "$EXPECTED_HASH"
+      - name: Upload safe read-only evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qsync-f-ro-evidence-${{ github.run_id }}
+          path: ${{ runner.temp }}/qsync-f-evidence
+          if-no-files-found: error
+          retention-days: 7

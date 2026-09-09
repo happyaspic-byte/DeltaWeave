@@ -5,6 +5,17 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      qsync_three_host:
+        description: 'Run the gated F three-host bootstrap jobs'
+        required: false
+        default: false
+        type: boolean
+      qsync_three_host_execute:
+        description: 'Use the supplied owner/key secrets for the hosted RO role'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -151,3 +162,17 @@ jobs:
   qsync-native-artifact:
     if: github.event_name == 'workflow_dispatch'
     uses: ./.github/workflows/qsync-native-artifact.yml
+
+  qsync-three-host-bootstrap:
+    if: github.event_name == 'workflow_dispatch' && inputs.qsync_three_host == true
+    needs: qsync-native-artifact
+    uses: ./.github/workflows/qsync-three-host-bootstrap.yml
+    with:
+      source_sha: ${{ github.sha }}
+      native_artifact_run_id: ${{ github.run_id }}
+      expected_file_hash: 8b666f88f7b033f647f9b5ae66d668b7bb88376630dbecfb0fba757f4f84334c
+      execute_ro: ${{ inputs.qsync_three_host_execute }}
+    secrets:
+      QSYNC_F_RO_SHARE_KEY: ${{ secrets.QSYNC_F_RO_SHARE_KEY }}
+      QSYNC_F_WINRM_USERNAME: ${{ secrets.QSYNC_F_WINRM_USERNAME }}
+      QSYNC_F_WINRM_PASSWORD: ${{ secrets.QSYNC_F_WINRM_PASSWORD }}
