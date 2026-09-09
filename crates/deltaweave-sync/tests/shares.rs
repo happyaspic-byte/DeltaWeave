@@ -976,6 +976,14 @@ fn authenticated_owner_rollback_divergence_and_missing_tombstones_are_rejected()
                 let session = member.open_session(grant.owner, grant.share_id).unwrap();
                 let empty = MerkleTree::from_records(Vec::new()).unwrap();
                 let old = session.fetch_snapshot(&empty).await.unwrap().records;
+                // Capture a real owner-signed roster before replacing the
+                // owner endpoint. The resumed managed engine performs the D3
+                // roster and heartbeat exchange before each snapshot; the
+                // hostile transport below must answer those operations as
+                // well so the three snapshot attempts still reach the
+                // rollback, divergence, and missing-tombstone checks.
+                let roster = session.refresh_roster().await.unwrap();
+                let roster_challenge = session.roster_challenge().unwrap();
                 fs::write(base.path().join("owner-root/file"), b"trusted new owner").unwrap();
                 engine.sync_read_only(None).await.unwrap();
                 let mut divergent = session.fetch_snapshot(&empty).await.unwrap().records;
@@ -1008,6 +1016,7 @@ fn authenticated_owner_rollback_divergence_and_missing_tombstones_are_rejected()
                 let address = iroh::EndpointAddr::new(endpoint.id())
                     .with_ip_addr(endpoint.bound_sockets()[0]);
                 let resumed_membership = grant.clone();
+                let roster_for_control = roster.clone();
                 let serving = endpoint.clone();
                 let responses = tokio::spawn(async move {
                     // Authenticate the address update through the real resume
@@ -1025,9 +1034,44 @@ fn authenticated_owner_rollback_divergence_and_missing_tombstones_are_rejected()
                     connection.closed().await;
                     for records in [old, divergent, Vec::new()] {
                         let tree = MerkleTree::from_records(records).unwrap();
-                        let connection = serving.accept().await.unwrap().await.unwrap();
-                        let (mut send, mut receive) = connection.accept_bi().await.unwrap();
-                        raw_read(&mut receive).await;
+                        // D3 liveness control is independent from the data
+                        // sync gate. Route its two share-control operations by
+                        // the serialized Operation tag, then continue with
+                        // the legacy Session/QueryNode exchange for this
+                        // snapshot attempt.
+                        let (connection, mut send) = loop {
+                            let connection = serving.accept().await.unwrap().await.unwrap();
+                            let (mut send, mut receive) = connection.accept_bi().await.unwrap();
+                            let hello = raw_read(&mut receive).await;
+                            let operation = hello.get(33).copied().unwrap_or(u8::MAX);
+                            match operation {
+                                4 => {
+                                    raw_write(
+                                        &mut send,
+                                        &postcard::to_stdvec(&(
+                                            5_u32,
+                                            roster_for_control.clone(),
+                                            roster_challenge,
+                                        ))
+                                        .unwrap(),
+                                    )
+                                    .await;
+                                    send.finish().unwrap();
+                                    connection.closed().await;
+                                }
+                                5 => {
+                                    raw_write(
+                                        &mut send,
+                                        &postcard::to_stdvec(&(6_u32, roster_for_control.clone()))
+                                            .unwrap(),
+                                    )
+                                    .await;
+                                    send.finish().unwrap();
+                                    connection.closed().await;
+                                }
+                                _ => break (connection, send),
+                            }
+                        };
                         raw_write(&mut send, &[2]).await;
                         send.finish().unwrap();
                         let (mut send, mut receive) = connection.accept_bi().await.unwrap();
