@@ -110,7 +110,7 @@ function Decode-Config {
 
 function Assert-Config {
     param($Value)
-    $required = @('artifact_url', 'artifact_sha256', 'artifact_size', 'owner_base_uri', 'share_key', 'destination_root', 'expected_file_hash', 'expected_file_name', 'expected_permission')
+    $required = @('artifact_url', 'artifact_sha256', 'artifact_size', 'owner_base_uri', 'share_key', 'destination_root', 'expected_file_hash', 'expected_file_size', 'expected_file_name', 'expected_permission')
     foreach ($name in $required) {
         $item = [string]$Value.$name
         if ([string]::IsNullOrWhiteSpace($item)) { throw 'config' }
@@ -118,6 +118,7 @@ function Assert-Config {
     if ([string]$Value.artifact_sha256 -notmatch '^[0-9a-f]{64}$') { throw 'config' }
     if ([string]$Value.artifact_size -notmatch '^[1-9][0-9]*$') { throw 'config' }
     if ([string]$Value.expected_file_hash -notmatch '^[0-9a-f]{64}$') { throw 'config' }
+    if ([string]$Value.expected_file_size -notmatch '^[1-9][0-9]{0,8}$') { throw 'config' }
     if ([string]$Value.destination_root -notmatch '^[A-Za-z]:\\[^\x00\r\n]+$') { throw 'config' }
     if ([string]$Value.expected_file_name -notmatch '^[A-Za-z0-9._-]{1,128}$') { throw 'config' }
     if ([string]$Value.expected_permission -notmatch '^(read_only|read_write)$') { throw 'config' }
@@ -761,12 +762,13 @@ try {
         if (Test-Path -LiteralPath $target -PathType Leaf) {
             try {
                 $fileHash = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash.ToLowerInvariant()
-                if ($fileHash -eq [string]$config.expected_file_hash) { $fileOk = $true; break }
+                $fileSize = (Get-Item -LiteralPath $target -Force).Length
+                if ($fileHash -eq [string]$config.expected_file_hash -and $fileSize -eq [int64]$config.expected_file_size) { $fileOk = $true; break }
             } catch { }
         }
         Start-Sleep -Milliseconds 500
     }
-    $fileSize = if ($fileOk) { (Get-Item -LiteralPath $target).Length } else { -1 }
+    $fileSize = if ($fileOk) { (Get-Item -LiteralPath $target -Force).Length } else { -1 }
     Emit-Phase 'file_hash' $fileOk $fileHash $fileSize
     if (-not $fileOk) { throw 'file_hash' }
 
@@ -805,11 +807,12 @@ try {
     $membershipShareOk = $membershipStatusOk -and $null -ne $membership -and [string]$membership.share_id -eq $shareId
     $membershipRoleOk = $membershipShareOk -and [string]$membership.role -eq 'member'
     $membershipPermissionOk = $membershipRoleOk -and [string]$membership.permission -eq [string]$config.expected_permission
-    $fileHashOk = $afterHash -eq [string]$config.expected_file_hash
+    $afterSize = if (Test-Path -LiteralPath $target -PathType Leaf) { (Get-Item -LiteralPath $target -Force).Length } else { -1 }
+    $fileHashOk = $afterHash -eq [string]$config.expected_file_hash -and $afterSize -eq [int64]$config.expected_file_size
     $reopenChecks = [int]$reopenLoginOk + (2 * [int]$membershipStatusOk) + (4 * [int]$membershipShareOk) + (8 * [int]$fileHashOk) + (16 * [int]$membershipRoleOk) + (32 * [int]$membershipPermissionOk)
     Emit-Diagnostic 'reopen_checks' -Count $reopenChecks
     $reopenOk = $reopenLoginOk -and $membershipPermissionOk -and $fileHashOk
-    $afterSize = if ($reopenOk) { (Get-Item -LiteralPath $target).Length } else { -1 }
+    $afterSize = if ($reopenOk) { (Get-Item -LiteralPath $target -Force).Length } else { $afterSize }
     Emit-Phase 'member_reopen_membership' $reopenOk $afterHash $afterSize
     if (-not $reopenOk) { throw 'reopen' }
     $script:AllPassed = $true

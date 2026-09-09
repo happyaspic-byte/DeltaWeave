@@ -32,6 +32,7 @@ def parser() -> argparse.ArgumentParser:
     root.add_argument("--native-manifest", required=True, type=Path)
     root.add_argument("--windows-binary", required=True, type=Path)
     root.add_argument("--expected-file-hash", required=True)
+    root.add_argument("--expected-file-size", required=True, type=int)
     root.add_argument("--evidence-dir", required=True, type=Path)
     root.add_argument("--keepalive-seconds", type=int, default=300)
     return root
@@ -84,6 +85,7 @@ def write_result(
     source_sha: str,
     artifact: dict[str, Any] | None,
     expected_file_hash: str,
+    expected_file_size: int,
     requested: int,
     remote: bootstrap.RemoteRun | None,
     status: str,
@@ -118,7 +120,7 @@ def write_result(
             remote.diagnostic_observed_utc.get("keepalive_done") if remote is not None else None
         ),
         "expected_file_hash": expected_file_hash,
-        "expected_file_size_bytes": bootstrap.FIXTURE_A_SIZE_BYTES,
+        "expected_file_size_bytes": expected_file_size,
         "remote_status_code": remote.status_code if remote is not None else None,
         "remote_phase_count": len(phases),
         "remote_contract_valid": bool(
@@ -129,7 +131,7 @@ def write_result(
                 str(artifact["sha256"]),
                 int(artifact["size_bytes"]),
                 expected_file_hash,
-                bootstrap.FIXTURE_A_SIZE_BYTES,
+                expected_file_size,
                 require_keepalive=True,
             )
         ),
@@ -169,6 +171,8 @@ def run(args: argparse.Namespace) -> int:
         run_id = bootstrap.require_run_id(args.run_id)
         source_sha = bootstrap.require_source_sha(args.source_sha)
         expected_file_hash = bootstrap.require_sha256(args.expected_file_hash)
+        if type(args.expected_file_size) is not int or not 1 <= args.expected_file_size <= 128 * 1024 * 1024:
+            bootstrap.fail("config_invalid")
         if not isinstance(args.keepalive_seconds, int) or not 1 <= args.keepalive_seconds <= 900:
             bootstrap.fail("config_invalid")
         evidence = bootstrap.SafeEvidence(args.evidence_dir, vault)
@@ -221,6 +225,7 @@ def run(args: argparse.Namespace) -> int:
             artifact["size_bytes"],
             vault,
             keepalive_seconds=args.keepalive_seconds,
+            expected_file_size=args.expected_file_size,
         )
         remote_command_finished_utc = bootstrap.utc_now_precise()
         if keepalive_observed(remote, args.keepalive_seconds) and bootstrap.remote_contract_is_complete(
@@ -228,7 +233,7 @@ def run(args: argparse.Namespace) -> int:
             artifact["sha256"],
             artifact["size_bytes"],
             expected_file_hash,
-            bootstrap.FIXTURE_A_SIZE_BYTES,
+            args.expected_file_size,
             require_keepalive=True,
         ):
             status = "pass"
@@ -275,6 +280,7 @@ def run(args: argparse.Namespace) -> int:
                     source_sha=str(args.source_sha),
                     artifact=artifact,
                     expected_file_hash=expected_file_hash if "expected_file_hash" in locals() else "",
+                    expected_file_size=args.expected_file_size,
                     requested=int(args.keepalive_seconds),
                     remote=remote,
                     status=status,

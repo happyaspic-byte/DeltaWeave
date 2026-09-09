@@ -40,6 +40,7 @@ def parser() -> argparse.ArgumentParser:
     root.add_argument("--evidence-dir", required=True, type=Path)
     root.add_argument("--share-key-env", required=True)
     root.add_argument("--expected-file-hash", required=True)
+    root.add_argument("--expected-file-size", required=True, type=int)
     root.add_argument("--expected-file-name", default="fixture-a.bin")
     return root
 
@@ -120,6 +121,8 @@ def _run(argv: list[str] | None = None) -> int:
         evidence = bootstrap.SafeEvidence(args.evidence_dir, vault)
         bootstrap.require_source_sha(args.source_sha)
         expected_hash = bootstrap.require_sha256(args.expected_file_hash)
+        if type(args.expected_file_size) is not int or not 1 <= args.expected_file_size <= 128 * 1024 * 1024:
+            bootstrap.fail("config_invalid")
         if not args.expected_file_name or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", args.expected_file_name):
             bootstrap.fail("config_invalid")
         share_key_env = safe_env(args.share_key_env)
@@ -214,8 +217,9 @@ def _run(argv: list[str] | None = None) -> int:
             while time.monotonic() < deadline:
                 if target.is_file():
                     actual = bootstrap.file_sha256(target)
-                    if actual == expected_hash:
-                        return {"sha256": actual, "size_bytes": target.stat().st_size, "observed": True}
+                    size = target.stat().st_size
+                    if actual == expected_hash and size == args.expected_file_size:
+                        return {"sha256": actual, "size_bytes": size, "observed": True}
                 time.sleep(0.5)
             bootstrap.fail("hash_mismatch")
 
@@ -357,14 +361,7 @@ def _run(argv: list[str] | None = None) -> int:
                 "file_hash_verified": file_hash_verified,
                 "expected_file_hash": expected_hash if "expected_hash" in locals() else None,
                 "expected_file_size_bytes": (
-                    next(
-                        (
-                            value.get("size_bytes")
-                            for value in file_hash_verified.values()
-                            if isinstance(value, dict) and isinstance(value.get("size_bytes"), int)
-                        ),
-                        None,
-                    )
+                    args.expected_file_size if isinstance(getattr(args, "expected_file_size", None), int) else None
                 ),
                 "phases": recorder.phases,
                 "cleanup": cleanup,
