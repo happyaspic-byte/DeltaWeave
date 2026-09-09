@@ -594,6 +594,24 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn admission_created_preparation_requires_an_existing_private_leaf() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = test_directory();
+        let target = root.0.join("managed");
+        assert_eq!(
+            prepare_directory_created(&target)
+                .expect_err("admission-created preparation must not mkdir")
+                .kind(),
+            ErrorKind::NotFound
+        );
+        fs::create_dir(&target).expect("target");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).expect("private mode");
+        prepare_directory_created(&target).expect("existing admission leaf remains valid");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn rejects_symlink_target_and_parent() {
         use std::os::unix::fs::symlink;
 
@@ -633,10 +651,12 @@ mod tests {
         let canonical_parent = fs::canonicalize(&root.0).expect("canonical temp root");
         let target = canonical_parent.join("managed");
 
-        // The first call creates the leaf and validates the real DACL.  A
-        // second call exercises the existing-directory path and proves that a
-        // valid private leaf can be reopened without changing its ACL.
-        prepare_directory(&target).expect("native private directory is prepared");
+        // Simulate admission creating the leaf with inherited permissions,
+        // then use the explicit created-leaf path to apply the initial DACL.
+        fs::create_dir(&target).expect("admission-created target");
+        prepare_directory_created(&target).expect("native private directory is prepared");
+        // A second call exercises the existing-directory path and proves that
+        // a valid private leaf can be reopened without changing its ACL.
         prepare_directory(&target).expect("native preparation is idempotent");
 
         let before = windows_acl_fingerprint(&target).expect("read private ACL");
