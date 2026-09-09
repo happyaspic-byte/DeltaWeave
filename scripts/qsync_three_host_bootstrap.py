@@ -1571,11 +1571,16 @@ def run_winrm_member(
     artifact_size: int,
     vault: SecretVault,
     keepalive_seconds: int = 0,
+    expected_file_size: int | None = None,
 ) -> RemoteRun:
     """Run the approved Windows role over encrypted WinRM without a fake local pass."""
 
     if not isinstance(artifact_size, int) or artifact_size <= 0:
         fail("manifest_invalid")
+    if expected_file_size is None:
+        expected_file_size = FIXTURE_A_SIZE_BYTES
+    if not isinstance(expected_file_size, int) or not 1 <= expected_file_size <= 128 * 1024 * 1024:
+        fail("config_invalid")
     if not isinstance(keepalive_seconds, int) or not 0 <= keepalive_seconds <= 900:
         fail("config_invalid")
     if not all((spec.winrm_host_env, spec.winrm_username_env, spec.winrm_password_env)):
@@ -1606,6 +1611,7 @@ def run_winrm_member(
             "share_key": share_key,
             "destination_root": destination,
             "expected_file_hash": expected_file_hash,
+            "expected_file_size": str(expected_file_size),
             "expected_file_name": "fixture-a.bin",
             "expected_permission": "read_write",
             "keepalive_seconds": str(keepalive_seconds),

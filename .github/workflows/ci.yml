@@ -1,5 +1,7 @@
 name: CI
 
+run-name: DeltaWeave CI qsync-${{ inputs.qsync_three_host_coordination_id || github.run_id }}
+
 on:
   pull_request:
   push:
@@ -26,6 +28,26 @@ on:
         required: false
         default: ''
         type: string
+      qsync_three_host_expected_file_hash:
+        description: 'SHA-256 of the controller-selected deterministic fixture'
+        required: false
+        default: ''
+        type: string
+      qsync_three_host_expected_file_size:
+        description: 'Byte size of the controller-selected deterministic fixture'
+        required: false
+        default: ''
+        type: string
+      qsync_three_host_prebuilt_run_id:
+        description: 'Prepare run whose immutable role artifact is reused by execute'
+        required: false
+        default: ''
+        type: string
+      qsync_three_host_native_artifact_run_id:
+        description: 'Native artifact provenance run (metadata only during execute)'
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -41,6 +63,7 @@ env:
 jobs:
   quality-linux:
     name: Linux quality gates
+    if: github.event_name != 'workflow_dispatch' || inputs.qsync_three_host_execute != true
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -91,6 +114,7 @@ jobs:
 
   test-windows:
     name: Windows tests
+    if: github.event_name != 'workflow_dispatch' || inputs.qsync_three_host_execute != true
     runs-on: windows-latest
     timeout-minutes: 30
     env:
@@ -137,7 +161,7 @@ jobs:
       - run: cargo run --locked --all-features -p deltaweave -- self-test
 
   qsync-private-acl-probe:
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && inputs.qsync_three_host_execute != true
     name: QSync private ACL probe
     runs-on: windows-latest
     timeout-minutes: 10
@@ -170,11 +194,11 @@ jobs:
           exit $LASTEXITCODE
 
   qsync-native-artifact:
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && inputs.qsync_three_host_execute != true
     uses: ./.github/workflows/qsync-native-artifact.yml
 
   qsync-three-host-bootstrap:
-    if: github.event_name == 'workflow_dispatch' && inputs.qsync_three_host == true
+    if: github.event_name == 'workflow_dispatch' && inputs.qsync_three_host == true && inputs.qsync_three_host_execute != true
     needs: qsync-native-artifact
     permissions:
       contents: read
@@ -182,9 +206,30 @@ jobs:
     uses: ./.github/workflows/qsync-three-host-bootstrap.yml
     with:
       source_sha: ${{ github.sha }}
-      native_artifact_run_id: ${{ github.run_id }}
-      expected_file_hash: 8b666f88f7b033f647f9b5ae66d668b7bb88376630dbecfb0fba757f4f84334c
-      execute_ro: ${{ inputs.qsync_three_host_execute }}
+      native_artifact_run_id: ${{ inputs.qsync_three_host_native_artifact_run_id || github.run_id }}
+      expected_file_hash: ${{ inputs.qsync_three_host_expected_file_hash }}
+      expected_file_size: ${{ inputs.qsync_three_host_expected_file_size }}
+      execution_mode: prepare
+      execute_ro: false
+      coordination_run_id: ${{ inputs.qsync_three_host_coordination_id || github.run_id }}
+      ro_share_key_secret_name: ${{ inputs.qsync_three_host_ro_secret_name }}
+    secrets:
+      QSYNC_F_RO_SHARE_KEY: ${{ secrets[inputs.qsync_three_host_ro_secret_name] }}
+
+  qsync-three-host-bootstrap-execute:
+    if: github.event_name == 'workflow_dispatch' && inputs.qsync_three_host == true && inputs.qsync_three_host_execute == true
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/qsync-three-host-bootstrap.yml
+    with:
+      source_sha: ${{ github.sha }}
+      native_artifact_run_id: ${{ inputs.qsync_three_host_native_artifact_run_id }}
+      prebuilt_role_run_id: ${{ inputs.qsync_three_host_prebuilt_run_id }}
+      expected_file_hash: ${{ inputs.qsync_three_host_expected_file_hash }}
+      expected_file_size: ${{ inputs.qsync_three_host_expected_file_size }}
+      execution_mode: execute
+      execute_ro: true
       coordination_run_id: ${{ inputs.qsync_three_host_coordination_id || github.run_id }}
       ro_share_key_secret_name: ${{ inputs.qsync_three_host_ro_secret_name }}
     secrets:
