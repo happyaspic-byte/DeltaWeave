@@ -152,11 +152,19 @@ pub(crate) async fn read_hello(receive: &mut RecvStream) -> Result<Hello> {
     ensure!(postcard::to_stdvec(&hello)? == bytes, ShareError::Protocol);
     Ok(hello)
 }
-pub(crate) async fn exchange(connection: &Connection, hello: Hello) -> Result<Reply> {
+/// Exchanges one frame without collapsing a peer's authenticated protocol
+/// error into the transport result. The caller can therefore distinguish a
+/// received `Reply::Error` (the operation reached the authenticated handler)
+/// from an offline/connect/read failure.
+pub(crate) async fn exchange_raw(connection: &Connection, hello: Hello) -> Result<Reply> {
     let (mut send, mut receive) = connection.open_bi().await?;
     write_frame(&mut send, &hello).await?;
     send.finish()?;
-    let reply = read_frame(&mut receive).await?;
+    read_frame(&mut receive).await
+}
+
+pub(crate) async fn exchange(connection: &Connection, hello: Hello) -> Result<Reply> {
+    let reply = exchange_raw(connection, hello).await?;
     match reply {
         Reply::Error(error) => Err(error.into()),
         other => Ok(other),
