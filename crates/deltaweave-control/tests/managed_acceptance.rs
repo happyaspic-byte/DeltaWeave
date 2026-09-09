@@ -666,7 +666,7 @@ fn managed_memberships_survive_restart_and_status_gates() {
                 })
                 .await
                 .unwrap();
-                let ro_complete = wait_status(&ro, share, ManagedStatus::Complete).await;
+                wait_status(&ro, share, ManagedStatus::Complete).await;
                 let rw_binding_before = binding_snapshot(&rw_data, share);
                 let ro_binding_before = binding_snapshot(&ro_data, share);
                 let members_before = member_summary(owner.list_members(share).await.unwrap());
@@ -679,7 +679,10 @@ fn managed_memberships_survive_restart_and_status_gates() {
                 .await
                 .unwrap();
                 let paused = wait_status(&ro, share, ManagedStatus::Paused).await;
-                assert_eq!(paused.last_sync_at, ro_complete.last_sync_at);
+                // The pause transition is the durable observation baseline;
+                // a final tick may have advanced `last_sync_at` after the
+                // earlier Complete snapshot was read.
+                let paused_last_sync_at = paused.last_sync_at;
 
                 let rw_member = owner
                     .list_members(share)
@@ -719,7 +722,7 @@ fn managed_memberships_survive_restart_and_status_gates() {
                 let ro_view = ro_reopened.snapshot().await.shares[0].clone();
                 assert_eq!(rw_view.status, ManagedStatus::Revoked);
                 assert_eq!(ro_view.status, ManagedStatus::Paused);
-                assert_eq!(ro_view.last_sync_at, ro_complete.last_sync_at);
+                assert_eq!(ro_view.last_sync_at, paused_last_sync_at);
                 assert_eq!(binding_snapshot(&rw_data, share), rw_binding_before);
                 assert_eq!(binding_snapshot(&ro_data, share), ro_binding_before);
                 assert_eq!(
@@ -777,7 +780,11 @@ fn managed_pending_resume_survives_ticket_loss_and_owner_offline() {
                         request_id: "expiring-key".into(),
                         share,
                         permission: Permission::ReadWrite,
-                        expires_at: Some(now_seconds().saturating_add(2)),
+                        // Windows private-namespace preparation can take
+                        // several seconds. Keep enough bounded lifetime for
+                        // issue + enrollment, then wait against this actual
+                        // expiry below before asserting the terminal path.
+                        expires_at: Some(now_seconds().saturating_add(30)),
                     })
                     .await
                     .unwrap();
@@ -831,6 +838,19 @@ fn managed_pending_resume_survives_ticket_loss_and_owner_offline() {
                     })
                     .await
                     .unwrap();
+
+                let expires_at = expiring_key
+                    .expires_at
+                    .expect("the fixture ticket has a bounded expiry");
+                let remaining = expires_at.saturating_sub(now_seconds());
+                if remaining > 0 {
+                    tokio::time::timeout(
+                        Duration::from_secs(remaining.saturating_add(2)),
+                        tokio::time::sleep(Duration::from_secs(remaining.saturating_add(1))),
+                    )
+                    .await
+                    .expect("bounded wait for the issued ticket expiry");
+                }
 
                 let ticket_path = member_data
                     .join("managed")
