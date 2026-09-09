@@ -42,6 +42,14 @@ run·job URL, HEAD 대조, 원문 오류 발췌는 [github-status-20260908.txt](
 
 세 원인의 source 경로와 관찰/가설 구분은 [ci-audit-20260908.txt](/home/ubuntu/project/DeltaWeave-qsync-evidence/2026-09-08/ci-audit-20260908.txt)에 별도로 기록했다.
 
+## 2026-09-09 후속 CI 확인
+
+통합 브랜치 `integration/qbittorrent-sync-20260908`의 `bcd5a4b19cdb6a0000a05a7af86ea6ac98655270`에서 run `34305443471`을 실행했다. Linux quality gates는 성공했다. ANSI를 제거한 최종 `test result` 중 child/filtered 실행을 부모 테스트로 중복 집계하지 않은 결과는 28개 outer binary, 385 passed, 0 failed이며, 로그에 관찰된 437 passed에는 제외한 52개 child/filtered 관찰이 포함된다. 독립 ACL probe는 1/1 성공했고, Windows native artifact는 source 일치·self-test 성공, exe SHA-256 `d2b4a09b51f184e115708f090cb8e2d740f30665e20144f67205db7454aedcbb`, 33,190,912 bytes였다.
+
+Windows workspace는 outer 75 passed, 1 logical failed였다. 관찰값 88 passed, 2 failed는 child process가 부모와 함께 출력된 값이다. 남은 logical failure는 `managed_pending_resume_survives_ticket_loss_and_owner_offline`의 managed acceptance `open_manager` 단계이며, 실행 결과의 고정 오류 분류는 `invalid_path`다. 이는 반환 오류의 분류일 뿐 production root cause 확정이 아니다. ACL 생성 경계와 독립 ACL probe는 통과했고 cargo self-test는 workspace test 실패 뒤 skip됐다. 실행 원문과 child 중복을 남기지 않은 대장은 [ci-34305443471-final-sanitized.json](/home/ubuntu/project/DeltaWeave-qsync-evidence/2026-09-09/c-web/ci-34305443471-final-sanitized.json), [ci-34305443471-workspace-summary.json](/home/ubuntu/project/DeltaWeave-qsync-evidence/2026-09-09/c-web/ci-34305443471-workspace-summary.json), [ci-34305443471-command-ledger.txt](/home/ubuntu/project/DeltaWeave-qsync-evidence/2026-09-09/c-web/ci-34305443471-command-ledger.txt)에 있다.
+
+승인된 Windows 서버의 full-app smoke는 메모리 credential 주입으로 실행했고, 고정 phase 14개가 모두 성공했다. artifact hash와 native self-test, owner/member web start·login, owner create, read-only key issue, member join, 실제 파일 hash(`32e5b1a1…`), member shutdown/reopen membership, process shutdown, complete를 확인했다. WinRM과 원격 명령은 exit 0이었다. 새 격리 namespace만 사용했으며 기존 서비스·profile은 변경하지 않았다. 전체 phase와 artifact/source hash는 [native-full-app-smoke-20260909-result.json](/home/ubuntu/project/DeltaWeave-qsync-evidence/2026-09-09/c-web/native-full-app-smoke-20260909-result.json)에 있다. 이 smoke의 shutdown phase는 forceful process termination을 사용했으므로 graceful shutdown 의미까지 주장하지 않는다.
+
 ## F 단계의 후속 명령과 완료 조건
 
 다음 명령은 이 기준선에서 실행하지 않았고, F 담당이 실패 원인 수정 후 새 로그로 실행해야 한다.

@@ -15,7 +15,7 @@ use std::{
     collections::BTreeMap,
     fs::{File, OpenOptions},
     future::Future,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -1438,31 +1438,100 @@ impl Manager {
         })
     }
 
-    fn is_generated_private_path(root: &Path, path: &Path, suffix: &str) -> bool {
-        let Some(parent) = path.parent() else {
-            return false;
-        };
-        if parent != root {
-            return false;
+    #[cfg(windows)]
+    fn private_file_is_reparse(metadata: &std::fs::Metadata) -> bool {
+        use std::os::windows::fs::MetadataExt;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+
+    #[cfg(not(windows))]
+    const fn private_file_is_reparse(_metadata: &std::fs::Metadata) -> bool {
+        false
+    }
+
+    /// Windows file names are case-insensitive while `PathBuf` ordering is
+    /// not.  GC compares only this normalized key; all I/O keeps the
+    /// validated path spelling returned by `generated_private_path`.
+    #[cfg(windows)]
+    fn private_path_key(path: &Path) -> PathBuf {
+        let mut key = path.to_owned();
+        if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+            key.set_file_name(name.to_ascii_lowercase());
         }
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            return false;
-        };
-        let Some(hash) = name.strip_suffix(suffix) else {
-            return false;
-        };
-        hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        key
+    }
+
+    #[cfg(not(windows))]
+    fn private_path_key(path: &Path) -> PathBuf {
+        path.to_owned()
+    }
+
+    /// Resolves a persisted managed-private file through its trusted
+    /// namespace.  Configurations written by Windows versions before the
+    /// data directory was stored in verbatim (`\\?\\`) form can contain a
+    /// regular drive path.  Comparing the raw parent strings rejects that
+    /// valid alias, so both parents are canonicalized only after the original
+    /// components have been checked without following links.
+    ///
+    /// The returned path always uses the canonical trusted root and the
+    /// validated generated leaf.  A missing leaf is valid: an expired ticket
+    /// may have been removed while its pending metadata remains resumable.
+    fn generated_private_path(root: &Path, path: &Path, suffix: &str) -> Result<PathBuf> {
+        let invalid = || anyhow::Error::new(ManagedError::new(ManagedErrorKind::InvalidPath));
+        ensure!(root.is_absolute() && path.is_absolute(), invalid());
+        ensure!(
+            !path
+                .components()
+                .any(|component| matches!(component, Component::CurDir | Component::ParentDir)),
+            invalid()
+        );
+
+        let parent = path.parent().ok_or_else(invalid)?;
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(invalid)?;
+        let hash = name.strip_suffix(suffix).ok_or_else(invalid)?;
+        ensure!(
+            hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            invalid()
+        );
+
+        // Check the persisted spelling before canonicalization.  This rejects
+        // symlink/reparse ancestors even when they would resolve inside the
+        // expected namespace.
+        private::validate_directory_path(root).map_err(|_| invalid())?;
+        private::validate_directory_path(parent).map_err(|_| invalid())?;
+        let expected_root = std::fs::canonicalize(root).map_err(|_| invalid())?;
+        let actual_parent = std::fs::canonicalize(parent).map_err(|_| invalid())?;
+        ensure!(actual_parent == expected_root, invalid());
+
+        // The leaf is never followed.  A missing leaf is deliberately
+        // accepted, but an existing directory, symlink, or reparse point is
+        // rejected before the canonical path is returned to callers.
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                ensure!(
+                    metadata.file_type().is_file()
+                        && !metadata.file_type().is_symlink()
+                        && !Self::private_file_is_reparse(&metadata),
+                    invalid()
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(invalid()),
+        }
+
+        Ok(expected_root.join(name))
     }
 
     fn pending_ticket_path(&self, pending: &config::PendingRecord) -> Result<PathBuf> {
         let root = self.data_dir.join("managed").join("pending");
         private::prepare_directory(&root)?;
         let path = PathBuf::from(&pending.ticket_file);
-        ensure!(
-            Self::is_generated_private_path(&root, &path, ".ticket"),
-            ManagedError::new(ManagedErrorKind::InvalidPath)
-        );
-        Ok(path)
+        Self::generated_private_path(&root, &path, ".ticket")
     }
 
     async fn install_pending_slot_with_lease(
@@ -1674,11 +1743,16 @@ impl Manager {
             let mut referenced = BTreeMap::new();
             for pending in &state.config.managed.pending {
                 let path = PathBuf::from(&pending.ticket_file);
-                ensure!(
-                    Self::is_generated_private_path(&root, &path, ".ticket"),
-                    ManagedError::new(ManagedErrorKind::InvalidPath)
-                );
-                referenced.insert(path, Self::pending_deadline(pending) <= now);
+                let canonical = Self::generated_private_path(&root, &path, ".ticket")?;
+                let key = Self::private_path_key(&canonical);
+                let expired = Self::pending_deadline(pending) <= now;
+                // Duplicate records can be left by a crash/replay.  Keep a
+                // ticket referenced while any record is still live; an
+                // expired duplicate must never make that live ticket GCable.
+                referenced
+                    .entry(key)
+                    .and_modify(|known_expired| *known_expired &= expired)
+                    .or_insert(expired);
             }
             referenced
         };
@@ -1688,15 +1762,17 @@ impl Manager {
             if !entry.file_type()?.is_file() || path.is_symlink() {
                 continue;
             }
-            if !Self::is_generated_private_path(&root, &path, ".ticket") {
-                continue;
-            }
+            let canonical = match Self::generated_private_path(&root, &path, ".ticket") {
+                Ok(path) => path,
+                Err(_) => continue,
+            };
+            let key = Self::private_path_key(&canonical);
             if referenced
-                .get(&path)
+                .get(&key)
                 .copied()
                 .is_none_or(|is_expired| is_expired)
             {
-                Self::remove_private_file(&path)?;
+                Self::remove_private_file(&canonical)?;
             }
         }
         Ok(())
@@ -1717,15 +1793,16 @@ impl Manager {
             if !entry.file_type()?.is_file() || path.is_symlink() {
                 continue;
             }
-            if !Self::is_generated_private_path(&root, &path, ".ticket") {
-                continue;
-            }
+            let canonical = match Self::generated_private_path(&root, &path, ".ticket") {
+                Ok(path) => path,
+                Err(_) => continue,
+            };
             if entry
                 .metadata()?
                 .modified()
                 .is_ok_and(|modified| modified <= cutoff)
             {
-                Self::remove_private_file(&path)?;
+                Self::remove_private_file(&canonical)?;
             }
         }
         Ok(())
@@ -1794,11 +1871,7 @@ impl Manager {
         let root = self.data_dir.join("managed").join("responses");
         private::prepare_directory(&root)?;
         let path = PathBuf::from(&intent.response_file);
-        ensure!(
-            Self::is_generated_private_path(&root, &path, ".ticket"),
-            ManagedError::new(ManagedErrorKind::InvalidPath)
-        );
-        Ok(path)
+        Self::generated_private_path(&root, &path, ".ticket")
     }
 
     fn validate_key_intent(
@@ -4703,10 +4776,7 @@ impl Manager {
         );
         let response_root = self.data_dir.join("managed").join("responses");
         let path = PathBuf::from(result_ref);
-        ensure!(
-            Self::is_generated_private_path(&response_root, &path, ".ticket"),
-            ManagedError::new(ManagedErrorKind::InvalidPath)
-        );
+        let path = Self::generated_private_path(&response_root, &path, ".ticket")?;
         let encoded = Self::read_private_text(&path, 32 * 1024).map_err(|_| {
             anyhow::Error::new(ManagedError::new(ManagedErrorKind::KeyResponseExpired))
         })?;
@@ -6420,6 +6490,166 @@ mod managed_error_tests {
             assert!(!generated.exists());
             manager.shutdown().await.unwrap();
         });
+    }
+
+    #[test]
+    fn generated_private_path_canonicalizes_parent_and_allows_missing_leaf() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("managed").join("pending");
+        std::fs::create_dir(root.parent().unwrap()).unwrap();
+        private::prepare_directory(&root).unwrap();
+        let canonical_root = std::fs::canonicalize(&root).unwrap();
+        let leaf = format!("{}.ticket", "ef".repeat(32));
+        let persisted = canonical_root.join(&leaf);
+
+        let resolved = Manager::generated_private_path(&root, &persisted, ".ticket").unwrap();
+        assert_eq!(resolved, canonical_root.join(&leaf));
+        assert!(
+            !resolved.exists(),
+            "a missing expired ticket remains resumable"
+        );
+
+        std::fs::write(&persisted, b"fixture").unwrap();
+        assert_eq!(
+            Manager::generated_private_path(&root, &persisted, ".ticket").unwrap(),
+            canonical_root.join(&leaf)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn generated_private_path_accepts_windows_normal_and_extended_parent_forms() {
+        fn normal_form(path: &std::path::Path) -> std::path::PathBuf {
+            let text = path.to_string_lossy();
+            if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+                std::path::PathBuf::from(format!(r"\\{rest}"))
+            } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+                std::path::PathBuf::from(rest)
+            } else {
+                path.to_owned()
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("managed").join("pending");
+        std::fs::create_dir(root.parent().unwrap()).unwrap();
+        private::prepare_directory(&root).unwrap();
+        let canonical_root = std::fs::canonicalize(&root).unwrap();
+        let leaf = format!("{}.ticket", "12".repeat(32));
+        let normal_parent = normal_form(&canonical_root);
+        let normal_path = normal_parent.join(&leaf);
+        let extended_path = canonical_root.join(&leaf);
+
+        assert_eq!(
+            Manager::generated_private_path(&root, &normal_path, ".ticket").unwrap(),
+            canonical_root.join(&leaf)
+        );
+        assert_eq!(
+            Manager::generated_private_path(&root, &extended_path, ".ticket").unwrap(),
+            canonical_root.join(&leaf)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_gc_keeps_live_ticket_when_persisted_leaf_case_differs() {
+        fn normal_form(path: &std::path::Path) -> std::path::PathBuf {
+            let text = path.to_string_lossy();
+            if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+                std::path::PathBuf::from(format!(r"\\{rest}"))
+            } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+                std::path::PathBuf::from(rest)
+            } else {
+                path.to_owned()
+            }
+        }
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let data_dir = temp.path().join("admin");
+            let manager = Manager::open(data_dir.clone()).await.unwrap();
+            let managed_root = data_dir.join("managed");
+            reserve_prepared_private_directory(&managed_root).unwrap();
+            let root = managed_root.join("pending");
+            reserve_prepared_private_directory(&root).unwrap();
+            let canonical_root = std::fs::canonicalize(&root).unwrap();
+            let lower_leaf = format!("{}.ticket", "ab".repeat(32));
+            let upper_leaf = format!("{}.ticket", "AB".repeat(32));
+            let actual_ticket = canonical_root.join(&lower_leaf);
+            let persisted_ticket = normal_form(&canonical_root).join(&upper_leaf);
+            std::fs::write(&actual_ticket, b"fixture").unwrap();
+
+            let now = manager.managed_time().unwrap();
+            let pending = |request_id: &str, expires_at| config::PendingRecord {
+                request_id: request_id.into(),
+                share_id: "11".repeat(32),
+                owner: "22".repeat(32),
+                owner_address: None,
+                name: "case-folded-path".into(),
+                permission: Some(Permission::ReadWrite),
+                root: temp
+                    .path()
+                    .join("member-root")
+                    .to_string_lossy()
+                    .into_owned(),
+                state_root: temp
+                    .path()
+                    .join("member-state")
+                    .to_string_lossy()
+                    .into_owned(),
+                ticket_file: persisted_ticket.to_string_lossy().into_owned(),
+                created_at: now,
+                expires_at: Some(expires_at),
+                status: ManagedStatus::Waiting,
+                retry_at: None,
+                min_free_space_bytes: 0,
+            };
+            {
+                let mut state = manager.shared.lock().expect("snapshot mutex");
+                state
+                    .config
+                    .managed
+                    .pending
+                    .push(pending("live", now.saturating_add(3600)));
+                state
+                    .config
+                    .managed
+                    .pending
+                    .push(pending("expired-duplicate", now.saturating_sub(1)));
+            }
+
+            manager.gc_pending_tickets().await.unwrap();
+            assert!(actual_ticket.exists());
+            manager.shutdown().await.unwrap();
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_private_path_rejects_traversal_external_and_symlink_parent() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("managed").join("pending");
+        std::fs::create_dir(root.parent().unwrap()).unwrap();
+        private::prepare_directory(&root).unwrap();
+        let leaf = format!("{}.ticket", "34".repeat(32));
+
+        let traversal = root.join("..").join("pending").join(&leaf);
+        assert!(Manager::generated_private_path(&root, &traversal, ".ticket").is_err());
+
+        let external = temp.path().join("external");
+        private::prepare_directory(&external).unwrap();
+        let outside = external.join(&leaf);
+        assert!(Manager::generated_private_path(&root, &outside, ".ticket").is_err());
+
+        let alias = temp.path().join("pending-alias");
+        symlink(&root, &alias).unwrap();
+        let aliased = alias.join(&leaf);
+        assert!(Manager::generated_private_path(&root, &aliased, ".ticket").is_err());
+
+        let ads_like = root.join(format!("{}:stream.ticket", "56".repeat(32)));
+        assert!(Manager::generated_private_path(&root, &ads_like, ".ticket").is_err());
     }
 
     #[test]
