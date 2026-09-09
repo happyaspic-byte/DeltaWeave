@@ -94,19 +94,8 @@ async fn wait_for_receiving(app: &WebApp) {
         } else {
             "other"
         };
-        let safe_error_words = activity_error
-            .split_whitespace()
-            .map(|word| word.trim_matches(|character: char| !character.is_ascii_alphabetic()))
-            .filter(|word| !word.is_empty() && word.len() <= 32)
-            .filter(|word| {
-                word.chars()
-                    .all(|character| character.is_ascii_alphabetic())
-            })
-            .take(12)
-            .collect::<Vec<_>>();
         eprintln!("receiver readiness timeout: phase={phase} activity_status={activity_status}");
         eprintln!("receiver readiness error class: {error_class}");
-        eprintln!("receiver readiness error words: {safe_error_words:?}");
     }
     readiness.unwrap();
 }
