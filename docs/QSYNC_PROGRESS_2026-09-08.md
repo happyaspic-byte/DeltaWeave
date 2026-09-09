@@ -6,12 +6,13 @@
 
 작성 agent: `qsync_contracts` / Luna Max
 
-현재 단계: D3 network lifecycle checkpoint. A 계약 문서는 `121d042`로
+현재 단계: E1 durable activation receipt/status checkpoint. A 계약 문서는 `121d042`로
 통합되었고, B 최종 source checkpoint는 `5702ab1`, D2 source checkpoint는
 `04818f2b224249b2839b20d0b18f7b6634ae0c0a`이다. D2는 authority와
 request-start monotonic activation lease 검증까지 완료했다. D3 checkpoint
 `f886ab0`은 heartbeat와 bounded endpoint-ID fallback을 포함하지만 실제
-Internet/N0·relay와 E data-plane은 완료로 표시하지 않는다.
+Internet/N0·relay와 E data-plane은 완료로 표시하지 않는다. E1 source checkpoint는
+`bfe6f92`이며, durable activation 상태 조회/취소와 양쪽 drain 상태 검증만 포함한다.
 
 ## 작업 공간과 agent
 
@@ -24,7 +25,7 @@ Internet/N0·relay와 E data-plane은 완료로 표시하지 않는다.
 | B control | `/home/ubuntu/project/DeltaWeave-qsync-control-20260908` | `feat/qsync-control-20260908` | `ca63e04` persisted managed-private path recovery; prior final source `5702ab1`, Windows acceptance fixture `39ae489` |
 | C web | `/home/ubuntu/project/DeltaWeave-qsync-web-20260908` | `feat/qsync-web-20260908` | 병렬 구현 진행 |
 | validation | `/home/ubuntu/project/DeltaWeave-qsync-verification-20260908` | `test/qsync-verification-20260908` | 후속 검증 |
-| D network | `/home/ubuntu/project/DeltaWeave-qsync-network-20260908` | `feat/qsync-network-20260908` | `f886ab0` D3 heartbeat/address fallback checkpoint; root merge 및 실제 Internet/N0·relay 검증 대기 |
+| D network | `/home/ubuntu/project/DeltaWeave-qsync-network-20260908` | `feat/qsync-network-20260908` | `bfe6f92` E1 activation status/cancel checkpoint; D3 Internet/N0·relay 및 E data-plane 검증 대기 |
 
 ## A에서 고정한 계약
 
@@ -268,3 +269,46 @@ F release 검증은 여전히 E/F 순차 범위다.
 CI dispatch `34317854588`는 integration ref `63cb43c4142e0d28931dd5f81decb5506aa5d948`
 에서 실행됐으며, 이 후속 로컬 commit은 해당 실행에 포함되지 않는다. 실제 integration
 CI 결과와 이 후속 source 검사는 별도 근거로 집계한다.
+
+## E1 durable activation receipt checkpoint (`bfe6f92`)
+
+- `ActivationStatus`와 `ActivationCancel`은 기존 `Operation`/`Reply` 뒤에 append되어
+  postcard wire ordinal을 보존한다. `ActivationBinding`은 owner/share/consumer/provider,
+  양쪽 epoch, manifest/request hash와 nonce를 고정하며 raw key나 endpoint secret을
+  담지 않는다. `ActivationReceipt::verify_for`는 이 binding과 요청한 activation ID를
+  exact 비교한다.
+- owner registry의 status 조회는 `GrantRow`와 양쪽 `GrantDrainState`를 하나의 redb
+  read snapshot에서 읽고 lease를 갱신하지 않는다. 저장 상태가 `Issued`인 동안 wall
+  clock만으로 `Expired`를 합성하지 않으며, `ActivationCancel`이 같은 transaction에서
+  `Issued → Denied` 또는 만료된 `Issued → Expired`를 기록한다. `Active`/`Restarted`는
+  늦은 취소가 지우지 않고 provider/consumer 양쪽 drain ACK가 모두 있을 때만 `Drained`가
+  된다. 새 grant/data admission에는 현재 epoch 검사가 남고, response-loss recovery의
+  status/cancel만 기존 exact binding을 보존한 채 membership epoch 변경을 허용한다.
+- `ShareService::unload_owned_share`는 runtime을 먼저 pause하고 registry 삭제가
+  성공한 뒤에만 runtime map에서 제거한다. nonterminal activation/apply row가 있으면
+  remove를 `RevocationPending`으로 보류하며, 같은 ShareId를 쓰는 foreign-owner
+  relationship은 삭제하지 않는다.
+
+| E1 검사 | 결과 | 증거 |
+| --- | --- | --- |
+| registry authority status/cancel/remove | `13 passed, 0 failed`, exit `0`, outer `13` | `2026-09-09/e1/registry-e1-final2-20260909T064242Z.log`, 06:42:42Z–06:43:00Z |
+| bilateral drain + idempotent cancel service regression | `1 passed, 0 failed`, exit `0`, logical outer `1`; nested child 출력 미합산 | `2026-09-09/e1/service-bilateral-drain-e1-final2.log`, 06:48:27Z 완료 |
+| activation recovery binding after epoch change | outer `1 passed`, exit `0` | `2026-09-09/e1/service-recovery-binding-final-20260909T064351Z.log` |
+| locked net check | `cargo check --locked -p deltaweave-net --all-targets --all-features`, exit `0` | `2026-09-09/e1/net-check-e1-final2.log`, 06:48:52Z 완료; `CARGO_TARGET_DIR` 공유 캐시와 jobs `4` |
+| strict net clippy | `cargo clippy --locked -p deltaweave-net --all-targets --all-features -- -D warnings`, exit `0` | `2026-09-09/e1/net-clippy-e1-final2.log`, 06:49:14Z 완료 |
+| format | `cargo fmt --all -- --check`, exit `0` | `2026-09-09/e1/fmt-e1-final.log`, 06:47:55Z |
+
+E1은 provider/consumer durable intent와 late/lost Activate receipt의 양단 query/ACK
+복구, paused runtime의 별도 admission-open 확인, 실제 `share-swarm/1` verified-CAS
+다중 provider payload를 구현하지 않는다. 이 항목들은 E2/E3의 후속 소비 계약이며,
+timeout/TTL만으로 Active/Restarted를 Complete로 만들지 않는 조건을 유지한다.
+
+CI fixture `af5b21a23ce418811abae0c30da9c0ca96179da6`는 실제 owner-signed roster와
+별도 roster/heartbeat 응답을 제공하도록 수정했고 기존 rollback/divergence,
+tombstone, 파일 보존 assertion을 유지했다. `ci-malicious-owner-fixture-final2-20260909T064051Z.log`
+의 두 cargo `test ... ok` 줄은 parent와 isolated child가 같은 logical outer test를
+출력한 것이므로 `logical_outer_count=1`로 정정했다. 그 실행은 E1 net dirty tree에서
+수행되어 `af5b21a` exact-tree 검증으로 집계하지 않으며, fixture commit과 원격
+integration CI는 별도 근거다. 새 dispatch `34320666264`는 integration ref
+`af5b21a23ce418811abae0c30da9c0ca96179da6`에서 실행됐고, 이 기록 시점에는 결과를
+완료로 표시하지 않는다.
