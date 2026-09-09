@@ -314,41 +314,46 @@ $systemSid = 'S-1-5-18'
 $repair = $env:DELTAWEAVE_PRIVATE_ACL_REPAIR -eq '1'
 
 if ([string]::IsNullOrWhiteSpace($path) -or [string]::IsNullOrWhiteSpace($userSid)) { exit 31 }
-$item = Get-Item -LiteralPath $path -Force
+try { $item = Get-Item -LiteralPath $path -Force } catch { exit 40 }
 if (-not $item.PSIsContainer -or (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)) { exit 32 }
 
 $sids = @($userSid, $systemSid) | Sort-Object -Unique
 if ($repair) {
-    $acl = New-Object System.Security.AccessControl.DirectorySecurity
-    $acl.SetAccessRuleProtection($true, $false)
-    $userIdentity = New-Object System.Security.Principal.SecurityIdentifier($userSid)
-    $acl.SetOwner($userIdentity)
-    $rights = [System.Security.AccessControl.FileSystemRights]::FullControl
-    $inheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
-    $propagation = [System.Security.AccessControl.PropagationFlags]::None
-    $allow = [System.Security.AccessControl.AccessControlType]::Allow
-    foreach ($sid in $sids) {
-        $identity = New-Object System.Security.Principal.SecurityIdentifier($sid)
-        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($identity, $rights, $inheritance, $propagation, $allow)
-        $acl.AddAccessRule($rule)
-    }
-    Set-Acl -LiteralPath $path -AclObject $acl
+    try {
+        $acl = New-Object System.Security.AccessControl.DirectorySecurity
+        $acl.SetAccessRuleProtection($true, $false)
+        $userIdentity = New-Object System.Security.Principal.SecurityIdentifier($userSid)
+        $acl.SetOwner($userIdentity)
+        $rights = [System.Security.AccessControl.FileSystemRights]::FullControl
+        $inheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+        $propagation = [System.Security.AccessControl.PropagationFlags]::None
+        $allow = [System.Security.AccessControl.AccessControlType]::Allow
+        foreach ($sid in $sids) {
+            $identity = New-Object System.Security.Principal.SecurityIdentifier($sid)
+            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($identity, $rights, $inheritance, $propagation, $allow)
+            $acl.AddAccessRule($rule)
+        }
+        Set-Acl -LiteralPath $path -AclObject $acl
+    } catch { exit 41 }
 }
 
-$item = Get-Item -LiteralPath $path -Force
+try { $item = Get-Item -LiteralPath $path -Force } catch { exit 42 }
 if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { exit 33 }
-$acl = Get-Acl -LiteralPath $path
+try { $acl = Get-Acl -LiteralPath $path } catch { exit 43 }
 if (-not $acl.AreAccessRulesProtected) { exit 34 }
-$owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+try { $owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value } catch { exit 44 }
 if ($owner -notin $sids) { exit 37 }
-$rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+try { $rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) } catch { exit 45 }
 if ($rules.Count -ne $sids.Count) { exit 35 }
 $rights = [System.Security.AccessControl.FileSystemRights]::FullControl
 $inheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
 $propagation = [System.Security.AccessControl.PropagationFlags]::None
 $allow = [System.Security.AccessControl.AccessControlType]::Allow
-foreach ($rule in $rules) {
-    if ($rule.IsInherited -or $rule.IdentityReference.Value -notin $sids -or $rule.AccessControlType -ne $allow -or $rule.FileSystemRights -ne $rights -or $rule.InheritanceFlags -ne $inheritance -or $rule.PropagationFlags -ne $propagation) { exit 36 }
+try {
+    foreach ($rule in $rules) {
+        if ($rule.IsInherited -or $rule.IdentityReference.Value -notin $sids -or $rule.AccessControlType -ne $allow -or $rule.FileSystemRights -ne $rights -or $rule.InheritanceFlags -ne $inheritance -or $rule.PropagationFlags -ne $propagation) { exit 36 }
+    }
+} catch { exit 46 }
 }
 exit 0
 "#;

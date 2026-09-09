@@ -86,6 +86,13 @@ jobs:
           npm --prefix web test
           npm --prefix web run build
       - uses: dtolnay/rust-toolchain@1.91.0
+      - name: Probe managed private ACL boundary
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $probe = Join-Path $env:RUNNER_TEMP 'deltaweave-private-acl-probe.exe'
+          rustc --edition 2024 --test crates/deltaweave-control/src/private.rs -o $probe
+          & $probe --exact tests::native_acl_preparation_is_idempotent_and_fails_closed --nocapture
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
