@@ -65,6 +65,7 @@ struct ManagedInner {
     local: Arc<ReplicaState>,
     session: ShareSession,
     gate: tokio::sync::Mutex<()>,
+    heartbeat_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ManagedSyncEngine {
@@ -172,12 +173,14 @@ impl ManagedSyncEngine {
             );
             read_only::initialize(&local, member)?;
         }
+        let heartbeat_task = session.start_heartbeat();
         Ok(Self {
             pending: std::sync::Mutex::new(Vec::new()),
             inner: Arc::new(ManagedInner {
                 local,
                 session,
                 gate: tokio::sync::Mutex::new(()),
+                heartbeat_task: Some(heartbeat_task),
             }),
         })
     }
@@ -202,8 +205,13 @@ impl ManagedSyncEngine {
         tokio::spawn(async move {
             let result = async {
                 let _guard = inner.gate.lock().await;
+                // Liveness is checked on the managed session before local
+                // reconciliation. A separate supervisor repeats this work
+                // every 30 seconds, so a long transfer cannot age the roster
+                // past its 90-second freshness window.
+                inner.session.ensure_roster_heartbeat().await?;
                 inner.local.observe(&observer, "scanning", None, None, 0);
-                let result = match inner.session.membership().permission {
+                match inner.session.membership().permission {
                     Permission::ReadWrite => {
                         inner.local.recover_pending()?;
                         let scan = scan_index(inner.local.index.clone()).await?;
@@ -221,17 +229,20 @@ impl ManagedSyncEngine {
                             .await
                             .map(ManagedSyncReport::ReadOnly)
                     }
-                };
-                inner.local.observe(
-                    &observer,
-                    if result.is_ok() { "complete" } else { "error" },
-                    None,
-                    None,
-                    0,
-                );
-                result
+                }
             }
             .await;
+            // Heartbeat/control failures happen before the role-specific sync
+            // can emit an event. Publish the terminal observer event outside
+            // the fallible body so those failures are visible to management
+            // callers and do not look like a silent cancelled round.
+            inner.local.observe(
+                &observer,
+                if result.is_ok() { "complete" } else { "error" },
+                None,
+                None,
+                0,
+            );
             // Release every lease-owning clone before acknowledging drain completion.
             drop(inner);
             let _ = finished.send(());
@@ -289,7 +300,16 @@ impl ManagedSyncEngine {
         }
         let inner = Arc::try_unwrap(self.inner)
             .map_err(|_| anyhow::anyhow!("managed work is still active"))?;
-        inner.session.close().await;
+        let ManagedInner {
+            session,
+            heartbeat_task,
+            ..
+        } = inner;
+        if let Some(task) = heartbeat_task {
+            task.abort();
+            let _ = task.await;
+        }
+        session.close().await;
         Ok(())
     }
 }
@@ -426,5 +446,101 @@ mod tests {
             min_free_space_bytes: 0,
         };
         assert!(validate_transferred_lease(&lease, owner, share, &wrong_private_config).is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn heartbeat_failure_reaches_managed_observer() {
+        let name = "shared::tests::heartbeat_failure_reaches_managed_observer";
+        if std::env::var("DW_MANAGED_HEARTBEAT_FAILURE_CHILD")
+            .ok()
+            .as_deref()
+            != Some(name)
+        {
+            let profile = tempfile::tempdir().expect("isolated home");
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture"])
+                .env("DW_MANAGED_HEARTBEAT_FAILURE_CHILD", name)
+                .env("HOME", profile.path())
+                .env("USERPROFILE", profile.path())
+                .status()
+                .expect("run isolated heartbeat test");
+            assert!(status.success());
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("test root");
+        let owner = ShareService::open(
+            temp.path().join("owner-service"),
+            deltaweave_net::NetworkMode::DirectOnly,
+            None,
+        )
+        .await
+        .unwrap();
+        let member = ShareService::open(
+            temp.path().join("member-service"),
+            deltaweave_net::NetworkMode::DirectOnly,
+            None,
+        )
+        .await
+        .unwrap();
+        let owner_root = temp.path().join("owner-root");
+        std::fs::create_dir_all(&owner_root).unwrap();
+        std::fs::write(owner_root.join("heartbeat.txt"), b"heartbeat").unwrap();
+        let owner_share = owner
+            .create_owned_share(
+                "Heartbeat".into(),
+                owner_root,
+                temp.path().join("owner-state"),
+                None,
+                0,
+            )
+            .await
+            .unwrap();
+        let share = owner_share.config().share_id;
+        let ticket = owner_share
+            .issue_key(Permission::ReadWrite, None, owner.endpoint_addr())
+            .unwrap();
+        member.enroll(&ticket, None).await.unwrap();
+        let engine = ManagedSyncEngine::open(
+            &member,
+            owner.endpoint_id(),
+            share,
+            ManagedSyncConfig {
+                root: temp.path().join("member-root"),
+                state_root: temp.path().join("member-state"),
+                profile: ChunkingProfile::DEFAULT,
+                min_free_space_bytes: 0,
+            },
+        )
+        .unwrap();
+        drop(owner_share);
+        owner.shutdown().await.unwrap();
+
+        let phases = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let observed = phases.clone();
+        let observer = TransferObserver::new(move |event| {
+            observed.lock().expect("observer lock").push(event.phase);
+        });
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            engine.sync_once(Some(observer)),
+        )
+        .await
+        .expect("heartbeat failure must remain bounded");
+        assert!(
+            result.is_err(),
+            "an offline owner must fail the managed round"
+        );
+        assert!(
+            phases
+                .lock()
+                .expect("observer lock")
+                .iter()
+                .any(|phase| phase == "error"),
+            "heartbeat failure must emit the terminal observer error event"
+        );
+
+        engine.shutdown().await.unwrap();
+        member.shutdown().await.unwrap();
     }
 }

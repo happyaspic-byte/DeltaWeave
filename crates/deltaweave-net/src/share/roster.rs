@@ -334,6 +334,8 @@ mod tests {
         roster.verify_for(owner_key.public(), share, 50).unwrap();
         assert!(roster.fresh_members(50).is_empty());
         assert!(!roster.member_is_fresh(member, 50));
+        assert!(!roster.fresh_members(19).is_empty());
+        assert!(roster.fresh_members(20).is_empty());
         assert_eq!(
             roster
                 .verify_for(other_owner.public(), share, 50)

@@ -18,6 +18,7 @@ deltaweave-store = { path = "../deltaweave-store" }
 deltaweave-swarm = { path = "../deltaweave-swarm" }
 hex.workspace = true
 fs2.workspace = true
+futures-lite = "2.6"
 iroh.workspace = true
 postcard.workspace = true
 redb.workspace = true

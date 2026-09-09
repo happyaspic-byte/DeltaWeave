@@ -733,6 +733,7 @@ dependencies = [
  "deltaweave-store",
  "deltaweave-swarm",
  "fs2",
+ "futures-lite",
  "hex",
  "iroh",
  "postcard",

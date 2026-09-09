@@ -15,8 +15,8 @@ use super::{
 };
 use crate::{
     NetworkMode, OperationAdmission, SyncClient, SyncHandler, SyncSession, SyncWireRequest,
-    SyncWireResponse, bind_endpoint, endpoint_addr_with_local_fallback, load_or_create_identity,
-    prepare_server_roots, read_frame,
+    SyncWireResponse, TransportObservation, bind_endpoint, endpoint_addr_with_local_fallback,
+    load_or_create_identity, prepare_server_roots, read_frame,
     root_admission::{self, RootLease, RootUse},
     write_frame,
 };
@@ -72,10 +72,6 @@ impl ActivationLease {
             .ok_or(ShareError::GrantExpired)?;
         ensure!(now < deadline, ShareError::GrantExpired);
         Ok(Self { reply, deadline })
-    }
-
-    fn from_reply(reply: super::ActivateGrantReply, request_started: Instant) -> Result<Self> {
-        Self::from_reply_at(reply, request_started, Instant::now())
     }
 
     /// Returns the remaining monotonic lifetime without exposing wall-clock
@@ -490,7 +486,7 @@ impl ShareService {
     }
     pub async fn validate_ticket(&self, ticket: &ShareTicket) -> Result<TicketPreview> {
         ticket.verify_at(super::now())?;
-        let connection = self.connect_ticket(ticket).await?;
+        let (connection, _) = self.connect_ticket(ticket).await?;
         let result = self
             .exchange_bounded(
                 &connection,
@@ -516,7 +512,7 @@ impl ShareService {
         proof: Option<LegacyProof>,
     ) -> Result<Membership> {
         ticket.verify_at(super::now())?;
-        let connection = self.connect_ticket(ticket).await?;
+        let (connection, connected_address) = self.connect_ticket(ticket).await?;
         let result = self
             .exchange_bounded(
                 &connection,
@@ -541,7 +537,7 @@ impl ShareService {
                 );
                 self.registry.store_relationship(MemberRelationship {
                     membership: member.clone(),
-                    address: ticket.address(),
+                    address: connected_address,
                 })?;
                 Ok(member)
             }
@@ -562,7 +558,7 @@ impl ShareService {
     ) -> Result<Membership> {
         ensure!(owner != self.endpoint_id(), ShareError::OwnerMismatch);
         ensure!(address.id == owner, ShareError::OwnerMismatch);
-        let connection = self.connect_address(address.clone()).await?;
+        let (connection, connected_address) = self.connect_address(owner, address).await?;
         let result = self
             .exchange_bounded(
                 &connection,
@@ -584,7 +580,7 @@ impl ShareService {
                 );
                 self.registry.store_relationship(MemberRelationship {
                     membership: member.clone(),
-                    address,
+                    address: connected_address,
                 })?;
                 ensure!(member.revoked_at.is_none(), ShareError::MemberRevoked);
                 Ok(member)
@@ -593,22 +589,36 @@ impl ShareService {
         }
     }
 
-    async fn connect_ticket(&self, ticket: &ShareTicket) -> Result<Connection> {
+    async fn connect_ticket(&self, ticket: &ShareTicket) -> Result<(Connection, EndpointAddr)> {
         ensure!(
             ticket.preview().owner != self.endpoint_id(),
             ShareError::OwnerMismatch
         );
-        self.connect_address(ticket.address()).await
+        self.connect_address(ticket.preview().owner, ticket.address())
+            .await
     }
 
-    async fn connect_address(&self, address: EndpointAddr) -> Result<Connection> {
-        tokio::time::timeout(
-            CONTROL_DEADLINE,
-            self.router.endpoint().connect(address, ALPN_V3),
-        )
-        .await
-        .map_err(|_| anyhow::Error::new(ShareError::Offline))?
-        .map_err(|_| ShareError::Offline.into())
+    async fn connect_address(
+        &self,
+        owner: EndpointId,
+        address: EndpointAddr,
+    ) -> Result<(Connection, EndpointAddr)> {
+        let transport = SyncSession {
+            client: SyncClient {
+                secret_key: self.key.clone(),
+                remote: address.clone(),
+                network_mode: self.mode,
+            },
+            endpoint: self.router.endpoint().clone(),
+            share: None,
+            remote: Arc::new(std::sync::RwLock::new(address)),
+            fallback_endpoint: (self.mode == NetworkMode::Internet).then_some(owner),
+            observation: Arc::new(std::sync::RwLock::new(None)),
+            n0_lookup: Arc::new(std::sync::RwLock::new(None)),
+        };
+        let connection = transport.connect_control().await?;
+        let connected_address = transport.remote_address();
+        Ok((connection, connected_address))
     }
 
     async fn exchange_bounded(&self, connection: &Connection, hello: Hello) -> Result<Reply> {
@@ -626,18 +636,27 @@ impl ShareService {
                 && owner != self.endpoint_id(),
             ShareError::OwnerMismatch
         );
+        let remote = relationship.address;
         Ok(ShareSession {
-            membership: relationship.membership,
-            roster_challenge: Mutex::new(None),
-            inner: SyncSession {
-                client: SyncClient {
-                    secret_key: self.key.clone(),
-                    remote: relationship.address,
-                    network_mode: self.mode,
+            state: Arc::new(ShareSessionState {
+                membership: relationship.membership,
+                roster_challenge: Mutex::new(None),
+                roster: Mutex::new(RosterCache::default()),
+                roster_gate: tokio::sync::Mutex::new(()),
+                transport: SyncSession {
+                    client: SyncClient {
+                        secret_key: self.key.clone(),
+                        remote: remote.clone(),
+                        network_mode: self.mode,
+                    },
+                    endpoint: self.router.endpoint().clone(),
+                    share: Some(share),
+                    remote: Arc::new(std::sync::RwLock::new(remote)),
+                    fallback_endpoint: (self.mode == NetworkMode::Internet).then_some(owner),
+                    observation: Arc::new(std::sync::RwLock::new(None)),
+                    n0_lookup: Arc::new(std::sync::RwLock::new(None)),
                 },
-                endpoint: self.router.endpoint().clone(),
-                share: Some(share),
-            },
+            }),
         })
     }
     /// A managed member engine must retain this lease for its entire lifetime.
@@ -674,45 +693,159 @@ impl ShareService {
     }
 }
 
+#[derive(Debug, Default)]
+struct RosterCache {
+    roster: Option<SignedRoster>,
+    last_heartbeat: Option<Instant>,
+    local_address: Option<EndpointAddr>,
+}
+
 #[derive(Debug)]
-pub struct ShareSession {
+struct ShareSessionState {
     membership: Membership,
     roster_challenge: Mutex<Option<GrantNonce>>,
-    inner: SyncSession,
+    roster: Mutex<RosterCache>,
+    roster_gate: tokio::sync::Mutex<()>,
+    transport: SyncSession,
+}
+
+/// A control connection closes even when its awaiting operation is cancelled.
+/// This is required by the managed heartbeat supervisor's shutdown barrier.
+struct ControlConnection(Connection);
+impl std::ops::Deref for ControlConnection {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl Drop for ControlConnection {
+    fn drop(&mut self) {
+        self.0.close(0u8.into(), b"share control complete");
+    }
+}
+
+/// One authenticated managed membership over the device's already-open
+/// endpoint. Clones share the exact roster cache, transport address hint, and
+/// heartbeat gate; they never create a second endpoint.
+#[derive(Clone, Debug)]
+pub struct ShareSession {
+    state: Arc<ShareSessionState>,
 }
 impl ShareSession {
     pub fn membership(&self) -> &Membership {
-        &self.membership
+        &self.state.membership
     }
 
-    /// Fetches the owner-signed member roster and arms one heartbeat challenge
-    /// for the next address update. Roster addresses are transport hints only;
-    /// persisted membership remains the authorization authority.
-    pub async fn refresh_roster(&self) -> Result<SignedRoster> {
+    /// Starts the managed liveness supervisor. The task holds only a weak
+    /// reference so dropping an engine without a graceful shutdown cannot keep
+    /// a session or endpoint alive. Its 30-second cadence is independent of
+    /// the data synchronization gate.
+    pub fn start_heartbeat(&self) -> tokio::task::JoinHandle<()> {
+        let weak = Arc::downgrade(&self.state);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(
+                super::ROSTER_HEARTBEAT_INTERVAL_SECONDS,
+            ));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let Some(state) = weak.upgrade() else {
+                    break;
+                };
+                let session = Self { state };
+                // Offline is a recoverable liveness result. The next tick
+                // retries against the same authenticated owner identity.
+                let _ = session.heartbeat_now().await;
+            }
+        })
+    }
+
+    /// Returns the latest secret-free lookup/path observation for the D3
+    /// harness. The observation never includes an endpoint address or ID.
+    #[must_use]
+    pub fn transport_observation(&self) -> Option<TransportObservation> {
+        self.state.transport.transport_observation()
+    }
+
+    /// Returns the latest secret-free N0 address-lookup result.  A value is
+    /// present only after endpoint-ID fallback has observed a matching
+    /// pkarr/DNS (or other configured) address item.
+    #[must_use]
+    pub fn n0_lookup_observation(&self) -> Option<crate::N0LookupObservation> {
+        self.state.transport.n0_lookup_observation()
+    }
+
+    async fn refresh_roster_inner(&self) -> Result<SignedRoster> {
         let result = self.control_exchange(Operation::Roster).await?;
         let (roster, challenge) = match result {
             Reply::Roster { roster, challenge } => (roster, challenge),
             _ => return Err(ShareError::Protocol.into()),
         };
         roster.verify_for(
-            self.membership.owner,
-            self.membership.share_id,
+            self.state.membership.owner,
+            self.state.membership.share_id,
             super::now(),
         )?;
         ensure!(
             roster
-                .member(self.membership.endpoint)
+                .member(self.state.membership.endpoint)
                 .is_some_and(|entry| {
-                    entry.permission == self.membership.permission
-                        && entry.member_epoch == self.membership.epoch
+                    entry.permission == self.state.membership.permission
+                        && entry.member_epoch == self.state.membership.epoch
                 }),
             ShareError::EpochMismatch
         );
         *self
+            .state
             .roster_challenge
             .lock()
             .expect("roster challenge mutex") = Some(challenge);
+        self.state.roster.lock().expect("roster cache mutex").roster = Some(roster.clone());
         Ok(roster)
+    }
+
+    /// Fetches the owner-signed member roster and arms one heartbeat challenge
+    /// for the next address update. Roster addresses are transport hints only;
+    /// persisted membership remains the authorization authority.
+    pub async fn refresh_roster(&self) -> Result<SignedRoster> {
+        let _gate = self.state.roster_gate.lock().await;
+        self.refresh_roster_inner().await
+    }
+
+    /// Refreshes and heartbeats when the 30-second lease or local address hint
+    /// requires it. This is called by both the managed supervisor and the
+    /// first sync round, while the gate serializes overlapping calls.
+    pub async fn ensure_roster_heartbeat(&self) -> Result<SignedRoster> {
+        let _gate = self.state.roster_gate.lock().await;
+        let local_address =
+            crate::endpoint_addr_with_local_fallback(&self.state.transport.endpoint);
+        let (due, cached_roster) = {
+            let cached = self.state.roster.lock().expect("roster cache mutex");
+            let due = cached.roster.is_none()
+                || cached.last_heartbeat.is_none_or(|last| {
+                    last.elapsed() >= Duration::from_secs(super::ROSTER_HEARTBEAT_INTERVAL_SECONDS)
+                })
+                || cached.local_address.as_ref() != Some(&local_address);
+            (due, cached.roster.clone())
+        };
+        if !due {
+            return cached_roster.ok_or_else(|| anyhow::Error::new(ShareError::Protocol));
+        }
+        self.refresh_roster_inner().await?;
+        let challenge = self
+            .roster_challenge()
+            .ok_or_else(|| anyhow::Error::new(ShareError::Protocol))?;
+        self.heartbeat_inner(challenge).await
+    }
+
+    async fn heartbeat_now(&self) -> Result<SignedRoster> {
+        let _gate = self.state.roster_gate.lock().await;
+        self.refresh_roster_inner().await?;
+        let challenge = self
+            .roster_challenge()
+            .ok_or_else(|| anyhow::Error::new(ShareError::Protocol))?;
+        self.heartbeat_inner(challenge).await
     }
 
     /// Returns the most recently issued challenge for callers that need to
@@ -720,6 +853,7 @@ impl ShareSession {
     #[must_use]
     pub fn roster_challenge(&self) -> Option<GrantNonce> {
         *self
+            .state
             .roster_challenge
             .lock()
             .expect("roster challenge mutex")
@@ -728,13 +862,13 @@ impl ShareSession {
     /// Signs the current endpoint address and submits it to the owner. The
     /// owner authenticates both the QUIC peer identity and this signature
     /// before updating the durable roster address.
-    pub async fn heartbeat(&self, challenge: GrantNonce) -> Result<()> {
-        let address = crate::endpoint_addr_with_local_fallback(&self.inner.endpoint);
+    async fn heartbeat_inner(&self, challenge: GrantNonce) -> Result<SignedRoster> {
+        let address = crate::endpoint_addr_with_local_fallback(&self.state.transport.endpoint);
         let heartbeat = RosterHeartbeat::sign(
-            &self.inner.client.secret_key,
-            self.membership.owner,
-            self.membership.share_id,
-            address,
+            &self.state.transport.client.secret_key,
+            self.state.membership.owner,
+            self.state.membership.share_id,
+            address.clone(),
             challenge,
             super::now(),
         );
@@ -746,57 +880,80 @@ impl ShareSession {
             _ => return Err(ShareError::Protocol.into()),
         };
         roster.verify_for(
-            self.membership.owner,
-            self.membership.share_id,
+            self.state.membership.owner,
+            self.state.membership.share_id,
             super::now(),
         )?;
         ensure!(
             roster
-                .member(self.membership.endpoint)
+                .member(self.state.membership.endpoint)
                 .is_some_and(|entry| {
-                    entry.permission == self.membership.permission
-                        && entry.member_epoch == self.membership.epoch
+                    entry.permission == self.state.membership.permission
+                        && entry.member_epoch == self.state.membership.epoch
                 }),
             ShareError::EpochMismatch
         );
         let mut stored = self
+            .state
             .roster_challenge
             .lock()
             .expect("roster challenge mutex");
         if stored.as_ref() == Some(&challenge) {
             *stored = None;
         }
-        Ok(())
+        drop(stored);
+        let mut cache = self.state.roster.lock().expect("roster cache mutex");
+        cache.roster = Some(roster.clone());
+        cache.last_heartbeat = Some(Instant::now());
+        cache.local_address = Some(address);
+        Ok(roster)
+    }
+
+    /// Signs and submits one explicit address heartbeat. Managed callers
+    /// normally use `ensure_roster_heartbeat`; this method remains available
+    /// for authenticated address-change tests and controlled drivers.
+    pub async fn heartbeat(&self, challenge: GrantNonce) -> Result<()> {
+        let _gate = self.state.roster_gate.lock().await;
+        self.heartbeat_inner(challenge).await.map(|_| ())
     }
 
     async fn control_exchange(&self, operation: Operation) -> Result<Reply> {
-        let connection = self.connect_control().await?;
+        self.control_exchange_until(operation, Instant::now() + CONTROL_DEADLINE)
+            .await
+    }
+
+    async fn control_exchange_until(
+        &self,
+        operation: Operation,
+        deadline: Instant,
+    ) -> Result<Reply> {
+        let connection = self.connect_control_until(deadline).await?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(ShareError::Offline.into());
+        }
         let result = tokio::time::timeout(
-            CONTROL_DEADLINE,
+            remaining,
             wire::exchange(
                 &connection,
                 Hello {
                     version: 3,
-                    share_id: self.membership.share_id,
+                    share_id: self.state.membership.share_id,
                     operation,
                 },
             ),
         )
         .await;
-        connection.close(0u8.into(), b"share control complete");
+        self.state
+            .transport
+            .refresh_transport_observation(&connection);
         result.map_err(|_| anyhow::Error::new(ShareError::Offline))?
     }
 
-    async fn connect_control(&self) -> Result<Connection> {
-        tokio::time::timeout(
-            CONTROL_DEADLINE,
-            self.inner
-                .endpoint
-                .connect(self.inner.client.remote.clone(), ALPN_V3),
-        )
-        .await
-        .map_err(|_| anyhow::Error::new(ShareError::Offline))?
-        .map_err(|_| ShareError::Offline.into())
+    async fn connect_control_until(&self, deadline: Instant) -> Result<ControlConnection> {
+        Ok(ControlConnection(
+            self.state.transport.connect_control_until(deadline).await?,
+        ))
     }
 
     /// Requests the complete owner-signed snapshot used by managed apply.
@@ -812,12 +969,12 @@ impl ShareSession {
             _ => return Err(ShareError::Protocol.into()),
         };
         snapshot.verify_complete(
-            self.membership.owner,
-            self.membership.share_id,
+            self.state.membership.owner,
+            self.state.membership.share_id,
             super::now(),
         )?;
         ensure!(
-            snapshot.token.epoch == self.membership.epoch,
+            snapshot.token.epoch == self.state.membership.epoch,
             ShareError::EpochMismatch
         );
         Ok(snapshot)
@@ -830,7 +987,7 @@ impl ShareSession {
         record: &SyncRecord,
     ) -> Result<ManifestAttestation> {
         ensure!(
-            snapshot.epoch == self.membership.epoch,
+            snapshot.epoch == self.state.membership.epoch,
             ShareError::EpochMismatch
         );
         let result = self
@@ -844,8 +1001,8 @@ impl ShareSession {
             _ => return Err(ShareError::Protocol.into()),
         };
         attestation.verify_for(
-            self.membership.owner,
-            self.membership.share_id,
+            self.state.membership.owner,
+            self.state.membership.share_id,
             super::now(),
         )?;
         attestation.verify_record(snapshot, record)?;
@@ -863,11 +1020,11 @@ impl ShareSession {
         hashes: &[Hash32],
     ) -> Result<ShareGrant> {
         ensure!(
-            snapshot.epoch == self.membership.epoch,
+            snapshot.epoch == self.state.membership.epoch,
             ShareError::EpochMismatch
         );
         ensure!(
-            snapshot.share == self.membership.share_id,
+            snapshot.share == self.state.membership.share_id,
             ShareError::OwnerMismatch
         );
         ensure!(
@@ -889,23 +1046,23 @@ impl ShareSession {
             _ => return Err(ShareError::Protocol.into()),
         };
         grant.verify_for(
-            self.membership.owner,
-            self.membership.share_id,
+            self.state.membership.owner,
+            self.state.membership.share_id,
             super::now(),
         )?;
         ensure!(
-            grant.consumer == self.membership.endpoint,
+            grant.consumer == self.state.membership.endpoint,
             ShareError::EndpointMismatch
         );
         ensure!(grant.provider == provider, ShareError::EndpointMismatch);
         ensure!(
-            grant.epoch == self.membership.epoch,
+            grant.epoch == self.state.membership.epoch,
             ShareError::EpochMismatch
         );
         ensure!(
             grant.request_hash
                 == request_hash(
-                    self.membership.share_id,
+                    self.state.membership.share_id,
                     snapshot.snapshot,
                     manifest.manifest_hash,
                     hashes,
@@ -920,35 +1077,45 @@ impl ShareSession {
     /// applies its own receive-side deadline and never extends this lease from
     /// a wall-clock expiry.
     pub async fn activate_grant(&self, grant: &ShareGrant) -> Result<ActivationLease> {
+        let started = Instant::now();
+        self.activate_grant_until(grant, started, started + CONTROL_DEADLINE)
+            .await
+    }
+
+    async fn activate_grant_until(
+        &self,
+        grant: &ShareGrant,
+        request_started: Instant,
+        deadline: Instant,
+    ) -> Result<ActivationLease> {
         ensure!(
-            grant.provider == self.membership.endpoint,
+            grant.provider == self.state.membership.endpoint,
             ShareError::EndpointMismatch
         );
         ensure!(
-            grant.share == self.membership.share_id
-                && grant.owner == self.membership.owner
-                && grant.provider_epoch == self.membership.epoch,
+            grant.share == self.state.membership.share_id
+                && grant.owner == self.state.membership.owner
+                && grant.provider_epoch == self.state.membership.epoch,
             ShareError::EpochMismatch
         );
-        let started = Instant::now();
         let result = self
-            .control_exchange(Operation::Activate(grant.activate_request()))
-            .await?;
-        ensure!(
-            started.elapsed() <= CONTROL_DEADLINE,
-            ShareError::GrantExpired
-        );
+            .control_exchange_until(Operation::Activate(grant.activate_request()), deadline)
+            .await;
+        if Instant::now() >= deadline {
+            return Err(ShareError::GrantExpired.into());
+        }
+        let result = result?;
         let reply = match result {
             Reply::Activate(reply) => reply,
             _ => return Err(ShareError::Protocol.into()),
         };
-        reply.verify_for(self.membership.owner, self.membership.share_id)?;
+        reply.verify_for(self.state.membership.owner, self.state.membership.share_id)?;
         ensure!(
-            reply.provider == self.membership.endpoint,
+            reply.provider == self.state.membership.endpoint,
             ShareError::EndpointMismatch
         );
         ensure!(reply.nonce == grant.nonce, ShareError::GrantReplay);
-        ActivationLease::from_reply(reply, started)
+        ActivationLease::from_reply_at(reply, request_started, Instant::now())
     }
 
     /// Sends one authenticated endpoint drain acknowledgement for an active
@@ -956,12 +1123,12 @@ impl ShareSession {
     /// sends the same activation-bound acknowledgement.
     pub async fn grant_drained(&self, grant: &ShareGrant, activation_id: [u8; 16]) -> Result<()> {
         ensure!(
-            grant.share == self.membership.share_id,
+            grant.share == self.state.membership.share_id,
             ShareError::OwnerMismatch
         );
         ensure!(
-            grant.consumer == self.membership.endpoint
-                || grant.provider == self.membership.endpoint,
+            grant.consumer == self.state.membership.endpoint
+                || grant.provider == self.state.membership.endpoint,
             ShareError::EndpointMismatch
         );
         let result = self
@@ -977,7 +1144,7 @@ impl ShareSession {
     /// Revalidates the owner root and obtains a short-lived apply permit.
     pub async fn revalidate_before_apply(&self, snapshot: &SnapshotToken) -> Result<ApplyPermit> {
         ensure!(
-            snapshot.epoch == self.membership.epoch,
+            snapshot.epoch == self.state.membership.epoch,
             ShareError::EpochMismatch
         );
         let result = self
@@ -990,13 +1157,13 @@ impl ShareSession {
             _ => return Err(ShareError::Protocol.into()),
         };
         permit.verify_for(
-            self.membership.owner,
-            self.membership.share_id,
-            self.membership.endpoint,
+            self.state.membership.owner,
+            self.state.membership.share_id,
+            self.state.membership.endpoint,
             super::now(),
         )?;
         ensure!(
-            permit.epoch == self.membership.epoch,
+            permit.epoch == self.state.membership.epoch,
             ShareError::EpochMismatch
         );
         ensure!(
@@ -1018,7 +1185,7 @@ impl ShareSession {
     /// Records the beginning of a permit-scoped local apply at the owner.
     pub async fn apply_start(&self, permit: &ApplyPermit, operation_id: [u8; 16]) -> Result<()> {
         ensure!(
-            permit.consumer == self.membership.endpoint,
+            permit.consumer == self.state.membership.endpoint,
             ShareError::EndpointMismatch
         );
         let result = self
@@ -1039,7 +1206,7 @@ impl ShareSession {
         committed: bool,
     ) -> Result<()> {
         ensure!(
-            permit.consumer == self.membership.endpoint,
+            permit.consumer == self.state.membership.endpoint,
             ShareError::EndpointMismatch
         );
         let result = self
@@ -1054,14 +1221,14 @@ impl ShareSession {
     }
 
     pub async fn fetch_snapshot(&self, local: &MerkleTree) -> Result<crate::RemoteSnapshot> {
-        self.inner.fetch_snapshot(local).await
+        self.state.transport.fetch_snapshot(local).await
     }
     pub async fn pull_record(
         &self,
         record: SyncRecord,
         store: Arc<Store>,
     ) -> Result<crate::PullReceipt> {
-        self.inner.pull_record(record, store).await
+        self.state.transport.pull_record(record, store).await
     }
     pub async fn pull_record_to(
         &self,
@@ -1069,7 +1236,8 @@ impl ShareSession {
         store: Arc<Store>,
         destination_root: PathBuf,
     ) -> Result<crate::PullReceipt> {
-        self.inner
+        self.state
+            .transport
             .pull_record_to(record, store, destination_root)
             .await
     }
@@ -1081,7 +1249,8 @@ impl ShareSession {
         min_free_space_bytes: u64,
         pending_destination_bytes: u64,
     ) -> Result<crate::PullReceipt> {
-        self.inner
+        self.state
+            .transport
             .pull_record_to_with_budget(
                 record,
                 store,
@@ -1097,14 +1266,19 @@ impl ShareSession {
         record: SyncRecord,
         profile: ChunkingProfile,
     ) -> Result<crate::SyncApplyReceipt> {
-        self.inner.push_record(source, record, profile).await
+        self.state
+            .transport
+            .push_record(source, record, profile)
+            .await
     }
     pub async fn apply_metadata(&self, record: SyncRecord) -> Result<crate::SyncApplyReceipt> {
-        self.inner.apply_metadata(record).await
+        self.state.transport.apply_metadata(record).await
     }
     /// Releases only this session; the shared device endpoint remains alive.
     pub async fn close(self) {
-        self.inner.close().await;
+        // Share sessions borrow the device endpoint owned by ShareService;
+        // dropping this state releases only this membership cache.
+        drop(self);
     }
 }
 
@@ -1463,6 +1637,24 @@ fn safe_error(error: &anyhow::Error) -> ShareError {
 mod tests {
     use super::super::Permission;
     use super::*;
+    use futures_lite::StreamExt;
+    use iroh::address_lookup::{
+        AddressLookup, EndpointData, Error as LookupError, Item, memory::MemoryLookup,
+    };
+
+    #[derive(Debug, Clone)]
+    struct HangingAddressLookup;
+
+    impl AddressLookup for HangingAddressLookup {
+        fn publish(&self, _data: &EndpointData) {}
+
+        fn resolve(
+            &self,
+            _endpoint_id: EndpointId,
+        ) -> Option<futures_lite::stream::Boxed<Result<Item, LookupError>>> {
+            Some(futures_lite::stream::pending().boxed())
+        }
+    }
 
     async fn roster_exchange(
         client: &ShareService,
@@ -1547,6 +1739,194 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn activation_deadline_blocks_delayed_lookup_before_owner_activation() {
+        let name = "share::service::tests::activation_deadline_blocks_delayed_lookup_before_owner_activation";
+        if std::env::var("DW_ACTIVATION_DEADLINE_CHILD")
+            .ok()
+            .as_deref()
+            != Some(name)
+        {
+            let profile = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture"])
+                .env("DW_ACTIVATION_DEADLINE_CHILD", name)
+                .env("HOME", profile.path())
+                .env("USERPROFILE", profile.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let owner = ShareService::open(
+            temp.path().join("owner-service"),
+            NetworkMode::DirectOnly,
+            None,
+        )
+        .await
+        .unwrap();
+        let consumer = ShareService::open(
+            temp.path().join("consumer-service"),
+            NetworkMode::DirectOnly,
+            None,
+        )
+        .await
+        .unwrap();
+        let provider = ShareService::open(
+            temp.path().join("provider-service"),
+            NetworkMode::DirectOnly,
+            None,
+        )
+        .await
+        .unwrap();
+        std::fs::create_dir_all(temp.path().join("shared-root")).unwrap();
+        std::fs::write(temp.path().join("shared-root/deadline.txt"), b"deadline").unwrap();
+        let owner_share = owner
+            .create_owned_share(
+                "Deadline".into(),
+                temp.path().join("shared-root"),
+                temp.path().join("shared-state"),
+                None,
+                0,
+            )
+            .await
+            .unwrap();
+        let share = owner_share.config().share_id;
+        let consumer_ticket = owner_share
+            .issue_key(Permission::ReadWrite, None, owner.endpoint_addr())
+            .unwrap();
+        let provider_ticket = owner_share
+            .issue_key(Permission::ReadOnly, None, owner.endpoint_addr())
+            .unwrap();
+        let consumer_membership = consumer.enroll(&consumer_ticket, None).await.unwrap();
+        let provider_membership = provider.enroll(&provider_ticket, None).await.unwrap();
+        assert_eq!(provider_membership.permission, Permission::ReadOnly);
+        let consumer_session = consumer.open_session(owner.endpoint_id(), share).unwrap();
+        let provider_membership_session =
+            provider.open_session(owner.endpoint_id(), share).unwrap();
+        provider_membership_session.refresh_roster().await.unwrap();
+        let provider_challenge = provider_membership_session.roster_challenge().unwrap();
+        provider_membership_session
+            .heartbeat(provider_challenge)
+            .await
+            .unwrap();
+        let provider_membership_for_session = provider_membership_session.membership().clone();
+        let snapshot = consumer_session
+            .fetch_authoritative_snapshot(&MerkleTree::from_records(Vec::new()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(snapshot.token.epoch, consumer_membership.epoch);
+        let record = snapshot
+            .records
+            .first()
+            .cloned()
+            .unwrap_or_else(|| panic!("deadline fixture requires an authoritative record"));
+        let manifest = consumer_session
+            .request_manifest(&snapshot.token, &record)
+            .await
+            .unwrap();
+        let hashes: Vec<_> = manifest
+            .manifest
+            .chunks
+            .iter()
+            .map(|chunk| chunk.hash)
+            .collect();
+        let grant = consumer_session
+            .request_swarm_grant(provider.endpoint_id(), &snapshot.token, &manifest, &hashes)
+            .await
+            .unwrap();
+        assert_eq!(grant.provider_epoch, provider_membership.epoch);
+
+        // Remove the provider's cached owner path before the delayed lookup
+        // probe. Reopening the same persistent identity keeps the membership
+        // binding while ensuring the stale address is genuinely exercised.
+        provider_membership_session.close().await;
+        provider.shutdown().await.unwrap();
+        let provider = ShareService::open(
+            temp.path().join("provider-service"),
+            NetworkMode::DirectOnly,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // The session intentionally has an unusable persisted hint. The test
+        // enables the Internet lookup path on this otherwise DirectOnly
+        // fixture and installs a resolver that never produces an address.
+        // The short caller deadline must expire before any Activate frame is
+        // sent, so the owner grant remains Issued rather than Active.
+        let stale = EndpointAddr::from_parts(
+            owner.endpoint_id(),
+            [iroh::TransportAddr::Ip("192.0.2.1:9".parse().unwrap())],
+        );
+        provider
+            .router
+            .endpoint()
+            .address_lookup()
+            .unwrap()
+            .add(HangingAddressLookup);
+        let provider_session = ShareSession {
+            state: Arc::new(ShareSessionState {
+                membership: provider_membership_for_session,
+                roster_challenge: Mutex::new(None),
+                roster: Mutex::new(RosterCache::default()),
+                roster_gate: tokio::sync::Mutex::new(()),
+                transport: SyncSession {
+                    client: SyncClient {
+                        secret_key: provider.key.clone(),
+                        remote: stale.clone(),
+                        network_mode: NetworkMode::Internet,
+                    },
+                    endpoint: provider.router.endpoint().clone(),
+                    share: Some(share),
+                    remote: Arc::new(std::sync::RwLock::new(stale)),
+                    fallback_endpoint: Some(owner.endpoint_id()),
+                    observation: Arc::new(std::sync::RwLock::new(None)),
+                    n0_lookup: Arc::new(std::sync::RwLock::new(None)),
+                },
+            }),
+        };
+        assert_eq!(
+            owner
+                .registry
+                .active_grant_blockers(share, provider.endpoint_id())
+                .unwrap(),
+            0
+        );
+        let started = Instant::now();
+        let result = provider_session
+            .activate_grant_until(&grant, started, started + Duration::from_millis(100))
+            .await;
+        let error = match result {
+            Ok(_) => panic!("a lookup that outlives the caller deadline cannot activate"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                error.downcast_ref::<ShareError>(),
+                Some(ShareError::Offline | ShareError::GrantExpired)
+            ),
+            "deadline failure must remain a safe offline/expired result"
+        );
+        assert_eq!(
+            owner
+                .registry
+                .active_grant_blockers(share, provider.endpoint_id())
+                .unwrap(),
+            0,
+            "no Activate frame may create an owner Active row after lookup expiry"
+        );
+
+        consumer_session.close().await;
+        provider_session.close().await;
+        drop(owner_share);
+        provider.shutdown().await.unwrap();
+        consumer.shutdown().await.unwrap();
+        owner.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn authenticated_roster_heartbeat_updates_address_and_rejects_replay() {
         let name = "share::service::tests::authenticated_roster_heartbeat_updates_address_and_rejects_replay";
         if std::env::var("DW_ROSTER_CHILD").ok().as_deref() != Some(name) {
@@ -1591,6 +1971,14 @@ mod tests {
         let session = member.open_session(owner.endpoint_id(), share).unwrap();
 
         let roster = session.refresh_roster().await.unwrap();
+        let observation = session
+            .transport_observation()
+            .expect("control connection records a transport observation");
+        assert_eq!(
+            observation.provenance,
+            crate::LookupProvenance::PersistedAddress,
+            "DirectOnly fixture should use the persisted address hint"
+        );
         roster
             .verify_for(owner.endpoint_id(), share, super::super::now())
             .unwrap();
@@ -1699,6 +2087,101 @@ mod tests {
         drop(session);
         drop(owner_share);
         outsider.shutdown().await.unwrap();
+        member.shutdown().await.unwrap();
+        owner.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn resume_membership_uses_endpoint_id_lookup_after_address_change() {
+        let name =
+            "share::service::tests::resume_membership_uses_endpoint_id_lookup_after_address_change";
+        if std::env::var("DW_RESUME_LOOKUP_CHILD").ok().as_deref() != Some(name) {
+            let profile = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture"])
+                .env("DW_RESUME_LOOKUP_CHILD", name)
+                .env("HOME", profile.path())
+                .env("USERPROFILE", profile.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let owner = ShareService::open(
+            temp.path().join("owner-service"),
+            NetworkMode::DirectOnly,
+            None,
+        )
+        .await
+        .unwrap();
+        let member_path = temp.path().join("member-service");
+        let member = ShareService::open(&member_path, NetworkMode::Internet, None)
+            .await
+            .unwrap();
+        let root = temp.path().join("shared-root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("resume.txt"), b"resume").unwrap();
+        let owner_share = owner
+            .create_owned_share(
+                "Resume".into(),
+                root,
+                temp.path().join("shared-state"),
+                None,
+                0,
+            )
+            .await
+            .unwrap();
+        let share = owner_share.config().share_id;
+        let ticket = owner_share
+            .issue_key(Permission::ReadWrite, None, owner.endpoint_addr())
+            .unwrap();
+        let expected = member.enroll(&ticket, None).await.unwrap();
+        let stale = EndpointAddr::from_parts(
+            owner.endpoint_id(),
+            [iroh::TransportAddr::Ip("192.0.2.1:9".parse().unwrap())],
+        );
+
+        // Reopen the same device identity to remove any cached owner path.
+        member.shutdown().await.unwrap();
+        let member = ShareService::open(&member_path, NetworkMode::Internet, None)
+            .await
+            .unwrap();
+        let lookup = MemoryLookup::with_provenance("pkarr");
+        lookup.set_endpoint_info(owner.endpoint_addr());
+        member
+            .router
+            .endpoint()
+            .address_lookup()
+            .unwrap()
+            .add(lookup);
+
+        let resumed = member
+            .resume_membership(owner.endpoint_id(), share, stale.clone())
+            .await
+            .unwrap();
+        assert!(resumed.permission == expected.permission);
+        assert!(resumed.replica == expected.replica);
+        assert!(resumed.epoch == expected.epoch);
+        assert!(resumed.enrolled_at == expected.enrolled_at);
+        let relationship = member
+            .relationships()
+            .unwrap()
+            .into_iter()
+            .find(|relationship| {
+                relationship.membership.owner == owner.endpoint_id()
+                    && relationship.membership.share_id == share
+            })
+            .expect("resume must retain the active relationship");
+        assert!(relationship.address.id == owner.endpoint_id());
+        assert!(relationship.address != stale);
+        assert!(
+            relationship.address.addrs.iter().next().is_some(),
+            "resume must persist a usable discovered address"
+        );
+
+        drop(owner_share);
         member.shutdown().await.unwrap();
         owner.shutdown().await.unwrap();
     }
