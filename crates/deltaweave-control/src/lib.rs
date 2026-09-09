@@ -659,6 +659,13 @@ const MANAGED_OBSERVATION_RESAVE_LIMIT: usize = 2;
 #[derive(Default)]
 struct TestPersistGate {
     next: Mutex<Vec<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    pending_join: Mutex<
+        Vec<(
+            String,
+            std::sync::mpsc::Sender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
     resave: Mutex<Vec<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
     final_save: Mutex<Vec<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
     after_save: Mutex<Vec<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
@@ -668,6 +675,19 @@ struct TestPersistGate {
 impl TestPersistGate {
     fn arm(&self) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
         Self::arm_queue(&self.next)
+    }
+
+    fn arm_pending_join(
+        &self,
+        request_id: impl Into<String>,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered_sender, entered_receiver) = std::sync::mpsc::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        self.pending_join
+            .lock()
+            .expect("persist test gate mutex")
+            .push((request_id.into(), entered_sender, release_receiver));
+        (entered_receiver, release_sender)
     }
 
     fn arm_resave(&self) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
@@ -696,6 +716,26 @@ impl TestPersistGate {
 
     fn wait(&self) {
         Self::wait_queue(&self.next);
+    }
+
+    fn wait_pending_join(&self, config: &config::Config) {
+        let pending_request_ids = config
+            .managed
+            .pending
+            .iter()
+            .map(|pending| pending.request_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let pending = {
+            let mut queue = self.pending_join.lock().expect("persist test gate mutex");
+            queue
+                .iter()
+                .position(|(request_id, _, _)| pending_request_ids.contains(request_id.as_str()))
+                .map(|index| queue.remove(index))
+        };
+        if let Some((_, entered, release)) = pending {
+            let _ = entered.send(());
+            let _ = release.recv();
+        }
     }
 
     fn wait_resave(&self) {
@@ -1193,6 +1233,8 @@ impl Manager {
             // cannot expose a second writer to an unfinished replacement.
             #[cfg(test)]
             test_persist_gate.wait();
+            #[cfg(test)]
+            test_persist_gate.wait_pending_join(&config);
             let mut saved_observation_revision = observation_revision;
             let mut observation_resaves = 0;
             let mut changed = changed;
@@ -6901,7 +6943,7 @@ mod managed_error_tests {
                 .join("managed")
                 .join("member-state")
                 .join(request_hash("join_share", &join_input).unwrap());
-            let (entered, release) = member.test_persist_gate.arm();
+            let (entered, release) = member.test_persist_gate.arm_pending_join("abort-join");
             let caller_manager = Arc::clone(&member);
             let caller = tokio::spawn(async move { caller_manager.join_share(join_input).await });
             tokio::task::spawn_blocking(move || {
