@@ -292,39 +292,39 @@ fn managed_read_only_uses_owner_and_member_suppliers_for_real_chunks() {
                     .unwrap();
                 assert_eq!(report.status, "pass");
                 assert!(report.pulled_bytes > 0);
-                let events = events.lock().expect("observer lock");
-                let starts: Vec<_> = events
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, event)| event.phase == "swarm_provider_started")
-                    .collect();
-                let verified: Vec<_> = events
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, event)| {
-                        event.phase == "swarm_provider_verified" && event.bytes > 0
-                    })
-                    .collect();
-                let started_peers: BTreeSet<_> = starts
-                    .iter()
-                    .filter_map(|(_, event)| event.peer.as_deref())
-                    .collect();
-                let verified_peers: BTreeSet<_> = verified
-                    .iter()
-                    .filter_map(|(_, event)| event.peer.as_deref())
-                    .collect();
-                assert!(started_peers.len() >= 2);
-                assert!(verified_peers.len() >= 2);
-                assert!(starts.len() >= 2);
-                assert!(verified.first().is_some_and(|(first_verified, _)| {
-                    starts.iter().all(|(started, _)| started < first_verified)
-                }));
+                {
+                    let events = events.lock().expect("observer lock");
+                    let starts: Vec<_> = events
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, event)| event.phase == "swarm_provider_started")
+                        .collect();
+                    let verified: Vec<_> = events
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, event)| {
+                            event.phase == "swarm_provider_verified" && event.bytes > 0
+                        })
+                        .collect();
+                    let started_peers: BTreeSet<_> = starts
+                        .iter()
+                        .filter_map(|(_, event)| event.peer.as_deref())
+                        .collect();
+                    let verified_peers: BTreeSet<_> = verified
+                        .iter()
+                        .filter_map(|(_, event)| event.peer.as_deref())
+                        .collect();
+                    assert!(started_peers.len() >= 2);
+                    assert!(verified_peers.len() >= 2);
+                    assert!(starts.len() >= 2);
+                    assert!(verified.first().is_some_and(|(first_verified, _)| {
+                        starts.iter().all(|(started, _)| started < first_verified)
+                    }));
+                }
                 assert_eq!(
                     fs::read(base.join("consumer-root/payload.bin")).unwrap(),
                     payload
                 );
-                drop(events);
-
                 // Keep the owner roster entry from the successful round, then
                 // take the member supplier offline.  A fresh RO consumer must
                 // recover that terminal provider failure and continue through
@@ -372,17 +372,18 @@ fn managed_read_only_uses_owner_and_member_suppliers_for_real_chunks() {
                     fs::read(base.join("consumer2-root/payload.bin")).unwrap(),
                     payload
                 );
-                let loss_events = loss_events.lock().unwrap();
-                assert!(loss_events.iter().any(|event| {
-                    event.phase == "swarm_provider_started"
-                        && event.peer.as_deref() == Some(provider_peer.as_str())
-                }));
-                assert!(loss_events.iter().any(|event| {
-                    event.phase == "swarm_provider_verified"
-                        && event.peer.as_deref() == Some(owner_peer.as_str())
-                        && event.bytes > 0
-                }));
-                drop(loss_events);
+                {
+                    let loss_events = loss_events.lock().unwrap();
+                    assert!(loss_events.iter().any(|event| {
+                        event.phase == "swarm_provider_started"
+                            && event.peer.as_deref() == Some(provider_peer.as_str())
+                    }));
+                    assert!(loss_events.iter().any(|event| {
+                        event.phase == "swarm_provider_verified"
+                            && event.peer.as_deref() == Some(owner_peer.as_str())
+                            && event.bytes > 0
+                    }));
+                }
                 consumer2_engine.shutdown().await.unwrap();
                 consumer2.shutdown().await.unwrap();
                 consumer_engine.shutdown().await.unwrap();
