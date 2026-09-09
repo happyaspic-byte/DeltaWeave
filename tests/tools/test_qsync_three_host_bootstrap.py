@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -99,6 +100,29 @@ class QsyncBootstrapTests(unittest.TestCase):
                 os.environ.pop("QSYNC_F_TEST_SECRET", None)
             else:
                 os.environ["QSYNC_F_TEST_SECRET"] = old
+
+    def test_cleanup_retains_started_state_without_drain_ack(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_root = Path(temporary) / "run"
+            run_root.mkdir(mode=0o700)
+            spec = MODULE.RoleSpec(
+                "owner",
+                "local",
+                None,
+                "a" * 64,
+                None,
+                None,
+                None,
+                "127.0.0.1",
+                None,
+                None,
+                None,
+            )
+            process = MODULE.LocalWebProcess(spec, run_root, "owner", MODULE.SecretVault())
+            process.started_once = True
+            self.assertEqual(MODULE.safe_cleanup([process], run_root), (True, False))
+            self.assertTrue(run_root.is_dir())
+            shutil.rmtree(run_root)
 
 
 if __name__ == "__main__":

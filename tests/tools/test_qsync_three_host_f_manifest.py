@@ -202,6 +202,15 @@ class QsyncRoleManifestTests(unittest.TestCase):
             else:
                 os.environ["QSYNC_F_WINRM_DESTINATION"] = old
 
+    def test_windows_driver_redacts_child_streams_and_retains_uncertain_state(self) -> None:
+        script = (ROOT / "scripts" / "qsync_three_host_winrm_member.ps1").read_text(encoding="utf-8")
+        self.assertNotRegex(script, r"\$home\s*=")
+        self.assertIn("$info.RedirectStandardOutput = $true", script)
+        self.assertIn("$info.RedirectStandardError = $true", script)
+        self.assertIn("if ($stopped) { $script:MemberProcess = $null }", script)
+        self.assertIn("$script:GracefulDrainProven", script)
+        self.assertIn("$script:GracefulDrainProven -and -not $script:ForcedTermination", script)
+
 
 if __name__ == "__main__":
     unittest.main()

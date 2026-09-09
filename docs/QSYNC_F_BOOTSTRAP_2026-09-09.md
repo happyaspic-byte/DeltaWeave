@@ -90,10 +90,26 @@ member discovery, relay session/payload와 `share-swarm/1` payload hook가 실�
 정상 종료와 강제 종료는 `forced_termination_used`로 구분한다. graceful drain을
 확인하지 못한 상태에서 complete/cleanup 성공을 주장하지 않는다. run 소유 namespace만
 삭제하고, 종료·drain이 확인되지 않으면 state를 보존하고 cleanup을 pending으로
-기록한다. pre-existing 보호 상태는 실제 before/after 비교가 없으면
+기록한다. 현재 이 subset에는 managed pause/revoke drain ACK adapter가 없으므로
+프로세스가 정상 종료해도 `graceful_drain_proven=unverified`로 남기고 소유 state를
+보존한다. pre-existing 보호 상태는 실제 before/after 비교가 없으면
 `unverified`로 남는다.
 
 ## 검증 범위
+
+현재 source checkpoint의 Linux release binary로 같은 호스트에서 owner와 한 RO
+member subprocess를 실제 실행한 smoke는 2026-09-09T04:37:46Z~04:37:50Z에
+owner create → RO key 발급 → preview → online validate → join → fixture file
+SHA-256/크기 확인까지 모두 통과했다. binary SHA-256은
+`7df0b2002d2b3b41f09870281f63e834a41c4d41557e241fd448a159d661e503`, 크기는
+`32245040` bytes이며 fixture는
+`8b666f88f7b033f647f9b5ae66d668b7bb88376630dbecfb0fba757f4f84334c`, `262144`
+bytes였다. 이는 두 local process의 API 경로 확인이며 3-host 실행이나 provider
+payload 증거가 아니다. 두 process는 forced termination 없이 종료됐지만 managed
+drain ACK adapter가 없어 smoke namespace는 보존하고 `drain_ack=unverified`로
+기록했다. 상세 비밀 없는 기록은
+`/home/ubuntu/project/DeltaWeave-qsync-evidence/2026-09-09/f-bootstrap/` 아래에
+둔다.
 
 다음은 이 checkpoint에서 실행하는 로컬 비밀 없는 검사다.
 

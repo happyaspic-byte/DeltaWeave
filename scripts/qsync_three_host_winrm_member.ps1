@@ -12,6 +12,7 @@ $script:MemberProcess = $null
 $script:ForcedTermination = $false
 $script:AllPassed = $false
 $script:CleanupPassed = $false
+$script:GracefulDrainProven = $false
 $script:DestinationCreated = $false
 $script:LastApiStatus = 0
 
@@ -48,12 +49,13 @@ function Decode-Config {
 
 function Assert-Config {
     param($Value)
-    $required = @('artifact_url', 'artifact_sha256', 'owner_base_uri', 'share_key', 'destination_root', 'expected_file_hash', 'expected_file_name')
+    $required = @('artifact_url', 'artifact_sha256', 'artifact_size', 'owner_base_uri', 'share_key', 'destination_root', 'expected_file_hash', 'expected_file_name')
     foreach ($name in $required) {
         $item = [string]$Value.$name
         if ([string]::IsNullOrWhiteSpace($item)) { throw 'config' }
     }
     if ([string]$Value.artifact_sha256 -notmatch '^[0-9a-f]{64}$') { throw 'config' }
+    if ([string]$Value.artifact_size -notmatch '^[1-9][0-9]*$') { throw 'config' }
     if ([string]$Value.expected_file_hash -notmatch '^[0-9a-f]{64}$') { throw 'config' }
     if ([string]$Value.destination_root -notmatch '^[A-Za-z]:\\[^\x00\r\n]+$') { throw 'config' }
     if ([string]$Value.expected_file_name -notmatch '^[A-Za-z0-9._-]{1,128}$') { throw 'config' }
@@ -85,15 +87,17 @@ function New-ProcessInfo {
     $info.WorkingDirectory = $WorkingDirectory
     $info.UseShellExecute = $false
     $info.CreateNoWindow = $true
+    $info.RedirectStandardOutput = $true
+    $info.RedirectStandardError = $true
     $info.EnvironmentVariables.Clear()
     foreach ($name in @('PATH', 'SystemRoot', 'WINDIR', 'ComSpec', 'PATHEXT')) {
         $value = [Environment]::GetEnvironmentVariable($name)
         if (-not [string]::IsNullOrWhiteSpace($value)) { $info.EnvironmentVariables[$name] = $value }
     }
-    $home = Join-Path $Profile 'home'
+    $qsyncProfileHome = Join-Path $Profile 'home'
     $tmp = Join-Path $Profile 'tmp'
-    $info.EnvironmentVariables['HOME'] = $home
-    $info.EnvironmentVariables['USERPROFILE'] = $home
+    $info.EnvironmentVariables['HOME'] = $qsyncProfileHome
+    $info.EnvironmentVariables['USERPROFILE'] = $qsyncProfileHome
     $info.EnvironmentVariables['XDG_CONFIG_HOME'] = (Join-Path $Profile 'config')
     $info.EnvironmentVariables['XDG_CACHE_HOME'] = (Join-Path $Profile 'cache')
     $info.EnvironmentVariables['XDG_STATE_HOME'] = (Join-Path $Profile 'state')
@@ -111,6 +115,12 @@ function Invoke-BinarySelfTest {
     $process = [Diagnostics.Process]::new()
     $process.StartInfo = $info
     if (-not $process.Start()) { return $false }
+    # Never inherit the child streams into the WinRM host output.  Discard
+    # them asynchronously so a noisy binary cannot block on a full pipe.
+    $process.add_OutputDataReceived({ param($sender, $eventArgs) })
+    $process.add_ErrorDataReceived({ param($sender, $eventArgs) })
+    $process.BeginOutputReadLine()
+    $process.BeginErrorReadLine()
     if (-not $process.WaitForExit(60000)) {
         try { $process.Kill() } catch { }
         return $false
@@ -125,6 +135,12 @@ function Start-WebProcess {
     $process = [Diagnostics.Process]::new()
     $process.StartInfo = $info
     if (-not $process.Start()) { return $null }
+    # Keep application stdout/stderr out of the remoting transcript and drain
+    # both redirected pipes while the long-running web process is alive.
+    $process.add_OutputDataReceived({ param($sender, $eventArgs) })
+    $process.add_ErrorDataReceived({ param($sender, $eventArgs) })
+    $process.BeginOutputReadLine()
+    $process.BeginErrorReadLine()
     for ($attempt = 0; $attempt -lt 150; $attempt++) {
         if ($process.HasExited) { return $null }
         if (Test-Path -LiteralPath (Join-Path $DataDirectory 'admin-token')) {
@@ -233,7 +249,8 @@ try {
     $incoming = Join-Path $script:Base '.incoming.exe'
     Invoke-WebRequest -UseBasicParsing -Uri ([string]$config.artifact_url) -OutFile $incoming -TimeoutSec 120
     $artifactHash = (Get-FileHash -LiteralPath $incoming -Algorithm SHA256).Hash.ToLowerInvariant()
-    Emit-Phase 'binary_verification' ($artifactHash -eq [string]$config.artifact_sha256) $artifactHash
+    $artifactSize = (Get-Item -LiteralPath $incoming).Length
+    Emit-Phase 'binary_verification' (($artifactHash -eq [string]$config.artifact_sha256) -and ($artifactSize -eq [int64]$config.artifact_size)) $artifactHash $artifactSize
     if ($artifactHash -ne [string]$config.artifact_sha256) { throw 'artifact_hash' }
     $artifact = Join-Path $script:Base 'deltaweave.exe'
     Move-Item -LiteralPath $incoming -Destination $artifact -Force:$false
@@ -296,9 +313,9 @@ try {
     if (-not $fileOk) { throw 'file_hash' }
 
     $stopped = Stop-WebProcess $script:MemberProcess
-    $script:MemberProcess = $null
+    if ($stopped) { $script:MemberProcess = $null }
     $script:CurrentPhase = 'member_reopen_membership'
-    if (-not $stopped) { throw 'shutdown' }
+    if (-not $stopped -or $script:ForcedTermination) { throw 'shutdown' }
     $memberPort = Get-FreeTcpPort
     $script:MemberProcess = Start-WebProcess $artifact $data $memberPort $profile
     $reopened = $null -ne $script:MemberProcess
@@ -317,9 +334,12 @@ try {
     Emit-Phase $script:CurrentPhase $false -Forced:$script:ForcedTermination -ErrorClass 'remote_failure'
 } finally {
     $stoppedFinal = Stop-WebProcess $script:MemberProcess
-    $script:MemberProcess = $null
+    if ($stoppedFinal) { $script:MemberProcess = $null }
     $clean = $false
-    if ($stoppedFinal -and $script:AllPassed -and $null -ne $script:Base) {
+    # No managed pause/revoke drain acknowledgement is exposed by this
+    # subset.  Retain the run namespace when the acknowledgement is unknown,
+    # on a forced stop, or when the process did not stop cleanly.
+    if ($stoppedFinal -and $script:AllPassed -and $script:GracefulDrainProven -and -not $script:ForcedTermination -and $null -ne $script:Base) {
         try {
             if ($script:DestinationCreated -and (Test-Path -LiteralPath $config.destination_root)) {
                 Remove-Item -LiteralPath $config.destination_root -Recurse -Force -ErrorAction Stop
@@ -328,10 +348,9 @@ try {
             $clean = $true
         } catch { $clean = $false }
     }
-    $script:CleanupPassed = $stoppedFinal -and $clean
+    $script:CleanupPassed = $stoppedFinal -and $clean -and $script:GracefulDrainProven -and -not $script:ForcedTermination
     Emit-Phase 'cleanup' $script:CleanupPassed -Forced:$script:ForcedTermination -ErrorClass $(if ($script:CleanupPassed) { '' } else { 'cleanup_incomplete' })
 }
 
-if (-not $script:AllPassed -or -not $script:CleanupPassed) { exit 1 }
-if ($script:ForcedTermination) { exit 0 }
+if (-not $script:AllPassed -or -not $script:CleanupPassed -or $script:ForcedTermination) { exit 1 }
 exit 0

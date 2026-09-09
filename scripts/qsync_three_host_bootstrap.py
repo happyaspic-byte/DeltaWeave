@@ -109,6 +109,7 @@ ERROR_CLASSES = {
     "share_swarm_missing",
     "external_unavailable",
     "precondition_missing",
+    "remote_failure",
     "timeout",
     "cleanup_incomplete",
     "unexpected",
@@ -776,11 +777,12 @@ class RemoteRun:
     phases: list[dict[str, Any]] = field(default_factory=list)
     file_hash: str | None = None
     file_size: int | None = None
+    binary_size: int | None = None
     forced_termination: bool = False
     status_code: int = 1
 
 
-def parse_remote_output(stdout: bytes | str, expected_hash: str) -> RemoteRun:
+def parse_remote_output(stdout: bytes | str, expected_hash: str, expected_size: int | None = None) -> RemoteRun:
     """Parse only the fixed FROLE vocabulary; discard all other remote output."""
 
     if isinstance(stdout, bytes):
@@ -801,7 +803,12 @@ def parse_remote_output(stdout: bytes | str, expected_hash: str) -> RemoteRun:
             result.file_hash = hash_value
             if size_value is not None:
                 result.file_size = int(size_value)
+        if phase == "binary_verification" and size_value is not None:
+            result.binary_size = int(size_value)
         if hash_value and phase == "binary_verification" and hash_value != expected_hash:
+            ok = "false"
+            error_class = "binary_hash_mismatch"
+        if phase == "binary_verification" and expected_size is not None and result.binary_size != expected_size:
             ok = "false"
             error_class = "binary_hash_mismatch"
         if forced == "true":
@@ -865,10 +872,13 @@ def run_winrm_member(
     destination: str,
     expected_file_hash: str,
     public_host: str,
+    artifact_size: int,
     vault: SecretVault,
 ) -> RemoteRun:
     """Run the approved Windows role over encrypted WinRM without a fake local pass."""
 
+    if not isinstance(artifact_size, int) or artifact_size <= 0:
+        fail("manifest_invalid")
     if not all((spec.winrm_host_env, spec.winrm_username_env, spec.winrm_password_env)):
         fail("config_invalid")
     host_raw = os.environ.get(spec.winrm_host_env or "")
@@ -892,6 +902,7 @@ def run_winrm_member(
         remote_config = {
             "artifact_url": server.url(),
             "artifact_sha256": artifact_hash,
+            "artifact_size": str(artifact_size),
             "owner_base_uri": owner_url,
             "share_key": share_key,
             "destination_root": destination,
@@ -915,7 +926,7 @@ def run_winrm_member(
             fail("external_unavailable", "blocked")
         except Exception:
             fail("external_unavailable", "blocked")
-        remote = parse_remote_output(result.std_out, artifact_hash)
+        remote = parse_remote_output(result.std_out, artifact_hash, artifact_size)
         remote.status_code = int(result.status_code)
         if remote.status_code != 0 and not remote.phases:
             fail("external_unavailable", "blocked")
@@ -1077,6 +1088,11 @@ class LocalWebProcess:
         self.profile = run_root / (role + "-profile")
         self.profile_env: dict[str, str] = {}
         self.forced_termination = False
+        # A process exit is not a protocol drain acknowledgement.  Keep the
+        # distinction explicit so cleanup cannot erase a state directory when
+        # the harness only observed the OS process stopping.
+        self.started_once = False
+        self.graceful_drain_proven = False
 
     def prepare(self) -> None:
         if self.spec.binary is None:
@@ -1115,6 +1131,7 @@ class LocalWebProcess:
                 env=self.child_environment(),
                 close_fds=True,
             )
+            self.started_once = True
         except OSError:
             fail("process_start_failed")
         self.base_url = f"http://127.0.0.1:{port}"
@@ -1149,7 +1166,6 @@ class LocalWebProcess:
         process = self.process
         if process is None:
             return True
-        self.forced_termination = False
         if process.poll() is None:
             process.terminate()
             try:
@@ -1220,13 +1236,24 @@ def fresh_winrm_destination(spec: RoleSpec) -> str:
 
 def safe_cleanup(processes: list[LocalWebProcess], run_root: Path) -> tuple[bool, bool]:
     all_stopped = True
+    graceful_drain_proven = True
     for process in reversed(processes):
         try:
             all_stopped = process.stop() and all_stopped
+            graceful_drain_proven = (
+                graceful_drain_proven
+                and (not process.started_once or process.graceful_drain_proven)
+            )
         except Exception:
             all_stopped = False
-    if not all_stopped:
-        return False, False
+            graceful_drain_proven = False
+    # The harness has no managed pause/revoke drain acknowledgement yet.  A
+    # normal OS exit therefore leaves the owned state for later inspection;
+    # forced/unknown termination must never be hidden by rmtree.
+    if not all_stopped or not graceful_drain_proven or any(
+        process.forced_termination for process in processes
+    ):
+        return all_stopped, False
     try:
         if not run_root.is_dir() or len(run_root.parts) < 3:
             return True, False
@@ -1248,6 +1275,7 @@ def run_harness(config: HarnessConfig, evidence_dir: Path, execute_external: boo
         {"role": "rw-provider", "epoch": None, "verified_chunks": 0, "verified_bytes": 0},
     ]
     file_hash_verified: dict[str, dict[str, Any]] = {}
+    remote_binary: dict[str, dict[str, Any]] = {}
     remote_forced_termination: dict[str, bool] = {}
     status = "failed"
     cleanup_state = {
@@ -1255,6 +1283,7 @@ def run_harness(config: HarnessConfig, evidence_dir: Path, execute_external: boo
         "owned_paths_removed": False,
         "preexisting_protected_state_unchanged": "unverified",
         "forced_termination_used": False,
+        "graceful_drain_proven": "unverified",
         "remote_forced_termination_used": remote_forced_termination,
     }
     try:
@@ -1421,6 +1450,7 @@ def run_harness(config: HarnessConfig, evidence_dir: Path, execute_external: boo
                         destination,
                         expected,
                         public_host,
+                        rw_artifact["size_bytes"],
                         vault,
                     ),
                 )
@@ -1436,15 +1466,30 @@ def run_harness(config: HarnessConfig, evidence_dir: Path, execute_external: boo
                 )
                 if binary_observed:
                     binary_hashes[role] = rw_artifact["sha256"]
+                    remote_binary[role] = {
+                        "sha256": rw_artifact["sha256"],
+                        "size_bytes": remote.binary_size,
+                        "observed": True,
+                    }
                 if remote.file_hash == expected:
                     file_hash_verified[role] = {
                         "sha256": remote.file_hash,
                         "size_bytes": remote.file_size,
                         "observed": True,
                     }
+                if remote.forced_termination:
+                    # A forced/unknown remote stop leaves the remote namespace
+                    # for inspection; it cannot be reported as a completed
+                    # role even when the file hash was correct.
+                    status = "pending"
+                    return 2
                 if remote.status_code != 0 or not remote.phases or any(not item["ok"] for item in remote.phases):
-                    status = "failed"
-                    return 1
+                    cleanup_pending = any(
+                        item["phase"] == "cleanup" and item["error_class"] == "cleanup_incomplete"
+                        for item in remote.phases
+                    )
+                    status = "pending" if cleanup_pending else "failed"
+                    return 2 if cleanup_pending else 1
                 if remote.file_hash != expected or remote.file_size is None or remote.file_size <= 0:
                     status = "failed"
                     return 1
@@ -1550,6 +1595,16 @@ def run_harness(config: HarnessConfig, evidence_dir: Path, execute_external: boo
             cleanup_state["owned_processes_stopped"] = stopped
             cleanup_state["owned_paths_removed"] = removed
             cleanup_state["forced_termination_used"] = any(process.forced_termination for process in processes)
+            started_processes = [process for process in processes if process.started_once]
+            cleanup_state["graceful_drain_proven"] = (
+                "not_needed"
+                if not started_processes
+                else (
+                    "verified"
+                    if all(process.graceful_drain_proven for process in started_processes)
+                    else "unverified"
+                )
+            )
         if evidence is not None:
             if run_root is not None and not cleanup_state["owned_paths_removed"]:
                 cleanup_status = "pending"
@@ -1584,6 +1639,7 @@ def run_harness(config: HarnessConfig, evidence_dir: Path, execute_external: boo
                 "status": final_status,
                 "source_sha": config.source_sha,
                 "binary_sha256": binary_hashes,
+                "remote_binary": remote_binary,
                 "topology": [ROLE_LABELS[role] for role in ROLE_NAMES],
                 "providers": providers,
                 "file_hash_verified": file_hash_verified,

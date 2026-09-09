@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Run the hosted-Ubuntu read-only role of the F bootstrap.
 
-The owner URL, owner token, and one-use share key are environment inputs.  The
-role driver never places them in argv, child environments, evidence, or logs.
+Only the one-use share key is an environment input.  The owner endpoint and
+administrator credential stay on the owner side; the role driver never places
+the share key in argv, child environments, evidence, or logs.
 It starts one fresh local member process, exercises the managed API, verifies a
 real file hash, reopens the same state, and reports only fixed phase records.
 """
@@ -82,6 +83,7 @@ def _run(argv: list[str] | None = None) -> int:
         "owned_processes_stopped": False,
         "owned_paths_removed": False,
         "forced_termination_used": False,
+        "graceful_drain_proven": "unverified",
         "preexisting_protected_state_unchanged": "unverified",
     }
     try:
@@ -193,7 +195,10 @@ def _run(argv: list[str] | None = None) -> int:
 
         stopped = process.stop()
         cleanup["forced_termination_used"] = process.forced_termination
-        if not stopped:
+        # Stopping the OS process is not a managed pause/revoke drain ACK.  Do
+        # not start the recovery leg after a forced or otherwise uncertain
+        # termination; retain the owned namespace for inspection.
+        if not stopped or process.forced_termination:
             recorder.add(
                 phase="member_reopen_membership",
                 role="ro_consumer",
@@ -237,20 +242,37 @@ def _run(argv: list[str] | None = None) -> int:
         return result_code
     finally:
         if process is not None:
+            started_once = process.started_once
             try:
                 stopped = process.stop()
                 cleanup["owned_processes_stopped"] = stopped
                 cleanup["forced_termination_used"] = cleanup["forced_termination_used"] or process.forced_termination
             except Exception:
                 cleanup["owned_processes_stopped"] = False
-        if run_root is not None and cleanup["owned_processes_stopped"]:
+                started_once = True
+            cleanup["graceful_drain_proven"] = (
+                "verified" if started_once and process.graceful_drain_proven
+                else "unverified" if started_once
+                else "not_needed"
+            )
+        else:
+            # No child was created, so the run namespace can be removed even
+            # when an earlier precondition failed.
+            cleanup["owned_processes_stopped"] = True
+            cleanup["graceful_drain_proven"] = "not_needed"
+        if (
+            run_root is not None
+            and cleanup["owned_processes_stopped"]
+            and cleanup["graceful_drain_proven"] in {"verified", "not_needed"}
+            and not cleanup["forced_termination_used"]
+        ):
             try:
                 shutil.rmtree(run_root)
                 cleanup["owned_paths_removed"] = not run_root.exists()
             except OSError:
                 cleanup["owned_paths_removed"] = False
         if evidence is not None:
-            cleanup_status = "pass" if cleanup["owned_paths_removed"] else "pending"
+            cleanup_status = "pass" if run_root is None or cleanup["owned_paths_removed"] else "pending"
             recorder.add(
                 phase="cleanup",
                 role="controller",
