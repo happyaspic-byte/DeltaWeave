@@ -1247,7 +1247,14 @@ fn closed_catalog_bytes(path: &std::path::Path) -> Vec<u8> {
             .unwrap()
             .map(|table| table.name().to_owned())
             .collect::<Vec<_>>(),
-        vec!["owner_share_catalog_v3"]
+        vec![
+            "owner_share_catalog_v3",
+            "share-swarm-apply-v1",
+            "share-swarm-clock-v1",
+            "share-swarm-grant-drain-v1",
+            "share-swarm-grant-v1",
+            "share-swarm-snapshot-v1",
+        ]
     );
     assert!(read.list_multimap_tables().unwrap().next().is_none());
     let table = read

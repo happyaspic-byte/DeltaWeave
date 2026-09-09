@@ -6,9 +6,11 @@
 
 작성 agent: `qsync_contracts` / Luna Max
 
-현재 단계: B control final acceptance fixture follow-up. A 계약 문서는 `121d042`로
-통합되었고, B의 현재 source/test checkpoint는 `5702ab1`이며 fixture follow-up은
-`16e8882` 이후 진행 중이다. D/E와 최종 통합·push는 root가 조정한다.
+현재 단계: D2 network authority checkpoint. A 계약 문서는 `121d042`로
+통합되었고, B 최종 source checkpoint는 `5702ab1`, D2 source checkpoint는
+`04818f2b224249b2839b20d0b18f7b6634ae0c0a`이다. D2는 authority와
+request-start monotonic activation lease 검증까지 완료했으며
+D3 heartbeat/N0와 E data-plane은 완료로 표시하지 않는다.
 
 ## 작업 공간과 agent
 
@@ -18,9 +20,10 @@
 | A contracts | `/home/ubuntu/project/DeltaWeave-qsync-contracts-20260908` | `feat/qsync-contracts-20260908` | `121d042` 완료 |
 | A protocol audit | 별도 agent `qsync_protocol_audit` | root 기록 예정 | `8d50a14` network 계약 완료, D/E 입력 |
 | baseline validation | `luna_protocol_plan` 재사용 | root 기록 예정 | CI 실패 원인 조사 |
-| B control | `/home/ubuntu/project/DeltaWeave-qsync-control-20260908` | `feat/qsync-control-20260908` | `5702ab1` final source; acceptance fixture follow-up `16e8882` |
+| B control | `/home/ubuntu/project/DeltaWeave-qsync-control-20260908` | `feat/qsync-control-20260908` | `5702ab1` final source; Windows acceptance fixture follow-up `39ae489` |
 | C web | `/home/ubuntu/project/DeltaWeave-qsync-web-20260908` | `feat/qsync-web-20260908` | 병렬 구현 진행 |
 | validation | `/home/ubuntu/project/DeltaWeave-qsync-verification-20260908` | `test/qsync-verification-20260908` | 후속 검증 |
+| D network | `/home/ubuntu/project/DeltaWeave-qsync-network-20260908` | `feat/qsync-network-20260908` | `04818f2` D2 authority/registry/handler와 request-start activation lease checkpoint, isolated full-net 통과; D3 대기 |
 
 ## A에서 고정한 계약
 
@@ -73,6 +76,12 @@
 | B cancellation/observer checkpoint | cancelled first shutdown caller, concurrent shutdown waiter, public join/retry caller abort, started writer serialization, pause→resume and revoke→late-error status precedence, observer/failure field preservation `6` focused cases passed; source commit `7a29c7b` | `b-control/aborted_public_join_keeps_pending_save_and_lease-p1p2-current.log`, `b-control/aborted_public_retry_keeps_membership_transition_durable-p1p2-current.log`, `b-control/aborted_save_keeps_writer_until_publication_and_shutdown_is_serial-p1p2-current.log`, `b-control/shutdown-cancellation-final.log`, `b-control/observer-p2-precedence-final.log`, `b-control/observer-p2-publication-final.log` |
 | B final compile/lint for checkpoint | `cargo check --locked ... --all-targets --all-features` exit `0`; strict clippy with `-D warnings` exit `0`; fmt and diff check exit `0` | `b-control/check-control-net-cancellation-final-2.log`, `b-control/clippy-control-net-cancellation-final-3.log`; an earlier clippy attempt failed on newly introduced conditional-shape lints and is retained separately, then fixed before this result |
 | B final-save observation publication | source `5702ab1`; final fsync callback barrier, memory publication, automatic persistence `config::save`, shutdown/reopen durable Revoked view all passed; no manual follow-up persist | `b-control/final-save-auto-flush-durable-20260909.log`, exit `0`, child+outer each `1 passed`; command used `CARGO_TARGET_DIR=/home/ubuntu/.herdr/worktrees/DeltaWeave/share-key-sync-update/target CARGO_BUILD_JOBS=4 TMPDIR=... cargo test --locked -p deltaweave-control --lib managed_error_tests::final_save_preserves_callback_before_memory_publication_and_next_flush -- --exact --nocapture` (started `2026-09-09T01:37:17Z`, ended `2026-09-09T01:37:47Z`) |
+| B Windows acceptance fixture follow-up | source `39ae489`; pause-completion `last_sync_at` baseline, actual ticket expiry bounded wait, and reopen-after-expiry assertion fixed; lifecycle and pending-expiry tests each exit `0` (outer/child each `1 passed`) | `b-control/acceptance-pause-final-20260909T025639Z.log`, `b-control/acceptance-expiry-final2-20260909T025704Z.log`; no production clock or ACL relaxation |
+| D2 source checkpoint | source `63226b9d7dbd0e227e27c9dbb9748a5fa479f91a`; authority signed snapshot/manifest/grant/permit, exact record size/root/epoch/provider checks, bounded registry GC, clock quarantine/restart blockers, revoke and bilateral drain, ALPN `share-swarm/1` grant-only rejection handler | `d-network/d2-final-build-20260909T025247Z.log`: control+net check exit `0`, strict net clippy exit `0`; `d-network/d2-focused-final-20260909T025317Z.log`: authority `3`, roster `3`, registry `10`, service `4` tests passed, all exits `0` |
+| D2 activation lease checkpoint | source `04818f2b224249b2839b20d0b18f7b6634ae0c0a`; `ShareSession::activate_grant` now returns local `ActivationLease { reply, deadline }`, with `deadline = request_started + min(reply.max_duration_secs, 15s)` and no response-time extension; wire reply remains unchanged | `d-network/d2-activation-lease-20260909T031405Z.log`: the two activation lease tests passed, exit `0`; delayed-reply test proves exactly 6 seconds remain from a fixed request/reply interval, and late-reply test rejects the expired lease |
+| D2 quality gates | source `04818f2b224249b2839b20d0b18f7b6634ae0c0a`; format, diff, control+net all-target check, and strict clippy all passed | `d-network/d2-activation-quality-20260909T031532Z.log`: start `2026-09-09T03:15:32Z`, end `2026-09-09T03:15:58Z`, each step exit `0`; command records `CARGO_TARGET_DIR` and `CARGO_BUILD_JOBS=4` |
+| D2 isolated full-net rerun | source `04818f2b224249b2839b20d0b18f7b6634ae0c0a`; fresh workspace-private `HOME`/`USERPROFILE`/`TMPDIR` with preserved `/home/ubuntu/.rustup` and `/home/ubuntu/.cargo`; previous 31 ENOENT did not recur | `f-validation/net-full-isolated-20260909T031429Z.log`: start `2026-09-09T03:14:29Z`, end `2026-09-09T03:14:45Z`, exit `0`; unit `104`, admission `2`, share `13`, doctest `0`, all failed `0` |
+| D2 full-net baseline observation | source `b571d30` plus uncommitted D2 tree at test start; `64 passed, 31 failed`, exit `101`; all 31 failures were existing ENOENT child/profile or host admission fixture failures, while D2 modules passed | `d-network/net-all-tests-20260909T024459Z.log`; retained as baseline evidence and not reclassified as D2 logic failures |
 | npm/Windows/Internet/full CI | 아직 실행하지 않음 | 후속 evidence 필요 |
 
 ## baseline 실패와 남은 문제
@@ -106,6 +115,37 @@ tmpfs `usrquota`의 `EDQUOT`로 중단되었으며 제품 오류로 분류하지
 미실행 acceptance: B/C 전체 API 통합과 실제 인증 web 통신, 3기기 owner/RO/RW browser
 flow, D N0/relay/address update, E swarm grant/manifest/max-8/fallback, root safety의
 전체 경로, Windows native 제품 검증, external Internet, full CI 및 main push.
+
+## D2 network authority checkpoint (`63226b9`)
+
+- `ShareService`가 기존 device endpoint에서 `share/3` control과 정확한
+  `share-swarm/1` ALPN을 함께 소유한다. D2의 swarm handler는 grant 없는 데이터 연결을
+  명시적으로 거부하며 실제 CAS/chunk 응답은 E가 연결할 때까지 성공으로 주장하지 않는다.
+- `SnapshotToken`/`AuthoritativeSnapshot`은 owner/share/consumer epoch, 정렬된 전체
+  record, Merkle root/count/frame bound를 검증한다. `ManifestAttestation`은 exact
+  record hash, content hash, descriptor hash와 `record.size`를 모두 대조한다.
+- `Registry`의 별도 v1 authority tables는 provider/consumer epoch와 fresh signed
+  roster를 확인하고, owner provider는 `provider_epoch=0`과 현재 enabled runtime을
+  요구한다. RO member provider도 허용한다. row/byte cap, finite GC, managed clock
+  high-water/quarantine, restart의 Active/Started `Restarted` blocker를 유지한다.
+- revoke는 catalog와 grant/apply deny를 같은 transaction에 기록한다. Issued/Prepared는
+  즉시 deny하고 Active/Started는 blocker로 남긴다. grant는 provider와 consumer 양쪽의
+  exact activation drain ACK가 있어야 Drained/Complete가 되며 한쪽 ACK, partition,
+  restart, TTL만으로 Complete로 승격하지 않는다.
+- `ShareSession`에는 bounded snapshot/manifest/grant/activate/revalidate/apply/drain
+  methods가 연결되고, `activate_grant`는 wire reply와 request 시작 기준의 local
+  monotonic `ActivationLease`를 함께 반환하여 늦은 응답이 새 15초를 시작하지 못하게
+  한다. provider 검증 primitive는 local endpoint가 signed provider, remote peer가
+  signed consumer인지 확인한다. `Registry::remove_share`는 authority rows를 share
+  단위로 정리하며 기존 root/index/CAS 파일은 보존한다.
+
+D2에서 실제 확인한 것은 위 source-level authority/control 경계와 DirectOnly isolated
+  tests, request-start activation lease 및 isolated full-net 회귀다. 아직 D 전체 완료가
+  아닌 남은 항목은 managed worker의 30초 heartbeat와 90초
+  stale refresh, owner 주소 변경/실제 offline 복귀, Internet/N0 relay payload 증거,
+  signed roster pagination, E의 실제 `share-swarm/1` verified-CAS multi-provider data
+  handler/stream limits, Windows 3-host 및 F full CI 검증이다. DirectOnly stale-address
+  refresh와 live provider discovery는 D3 의존성으로 유지한다.
 
 ## e8122ac finding 매핑
 

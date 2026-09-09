@@ -1,10 +1,15 @@
 //! Owner-mediated, folder-scoped sharing over one persistent device endpoint.
+mod authority;
 mod registry;
 mod roster;
 mod runtime;
 mod service;
 mod ticket;
 pub(crate) mod wire;
+pub use authority::{
+    ActivateGrantReply, ActivateGrantRequest, ApplyDrained, ApplyPermit, ApplyStart,
+    AuthoritativeSnapshot, ManifestAttestation, RevocationReceipt, ShareGrant, SnapshotToken,
+};
 pub use registry::{Invitation, MemberRelationship, Membership, OwnedShareConfig};
 pub use roster::{
     GrantNonce, PermissionEpoch, ROSTER_HEARTBEAT_INTERVAL_SECONDS, RosterEntry, RosterHeartbeat,
@@ -12,9 +17,13 @@ pub use roster::{
 };
 pub(crate) use runtime::Authorization;
 pub use runtime::{MutationProvenance, OwnerShare};
-pub use service::{ShareService, ShareSession};
+pub use service::{ActivationLease, ShareService, ShareSession};
 
 pub const ALPN_V3: &[u8] = b"deltaweave/share/3";
+/// Separate grant-gated data protocol.  D2 registers the endpoint and
+/// rejects unauthenticated streams; E supplies the chunk adapter after the
+/// authority contract is verified.
+pub const ALPN_SWARM_V1: &[u8] = b"deltaweave/share-swarm/1";
 pub use ticket::{InvitationId, LegacyProof, Permission, ShareId, ShareTicket, TicketPreview};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
