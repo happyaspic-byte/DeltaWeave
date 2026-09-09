@@ -1616,6 +1616,7 @@ class LocalController:
         remote_result: bootstrap.RemoteRun | None = None
         owner_stopped = False
         owner_forced = False
+        owner_exit_code: int | None = None
         runtime_removed = False
         ro_result: dict[str, Any] | None = None
         run_error: ControllerError | None = None
@@ -1626,6 +1627,7 @@ class LocalController:
             "run_status": "starting",
             "owner_stopped": False,
             "owner_forced": False,
+            "owner_exit_code": None,
             "rw_ready": False,
             "rw_completed": False,
             "rw_contract_valid": False,
@@ -1784,6 +1786,7 @@ class LocalController:
             except Exception:
                 owner_stopped = False
             owner_forced = bool(owner_process.forced_termination)
+            owner_exit_code = getattr(owner_process, "exit_code", None)
         if remote_result is not None:
             state_after, refresh_failed = _load_state_or(state_path, state_after)
             state_refresh_failed = state_refresh_failed or refresh_failed
@@ -1794,6 +1797,7 @@ class LocalController:
                 except Exception:
                     owner_stopped = False
                 owner_forced = bool(owner_process.forced_termination)
+                owner_exit_code = getattr(owner_process, "exit_code", None)
             rw_contract_valid = bootstrap.remote_contract_is_complete(
                 remote_result,
                 rw_info["sha256"],
@@ -1806,6 +1810,7 @@ class LocalController:
             rw_contract_valid = False
         if owner_process is not None:
             owner_forced = owner_forced or bool(owner_process.forced_termination)
+            owner_exit_code = getattr(owner_process, "exit_code", None)
 
         current_state, refresh_failed = _load_state_or(state_path, state_after)
         state_refresh_failed = state_refresh_failed or refresh_failed
@@ -1850,6 +1855,7 @@ class LocalController:
             "run_status": final_status,
             "owner_stopped": owner_stopped,
             "owner_forced": owner_forced,
+            "owner_exit_code": owner_exit_code,
             "owner_drain_proven": owner_drain_proven,
             "rw_ready": bool(observer is not None and observer.is_ready()),
             "rw_completed": remote_result is not None,

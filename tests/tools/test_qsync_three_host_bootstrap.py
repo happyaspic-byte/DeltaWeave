@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import subprocess
 import shutil
 import sys
 import tempfile
@@ -21,6 +22,36 @@ SPEC.loader.exec_module(MODULE)
 
 
 class QsyncBootstrapTests(unittest.TestCase):
+    @staticmethod
+    def _process_spec() -> object:
+        return MODULE.RoleSpec(
+            "owner",
+            "local",
+            None,
+            "a" * 64,
+            None,
+            None,
+            None,
+            "127.0.0.1",
+            None,
+            None,
+            None,
+        )
+
+    @staticmethod
+    def _signal_child(exit_code: int, ready: Path) -> list[str]:
+        code = (
+            "import signal,sys,time\n"
+            "from pathlib import Path\n"
+            f"def stop(_signum, _frame): sys.exit({exit_code})\n"
+            "signal.signal(signal.SIGTERM, stop)\n"
+            "sigbreak = getattr(signal, 'SIGBREAK', None)\n"
+            "if sigbreak is not None: signal.signal(sigbreak, stop)\n"
+            f"Path({json.dumps(str(ready))}).write_text('ready')\n"
+            "time.sleep(60)\n"
+        )
+        return [sys.executable, "-c", code]
+
     def test_phase_recorder_uses_subsecond_utc_timestamps(self) -> None:
         recorder = MODULE.PhaseRecorder()
         with mock.patch.object(
@@ -136,6 +167,134 @@ class QsyncBootstrapTests(unittest.TestCase):
             self.assertEqual(MODULE.safe_cleanup([process], run_root), (True, False))
             self.assertTrue(run_root.is_dir())
             shutil.rmtree(run_root)
+
+    @unittest.skipUnless(os.name == "posix", "native Windows signal proof uses the dedicated helper")
+    def test_stop_proves_signal_and_exit_zero_for_owned_process(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_root = Path(temporary) / "run"
+            run_root.mkdir(mode=0o700)
+            process = MODULE.LocalWebProcess(
+                self._process_spec(), run_root, "owner", MODULE.SecretVault()
+            )
+            ready = run_root / "ready"
+            process.process = subprocess.Popen(
+                self._signal_child(0, ready),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            process.started_once = True
+            try:
+                deadline = MODULE.time.monotonic() + 5
+                while not ready.exists() and MODULE.time.monotonic() < deadline:
+                    self.assertIsNone(process.process.poll())
+                    MODULE.time.sleep(0.01)
+                self.assertTrue(ready.exists())
+                self.assertTrue(process.stop())
+                self.assertIsNone(process.process)
+                self.assertEqual(process.exit_code, 0)
+                self.assertTrue(process.graceful_drain_proven)
+                self.assertFalse(process.forced_termination)
+            finally:
+                if process.process is not None:
+                    process.process.kill()
+                    process.process.wait(timeout=5)
+
+    @unittest.skipUnless(os.name == "posix", "native Windows signal proof uses the dedicated helper")
+    def test_nonzero_owned_process_exit_is_stopped_but_not_graceful(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_root = Path(temporary) / "run"
+            run_root.mkdir(mode=0o700)
+            process = MODULE.LocalWebProcess(
+                self._process_spec(), run_root, "owner", MODULE.SecretVault()
+            )
+            ready = run_root / "ready"
+            process.process = subprocess.Popen(
+                self._signal_child(7, ready),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            process.started_once = True
+            try:
+                deadline = MODULE.time.monotonic() + 5
+                while not ready.exists() and MODULE.time.monotonic() < deadline:
+                    self.assertIsNone(process.process.poll())
+                    MODULE.time.sleep(0.01)
+                self.assertTrue(ready.exists())
+                self.assertTrue(process.stop())
+                self.assertIsNone(process.process)
+                self.assertEqual(process.exit_code, 7)
+                self.assertFalse(process.graceful_drain_proven)
+                self.assertFalse(process.forced_termination)
+            finally:
+                if process.process is not None:
+                    process.process.kill()
+                    process.process.wait(timeout=5)
+
+    def test_signal_failure_keeps_owned_process_handle_for_reconciliation(self) -> None:
+        class RefusedProcess:
+            returncode = None
+
+            def poll(self) -> None:
+                return None
+
+            def send_signal(self, _signal: object) -> None:
+                raise OSError("signal refused")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            run_root = Path(temporary) / "run"
+            run_root.mkdir(mode=0o700)
+            process = MODULE.LocalWebProcess(
+                self._process_spec(), run_root, "owner", MODULE.SecretVault()
+            )
+            owned = RefusedProcess()
+            process.process = owned  # type: ignore[assignment]
+            process.started_once = True
+            self.assertFalse(process.stop())
+            self.assertIs(process.process, owned)
+            self.assertIsNone(process.exit_code)
+            self.assertFalse(process.graceful_drain_proven)
+            self.assertFalse(process.forced_termination)
+
+    def test_forced_owned_process_stop_records_non_graceful_exit(self) -> None:
+        class SlowProcess:
+            returncode = None
+
+            def __init__(self) -> None:
+                self.wait_calls = 0
+                self.killed = False
+
+            def poll(self) -> int | None:
+                return -9 if self.killed else None
+
+            def send_signal(self, _signal: object) -> None:
+                return None
+
+            def wait(self, timeout: int) -> int:
+                self.wait_calls += 1
+                if self.wait_calls == 1:
+                    raise subprocess.TimeoutExpired("owned", timeout)
+                self.returncode = -9
+                return self.returncode
+
+            def kill(self) -> None:
+                self.killed = True
+
+        with tempfile.TemporaryDirectory() as temporary:
+            run_root = Path(temporary) / "run"
+            run_root.mkdir(mode=0o700)
+            process = MODULE.LocalWebProcess(
+                self._process_spec(), run_root, "owner", MODULE.SecretVault()
+            )
+            owned = SlowProcess()
+            process.process = owned  # type: ignore[assignment]
+            process.started_once = True
+            self.assertTrue(process.stop())
+            self.assertIsNone(process.process)
+            self.assertEqual(process.exit_code, -9)
+            self.assertFalse(process.graceful_drain_proven)
+            self.assertTrue(process.forced_termination)
 
 
 if __name__ == "__main__":
