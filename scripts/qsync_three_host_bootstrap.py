@@ -779,6 +779,15 @@ REMOTE_PHASES = {
 # WinRS argument itself; it is never reported with payload contents.
 WINRM_CMD_SHELL_LIMIT_BYTES = 8191
 WINRM_MAX_ENCODED_COMMAND_BYTES = 512 * 1024
+WINRM_DIRECT_COMMAND_LIMIT_BYTES = 32767
+WINRM_POWER_SHELL_ARGUMENTS = (
+    "-NoLogo",
+    "-NoProfile",
+    "-NonInteractive",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-EncodedCommand",
+)
 
 
 @dataclass
@@ -895,10 +904,7 @@ def _winrm_command_lengths(command: str) -> dict[str, int]:
 
     encoded = _winrm_encoded_command(command)
     legacy_command = "powershell -encodedcommand " + encoded
-    direct_command = (
-        "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand "
-        + encoded
-    )
+    direct_command = "powershell.exe " + " ".join((*WINRM_POWER_SHELL_ARGUMENTS, encoded))
     return {
         "wrapper_bytes": len(command.encode("utf-8")),
         "encoded_command_bytes": len(encoded.encode("ascii")),
@@ -914,6 +920,9 @@ def _run_winrm_powershell(session: Any, command: str) -> WinRMResult:
     if protocol is None:
         fail("external_unavailable", "blocked")
     encoded = _winrm_encoded_command(command)
+    direct_command = "powershell.exe " + " ".join((*WINRM_POWER_SHELL_ARGUMENTS, encoded))
+    if len(direct_command.encode("ascii")) > WINRM_DIRECT_COMMAND_LIMIT_BYTES:
+        fail("api_response_invalid")
     shell_id: Any = None
     command_id: Any = None
     cleanup_failed = False
@@ -922,15 +931,7 @@ def _run_winrm_powershell(session: Any, command: str) -> WinRMResult:
         command_id = protocol.run_command(
             shell_id,
             "powershell.exe",
-            (
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-EncodedCommand",
-                encoded,
-            ),
+            (*WINRM_POWER_SHELL_ARGUMENTS, encoded),
             console_mode_stdin=False,
             skip_cmd_shell=True,
         )

@@ -278,6 +278,20 @@ class QsyncRoleManifestTests(unittest.TestCase):
         self.assertGreater(lengths["legacy_run_ps_command_bytes"], BOOTSTRAP.WINRM_CMD_SHELL_LIMIT_BYTES)
         self.assertGreater(lengths["direct_skip_cmd_shell_command_bytes"], BOOTSTRAP.WINRM_CMD_SHELL_LIMIT_BYTES)
         self.assertLessEqual(lengths["encoded_command_bytes"], BOOTSTRAP.WINRM_MAX_ENCODED_COMMAND_BYTES)
+        self.assertLessEqual(
+            lengths["direct_skip_cmd_shell_command_bytes"], BOOTSTRAP.WINRM_DIRECT_COMMAND_LIMIT_BYTES
+        )
+
+        class NoRunProtocol:
+            def open_shell(self) -> None:
+                raise AssertionError("oversized command must fail before opening WinRS")
+
+        class NoRunSession:
+            protocol = NoRunProtocol()
+
+        with self.assertRaises(BOOTSTRAP.HarnessError) as error:
+            BOOTSTRAP._run_winrm_powershell(NoRunSession(), "x" * 20000)
+        self.assertEqual(error.exception.error_class, "api_response_invalid")
 
 
 if __name__ == "__main__":
