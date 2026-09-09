@@ -163,7 +163,7 @@ struct ManagedSwarmOutcome {
 /// process.  If a persisted stage has no captured identity (for example, an
 /// older journal format), cleanup deliberately preserves the directory rather
 /// than risking deletion after a same-name replacement.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct ManagedStageIdentity {
     volume: u64,
     file: u64,
@@ -229,6 +229,8 @@ pub(crate) struct ManagedApplyJournal {
 /// RW engines use the index share-metadata slot for this versioned envelope.
 /// RO engines have a different envelope in `read_only.rs`; neither path
 /// silently overwrites an unknown metadata value.
+const MANAGED_RW_JOURNAL_VERSION: u8 = 2;
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct ManagedRwJournal {
     version: u8,
@@ -236,14 +238,19 @@ struct ManagedRwJournal {
     share: [u8; 32],
     #[serde(default)]
     stage_roots: Vec<PathBuf>,
+    /// Identity captured before a stage is used. `None` denotes a legacy
+    /// entry whose path is retained but cannot be safely deleted after restart.
+    #[serde(default)]
+    stage_identities: Vec<Option<ManagedStageIdentity>>,
     #[serde(default)]
     apply: Option<ManagedApplyJournal>,
 }
 
 /// The first E3 checkpoint stored one optional stage root.  Postcard is
-/// positional, so decode that shape explicitly before accepting a newer list
-/// of round roots.  A missing/invalid envelope remains StateUnavailable.
-#[derive(Clone, Debug, Deserialize)]
+/// positional, so decode both prior shapes explicitly before accepting the
+/// identity-bound v2 envelope. A missing/invalid envelope remains
+/// StateUnavailable.
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct LegacyManagedRwJournal {
     version: u8,
     owner: [u8; 32],
@@ -252,15 +259,58 @@ struct LegacyManagedRwJournal {
     apply: Option<ManagedApplyJournal>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct LegacyManagedRwJournalV1 {
+    version: u8,
+    owner: [u8; 32],
+    share: [u8; 32],
+    stage_roots: Vec<PathBuf>,
+    apply: Option<ManagedApplyJournal>,
+}
+
 impl ManagedRwJournal {
     fn new(owner: EndpointId, share: ShareId) -> Self {
         Self {
-            version: 1,
+            version: MANAGED_RW_JOURNAL_VERSION,
             owner: *owner.as_bytes(),
             share: share.0,
             stage_roots: Vec::new(),
+            stage_identities: Vec::new(),
             apply: None,
         }
+    }
+}
+
+fn decode_managed_rw_journal(bytes: &[u8]) -> Result<ManagedRwJournal> {
+    match postcard::from_bytes::<ManagedRwJournal>(bytes) {
+        Ok(journal) => Ok(journal),
+        Err(_) => match postcard::from_bytes::<LegacyManagedRwJournalV1>(bytes) {
+            Ok(legacy) => {
+                ensure!(legacy.version == 1, ShareError::StateUnavailable);
+                Ok(ManagedRwJournal {
+                    version: MANAGED_RW_JOURNAL_VERSION,
+                    owner: legacy.owner,
+                    share: legacy.share,
+                    stage_identities: vec![None; legacy.stage_roots.len()],
+                    stage_roots: legacy.stage_roots,
+                    apply: legacy.apply,
+                })
+            }
+            Err(_) => {
+                let legacy: LegacyManagedRwJournal =
+                    postcard::from_bytes(bytes).context(ShareError::StateUnavailable)?;
+                ensure!(legacy.version == 1, ShareError::StateUnavailable);
+                let stage_roots = legacy.stage_root.into_iter().collect::<Vec<_>>();
+                Ok(ManagedRwJournal {
+                    version: MANAGED_RW_JOURNAL_VERSION,
+                    owner: legacy.owner,
+                    share: legacy.share,
+                    stage_identities: vec![None; stage_roots.len()],
+                    stage_roots,
+                    apply: legacy.apply,
+                })
+            }
+        },
     }
 }
 
@@ -340,8 +390,15 @@ impl ManagedStages {
     /// Reconstructs a path from a persisted journal without claiming current
     /// filesystem ownership.  A post-restart same-name replacement is left in
     /// place until a future journal with an identity can prove it is ours.
-    fn for_recovery_root(root: PathBuf, state_root: &Path) -> Self {
+    fn for_recovery_root_with_identity(
+        root: PathBuf,
+        identity: Option<ManagedStageIdentity>,
+        state_root: &Path,
+    ) -> Self {
         let mut stages = Self::default();
+        if let Some(identity) = identity {
+            stages.identities.insert(root.clone(), identity);
+        }
         stages.roots.push(root);
         stages.cleanup_state_root = Some(state_root.to_path_buf());
         stages.cleanup_armed = true;
@@ -409,6 +466,27 @@ impl ManagedStages {
             self.roots.clear();
         }
     }
+}
+
+/// Removes only journaled stage paths that are now absent. Existing paths are
+/// retained when cleanup could not prove ownership, including old journals
+/// without a persisted identity. This makes a successful drain unable to
+/// erase the only recovery reference to an uncertain replacement.
+fn retain_existing_stage_roots(journal: &mut ManagedRwJournal) {
+    let mut roots = Vec::with_capacity(journal.stage_roots.len());
+    let mut identities = Vec::with_capacity(journal.stage_identities.len());
+    for (root, identity) in journal
+        .stage_roots
+        .drain(..)
+        .zip(journal.stage_identities.drain(..))
+    {
+        if fs::symlink_metadata(&root).is_ok() {
+            roots.push(root);
+            identities.push(identity);
+        }
+    }
+    journal.stage_roots = roots;
+    journal.stage_identities = identities;
 }
 
 impl Drop for ManagedStages {
@@ -747,24 +825,15 @@ impl ReplicaState {
         let Some(bytes) = self.index.share_metadata()? else {
             return Ok(ManagedRwJournal::new(membership.owner, membership.share_id));
         };
-        let journal = match postcard::from_bytes::<ManagedRwJournal>(&bytes) {
-            Ok(journal) => journal,
-            Err(_) => {
-                let legacy: LegacyManagedRwJournal = postcard::from_bytes(&bytes)
-                    .context(deltaweave_net::share::ShareError::StateUnavailable)?;
-                ManagedRwJournal {
-                    version: legacy.version,
-                    owner: legacy.owner,
-                    share: legacy.share,
-                    stage_roots: legacy.stage_root.into_iter().collect(),
-                    apply: legacy.apply,
-                }
-            }
-        };
+        let journal = decode_managed_rw_journal(&bytes)?;
         ensure!(
-            journal.version == 1
+            journal.version == MANAGED_RW_JOURNAL_VERSION
                 && journal.owner == *membership.owner.as_bytes()
                 && journal.share == membership.share_id.0,
+            deltaweave_net::share::ShareError::StateUnavailable
+        );
+        ensure!(
+            journal.stage_roots.len() == journal.stage_identities.len(),
             deltaweave_net::share::ShareError::StateUnavailable
         );
         ensure!(
@@ -801,7 +870,6 @@ impl ReplicaState {
         );
         recover_managed_apply(session, &apply).await?;
         journal.apply = None;
-        journal.stage_roots.clear();
         self.save_managed_rw_journal(journal)
     }
 
@@ -852,7 +920,6 @@ impl ReplicaState {
             .apply_drained(permit, operation_id, committed)
             .await?;
         journal.apply = None;
-        journal.stage_roots.clear();
         self.save_managed_rw_journal(journal)
     }
 
@@ -1078,15 +1145,21 @@ impl ReplicaState {
         let empty = MerkleTree::from_records(Vec::new())?;
         let mut journal = self.load_managed_rw_journal(session)?;
         let previous_stages = journal.stage_roots.clone();
+        let previous_identities = journal.stage_identities.clone();
         // Recover the previous exact ApplyStart before asking for a new owner
         // snapshot.  Revoked/paused owners may correctly reject new snapshot
         // admission while still allowing an exact drain/status recovery.
         self.recover_managed_rw_apply(session, &mut journal).await?;
-        for stage_root in previous_stages {
-            let mut previous =
-                ManagedStages::for_recovery_root(stage_root, self.store.state_root());
+        for (stage_root, identity) in previous_stages.into_iter().zip(previous_identities) {
+            let mut previous = ManagedStages::for_recovery_root_with_identity(
+                stage_root,
+                identity,
+                self.store.state_root(),
+            );
             previous.cleanup_owned(self.store.state_root());
         }
+        retain_existing_stage_roots(&mut journal);
+        self.save_managed_rw_journal(&journal)?;
 
         let mut owner_snapshot = session.fetch_authoritative_snapshot(&empty).await?;
 
@@ -1238,6 +1311,11 @@ impl ReplicaState {
             ensure_managed_deadline(deadline)?;
             let operation = managed_operation_id(b"managed-local-apply", &owner_snapshot.token, 0);
             journal.stage_roots = staged.roots.clone();
+            journal.stage_identities = staged
+                .roots
+                .iter()
+                .map(|root| staged.identities.get(root).copied())
+                .collect();
             journal.apply = Some(ManagedApplyJournal {
                 permit: permit.clone(),
                 operation_id: operation,
@@ -1296,6 +1374,8 @@ impl ReplicaState {
                 .await?;
         }
         staged.cleanup_owned(self.store.state_root());
+        retain_existing_stage_roots(&mut journal);
+        self.save_managed_rw_journal(&journal)?;
         Ok(SyncReport {
             status: "pass",
             local_before_root: local_tree.root_hash(),
@@ -3964,5 +4044,37 @@ mod tests {
         );
         std::fs::remove_dir_all(&stage).expect("replacement removed by test");
         std::fs::remove_dir_all(original).expect("original removed by test");
+    }
+
+    #[test]
+    fn managed_rw_journal_v1_stage_paths_migrate_without_ownership_claim() {
+        let legacy = LegacyManagedRwJournalV1 {
+            version: 1,
+            owner: [1; 32],
+            share: [2; 32],
+            stage_roots: vec![PathBuf::from("state/.managed-stage-old")],
+            apply: None,
+        };
+        let bytes = postcard::to_stdvec(&legacy).expect("legacy journal encoding");
+        let decoded = decode_managed_rw_journal(&bytes).expect("legacy journal decoding");
+        assert_eq!(decoded.version, MANAGED_RW_JOURNAL_VERSION);
+        assert_eq!(decoded.stage_roots, legacy.stage_roots);
+        assert_eq!(decoded.stage_identities, vec![None]);
+        assert!(decoded.apply.is_none());
+
+        let first = LegacyManagedRwJournal {
+            version: 1,
+            owner: [3; 32],
+            share: [4; 32],
+            stage_root: Some(PathBuf::from("state/.managed-stage-first")),
+            apply: None,
+        };
+        let bytes = postcard::to_stdvec(&first).expect("first journal encoding");
+        let decoded = decode_managed_rw_journal(&bytes).expect("first journal decoding");
+        assert_eq!(
+            decoded.stage_roots,
+            first.stage_root.into_iter().collect::<Vec<_>>()
+        );
+        assert_eq!(decoded.stage_identities, vec![None]);
     }
 }
