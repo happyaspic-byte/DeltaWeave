@@ -30,6 +30,20 @@ fn config(base: &std::path::Path, name: &str) -> ManagedSyncConfig {
     }
 }
 
+fn unique_payload() -> Vec<u8> {
+    let mut payload = Vec::with_capacity(8 * 1024 * 1024);
+    for block in 0..8192_u64 {
+        let mut state = block ^ 0x9e37_79b9_7f4a_7c15;
+        for _ in 0..1024 {
+            state ^= state << 7;
+            state ^= state >> 9;
+            state ^= state << 8;
+            payload.push((state >> 24) as u8);
+        }
+    }
+    payload
+}
+
 #[test]
 fn independent_owner_rw_ro_roundtrip_preserves_local_work_and_restart() {
     isolated(
@@ -187,16 +201,7 @@ fn managed_read_only_uses_owner_and_member_suppliers_for_real_chunks() {
                 // This deterministic 8 MiB payload produces multiple default
                 // FastCDC chunks, allowing the managed scheduler to assign
                 // distinct subsets to both authenticated providers.
-                let mut payload = Vec::with_capacity(8 * 1024 * 1024);
-                for block in 0..8192_u64 {
-                    let mut state = block ^ 0x9e37_79b9_7f4a_7c15;
-                    for _ in 0..1024 {
-                        state ^= state << 7;
-                        state ^= state >> 9;
-                        state ^= state << 8;
-                        payload.push((state >> 24) as u8);
-                    }
-                }
+                let payload = unique_payload();
                 let provider_grant = provider
                     .enroll(
                         &owned
@@ -318,9 +323,144 @@ fn managed_read_only_uses_owner_and_member_suppliers_for_real_chunks() {
                     fs::read(base.join("consumer-root/payload.bin")).unwrap(),
                     payload
                 );
+                drop(events);
+
+                // Keep the owner roster entry from the successful round, then
+                // take the member supplier offline.  A fresh RO consumer must
+                // recover that terminal provider failure and continue through
+                // the authenticated owner source/fallback instead of turning
+                // one unavailable roster hint into a false global failure.
+                let provider_peer = provider.endpoint_id().to_string();
+                let owner_peer = owner.endpoint_id().to_string();
                 provider_engine.shutdown().await.unwrap();
-                consumer_engine.shutdown().await.unwrap();
                 provider.shutdown().await.unwrap();
+                let consumer2 = ShareService::open(
+                    base.join("consumer2-device"),
+                    NetworkMode::DirectOnly,
+                    None,
+                )
+                .await
+                .unwrap();
+                let consumer2_grant = consumer2
+                    .enroll(
+                        &owned
+                            .issue_key(Permission::ReadOnly, None, owner.endpoint_addr())
+                            .unwrap(),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let consumer2_engine = ManagedSyncEngine::open(
+                    &consumer2,
+                    consumer2_grant.owner,
+                    consumer2_grant.share_id,
+                    config(base, "consumer2"),
+                )
+                .unwrap();
+                let loss_events = Arc::new(Mutex::new(Vec::<TransferEvent>::new()));
+                let loss_observed = Arc::clone(&loss_events);
+                let loss_observer = TransferObserver::new(move |event| {
+                    loss_observed.lock().expect("observer lock").push(event);
+                });
+                let loss_report = consumer2_engine
+                    .sync_read_only(Some(loss_observer))
+                    .await
+                    .unwrap();
+                assert_eq!(loss_report.status, "pass");
+                assert!(loss_report.pulled_bytes > 0);
+                assert_eq!(
+                    fs::read(base.join("consumer2-root/payload.bin")).unwrap(),
+                    payload
+                );
+                let loss_events = loss_events.lock().unwrap();
+                assert!(loss_events.iter().any(|event| {
+                    event.phase == "swarm_provider_started"
+                        && event.peer.as_deref() == Some(provider_peer.as_str())
+                }));
+                assert!(loss_events.iter().any(|event| {
+                    event.phase == "swarm_provider_verified"
+                        && event.peer.as_deref() == Some(owner_peer.as_str())
+                        && event.bytes > 0
+                }));
+                drop(loss_events);
+                consumer2_engine.shutdown().await.unwrap();
+                consumer2.shutdown().await.unwrap();
+                consumer_engine.shutdown().await.unwrap();
+                consumer.shutdown().await.unwrap();
+                owner.shutdown().await.unwrap();
+            });
+        },
+    );
+}
+
+#[test]
+fn managed_read_only_owner_originated_cold_cas_uses_share3_fallback() {
+    isolated(
+        "managed_read_only_owner_originated_cold_cas_uses_share3_fallback",
+        || {
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                let temp = tempfile::tempdir().unwrap();
+                let base = temp.path();
+                let owner =
+                    ShareService::open(base.join("owner-device"), NetworkMode::DirectOnly, None)
+                        .await
+                        .unwrap();
+                let consumer =
+                    ShareService::open(base.join("consumer-device"), NetworkMode::DirectOnly, None)
+                        .await
+                        .unwrap();
+                let owned = owner
+                    .create_owned_share(
+                        "owner cold CAS".into(),
+                        base.join("owner-root"),
+                        base.join("owner-state"),
+                        None,
+                        0,
+                    )
+                    .await
+                    .unwrap();
+                let payload = unique_payload();
+                fs::write(base.join("owner-root/payload.bin"), &payload).unwrap();
+                owned.refresh_inventory().await.unwrap();
+                let grant = consumer
+                    .enroll(
+                        &owned
+                            .issue_key(Permission::ReadOnly, None, owner.endpoint_addr())
+                            .unwrap(),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let engine = ManagedSyncEngine::open(
+                    &consumer,
+                    grant.owner,
+                    grant.share_id,
+                    config(base, "consumer"),
+                )
+                .unwrap();
+                let events = Arc::new(Mutex::new(Vec::<TransferEvent>::new()));
+                let observed = Arc::clone(&events);
+                let observer = TransferObserver::new(move |event| {
+                    observed.lock().expect("observer lock").push(event);
+                });
+                let report = engine.sync_read_only(Some(observer)).await.unwrap();
+                assert_eq!(report.status, "pass");
+                assert_eq!(report.pulled_bytes, payload.len() as u64);
+                // The owner scan/manifest endpoint is authoritative, while
+                // this fixture intentionally leaves the owner CAS cold.  A
+                // zero-byte swarm receipt followed by positive pulled
+                // bytes proves the authenticated share/3 CAS fallback supplied
+                // the data from the owner file.
+                assert!(
+                    events.lock().unwrap().iter().any(|event| {
+                        event.phase == "swarm_provider_verified" && event.bytes == 0
+                    })
+                );
+                assert_eq!(
+                    fs::read(base.join("consumer-root/payload.bin")).unwrap(),
+                    payload
+                );
+                engine.shutdown().await.unwrap();
                 consumer.shutdown().await.unwrap();
                 owner.shutdown().await.unwrap();
             });

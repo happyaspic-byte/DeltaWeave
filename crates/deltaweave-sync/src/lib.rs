@@ -441,6 +441,17 @@ fn ensure_managed_deadline(deadline: Instant) -> Result<()> {
     Ok(())
 }
 
+fn managed_swarm_error_can_fallback(class: ShareError) -> bool {
+    matches!(
+        class,
+        ShareError::Offline
+            | ShareError::TransferFailed
+            | ShareError::Busy
+            | ShareError::RosterStale
+            | ShareError::GrantExpired
+    )
+}
+
 /// Replays one exact owner apply journal after a process restart or a lost
 /// response.  The owner-side status is the only source of truth: a Prepared
 /// row is atomically cancelled, while a Started/Restarted row is closed only
@@ -1948,7 +1959,9 @@ impl ReplicaState {
                                             ),
                                             ShareError::RevocationPending
                                         );
-                                        first_error.get_or_insert(error);
+                                        if !managed_swarm_error_can_fallback(class) {
+                                            first_error.get_or_insert(error);
+                                        }
                                     }
                                 }
                             }
