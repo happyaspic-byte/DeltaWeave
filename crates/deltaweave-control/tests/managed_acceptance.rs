@@ -1128,14 +1128,70 @@ fn managed_rw_ro_lifecycle_preserves_ro_work_and_drains() {
                 .unwrap();
                 wait_status(&ro, share, ManagedStatus::Complete).await;
 
-                assert_eq!(
-                    rw.snapshot().await.shares[0].active_peer_count,
-                    0,
-                    "observer must clear completed RW transfer"
-                );
-                assert_eq!(ro.snapshot().await.shares[0].active_peer_count, 0);
-                assert_eq!(ro.snapshot().await.shares[0].speed_bps, 0);
-                assert!(ro.snapshot().await.shares[0].connected_devices.is_empty());
+                // Ask each worker for one synchronous completion snapshot. The
+                // returned view belongs to that command's completed round, so
+                // a later background tick cannot race the observer assertions.
+                let rw_completed = rw
+                    .share_command(ShareCommandInput {
+                        request_id: "observe-rw-complete".into(),
+                        share,
+                        command: ShareCommand::Sync,
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(rw_completed.status, ManagedStatus::Complete);
+                assert_eq!(rw_completed.active_peer_count, 0);
+                assert_eq!(rw_completed.speed_bps, 0);
+                assert!(rw_completed.connected_devices.is_empty());
+
+                let ro_completed = ro
+                    .share_command(ShareCommandInput {
+                        request_id: "observe-ro-complete".into(),
+                        share,
+                        command: ShareCommand::Sync,
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(ro_completed.status, ManagedStatus::Complete);
+                assert_eq!(ro_completed.active_peer_count, 0);
+                assert_eq!(ro_completed.speed_bps, 0);
+                assert!(ro_completed.connected_devices.is_empty());
+
+                // The later pause command remains the explicit admission and
+                // drain barrier used by the lifecycle portion of this test.
+                rw.share_command(ShareCommandInput {
+                    request_id: "pause-rw-observation".into(),
+                    share,
+                    command: ShareCommand::Pause,
+                })
+                .await
+                .unwrap();
+                ro.share_command(ShareCommandInput {
+                    request_id: "pause-ro-observation".into(),
+                    share,
+                    command: ShareCommand::Pause,
+                })
+                .await
+                .unwrap();
+                wait_status(&rw, share, ManagedStatus::Paused).await;
+                wait_status(&ro, share, ManagedStatus::Paused).await;
+
+                rw.share_command(ShareCommandInput {
+                    request_id: "resume-rw-after-observation".into(),
+                    share,
+                    command: ShareCommand::Resume,
+                })
+                .await
+                .unwrap();
+                wait_status(&rw, share, ManagedStatus::Complete).await;
+                ro.share_command(ShareCommandInput {
+                    request_id: "resume-ro-after-observation".into(),
+                    share,
+                    command: ShareCommand::Resume,
+                })
+                .await
+                .unwrap();
+                wait_status(&ro, share, ManagedStatus::Complete).await;
 
                 fs::write(rw_root.join("rw-local.txt"), b"rw local").unwrap();
                 wait_file(owner_root.join("rw-local.txt"), b"rw local".to_vec()).await;

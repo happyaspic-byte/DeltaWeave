@@ -283,6 +283,8 @@ impl Registry {
         }
         // Opening all tables is also an additive migration marker.  No rows
         // are removed here; cleanup is explicit and bounded below.
+        tx.open_table(ROSTERS)?;
+        tx.open_table(HEARTBEATS)?;
         tx.open_table(SNAPSHOTS)?;
         tx.open_table(GRANT_DRAINS)?;
         tx.commit()?;
