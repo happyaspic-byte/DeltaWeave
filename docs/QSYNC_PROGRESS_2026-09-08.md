@@ -195,7 +195,7 @@ root가 확인한다. Container image artifact는 운영 배포 증거와 구분
 4. final integration, 3기기/Windows/Internet/full CI 검증, release 판단과 goal complete
    판정은 root가 담당한다.
 
-## D3 network lifecycle checkpoint (`f886ab0`)
+## D3 network lifecycle and Internet control checkpoint (`d8225bf`)
 
 - `SyncSession`의 endpoint-ID fallback은 하나의 monotonic caller deadline을
   connect, bounded N0 lookup, 재연결에 전달한다. fallback이 있는 경우 stale
@@ -212,24 +212,38 @@ root가 확인한다. Container image artifact는 운영 배포 증거와 구분
   heartbeat/control 연결은 취소 시 Drop-close되고 engine shutdown에서 task를
   abort·await한 뒤 session을 해제한다. heartbeat 실패도 managed observer의
   terminal `error`로 전달된다.
+- share protocol Handler의 첫 stream/Hello와 accepted Session의 첫 sync request는
+  하나의 15초 admission deadline 안에서 읽고, preview/unknown-share와 완료된
+  session의 peer close 대기도 같은 bounded 정책으로 회수한다. `SyncSession`의
+  connect와 share Session handshake도 하나의 caller deadline을 공유한다.
 - `TransportObservation`과 `N0LookupObservation`은 주소, endpoint ID, key를
-  포함하지 않는 관측값이다. transport byte/path 값은 payload 전후 샘플을 위한
-  hook일 뿐이며 이번 checkpoint에서 실제 relay payload 증거로 사용하지 않는다.
+  포함하지 않는 관측값이다. 아래 Internet 실험의 byte/path 값은 인증된 roster
+  control exchange의 관측이며 `share-swarm/1` payload 증거로 사용하지 않는다.
 
 | D3 검사 | 결과 | 증거 |
 | --- | --- | --- |
 | net 전체 isolated suite | `121 passed, 0 failed`, exit `0`; outer `106` unit + `2` admission + `13` shares, child 출력 중복 제외 | `2026-09-09/d3/d3-full-net-isolated-rerun-20260909T051428Z.log`; 05:14:28Z–05:14:55Z, workspace-private HOME/USERPROFILE/TMPDIR, preserved rustup/cargo homes |
-| sync heartbeat/lease focused | `2 passed, 0 failed`, exit `0`; outer `2` | `2026-09-09/d3/d3-sync-focused-20260909T051525Z.log`; 05:15:25Z–05:15:51Z |
+| sync heartbeat/lease focused | `2 passed, 0 failed`, exit `0`; outer `2` | `2026-09-09/d3/d3-sync-focused-20260909T051524Z.log`; 05:15:25Z–05:15:51Z |
 | activation deadline and resume fallback | 각 outer `1 passed`, exit `0` | `d3-activation-deadline-rerun2-20260909T050211Z.log`, `d3-resume-lookup-rerun-20260909T050550Z.log`; resume의 `MemoryLookup`는 합성 lookup fixture이며 실제 pkarr/dns/N0 증거가 아님 |
 | managed heartbeat observer error | outer `1 passed`, exit `0` | `d3-heartbeat-observer-error-20260909T050732Z.log`; owner offline 시 sync 경로에서 observer `error` 확인 |
 | share focused tests | `27 passed, 0 failed`, exit `0` | `d3-share-focused-rerun-20260909T050953Z.log` 및 outer-count correction log |
 | format/diff | `git diff --check`, `cargo fmt --all -- --check` exit `0` | `d3-quality-20260909T051622Z.log`; 05:16:22Z–05:16:24Z |
-| compile/lint | locked all-target check와 strict `clippy -D warnings` exit `0` | `d3-check-all-targets-20260909T051022Z.log`, `d3-clippy-strict-rerun-20260909T051134Z.log`; 해당 로그는 `52c29fe` HEAD에 동일한 D3 dirty tree를 대상으로 실행했고 그 tree를 변경 없이 `f886ab0`에 commit했다 |
+| compile/lint | locked all-target check와 strict `clippy -D warnings` exit `0` | `d3-check-all-targets-20260909T051022Z.log`, `d3-clippy-strict-rerun-20260909T051134Z.log`; check는 `52c29fe` 기반의 이전 D3 tree이고, 이후 lint 수정 뒤 최종 strict clippy와 후속 검사가 최종 source를 검증했다 |
+| delayed endpoint-ID fallback | `1 passed, 0 failed`, exit `0`; outer `1` | `d3-delayed-fallback-ipv4-rerun2-20260909T053627Z.log`; stale direct hint가 IPv4 test socket을 잘못 재사용하지 않고 남은 deadline으로 delayed lookup/reconnect를 완료 |
+| actual Internet/N0/relay harness compile | test binary compile exit `0` | `d3-actual-experiment-compile-observation-20260909T054125Z.log`; workspace-private HOME/USERPROFILE/TMPDIR 및 보존된 rustup/cargo home |
+| actual Internet/N0/relay first observation | owner service open 단계에서 즉시 실패, outer `0`, exit `101` | `d3-actual-internet-n0-relay-observed-20260909T054203Z.log`; 상세 원인은 이 실행에서 미확인으로 남기고 이후 새 격리 profile 재실행 결과와 분리 기록 |
+| actual Internet/N0/relay observed rerun | `1 passed, 0 failed`, exit `0`; outer `1`, 26.90s | `d3-actual-internet-n0-relay-observed-rerun-20260909T054241Z.log`; 실제 DNS provenance, relay-only socket/path, authenticated roster/permission/epoch, positive tx/rx bytes, owner restart/address change, offline/back resume와 binding 보존을 secret-free JSON으로 기록 |
+| final net lint/check after harness | net strict clippy와 control/net all-targets/all-features check exit `0` | `d3-net-clippy-observation-final-20260909T054328Z.log`, `d3-control-net-check-observation-final-20260909T054350Z.log`; 최종 source checkpoint `1d5be66` 직전 실행 |
+| final format/diff after harness | `git diff --check`, `cargo fmt --all -- --check` exit `0` | `d3-quality-observation-final-20260909T054409Z.log`; source checkpoint `1d5be66` |
+| bounded share admission regression | child 포함 inner/outer `1 passed`, exit `0`, 30.57s; outer count는 `1` | `d3-admission-timeout-regression-rerun-20260909T055518Z.log`; workspace-private TMPDIR와 child HOME/USERPROFILE에서 silent Hello/preview close timeout, slot recovery, 정상 enrollment 확인 |
+| final Internet/N0/relay rerun after admission fix | `1 passed, 0 failed`, exit `0`; outer `1`, 26.58s | `d3-actual-internet-n0-relay-final-d8225bf-20260909T055805Z.log`; start `05:58:05Z`, end `05:58:32Z`, source `d8225bf9f912b81a977a257f1bace9f610b368e5`; wrapper exit marker `0`, phase JSON은 실제 DNS1/relay selected/IP 없음/tx-rx 양수/동일 binding 보존을 기록 |
+| final admission lint/check | strict `clippy -D warnings` 및 locked control/net all-targets/all-features check exit `0` | `d3-admission-timeout-clippy-final-20260909T055617Z.log`, `d3-admission-timeout-check-final-20260909T055633Z.log`; source `d8225bf` 직전 |
 
-이번 checkpoint의 isolated resume 검사는 owner endpoint ID를 반환하는 합성
-`MemoryLookup`로 stale 주소 경로를 검증한 것이다. 실제 Internet에서의 pkarr/dns
-provenance, owner 주소 변경·offline/back 재검색, N0 relay-only path event 및 전송
-전후 byte delta는 별도 D3 실험으로 남아 있다. `share-swarm/1`의 verified-CAS
-다중 provider payload, durable late activation receipt/ACK와 provider/consumer 양쪽
-drain, Windows 3-host 및 F release 검증은 E/F 순차 범위다. 현재 source checkpoint는
-실제 payload 또는 세 기기 검증을 완료했다고 주장하지 않는다.
+isolated resume의 `MemoryLookup` 검사는 합성 endpoint-ID lookup fixture이고 실제
+pkarr/dns/N0 증거가 아니다. source checkpoint `1d5be66`의 별도 ignored 실험은 같은
+Linux host에서 분리한 owner/member identity로 실제 DNS provenance와 relay-only
+control path를 확인했고, owner 재시작·주소변경·offline/back resume의 인증 binding을
+보존했다. JSON 관측의 tx/rx byte delta는 share-swarm payload 증거가 아니며, 이
+실험은 E의 verified-CAS 다중 provider payload 또는 세 기기 검증을 주장하지 않는다.
+durable late activation receipt/ACK, provider/consumer 양쪽 drain, Windows 3-host 및
+F release 검증은 여전히 E/F 순차 범위다.

@@ -1578,9 +1578,10 @@ impl SyncSession {
         } else {
             ALPN_V2
         };
-        let connection = OperationConnection(self.connect_raw(alpn).await?);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let connection = OperationConnection(self.connect_raw_until(alpn, deadline).await?);
         if let Some(share_id) = self.share {
-            share::wire::open_session(&connection, share_id).await?;
+            share::wire::open_session_until(&connection, share_id, deadline).await?;
         }
         Ok(connection)
     }
@@ -4890,16 +4891,19 @@ mod tests {
     async fn endpoint_id_fallback_reserves_budget_for_delayed_lookup() {
         let server = Endpoint::builder(presets::Minimal)
             .alpns(vec![ALPN_V3.to_vec()])
+            .clear_ip_transports()
+            .bind_addr("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+            .unwrap()
             .bind()
             .await
             .unwrap();
-        let server_address = EndpointAddr::from_parts(
-            server.id(),
-            [TransportAddr::Ip(SocketAddr::new(
-                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-                server.bound_sockets()[0].port(),
-            ))],
-        );
+        let server_socket = server
+            .bound_sockets()
+            .into_iter()
+            .find(|socket| socket.is_ipv4())
+            .expect("test server must expose an IPv4 socket");
+        let server_address =
+            EndpointAddr::from_parts(server.id(), [TransportAddr::Ip(server_socket)]);
         let server_task = tokio::spawn({
             let server = server.clone();
             async move {

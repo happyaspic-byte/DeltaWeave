@@ -8,6 +8,7 @@ use crate::{read_frame, write_frame};
 use anyhow::{Result, ensure};
 use iroh::endpoint::{Connection, RecvStream};
 use serde::{Deserialize, Serialize};
+use std::time::Instant;
 use tokio::io::AsyncReadExt;
 
 #[derive(Serialize, Deserialize)]
@@ -116,21 +117,25 @@ pub(crate) async fn exchange(connection: &Connection, hello: Hello) -> Result<Re
         other => Ok(other),
     }
 }
-pub(crate) async fn open_session(connection: &Connection, share_id: ShareId) -> Result<()> {
-    ensure!(
-        matches!(
-            exchange(
-                connection,
-                Hello {
-                    version: 3,
-                    share_id,
-                    operation: Operation::Session
-                }
-            )
-            .await?,
-            Reply::Accepted
+pub(crate) async fn open_session_until(
+    connection: &Connection,
+    share_id: ShareId,
+    deadline: Instant,
+) -> Result<()> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let reply = tokio::time::timeout(
+        remaining,
+        exchange(
+            connection,
+            Hello {
+                version: 3,
+                share_id,
+                operation: Operation::Session,
+            },
         ),
-        ShareError::Protocol
-    );
+    )
+    .await
+    .map_err(|_| anyhow::Error::new(ShareError::Offline))??;
+    ensure!(matches!(reply, Reply::Accepted), ShareError::Protocol);
     Ok(())
 }

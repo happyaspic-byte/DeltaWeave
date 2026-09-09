@@ -97,6 +97,8 @@ pub struct ShareService {
     lifecycle: tokio::sync::Mutex<()>,
     mode: NetworkMode,
     active: Arc<tokio::sync::RwLock<()>>,
+    #[cfg(test)]
+    admission_limit: Arc<tokio::sync::Semaphore>,
 }
 
 /// Opaque ownership proof for the already-bound device endpoint.  It exposes
@@ -180,20 +182,43 @@ impl ShareService {
             bind,
         )
         .await?;
+        Ok(Self::from_bound_endpoint(key, registry, mode, endpoint))
+    }
+
+    fn from_bound_endpoint(
+        key: SecretKey,
+        registry: Arc<Registry>,
+        mode: NetworkMode,
+        endpoint: crate::Endpoint,
+    ) -> Self {
+        Self::from_bound_endpoint_with_limit(key, registry, mode, endpoint, 64)
+    }
+
+    fn from_bound_endpoint_with_limit(
+        key: SecretKey,
+        registry: Arc<Registry>,
+        mode: NetworkMode,
+        endpoint: crate::Endpoint,
+        max_connections: usize,
+    ) -> Self {
+        assert!(max_connections > 0, "test endpoint limit must be positive");
         let runtimes = Arc::new(RwLock::new(BTreeMap::new()));
         let active = Arc::new(tokio::sync::RwLock::new(()));
+        let limit = Arc::new(tokio::sync::Semaphore::new(max_connections));
+        #[cfg(test)]
+        let admission_limit = limit.clone();
         let handler = Handler {
             registry: registry.clone(),
             key: key.clone(),
             runtimes: runtimes.clone(),
-            limit: Arc::new(tokio::sync::Semaphore::new(64)),
+            limit,
             active: active.clone(),
         };
         let router = Router::builder(endpoint)
             .accept(ALPN_V3, handler)
             .accept(ALPN_SWARM_V1, SwarmAdmissionHandler)
             .spawn();
-        Ok(Self {
+        Self {
             router,
             key,
             registry,
@@ -201,10 +226,16 @@ impl ShareService {
             lifecycle: tokio::sync::Mutex::new(()),
             mode,
             active,
-        })
+            #[cfg(test)]
+            admission_limit,
+        }
     }
     pub fn endpoint_id(&self) -> EndpointId {
         self.key.public()
+    }
+    #[cfg(test)]
+    fn available_admission_slots(&self) -> usize {
+        self.admission_limit.available_permits()
     }
     #[allow(dead_code)]
     pub(crate) fn endpoint_ownership(&self) -> ShareEndpointOwnership {
@@ -1327,8 +1358,15 @@ impl ProtocolHandler for Handler {
 }
 impl Handler {
     async fn run(&self, connection: Connection) -> Result<()> {
-        let (mut send, mut receive) = connection.accept_bi().await?;
-        let hello = wire::read_hello(&mut receive).await?;
+        let handshake_deadline = Instant::now() + CONTROL_DEADLINE;
+        let remaining = handshake_deadline.saturating_duration_since(Instant::now());
+        let (mut send, mut receive) = tokio::time::timeout(remaining, connection.accept_bi())
+            .await
+            .map_err(|_| anyhow::Error::new(ShareError::Offline))??;
+        let remaining = handshake_deadline.saturating_duration_since(Instant::now());
+        let hello = tokio::time::timeout(remaining, wire::read_hello(&mut receive))
+            .await
+            .map_err(|_| anyhow::Error::new(ShareError::Offline))??;
         let runtime = self
             .runtimes
             .read()
@@ -1338,7 +1376,7 @@ impl Handler {
         let Some(runtime) = runtime else {
             write_frame(&mut send, &Reply::Error(ShareError::UnknownShare)).await?;
             send.finish()?;
-            connection.closed().await;
+            Self::wait_closed_bounded(&connection).await;
             return Ok(());
         };
         let peer = connection.remote_id();
@@ -1419,7 +1457,7 @@ impl Handler {
         write_frame(&mut send, &reply).await?;
         send.finish()?;
         if !session {
-            connection.closed().await;
+            Self::wait_closed_bounded(&connection).await;
             return Ok(());
         }
         let member = self.registry.authorize(hello.share_id, peer, false)?;
@@ -1444,10 +1482,19 @@ impl Handler {
             state_root: runtime.config.state_root.clone(),
             receive_admission_lock: runtime.receive_gate.clone(),
         };
-        let (mut send, mut receive) = connection.accept_bi().await?;
+        let session_admission_deadline = Instant::now() + CONTROL_DEADLINE;
+        let remaining = session_admission_deadline.saturating_duration_since(Instant::now());
+        let (mut send, mut receive) = tokio::time::timeout(remaining, connection.accept_bi())
+            .await
+            .map_err(|_| anyhow::Error::new(ShareError::Offline))??;
         let result = async {
             auth.check(false)?;
-            match read_frame::<SyncWireRequest>(&mut receive).await? {
+            let remaining = session_admission_deadline.saturating_duration_since(Instant::now());
+            let request =
+                tokio::time::timeout(remaining, read_frame::<SyncWireRequest>(&mut receive))
+                    .await
+                    .map_err(|_| anyhow::Error::new(ShareError::Offline))??;
+            match request {
                 request @ SyncWireRequest::QueryNode { .. } => {
                     handler
                         .handle_query_session(request, &mut send, &mut receive)
@@ -1475,8 +1522,12 @@ impl Handler {
         }
         let _ = send.finish();
         // All disk/chunk work has completed before the tracked guard can disappear.
-        connection.closed().await;
+        Self::wait_closed_bounded(&connection).await;
         Ok(())
+    }
+
+    async fn wait_closed_bounded(connection: &Connection) {
+        let _ = tokio::time::timeout(CONTROL_DEADLINE, connection.closed()).await;
     }
 
     /// Handles the owner-authoritative v1 swarm control records.  Each branch
@@ -1641,6 +1692,10 @@ mod tests {
     use iroh::address_lookup::{
         AddressLookup, EndpointData, Error as LookupError, Item, memory::MemoryLookup,
     };
+    use iroh::{
+        Endpoint, TransportAddr,
+        endpoint::{PathEvent, presets},
+    };
 
     #[derive(Debug, Clone)]
     struct HangingAddressLookup;
@@ -1653,6 +1708,637 @@ mod tests {
             _endpoint_id: EndpointId,
         ) -> Option<futures_lite::stream::Boxed<Result<Item, LookupError>>> {
             Some(futures_lite::stream::pending().boxed())
+        }
+    }
+
+    async fn open_with_bound_test_endpoint(
+        state: impl AsRef<Path>,
+        mode: NetworkMode,
+        endpoint: Endpoint,
+    ) -> Result<ShareService> {
+        open_with_bound_test_endpoint_with_limit(state, mode, endpoint, 64).await
+    }
+
+    async fn open_with_bound_test_endpoint_with_limit(
+        state: impl AsRef<Path>,
+        mode: NetworkMode,
+        endpoint: Endpoint,
+        max_connections: usize,
+    ) -> Result<ShareService> {
+        let state = root_admission::reserve_private(state)?;
+        root_admission::private_directory(&state)?;
+        let key = load_or_create_identity(state.join("device.key"))?.secret_key;
+        ensure!(key.public() == endpoint.id(), ShareError::OwnerMismatch);
+        let registry = Arc::new(Registry::open(&state, key.public())?);
+        Ok(ShareService::from_bound_endpoint_with_limit(
+            key,
+            registry,
+            mode,
+            endpoint,
+            max_connections,
+        ))
+    }
+
+    fn relay_only_address(service: &ShareService) -> EndpointAddr {
+        let current = service.router.endpoint().addr();
+        let relays: Vec<_> = current
+            .relay_urls()
+            .cloned()
+            .map(TransportAddr::Relay)
+            .collect();
+        assert!(!relays.is_empty(), "N0 endpoint must advertise a relay");
+        EndpointAddr::from_parts(current.id, relays)
+    }
+
+    fn direct_only_address(service: &ShareService) -> EndpointAddr {
+        let socket = service
+            .router
+            .endpoint()
+            .bound_sockets()
+            .into_iter()
+            .find(|socket| socket.is_ipv4())
+            .expect("endpoint must expose a local direct hint");
+        let socket = if socket.ip().is_unspecified() {
+            let ip = if socket.is_ipv4() {
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+            } else {
+                std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+            };
+            std::net::SocketAddr::new(ip, socket.port())
+        } else {
+            socket
+        };
+        EndpointAddr::from_parts(service.endpoint_id(), [TransportAddr::Ip(socket)])
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct RelayControlObservation {
+        relay_bound_sockets_empty: bool,
+        selected_relay: bool,
+        selected_ip: bool,
+        path_has_relay: bool,
+        path_has_ip: bool,
+        opened_relay: bool,
+        opened_ip: bool,
+        selected_event_relay: bool,
+        selected_event_ip: bool,
+        saw_lagged: bool,
+        tx_delta: u64,
+        rx_delta: u64,
+        path_event_count: usize,
+        roster_binding_valid: bool,
+    }
+
+    fn print_relay_observation(
+        phase: &str,
+        started: Instant,
+        observation: RelayControlObservation,
+    ) {
+        println!(
+            "{{\"phase\":\"{phase}\",\"elapsed_ms\":{},\"relay_bound_sockets_empty\":{},\"selected_relay\":{},\"selected_ip\":{},\"path_has_relay\":{},\"path_has_ip\":{},\"opened_relay\":{},\"opened_ip\":{},\"selected_event_relay\":{},\"selected_event_ip\":{},\"saw_lagged\":{},\"tx_delta\":{},\"rx_delta\":{},\"path_event_count\":{},\"roster_binding_valid\":{}}}",
+            started.elapsed().as_millis(),
+            observation.relay_bound_sockets_empty,
+            observation.selected_relay,
+            observation.selected_ip,
+            observation.path_has_relay,
+            observation.path_has_ip,
+            observation.opened_relay,
+            observation.opened_ip,
+            observation.selected_event_relay,
+            observation.selected_event_ip,
+            observation.saw_lagged,
+            observation.tx_delta,
+            observation.rx_delta,
+            observation.path_event_count,
+            observation.roster_binding_valid,
+        );
+    }
+
+    async fn wait_for_actual_n0_address(
+        session: &ShareSession,
+        owner: EndpointId,
+        deadline: Instant,
+    ) -> Result<(crate::N0LookupObservation, EndpointAddr)> {
+        loop {
+            let lookup_deadline = Instant::now() + Duration::from_secs(8);
+            match session
+                .state
+                .transport
+                .resolve_n0(owner, lookup_deadline.min(deadline))
+                .await
+            {
+                Ok((observation, address))
+                    if observation.matched_endpoint
+                        && (observation.pkarr_results > 0 || observation.dns_results > 0) =>
+                {
+                    return Ok((observation, address));
+                }
+                Ok(_) | Err(_) if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                Ok(_) | Err(_) => {
+                    return Err(ShareError::Offline.into());
+                }
+            }
+        }
+    }
+
+    async fn observed_relay_roster_control(session: &ShareSession) -> RelayControlObservation {
+        let connection = match session.state.transport.connect_control().await {
+            Ok(connection) => ControlConnection(connection),
+            Err(_) => panic!("relay control connection failed"),
+        };
+        let mut events = connection.path_events();
+        let before = connection.stats();
+        let reply = match tokio::time::timeout(
+            CONTROL_DEADLINE,
+            wire::exchange(
+                &connection,
+                Hello {
+                    version: 3,
+                    share_id: session.membership().share_id,
+                    operation: Operation::Roster,
+                },
+            ),
+        )
+        .await
+        {
+            Ok(Ok(reply)) => reply,
+            Ok(Err(_)) => panic!("relay roster control exchange failed"),
+            Err(_) => panic!("relay roster control exchange timed out"),
+        };
+        let roster = match reply {
+            Reply::Roster { roster, .. } => roster,
+            _ => panic!("relay control returned an unexpected reply"),
+        };
+        let membership = session.membership();
+        assert!(
+            roster
+                .verify_for(membership.owner, membership.share_id, super::super::now())
+                .is_ok(),
+            "relay control roster authentication failed"
+        );
+        let roster_binding_valid = roster.member(membership.endpoint).is_some_and(|entry| {
+            entry.permission == membership.permission && entry.member_epoch == membership.epoch
+        });
+        assert!(
+            roster_binding_valid,
+            "relay control roster membership binding failed"
+        );
+        let relay_bound_sockets_empty = session.state.transport.endpoint.bound_sockets().is_empty();
+        let paths = connection.paths();
+        let selected_relay = paths
+            .iter()
+            .any(|path| path.is_selected() && path.is_relay());
+        let selected_ip = paths.iter().any(|path| path.is_selected() && path.is_ip());
+        let path_has_relay = paths.iter().any(|path| path.is_relay());
+        let path_has_ip = paths.iter().any(|path| path.is_ip());
+        let tx_delta = connection
+            .stats()
+            .udp_tx
+            .bytes
+            .saturating_sub(before.udp_tx.bytes);
+        let rx_delta = connection
+            .stats()
+            .udp_rx
+            .bytes
+            .saturating_sub(before.udp_rx.bytes);
+        let mut opened_relay = false;
+        let mut opened_ip = false;
+        let mut selected_event_relay = false;
+        let mut selected_event_ip = false;
+        let mut event_count = 0;
+        let mut saw_lagged = false;
+        let event_deadline = Instant::now() + Duration::from_millis(250);
+        while Instant::now() < event_deadline {
+            let remaining = event_deadline.saturating_duration_since(Instant::now());
+            match tokio::time::timeout(remaining, events.next()).await {
+                Ok(Some(PathEvent::Opened { remote_addr, .. })) => {
+                    opened_relay |= remote_addr.is_relay();
+                    opened_ip |= remote_addr.is_ip();
+                    event_count += 1;
+                }
+                Ok(Some(PathEvent::Selected { remote_addr, .. })) => {
+                    selected_event_relay |= remote_addr.is_relay();
+                    selected_event_ip |= remote_addr.is_ip();
+                    event_count += 1;
+                }
+                Ok(Some(PathEvent::Lagged { .. })) => saw_lagged = true,
+                Ok(Some(_)) => event_count += 1,
+                _ => break,
+            }
+        }
+        connection.close(0u8.into(), b"internet experiment complete");
+        RelayControlObservation {
+            relay_bound_sockets_empty,
+            selected_relay,
+            selected_ip,
+            path_has_relay,
+            path_has_ip,
+            opened_relay,
+            opened_ip,
+            selected_event_relay,
+            selected_event_ip,
+            saw_lagged,
+            tx_delta,
+            rx_delta,
+            path_event_count: event_count,
+            roster_binding_valid,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn silent_and_preview_connections_are_bounded_and_admission_recovers() {
+        let test_name = "share::service::tests::silent_and_preview_connections_are_bounded_and_admission_recovers";
+        if std::env::var("DW_ADMISSION_TIMEOUT_CHILD").ok().as_deref() != Some(test_name) {
+            let profile = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test_name, "--nocapture"])
+                .env("DW_ADMISSION_TIMEOUT_CHILD", test_name)
+                .env("HOME", profile.path())
+                .env("USERPROFILE", profile.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let owner_state = temp.path().join("owner");
+        let prepared = root_admission::reserve_private(&owner_state).unwrap();
+        root_admission::private_directory(&prepared).unwrap();
+        let identity = load_or_create_identity(prepared.join("device.key")).unwrap();
+        let endpoint = Endpoint::builder(presets::Minimal)
+            .secret_key(identity.secret_key)
+            .alpns(vec![ALPN_V3.to_vec(), ALPN_SWARM_V1.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        let owner = open_with_bound_test_endpoint_with_limit(
+            &owner_state,
+            NetworkMode::DirectOnly,
+            endpoint,
+            1,
+        )
+        .await
+        .unwrap();
+        let share = owner
+            .create_owned_share(
+                "bounded admission".into(),
+                temp.path().join("owner-root"),
+                temp.path().join("owner-state"),
+                None,
+                0,
+            )
+            .await
+            .unwrap();
+        let ticket = share
+            .issue_key(Permission::ReadWrite, None, owner.endpoint_addr())
+            .unwrap();
+
+        let silent_peer = Endpoint::builder(presets::Minimal).bind().await.unwrap();
+        let silent_connection = silent_peer
+            .connect(owner.endpoint_addr(), ALPN_V3)
+            .await
+            .unwrap();
+        let occupied_deadline = Instant::now() + Duration::from_secs(2);
+        while owner.available_admission_slots() != 0 && Instant::now() < occupied_deadline {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(owner.available_admission_slots(), 0);
+
+        let reclaim_deadline = Instant::now() + CONTROL_DEADLINE + Duration::from_secs(2);
+        while owner.available_admission_slots() == 0 && Instant::now() < reclaim_deadline {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            owner.available_admission_slots(),
+            1,
+            "silent peer did not release the bounded admission slot"
+        );
+        silent_connection.close(0u8.into(), b"silent admission complete");
+        silent_peer.close().await;
+
+        let member = ShareService::open(temp.path().join("member"), NetworkMode::DirectOnly, None)
+            .await
+            .unwrap();
+        let enrolled = member.enroll(&ticket, None).await.unwrap();
+        assert_eq!(enrolled.permission, Permission::ReadWrite);
+
+        let preview_peer = Endpoint::builder(presets::Minimal).bind().await.unwrap();
+        let preview_connection = preview_peer
+            .connect(owner.endpoint_addr(), ALPN_V3)
+            .await
+            .unwrap();
+        let preview_reply = wire::exchange(
+            &preview_connection,
+            Hello {
+                version: 3,
+                share_id: share.config().share_id,
+                operation: Operation::Validate(ticket),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(preview_reply, Reply::Validated(_)));
+        let preview_deadline = Instant::now() + CONTROL_DEADLINE + Duration::from_secs(2);
+        while owner.available_admission_slots() == 0 && Instant::now() < preview_deadline {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            owner.available_admission_slots(),
+            1,
+            "preview connection close wait was not bounded"
+        );
+        preview_connection.close(0u8.into(), b"preview admission complete");
+        preview_peer.close().await;
+
+        member.shutdown().await.unwrap();
+        owner.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires external N0 lookup and relay services"]
+    async fn actual_internet_n0_resume_and_relay_control_experiment() {
+        let started = Instant::now();
+        let temp = tempfile::tempdir().expect("experiment workspace");
+        let owner_state = temp.path().join("owner");
+        let owner = match ShareService::open(&owner_state, NetworkMode::Internet, None).await {
+            Ok(owner) => owner,
+            Err(_) => panic!("owner Internet service failed to start"),
+        };
+        assert!(
+            owner.wait_online(Duration::from_secs(45)).await,
+            "owner did not reach an N0 relay"
+        );
+        let owner_id = owner.endpoint_id();
+
+        let member_state = temp.path().join("relay-member");
+        let prepared = match root_admission::reserve_private(&member_state) {
+            Ok(prepared) => prepared,
+            Err(_) => panic!("member private namespace failed"),
+        };
+        if root_admission::private_directory(&prepared).is_err() {
+            panic!("member private namespace preparation failed");
+        }
+        let member_key = match load_or_create_identity(prepared.join("device.key")) {
+            Ok(identity) => identity.secret_key,
+            Err(_) => panic!("member identity failed to load"),
+        };
+        let relay_endpoint = match Endpoint::builder(presets::N0)
+            .secret_key(member_key)
+            .alpns(vec![ALPN_V3.to_vec(), ALPN_SWARM_V1.to_vec()])
+            .clear_ip_transports()
+            .bind()
+            .await
+        {
+            Ok(endpoint) => endpoint,
+            Err(_) => panic!("relay-only endpoint failed to bind"),
+        };
+        let member = match open_with_bound_test_endpoint(
+            &member_state,
+            NetworkMode::Internet,
+            relay_endpoint,
+        )
+        .await
+        {
+            Ok(member) => member,
+            Err(_) => panic!("relay member service failed to start"),
+        };
+        assert!(
+            member.wait_online(Duration::from_secs(45)).await,
+            "relay member did not reach an N0 relay"
+        );
+
+        let owner_root = temp.path().join("owner-root");
+        std::fs::create_dir_all(&owner_root).expect("owner root");
+        std::fs::write(owner_root.join("control.txt"), b"D3 control exchange")
+            .expect("owner fixture");
+        let owner_share = match owner
+            .create_owned_share(
+                "Internet experiment".into(),
+                owner_root,
+                temp.path().join("owner-state"),
+                None,
+                0,
+            )
+            .await
+        {
+            Ok(share) => share,
+            Err(_) => panic!("owner share failed to initialize"),
+        };
+        let share = owner_share.config().share_id;
+        let ticket =
+            match owner_share.issue_key(Permission::ReadWrite, None, relay_only_address(&owner)) {
+                Ok(ticket) => ticket,
+                Err(_) => panic!("owner relay ticket failed"),
+            };
+        let enrolled = match member.enroll(&ticket, None).await {
+            Ok(member) => member,
+            Err(_) => panic!("relay-only authenticated enrollment failed"),
+        };
+        let old_direct = direct_only_address(&owner);
+        let session = match member.open_session(owner_id, share) {
+            Ok(session) => session,
+            Err(_) => panic!("member session failed to open"),
+        };
+        let lookup_deadline = Instant::now() + Duration::from_secs(60);
+        let (lookup, _) =
+            match wait_for_actual_n0_address(&session, owner_id, lookup_deadline).await {
+                Ok(result) => result,
+                Err(_) => panic!("actual N0 lookup did not return the owner"),
+            };
+        assert!(
+            lookup.matched_endpoint,
+            "N0 lookup endpoint identity mismatch"
+        );
+        assert!(
+            matches!(
+                lookup.first_source,
+                Some(crate::AddressLookupSource::Pkarr | crate::AddressLookupSource::Dns)
+            ),
+            "N0 lookup had no pkarr or DNS provenance"
+        );
+        println!(
+            "{{\"phase\":\"n0_lookup_initial\",\"elapsed_ms\":{},\"matched_endpoint\":{},\"pkarr_results\":{},\"dns_results\":{},\"first_source_pkarr\":{},\"first_source_dns\":{}}}",
+            started.elapsed().as_millis(),
+            lookup.matched_endpoint,
+            lookup.pkarr_results,
+            lookup.dns_results,
+            matches!(lookup.first_source, Some(crate::AddressLookupSource::Pkarr)),
+            matches!(lookup.first_source, Some(crate::AddressLookupSource::Dns)),
+        );
+
+        let first_relay = observed_relay_roster_control(&session).await;
+        assert!(
+            first_relay.relay_bound_sockets_empty,
+            "relay-only endpoint unexpectedly has bound IP sockets"
+        );
+        assert!(
+            first_relay.selected_relay && first_relay.path_has_relay,
+            "relay-only control did not select a relay path"
+        );
+        assert!(!first_relay.selected_ip && !first_relay.path_has_ip);
+        assert!(!first_relay.selected_event_ip && !first_relay.opened_ip);
+        assert!(!first_relay.saw_lagged, "relay path event observer lagged");
+        assert!(
+            first_relay.tx_delta > 0 && first_relay.rx_delta > 0,
+            "relay control produced no observed transport bytes"
+        );
+        print_relay_observation("relay_control_initial", started, first_relay);
+        let owner_member_count = match owner_share.members() {
+            Ok(members) => members.len(),
+            Err(_) => panic!("owner member catalog read failed"),
+        };
+        session.close().await;
+        drop(owner_share);
+        if owner.shutdown().await.is_err() {
+            panic!("owner offline transition failed");
+        }
+
+        let offline = tokio::time::timeout(
+            Duration::from_secs(20),
+            member.resume_membership(owner_id, share, old_direct.clone()),
+        )
+        .await;
+        assert!(
+            matches!(offline, Ok(Err(_))),
+            "resume must remain bounded and fail while the owner is offline"
+        );
+
+        let owner = match ShareService::open(
+            &owner_state,
+            NetworkMode::Internet,
+            Some("127.0.0.1:0".parse().expect("loopback bind")),
+        )
+        .await
+        {
+            Ok(owner) => owner,
+            Err(_) => panic!("owner restart failed"),
+        };
+        let owner_share = match owner.load_owned_share(share).await {
+            Ok(share) => share,
+            Err(_) => panic!("owner share recovery failed"),
+        };
+        assert!(
+            owner.wait_online(Duration::from_secs(45)).await,
+            "restarted owner did not reach an N0 relay"
+        );
+        let new_direct = direct_only_address(&owner);
+        assert!(
+            new_direct != old_direct,
+            "owner restart did not produce a changed direct address"
+        );
+        let probe = match member.open_session(owner_id, share) {
+            Ok(session) => session,
+            Err(_) => panic!("member probe session failed"),
+        };
+        let (restart_lookup, _) = match wait_for_actual_n0_address(
+            &probe,
+            owner_id,
+            Instant::now() + Duration::from_secs(60),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => panic!("N0 lookup after owner restart failed"),
+        };
+        assert!(restart_lookup.matched_endpoint);
+        assert!(
+            restart_lookup.pkarr_results > 0 || restart_lookup.dns_results > 0,
+            "restart lookup had no actual N0 provenance"
+        );
+        println!(
+            "{{\"phase\":\"n0_lookup_after_restart\",\"elapsed_ms\":{},\"matched_endpoint\":{},\"pkarr_results\":{},\"dns_results\":{},\"first_source_pkarr\":{},\"first_source_dns\":{}}}",
+            started.elapsed().as_millis(),
+            restart_lookup.matched_endpoint,
+            restart_lookup.pkarr_results,
+            restart_lookup.dns_results,
+            matches!(
+                restart_lookup.first_source,
+                Some(crate::AddressLookupSource::Pkarr)
+            ),
+            matches!(
+                restart_lookup.first_source,
+                Some(crate::AddressLookupSource::Dns)
+            ),
+        );
+        probe.close().await;
+
+        let resumed = match tokio::time::timeout(
+            Duration::from_secs(30),
+            member.resume_membership(owner_id, share, old_direct.clone()),
+        )
+        .await
+        {
+            Ok(Ok(member)) => member,
+            _ => panic!("authenticated resume after owner address change failed"),
+        };
+        assert!(resumed.endpoint == enrolled.endpoint);
+        assert!(resumed.owner == enrolled.owner);
+        assert!(resumed.share_id == enrolled.share_id);
+        assert!(resumed.permission == enrolled.permission);
+        assert!(resumed.replica == enrolled.replica);
+        assert!(resumed.enrolled_at == enrolled.enrolled_at);
+        assert!(resumed.epoch == enrolled.epoch);
+        let relationship = match member.relationships().ok().and_then(|relationships| {
+            relationships
+                .into_iter()
+                .find(|relationship| relationship.membership.share_id == share)
+        }) {
+            Some(relationship) => relationship,
+            None => panic!("resumed relationship was not persisted"),
+        };
+        assert!(relationship.address.id == owner_id);
+        assert!(relationship.address != old_direct);
+
+        let resumed_session = match member.open_session(owner_id, share) {
+            Ok(session) => session,
+            Err(_) => panic!("resumed member session failed"),
+        };
+        let roster = match resumed_session.refresh_roster().await {
+            Ok(roster) => roster,
+            Err(_) => panic!("authenticated roster refresh failed"),
+        };
+        assert!(
+            roster
+                .member(resumed.endpoint)
+                .is_some_and(|entry| entry.permission == resumed.permission
+                    && entry.member_epoch == resumed.epoch),
+            "roster did not preserve the resumed membership binding"
+        );
+        let challenge = match resumed_session.roster_challenge() {
+            Some(challenge) => challenge,
+            None => panic!("owner did not issue a heartbeat challenge"),
+        };
+        if resumed_session.heartbeat(challenge).await.is_err() {
+            panic!("authenticated heartbeat after resume failed");
+        }
+        let resumed_relay = observed_relay_roster_control(&resumed_session).await;
+        assert!(resumed_relay.relay_bound_sockets_empty);
+        assert!(resumed_relay.selected_relay && resumed_relay.path_has_relay);
+        assert!(!resumed_relay.selected_ip && !resumed_relay.path_has_ip);
+        assert!(!resumed_relay.selected_event_ip && !resumed_relay.opened_ip);
+        assert!(!resumed_relay.saw_lagged);
+        assert!(resumed_relay.tx_delta > 0 && resumed_relay.rx_delta > 0);
+        print_relay_observation("relay_control_after_resume", started, resumed_relay);
+        assert!(
+            owner_share
+                .members()
+                .is_ok_and(|members| members.len() == owner_member_count),
+            "resume changed the owner membership count"
+        );
+        println!(
+            "{{\"phase\":\"resume_binding\",\"elapsed_ms\":{},\"same_identity\":true,\"address_changed\":true,\"permission_epoch_preserved\":true,\"replica_preserved\":true,\"enrolled_at_preserved\":true,\"owner_member_count_preserved\":true,\"roster_binding_preserved\":{}}}",
+            started.elapsed().as_millis(),
+            resumed_relay.roster_binding_valid,
+        );
+        resumed_session.close().await;
+        drop(owner_share);
+        if owner.shutdown().await.is_err() {
+            panic!("restarted owner shutdown failed");
+        }
+        if member.shutdown().await.is_err() {
+            panic!("relay member shutdown failed");
         }
     }
 
