@@ -1,7 +1,9 @@
 use deltaweave_core::ChunkingProfile;
-use deltaweave_net::{NetworkMode, share::*};
+use deltaweave_net::{NetworkMode, TransferEvent, TransferObserver, share::*};
 use deltaweave_sync::{ManagedSyncConfig, ManagedSyncEngine};
+use std::collections::BTreeSet;
 use std::fs;
+use std::sync::{Arc, Mutex};
 
 fn isolated(name: &str, body: impl FnOnce()) {
     if std::env::var("DW_MANAGED_SYNC_TEST").ok().as_deref() == Some(name) {
@@ -26,6 +28,20 @@ fn config(base: &std::path::Path, name: &str) -> ManagedSyncConfig {
         profile: ChunkingProfile::DEFAULT,
         min_free_space_bytes: 0,
     }
+}
+
+fn unique_payload() -> Vec<u8> {
+    let mut payload = Vec::with_capacity(8 * 1024 * 1024);
+    for block in 0..8192_u64 {
+        let mut state = block ^ 0x9e37_79b9_7f4a_7c15;
+        for _ in 0..1024 {
+            state ^= state << 7;
+            state ^= state >> 9;
+            state ^= state << 8;
+            payload.push((state >> 24) as u8);
+        }
+    }
+    payload
 }
 
 #[test]
@@ -146,6 +162,307 @@ fn independent_owner_rw_ro_roundtrip_preserves_local_work_and_restart() {
                 writer.shutdown().await.unwrap();
                 ro.shutdown().await.unwrap();
                 rw.shutdown().await.unwrap();
+                owner.shutdown().await.unwrap();
+            });
+        },
+    );
+}
+
+#[test]
+fn managed_read_only_uses_owner_and_member_suppliers_for_real_chunks() {
+    isolated(
+        "managed_read_only_uses_owner_and_member_suppliers_for_real_chunks",
+        || {
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                let temp = tempfile::tempdir().unwrap();
+                let base = temp.path();
+                let owner =
+                    ShareService::open(base.join("owner-device"), NetworkMode::DirectOnly, None)
+                        .await
+                        .unwrap();
+                let provider =
+                    ShareService::open(base.join("provider-device"), NetworkMode::DirectOnly, None)
+                        .await
+                        .unwrap();
+                let consumer =
+                    ShareService::open(base.join("consumer-device"), NetworkMode::DirectOnly, None)
+                        .await
+                        .unwrap();
+                let owned = owner
+                    .create_owned_share(
+                        "two suppliers".into(),
+                        base.join("owner-root"),
+                        base.join("owner-state"),
+                        None,
+                        0,
+                    )
+                    .await
+                    .unwrap();
+                // This deterministic 8 MiB payload produces multiple default
+                // FastCDC chunks, allowing the managed scheduler to assign
+                // distinct subsets to both authenticated providers.
+                let payload = unique_payload();
+                let provider_grant = provider
+                    .enroll(
+                        &owned
+                            .issue_key(Permission::ReadWrite, None, owner.endpoint_addr())
+                            .unwrap(),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let provider_engine = ManagedSyncEngine::open(
+                    &provider,
+                    provider_grant.owner,
+                    provider_grant.share_id,
+                    config(base, "provider"),
+                )
+                .unwrap();
+                fs::write(base.join("provider-root/payload.bin"), &payload).unwrap();
+                let provider_report = provider_engine.sync_read_write(None).await.unwrap();
+                assert!(provider_report.pushed_bytes > 0);
+
+                // The owner's inventory is authoritative, but an owner root
+                // scan alone does not populate its CAS.  Uploading through the
+                // authenticated RW member above makes both selected suppliers
+                // real CAS sources for the subsequent RO transfer.
+                let probe = provider
+                    .open_session(provider_grant.owner, provider_grant.share_id)
+                    .unwrap();
+                let probe_snapshot = probe
+                    .fetch_authoritative_snapshot(
+                        &deltaweave_reconcile::MerkleTree::from_records(Vec::new()).unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(probe_snapshot.records.len(), 1);
+                let probe_record = probe_snapshot.records[0].clone();
+                let probe_manifest = probe
+                    .request_manifest(&probe_snapshot.token, &probe_record)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    probe_manifest.manifest.file_hash,
+                    probe_record.content_hash.unwrap()
+                );
+                let probe_hashes: BTreeSet<_> = probe_manifest
+                    .manifest
+                    .chunks
+                    .iter()
+                    .map(|chunk| chunk.hash)
+                    .collect();
+                assert!(probe_hashes.len() >= 2);
+                assert!(probe_manifest.manifest.chunks.len() <= 64);
+                let mut probe_hashes: Vec<_> = probe_hashes.into_iter().collect();
+                probe_hashes.sort();
+                probe
+                    .request_swarm_grant(
+                        owner.endpoint_id(),
+                        &probe_snapshot.token,
+                        &probe_manifest,
+                        &probe_hashes,
+                    )
+                    .await
+                    .unwrap();
+                probe.close().await;
+                let consumer_grant = consumer
+                    .enroll(
+                        &owned
+                            .issue_key(Permission::ReadOnly, None, owner.endpoint_addr())
+                            .unwrap(),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let consumer_engine = ManagedSyncEngine::open(
+                    &consumer,
+                    consumer_grant.owner,
+                    consumer_grant.share_id,
+                    config(base, "consumer"),
+                )
+                .unwrap();
+                let events = Arc::new(Mutex::new(Vec::<TransferEvent>::new()));
+                let observed = Arc::clone(&events);
+                let observer = TransferObserver::new(move |event| {
+                    observed.lock().expect("observer lock").push(event);
+                });
+                let report = consumer_engine
+                    .sync_read_only(Some(observer))
+                    .await
+                    .unwrap();
+                assert_eq!(report.status, "pass");
+                assert!(report.pulled_bytes > 0);
+                {
+                    let events = events.lock().expect("observer lock");
+                    let starts: Vec<_> = events
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, event)| event.phase == "swarm_provider_started")
+                        .collect();
+                    let verified: Vec<_> = events
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, event)| {
+                            event.phase == "swarm_provider_verified" && event.bytes > 0
+                        })
+                        .collect();
+                    let started_peers: BTreeSet<_> = starts
+                        .iter()
+                        .filter_map(|(_, event)| event.peer.as_deref())
+                        .collect();
+                    let verified_peers: BTreeSet<_> = verified
+                        .iter()
+                        .filter_map(|(_, event)| event.peer.as_deref())
+                        .collect();
+                    assert!(started_peers.len() >= 2);
+                    assert!(verified_peers.len() >= 2);
+                    assert!(starts.len() >= 2);
+                    assert!(verified.first().is_some_and(|(first_verified, _)| {
+                        starts.iter().all(|(started, _)| started < first_verified)
+                    }));
+                }
+                assert_eq!(
+                    fs::read(base.join("consumer-root/payload.bin")).unwrap(),
+                    payload
+                );
+                // Keep the owner roster entry from the successful round, then
+                // take the member supplier offline.  A fresh RO consumer must
+                // recover that terminal provider failure and continue through
+                // the authenticated owner source/fallback instead of turning
+                // one unavailable roster hint into a false global failure.
+                let provider_peer = provider.endpoint_id().to_string();
+                let owner_peer = owner.endpoint_id().to_string();
+                provider_engine.shutdown().await.unwrap();
+                provider.shutdown().await.unwrap();
+                let consumer2 = ShareService::open(
+                    base.join("consumer2-device"),
+                    NetworkMode::DirectOnly,
+                    None,
+                )
+                .await
+                .unwrap();
+                let consumer2_grant = consumer2
+                    .enroll(
+                        &owned
+                            .issue_key(Permission::ReadOnly, None, owner.endpoint_addr())
+                            .unwrap(),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let consumer2_engine = ManagedSyncEngine::open(
+                    &consumer2,
+                    consumer2_grant.owner,
+                    consumer2_grant.share_id,
+                    config(base, "consumer2"),
+                )
+                .unwrap();
+                let loss_events = Arc::new(Mutex::new(Vec::<TransferEvent>::new()));
+                let loss_observed = Arc::clone(&loss_events);
+                let loss_observer = TransferObserver::new(move |event| {
+                    loss_observed.lock().expect("observer lock").push(event);
+                });
+                let loss_report = consumer2_engine
+                    .sync_read_only(Some(loss_observer))
+                    .await
+                    .unwrap();
+                assert_eq!(loss_report.status, "pass");
+                assert!(loss_report.pulled_bytes > 0);
+                assert_eq!(
+                    fs::read(base.join("consumer2-root/payload.bin")).unwrap(),
+                    payload
+                );
+                {
+                    let loss_events = loss_events.lock().unwrap();
+                    assert!(loss_events.iter().any(|event| {
+                        event.phase == "swarm_provider_started"
+                            && event.peer.as_deref() == Some(provider_peer.as_str())
+                    }));
+                    assert!(loss_events.iter().any(|event| {
+                        event.phase == "swarm_provider_verified"
+                            && event.peer.as_deref() == Some(owner_peer.as_str())
+                            && event.bytes > 0
+                    }));
+                }
+                consumer2_engine.shutdown().await.unwrap();
+                consumer2.shutdown().await.unwrap();
+                consumer_engine.shutdown().await.unwrap();
+                consumer.shutdown().await.unwrap();
+                owner.shutdown().await.unwrap();
+            });
+        },
+    );
+}
+
+#[test]
+fn managed_read_only_owner_originated_cold_cas_uses_share3_fallback() {
+    isolated(
+        "managed_read_only_owner_originated_cold_cas_uses_share3_fallback",
+        || {
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                let temp = tempfile::tempdir().unwrap();
+                let base = temp.path();
+                let owner =
+                    ShareService::open(base.join("owner-device"), NetworkMode::DirectOnly, None)
+                        .await
+                        .unwrap();
+                let consumer =
+                    ShareService::open(base.join("consumer-device"), NetworkMode::DirectOnly, None)
+                        .await
+                        .unwrap();
+                let owned = owner
+                    .create_owned_share(
+                        "owner cold CAS".into(),
+                        base.join("owner-root"),
+                        base.join("owner-state"),
+                        None,
+                        0,
+                    )
+                    .await
+                    .unwrap();
+                let payload = unique_payload();
+                fs::write(base.join("owner-root/payload.bin"), &payload).unwrap();
+                owned.refresh_inventory().await.unwrap();
+                let grant = consumer
+                    .enroll(
+                        &owned
+                            .issue_key(Permission::ReadOnly, None, owner.endpoint_addr())
+                            .unwrap(),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let engine = ManagedSyncEngine::open(
+                    &consumer,
+                    grant.owner,
+                    grant.share_id,
+                    config(base, "consumer"),
+                )
+                .unwrap();
+                let events = Arc::new(Mutex::new(Vec::<TransferEvent>::new()));
+                let observed = Arc::clone(&events);
+                let observer = TransferObserver::new(move |event| {
+                    observed.lock().expect("observer lock").push(event);
+                });
+                let report = engine.sync_read_only(Some(observer)).await.unwrap();
+                assert_eq!(report.status, "pass");
+                assert_eq!(report.pulled_bytes, payload.len() as u64);
+                // The owner scan/manifest endpoint is authoritative, while
+                // this fixture intentionally leaves the owner CAS cold.  A
+                // zero-byte swarm receipt followed by positive pulled
+                // bytes proves the authenticated share/3 CAS fallback supplied
+                // the data from the owner file.
+                assert!(
+                    events.lock().unwrap().iter().any(|event| {
+                        event.phase == "swarm_provider_verified" && event.bytes == 0
+                    })
+                );
+                assert_eq!(
+                    fs::read(base.join("consumer-root/payload.bin")).unwrap(),
+                    payload
+                );
+                engine.shutdown().await.unwrap();
+                consumer.shutdown().await.unwrap();
                 owner.shutdown().await.unwrap();
             });
         },
@@ -976,6 +1293,14 @@ fn authenticated_owner_rollback_divergence_and_missing_tombstones_are_rejected()
                 let session = member.open_session(grant.owner, grant.share_id).unwrap();
                 let empty = MerkleTree::from_records(Vec::new()).unwrap();
                 let old = session.fetch_snapshot(&empty).await.unwrap().records;
+                // Capture a real owner-signed roster before replacing the
+                // owner endpoint. The resumed managed engine performs the D3
+                // roster and heartbeat exchange before each snapshot; the
+                // hostile transport below must answer those operations as
+                // well so the three snapshot attempts still reach the
+                // rollback, divergence, and missing-tombstone checks.
+                let roster = session.refresh_roster().await.unwrap();
+                let roster_challenge = session.roster_challenge().unwrap();
                 fs::write(base.path().join("owner-root/file"), b"trusted new owner").unwrap();
                 engine.sync_read_only(None).await.unwrap();
                 let mut divergent = session.fetch_snapshot(&empty).await.unwrap().records;
@@ -1008,6 +1333,7 @@ fn authenticated_owner_rollback_divergence_and_missing_tombstones_are_rejected()
                 let address = iroh::EndpointAddr::new(endpoint.id())
                     .with_ip_addr(endpoint.bound_sockets()[0]);
                 let resumed_membership = grant.clone();
+                let roster_for_control = roster.clone();
                 let serving = endpoint.clone();
                 let responses = tokio::spawn(async move {
                     // Authenticate the address update through the real resume
@@ -1025,9 +1351,44 @@ fn authenticated_owner_rollback_divergence_and_missing_tombstones_are_rejected()
                     connection.closed().await;
                     for records in [old, divergent, Vec::new()] {
                         let tree = MerkleTree::from_records(records).unwrap();
-                        let connection = serving.accept().await.unwrap().await.unwrap();
-                        let (mut send, mut receive) = connection.accept_bi().await.unwrap();
-                        raw_read(&mut receive).await;
+                        // D3 liveness control is independent from the data
+                        // sync gate. Route its two share-control operations by
+                        // the serialized Operation tag, then continue with
+                        // the legacy Session/QueryNode exchange for this
+                        // snapshot attempt.
+                        let (connection, mut send) = loop {
+                            let connection = serving.accept().await.unwrap().await.unwrap();
+                            let (mut send, mut receive) = connection.accept_bi().await.unwrap();
+                            let hello = raw_read(&mut receive).await;
+                            let operation = hello.get(33).copied().unwrap_or(u8::MAX);
+                            match operation {
+                                4 => {
+                                    raw_write(
+                                        &mut send,
+                                        &postcard::to_stdvec(&(
+                                            5_u32,
+                                            roster_for_control.clone(),
+                                            roster_challenge,
+                                        ))
+                                        .unwrap(),
+                                    )
+                                    .await;
+                                    send.finish().unwrap();
+                                    connection.closed().await;
+                                }
+                                5 => {
+                                    raw_write(
+                                        &mut send,
+                                        &postcard::to_stdvec(&(6_u32, roster_for_control.clone()))
+                                            .unwrap(),
+                                    )
+                                    .await;
+                                    send.finish().unwrap();
+                                    connection.closed().await;
+                                }
+                                _ => break (connection, send),
+                            }
+                        };
                         raw_write(&mut send, &[2]).await;
                         send.finish().unwrap();
                         let (mut send, mut receive) = connection.accept_bi().await.unwrap();

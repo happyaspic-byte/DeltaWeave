@@ -38,14 +38,42 @@ struct ReadOnlyState {
     share: [u8; 32],
     checkpoint: Vec<SyncRecord>,
     pending: Option<Pending>,
+    /// Durable local admission record.  It is written before ApplyStart and
+    /// retained until the owner accepts the matching ApplyDrained message.
+    #[serde(default)]
+    apply: Option<ManagedApplyJournal>,
+}
+/// The retained RO envelope before managed apply/journal fields were added.
+/// Postcard is positional, so `serde(default)` on the current type is not a
+/// sufficient compatibility guarantee for an existing `pending` value.  Keep
+/// this decoder local and convert the old value without rewriting it until a
+/// subsequent successful state save.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct LegacyReadOnlyState {
+    version: u16,
+    owner: [u8; 32],
+    share: [u8; 32],
+    checkpoint: Vec<SyncRecord>,
+    pending: Option<LegacyPending>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct LegacyPending {
+    desired: Vec<SyncRecord>,
+    attempts: Vec<String>,
+    stage: Stage,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct Pending {
     desired: Vec<SyncRecord>,
     attempts: Vec<String>,
     stage: Stage,
+    /// Exact managed stage root retained across an interrupted apply.  It is
+    /// informational for recovery; a retry may allocate a new unique root
+    /// after revalidation rather than reusing an unjournalled path.
+    #[serde(default)]
+    stage_root: Option<PathBuf>,
 }
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 enum Stage {
     Prepared,
     Preserved,
@@ -55,8 +83,7 @@ enum Stage {
 
 pub(crate) fn initialize(local: &ReplicaState, member: &Membership) -> Result<()> {
     if let Some(bytes) = local.index.share_metadata()? {
-        let state: ReadOnlyState =
-            postcard::from_bytes(&bytes).context(ShareError::StateUnavailable)?;
+        let state = decode_state(&bytes)?;
         ensure!(
             state.version == 1
                 && state.owner == *member.owner.as_bytes()
@@ -73,22 +100,60 @@ pub(crate) fn initialize(local: &ReplicaState, member: &Membership) -> Result<()
                 share: member.share_id.0,
                 checkpoint: Vec::new(),
                 pending: None,
+                apply: None,
             },
         )?;
     }
     Ok(())
 }
 fn load(local: &ReplicaState) -> Result<ReadOnlyState> {
-    postcard::from_bytes(
-        &local
-            .index
-            .share_metadata()?
-            .context(ShareError::StateUnavailable)?,
-    )
-    .context(ShareError::StateUnavailable)
+    let bytes = local
+        .index
+        .share_metadata()?
+        .context(ShareError::StateUnavailable)?;
+    decode_state(&bytes)
+}
+
+fn decode_state(bytes: &[u8]) -> Result<ReadOnlyState> {
+    match postcard::from_bytes::<ReadOnlyState>(bytes) {
+        Ok(state) => Ok(state),
+        Err(_) => {
+            let legacy: LegacyReadOnlyState =
+                postcard::from_bytes(bytes).context(ShareError::StateUnavailable)?;
+            Ok(ReadOnlyState {
+                version: legacy.version,
+                owner: legacy.owner,
+                share: legacy.share,
+                checkpoint: legacy.checkpoint,
+                pending: legacy.pending.map(|pending| Pending {
+                    desired: pending.desired,
+                    attempts: pending.attempts,
+                    stage: pending.stage,
+                    stage_root: None,
+                }),
+                apply: None,
+            })
+        }
+    }
 }
 fn save(local: &ReplicaState, state: &ReadOnlyState) -> Result<()> {
     local.index.set_share_metadata(&postcard::to_stdvec(state)?)
+}
+
+/// Replays only an already-durable managed ApplyStart.  The caller invokes
+/// this before heartbeat/new owner admission so paused or revoked owners can
+/// still close an exact receipt without opening a fresh public mutation.
+pub(crate) async fn recover_managed_apply_before_liveness(
+    local: &ReplicaState,
+    session: &ShareSession,
+) -> Result<()> {
+    let mut state = load(local)?;
+    let Some(journal) = state.apply.clone() else {
+        return Ok(());
+    };
+    super::recover_managed_apply(session, &journal).await?;
+    state.apply = None;
+    save(local, &state)
 }
 
 fn validate_checkpoint(before: &[SyncRecord], after: &[SyncRecord]) -> Result<()> {
@@ -137,38 +202,299 @@ fn physical_equal(left: &SyncRecord, right: &SyncRecord) -> bool {
         && left.readonly == right.readonly
 }
 
+fn target_matches_record(change: &deltaweave_store::PathChange, record: &SyncRecord) -> bool {
+    if record.path != change.path {
+        return false;
+    }
+    match (&change.target, record.tombstone, record.kind) {
+        (PathTarget::Absent, true, _) => true,
+        (PathTarget::Directory, false, SyncEntryKind::Directory) => true,
+        (PathTarget::File(manifest), false, SyncEntryKind::File) => {
+            manifest.file_hash == record.content_hash.unwrap_or_default()
+                && manifest.size == record.size
+        }
+        _ => false,
+    }
+}
+
+fn owner_record<'a>(records: &'a [SyncRecord], path: &WirePath) -> Option<&'a SyncRecord> {
+    records.iter().find(|record| &record.path == path)
+}
+
+fn adopt_recovered_change(
+    local: &ReplicaState,
+    change: &deltaweave_store::PathChange,
+    record: &SyncRecord,
+) -> Result<()> {
+    ensure!(
+        change.state == PathChangeState::Materialized,
+        ShareError::StateUnavailable
+    );
+    ensure!(
+        target_matches_record(change, record),
+        ShareError::ManifestMismatch
+    );
+    match &change.target {
+        PathTarget::File(_) => {
+            let observation = local.store.observe_path_change(change)?;
+            local
+                .index
+                .adopt_materialized_record(record, &observation)?;
+        }
+        PathTarget::Directory | PathTarget::Absent => {
+            local.index.adopt_verified_record(record)?;
+        }
+    }
+    local.store.mark_path_change_indexed(&change.id)
+}
+
+async fn begin_apply(
+    local: &ReplicaState,
+    session: &ShareSession,
+    state: &mut ReadOnlyState,
+    snapshot: &deltaweave_net::share::SnapshotToken,
+    prefix: &[u8],
+    round: usize,
+) -> Result<(deltaweave_net::share::ApplyPermit, [u8; 16], Instant)> {
+    let started = Instant::now();
+    let permit = session.revalidate_before_apply(snapshot).await?;
+    let deadline = started + super::MANAGED_APPLY_TTL;
+    super::ensure_managed_deadline(deadline)?;
+    let operation_id = super::managed_operation_id(prefix, snapshot, round);
+    state.apply = Some(ManagedApplyJournal {
+        permit: permit.clone(),
+        operation_id,
+        committed: false,
+    });
+    // The exact permit and operation are durable before ApplyStart.  A
+    // restart can therefore close an uncertain owner row without inventing a
+    // new operation or silently dropping a local writer.
+    save(local, state)?;
+    session.apply_start(&permit, operation_id).await?;
+    Ok((permit, operation_id, deadline))
+}
+
+async fn finish_apply(
+    local: &ReplicaState,
+    session: &ShareSession,
+    state: &mut ReadOnlyState,
+    permit: &deltaweave_net::share::ApplyPermit,
+    operation_id: [u8; 16],
+    committed: bool,
+) -> Result<()> {
+    if let Some(apply) = state.apply.as_mut() {
+        ensure!(
+            apply.operation_id == operation_id && apply.permit == *permit,
+            ShareError::GrantReplay
+        );
+        apply.committed = committed;
+    } else {
+        state.apply = Some(ManagedApplyJournal {
+            permit: permit.clone(),
+            operation_id,
+            committed,
+        });
+    }
+    save(local, state)?;
+    session
+        .apply_drained(permit, operation_id, committed)
+        .await?;
+    state.apply = None;
+    save(local, state)
+}
+
 pub(crate) async fn sync(
     local: &Arc<ReplicaState>,
     session: &ShareSession,
     observer: &Option<TransferObserver>,
 ) -> Result<ReadOnlyReport> {
     let mut state = load(local)?;
-    // Always reconstruct the complete issuer snapshot: local-only vectors are not a Merkle base.
-    let empty = MerkleTree::from_records(Vec::new())?;
-    let remote = session.fetch_snapshot(&empty).await?;
-    validate_checkpoint(&state.checkpoint, &remote.records)?;
-    if let Some(pending) = &state.pending {
-        validate_checkpoint(&pending.desired, &remote.records)?;
+    // Finish the exact previous ApplyStart before requesting a new owner
+    // snapshot.  A revoked/paused owner may reject fresh data admission while
+    // still allowing this receipt/drain recovery; reversing these operations
+    // would strand the durable local writer journal forever.
+    if let Some(journal) = state.apply.clone() {
+        super::recover_managed_apply(session, &journal).await?;
+        state.apply = None;
+        save(local, &state)?;
     }
-    let owner_tree = MerkleTree::from_records(remote.records.clone())?;
+    // The managed path is owner-authoritative. On an already-initialized
+    // enrollment, perform the old share/3 snapshot exchange only as a
+    // compatibility *probe*: it can reject a peer that still serves a legacy
+    // unsigned snapshot before we open the managed control exchange, but its
+    // records are never used for planning, staging, or index adoption. This
+    // also lets an authenticated old peer finish its stream cleanly while the
+    // managed path reports the required fail-closed record-integrity result.
+    // An empty checkpoint has no prior history to validate, so it goes
+    // straight to the signed managed snapshot.
+    let empty = MerkleTree::from_records(Vec::new())?;
+    if !state.checkpoint.is_empty() {
+        let legacy = session.fetch_snapshot(&empty).await?;
+        validate_checkpoint(&state.checkpoint, &legacy.records)?;
+    }
+    let authoritative = match session.fetch_authoritative_snapshot(&empty).await {
+        Ok(snapshot) => snapshot,
+        // A peer that answers the old V3 snapshot shape cannot be accepted as
+        // an authoritative managed owner. Keep the fail-closed result in the
+        // stable record-integrity class used by the existing admission API.
+        Err(error) if ShareError::classify(&error) == ShareError::Protocol => {
+            return Err(ShareError::InvalidRecord.into());
+        }
+        Err(error) => return Err(error),
+    };
+    let remote = authoritative.records.clone();
+    validate_checkpoint(&state.checkpoint, &remote)?;
+    let owner_tree = MerkleTree::from_records(remote.clone())?;
     local.observe(observer, "peer_seen", None, None, 0);
-    if let Some(pending) = &state.pending {
-        for mut change in local
+
+    // Pending RO changes resume only after this current owner snapshot has
+    // been authenticated and admitted. A stale owner target uses the narrow
+    // no-promotion rollback helper and keeps both objects on drift.
+    let mut pending_ids = Vec::new();
+    if let Some(pending) = state.pending.as_ref() {
+        for attempt in &pending.attempts {
+            if !pending_ids.iter().any(|existing| existing == attempt) {
+                pending_ids.push(attempt.clone());
+            }
+        }
+    }
+    // Store preparation and the state-envelope update are separate durable
+    // operations.  If a process dies in that narrow interval, the path
+    // change has no causal binding but is still an owned managed attempt.  On
+    // the next authenticated round, attach such nonterminal rows to the
+    // pending journal before any scan can promote their materialized target
+    // as a fresh local edit.  The owner snapshot remains the authority for
+    // whether the attempt is resumed or rolled back.
+    let orphan_ids: Vec<_> = local
+        .store
+        .path_changes()?
+        .into_iter()
+        .filter(|change| {
+            change.root == local.root
+                && change.causal.is_none()
+                && matches!(
+                    change.state,
+                    PathChangeState::Prepared
+                        | PathChangeState::Preserved
+                        | PathChangeState::Materialized
+                        | PathChangeState::RollingBack
+                )
+        })
+        .map(|change| change.id)
+        .collect();
+    if !orphan_ids.is_empty() {
+        let pending = state.pending.get_or_insert_with(|| Pending {
+            desired: remote.clone(),
+            attempts: Vec::new(),
+            stage: Stage::Prepared,
+            stage_root: None,
+        });
+        for id in orphan_ids {
+            if !pending_ids.iter().any(|existing| existing == &id) {
+                pending_ids.push(id.clone());
+                pending.attempts.push(id);
+            }
+        }
+        save(local, &state)?;
+    }
+    if !pending_ids.is_empty() {
+        let all_changes: Vec<_> = local
             .store
             .path_changes()?
             .into_iter()
-            .filter(|c| pending.attempts.contains(&c.id))
-        {
-            local.store.resume_path_change(&mut change)?;
+            .filter(|change| {
+                change.root == local.root && pending_ids.iter().any(|attempt| attempt == &change.id)
+            })
+            .collect();
+        ensure!(
+            all_changes.len() == pending_ids.len(),
+            ShareError::StateUnavailable
+        );
+        let mut recovery_changes = Vec::new();
+        let mut completed_ids = Vec::new();
+        for change in all_changes {
+            if matches!(
+                change.state,
+                PathChangeState::Indexed
+                    | PathChangeState::Committed
+                    | PathChangeState::RolledBack
+                    | PathChangeState::Aborted
+            ) {
+                completed_ids.push(change.id);
+            } else {
+                recovery_changes.push(change);
+            }
+        }
+        if !recovery_changes.is_empty() {
+            let (permit, operation_id, deadline) = begin_apply(
+                local,
+                session,
+                &mut state,
+                &authoritative.token,
+                b"managed-ro-recovery",
+                0,
+            )
+            .await?;
+            for mut change in recovery_changes {
+                super::ensure_managed_deadline(deadline)?;
+                let target = owner_record(&remote, &change.path);
+                if change.state == PathChangeState::RollingBack {
+                    // A prior stale-target recovery has already published the
+                    // rollback write-ahead state.  Finish it before considering
+                    // the current owner target; never adopt from a halfway
+                    // rollback after restart.
+                    local.store.rollback_unadopted_path_change(&mut change)?;
+                    ensure!(
+                        change.state == PathChangeState::RolledBack,
+                        ShareError::StateUnavailable
+                    );
+                } else if target.is_some_and(|record| target_matches_record(&change, record)) {
+                    local.store.resume_path_change(&mut change)?;
+                    let record = target.context(ShareError::StateUnavailable)?;
+                    adopt_recovered_change(local, &change, record)?;
+                } else {
+                    ensure!(change.causal.is_none(), ShareError::StateUnavailable);
+                    local.store.rollback_unadopted_path_change(&mut change)?;
+                    ensure!(
+                        change.state == PathChangeState::RolledBack,
+                        ShareError::StateUnavailable
+                    );
+                }
+                completed_ids.push(change.id);
+            }
+            if let Some(pending) = state.pending.as_mut() {
+                pending
+                    .attempts
+                    .retain(|attempt| !completed_ids.iter().any(|done| done == attempt));
+                if pending.attempts.is_empty() {
+                    pending.stage = Stage::Adopted;
+                }
+            }
+            save(local, &state)?;
+            finish_apply(local, session, &mut state, &permit, operation_id, true).await?;
+        } else if let Some(pending) = state.pending.as_mut() {
+            pending
+                .attempts
+                .retain(|attempt| !completed_ids.iter().any(|done| done == attempt));
+            pending.stage = Stage::Adopted;
+            save(local, &state)?;
         }
     }
+    if state
+        .pending
+        .as_ref()
+        .is_some_and(|pending| pending.attempts.is_empty() && pending.stage == Stage::Adopted)
+    {
+        state.pending = None;
+        save(local, &state)?;
+    }
+
     let scan = scan_index(local.index.clone()).await?;
     ensure_scan_is_safe(&scan, "read-only local")?;
     let current = read_records(local.index.clone()).await?;
     let current_tree = MerkleTree::from_records(current.clone())?;
     let current_by_path: BTreeMap<_, _> = current.iter().map(|r| (r.path.clone(), r)).collect();
-    let remote_by_path: BTreeMap<_, _> =
-        remote.records.iter().map(|r| (r.path.clone(), r)).collect();
+    let remote_by_path: BTreeMap<_, _> = remote.iter().map(|r| (r.path.clone(), r)).collect();
     let mut changes: BTreeMap<WirePath, (Option<PathObservation>, Option<SyncRecord>)> =
         BTreeMap::new();
     for record in current.iter().filter(|r| !r.tombstone) {
@@ -179,7 +505,7 @@ pub(crate) async fn sync(
             );
         }
     }
-    for record in remote.records.iter().filter(|r| !r.tombstone) {
+    for record in remote.iter().filter(|r| !r.tombstone) {
         let previous = current_by_path.get(&record.path).filter(|r| !r.tombstone);
         if previous.is_some_and(|r| physical_equal(r, record)) {
             continue;
@@ -196,7 +522,7 @@ pub(crate) async fn sync(
         };
         changes.insert(record.path.clone(), (expected, Some(record.clone())));
     }
-    // Capturing a complete directory preserves its local-only descendants exactly once.
+    // Capturing a complete directory preserves local-only descendants once.
     let paths: Vec<_> = changes.keys().cloned().collect();
     for path in paths {
         let ancestors: Vec<_> = path.components().collect();
@@ -224,38 +550,65 @@ pub(crate) async fn sync(
         sum.checked_add(r.size)
             .context("pending RO byte count overflow")
     })?;
-    let (manifests, stats) = local
-        .stage_desired_files(
+    let (mut staged, stats) = local
+        .stage_managed_files(
             session,
             &files,
             &current,
-            &remote.records,
+            &remote,
             pending_bytes,
+            &authoritative,
+            false,
             observer,
         )
         .await?;
-    let scan = scan_index(local.index.clone()).await?;
-    ensure_scan_is_safe(&scan, "read-only before apply")?;
-    ensure!(
-        MerkleTree::from_records(read_records(local.index.clone()).await?)?.root_hash()
-            == current_tree.root_hash(),
-        "local state changed before authoritative apply"
-    );
+
+    // A no-op only advances the private checkpoint. Local-only edits remain
+    // local index state and never become owner history.
+    if changes.is_empty() && current_tree.root_hash() == owner_tree.root_hash() {
+        state.checkpoint = remote.clone();
+        state.pending = None;
+        save(local, &state)?;
+        return Ok(ReadOnlyReport {
+            status: "pass",
+            owner_root: owner_tree.root_hash(),
+            verified_local_root: current_tree.root_hash(),
+            pulled_bytes: stats.pulled_bytes,
+            preserved: preserved(local)?,
+        });
+    }
+
     let old_attempts = state.pending.take().map_or_else(Vec::new, |p| p.attempts);
     state.pending = Some(Pending {
-        desired: remote.records.clone(),
+        desired: remote.clone(),
         attempts: old_attempts,
         stage: Stage::Prepared,
+        stage_root: staged.roots.first().cloned(),
     });
     save(local, &state)?;
+
+    // The monotonic deadline starts before Revalidate and cannot be renewed by
+    // a delayed response. All public filesystem, readonly, and index writes
+    // are below this operation's ApplyStart.
+    let (permit, operation_id, deadline) = begin_apply(
+        local,
+        session,
+        &mut state,
+        &authoritative.token,
+        b"managed-ro-apply",
+        0,
+    )
+    .await?;
     local.observe(observer, "ro_prepared", None, None, 0);
-    // Parents first: a directory replacing a file must exist before installing its children.
     let mut changes: Vec<_> = changes.into_iter().collect();
     changes.sort_by_key(|(path, _)| path_depth(path));
+    let mut materialized_ids = Vec::new();
     for (path, (expected, desired)) in changes {
+        super::ensure_managed_deadline(deadline)?;
         let target = match desired {
             Some(record) if record.kind == SyncEntryKind::File => {
-                let manifest = manifests
+                let manifest = staged
+                    .manifests
                     .get(&record.content_hash.context("file has no hash")?)
                     .context("required RO content not staged")?
                     .clone();
@@ -283,6 +636,7 @@ pub(crate) async fn sync(
             .push(change.id.clone());
         save(local, &state)?;
         local.observe(observer, "ro_path_prepared", Some(&path), None, 0);
+        super::ensure_managed_deadline(deadline)?;
         local.store.capture_path_change(&mut change)?;
         state
             .pending
@@ -291,9 +645,12 @@ pub(crate) async fn sync(
             .stage = Stage::Preserved;
         save(local, &state)?;
         local.observe(observer, "ro_preserved", Some(&path), None, 0);
+        super::ensure_managed_deadline(deadline)?;
         local.store.materialize_path_change(&mut change)?;
+        materialized_ids.push(change.id.clone());
     }
-    for record in remote.records.iter().filter(|r| !r.tombstone) {
+    for record in remote.iter().filter(|r| !r.tombstone) {
+        super::ensure_managed_deadline(deadline)?;
         local
             .store
             .set_readonly(&local.root, &record.path, record.readonly)?;
@@ -305,37 +662,42 @@ pub(crate) async fn sync(
         .stage = Stage::Materialized;
     save(local, &state)?;
     local.observe(observer, "ro_materialized", None, None, 0);
-    state.checkpoint = remote.records.clone();
+    state.checkpoint = remote.clone();
     state
         .pending
         .as_mut()
         .context("pending journal missing")?
         .stage = Stage::Adopted;
-    // Complete replacement, including removal of all local-only versions, is one redb commit.
+    super::ensure_managed_deadline(deadline)?;
     local
         .index
-        .adopt_authoritative_snapshot(&remote.records, &postcard::to_stdvec(&state)?)?;
+        .adopt_authoritative_snapshot(&remote, &postcard::to_stdvec(&state)?)?;
     local.observe(observer, "ro_adopted", None, None, 0);
-    for change in local
-        .store
-        .path_changes()?
-        .into_iter()
-        .filter(|c| c.root == local.root && c.state == PathChangeState::Materialized)
-    {
-        local.store.mark_path_change_indexed(&change.id)?;
+    // Adopt only attempts created by this admitted round.  An unrelated
+    // retained Materialized row must remain recoverable instead of being
+    // silently promoted by a broad state scan.
+    for id in materialized_ids {
+        local.store.mark_path_change_indexed(&id)?;
     }
-    state.pending = None;
-    save(local, &state)?;
+
     let verification = scan_index(local.index.clone()).await?;
     ensure_scan_is_safe(&verification, "verified read-only")?;
     let verified = MerkleTree::from_records(read_records(local.index.clone()).await?)?;
-    let fresh_owner = session.fetch_snapshot(&owner_tree).await?;
-    let fresh_owner = MerkleTree::from_records(fresh_owner.records)?;
-    ensure!(
-        verified.root_hash() == owner_tree.root_hash()
-            && fresh_owner.root_hash() == owner_tree.root_hash(),
-        "owner or local namespace changed during authoritative verification; retry"
-    );
+    let fresh_owner = session.fetch_authoritative_snapshot(&empty).await?;
+    let fresh_owner_tree = MerkleTree::from_records(fresh_owner.records)?;
+    if verified.root_hash() != owner_tree.root_hash()
+        || fresh_owner_tree.root_hash() != owner_tree.root_hash()
+    {
+        // Keep Pending/apply state durable. A later round must be admitted
+        // again rather than treating an owner race as success.
+        let _ = finish_apply(local, session, &mut state, &permit, operation_id, false).await;
+        bail!(ShareError::ManifestMismatch);
+    }
+    finish_apply(local, session, &mut state, &permit, operation_id, true).await?;
+    state.pending = None;
+    state.checkpoint = remote.clone();
+    save(local, &state)?;
+    staged.cleanup_owned(local.store.state_root());
     Ok(ReadOnlyReport {
         status: "pass",
         owner_root: owner_tree.root_hash(),
@@ -344,7 +706,6 @@ pub(crate) async fn sync(
         preserved: preserved(local)?,
     })
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,5 +735,34 @@ mod tests {
         tombstone.tombstone = true;
         validate_checkpoint(&checkpoint, &[tombstone.clone()]).unwrap();
         assert!(validate_checkpoint(&[tombstone], &[]).is_err());
+    }
+
+    #[test]
+    fn legacy_v1_pending_some_decodes_without_loss() {
+        let desired = vec![record(b"legacy", 4)];
+        let attempts = vec!["legacy-operation".to_owned()];
+        let legacy = LegacyReadOnlyState {
+            version: 1,
+            owner: [7; 32],
+            share: [9; 32],
+            checkpoint: vec![record(b"checkpoint", 3)],
+            pending: Some(LegacyPending {
+                desired: desired.clone(),
+                attempts: attempts.clone(),
+                stage: Stage::Preserved,
+            }),
+        };
+        let bytes = postcard::to_stdvec(&legacy).expect("legacy fixture encoding");
+        let decoded = decode_state(&bytes).expect("legacy fixture decoding");
+        assert_eq!(decoded.version, legacy.version);
+        assert_eq!(decoded.owner, legacy.owner);
+        assert_eq!(decoded.share, legacy.share);
+        assert_eq!(decoded.checkpoint, legacy.checkpoint);
+        let pending = decoded.pending.expect("legacy pending retained");
+        assert_eq!(pending.desired, desired);
+        assert_eq!(pending.attempts, attempts);
+        assert_eq!(pending.stage, Stage::Preserved);
+        assert_eq!(pending.stage_root, None);
+        assert!(decoded.apply.is_none());
     }
 }

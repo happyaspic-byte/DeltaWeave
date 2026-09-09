@@ -733,6 +733,7 @@ dependencies = [
  "deltaweave-store",
  "deltaweave-swarm",
  "fs2",
+ "futures-lite",
  "hex",
  "iroh",
  "postcard",
@@ -795,6 +796,7 @@ dependencies = [
  "serde",
  "tempfile",
  "tokio",
+ "winapi-util",
 ]
 
 [[package]]

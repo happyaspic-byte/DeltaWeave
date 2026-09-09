@@ -101,6 +101,200 @@ pub struct ActivateGrantReply {
     pub signature: Signature,
 }
 
+/// The immutable owner binding for one activation attempt.  It deliberately
+/// contains the signed grant fields that identify the request, but no bearer
+/// key or private endpoint state.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ActivationBinding {
+    pub owner: EndpointId,
+    pub share: ShareId,
+    pub consumer: EndpointId,
+    pub provider: EndpointId,
+    pub epoch: PermissionEpoch,
+    pub provider_epoch: PermissionEpoch,
+    pub manifest: Hash32,
+    pub request_hash: Hash32,
+    pub nonce: GrantNonce,
+}
+
+impl ActivationBinding {
+    pub fn from_grant(grant: &ShareGrant) -> Self {
+        Self {
+            owner: grant.owner,
+            share: grant.share,
+            consumer: grant.consumer,
+            provider: grant.provider,
+            epoch: grant.epoch,
+            provider_epoch: grant.provider_epoch,
+            manifest: grant.manifest,
+            request_hash: grant.request_hash,
+            nonce: grant.nonce,
+        }
+    }
+}
+
+/// Queries the owner for the durable state of one exact activation nonce.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ActivationStatusQuery {
+    pub binding: ActivationBinding,
+    pub activation_id: Option<[u8; 16]>,
+}
+
+impl ActivationStatusQuery {
+    pub fn for_grant(grant: &ShareGrant, activation_id: Option<[u8; 16]>) -> Self {
+        Self {
+            binding: ActivationBinding::from_grant(grant),
+            activation_id,
+        }
+    }
+}
+
+/// Cancels an exact issued activation.  The operation ID belongs to the
+/// caller's durable intent journal; owner-side cancellation is idempotent for
+/// the immutable grant binding and never turns an Active grant into Denied.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ActivationCancel {
+    pub binding: ActivationBinding,
+    pub activation_id: Option<[u8; 16]>,
+    pub operation_id: [u8; 16],
+}
+
+impl ActivationCancel {
+    pub fn for_grant(
+        grant: &ShareGrant,
+        activation_id: Option<[u8; 16]>,
+        operation_id: [u8; 16],
+    ) -> Self {
+        Self {
+            binding: ActivationBinding::from_grant(grant),
+            activation_id,
+            operation_id,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivationStateView {
+    Issued,
+    Active,
+    Restarted,
+    Drained,
+    Denied,
+    Expired,
+}
+
+/// Owner-authenticated, durable activation state.  The receipt attests only
+/// the owner's grant and drain journal; it does not claim that a peer fsynced
+/// its local intent or that payload bytes were transferred.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ActivationReceipt {
+    pub binding: ActivationBinding,
+    pub state: ActivationStateView,
+    pub activation_id: Option<[u8; 16]>,
+    pub activation_deadline: Option<u64>,
+    pub revoked: bool,
+    pub provider_drained: bool,
+    pub consumer_drained: bool,
+    /// Current owner-side admission gate. This is a runtime observation, not
+    /// a lease extension or proof that the peer has persisted its intent.
+    #[serde(default = "default_admission_open")]
+    pub admission_open: bool,
+}
+
+fn default_admission_open() -> bool {
+    true
+}
+
+impl ActivationReceipt {
+    pub fn verify_for(
+        &self,
+        grant: &ShareGrant,
+        requested_activation_id: Option<[u8; 16]>,
+    ) -> Result<()> {
+        ensure!(
+            self.binding == ActivationBinding::from_grant(grant),
+            ShareError::GrantReplay
+        );
+        if let Some(requested) = requested_activation_id {
+            ensure!(
+                self.activation_id == Some(requested),
+                ShareError::GrantReplay
+            );
+        }
+        Ok(())
+    }
+}
+
+/// The endpoint-local side of one grant-gated data operation.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientSide {
+    Consumer,
+    Provider,
+}
+
+/// Durable endpoint-local intent phases.  Unknown and nonterminal phases are
+/// retained across a crash; they are never treated as permission to start a
+/// new payload operation.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientIntentPhase {
+    Prepared,
+    AwaitingActivation,
+    Active,
+    Draining,
+    Unknown,
+    Drained,
+    Cancelled,
+}
+
+/// Minimal durable client journal for one exact grant binding.  The signed
+/// grant is retained so recovery can query the owner without inventing a new
+/// signature; it contains no bearer key or private endpoint state.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ClientIntentRow {
+    pub grant: ShareGrant,
+    pub binding: ActivationBinding,
+    pub side: ClientSide,
+    pub activation_id: Option<[u8; 16]>,
+    pub operation_id: [u8; 16],
+    pub phase: ClientIntentPhase,
+    pub boot_id: [u8; 16],
+    pub started_at_wall: u64,
+    /// Wall-clock time at which this endpoint observed the authenticated
+    /// terminal result and durably recorded it.  Retention is measured from
+    /// this confirmation rather than from the operation start, so a delayed
+    /// owner response cannot make a still-recoverable row disappear early.
+    #[serde(default)]
+    pub terminal_at_wall: Option<u64>,
+    /// The boot generation which owned this intent before the most recent
+    /// restart. A value is present only after the registry has observed a
+    /// cross-process recovery. It is evidence that the row needs recovery;
+    /// it is never by itself evidence that a writer drained. This field is
+    /// appended so older postcard rows keep their original wire order.
+    #[serde(default)]
+    pub previous_boot_id: Option<[u8; 16]>,
+}
+
+/// Secret-free result of a verified share-swarm transfer.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SwarmTransferReceipt {
+    pub share: ShareId,
+    pub provider: EndpointId,
+    pub transferred_chunks: u16,
+    pub transferred_bytes: u64,
+    pub missing_chunks: u16,
+    pub verified: bool,
+    /// True when local bytes were verified and the local endpoint sent its
+    /// drain acknowledgement, but the owner has not yet authenticated the
+    /// bilateral terminal state. This is intentionally part of the result so
+    /// callers cannot mistake a successful byte transfer for a completed
+    /// grant lifecycle.
+    #[serde(default)]
+    pub drain_pending: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ApplyPermit {
     pub version: u8,
@@ -127,6 +321,80 @@ pub struct ApplyDrained {
     pub operation_id: [u8; 16],
     pub permit_nonce: GrantNonce,
     pub committed: bool,
+}
+
+/// Queries the owner's durable apply journal. `operation_id` is optional only
+/// while a permit is still Prepared and has not yet received ApplyStart; once
+/// the owner has recorded a start it must match exactly.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ApplyStatusQuery {
+    pub owner: EndpointId,
+    pub share: ShareId,
+    pub consumer: EndpointId,
+    pub permit_nonce: GrantNonce,
+    pub operation_id: Option<[u8; 16]>,
+}
+
+impl ApplyStatusQuery {
+    pub fn for_permit(permit: &ApplyPermit, operation_id: Option<[u8; 16]>) -> Self {
+        Self {
+            owner: permit.owner,
+            share: permit.share,
+            consumer: permit.consumer,
+            permit_nonce: permit.nonce,
+            operation_id,
+        }
+    }
+}
+
+/// Atomically cancels a Prepared apply. Started/Restarted applies are only
+/// queried and drained after their actual local writer has stopped.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ApplyCancel {
+    pub owner: EndpointId,
+    pub share: ShareId,
+    pub consumer: EndpointId,
+    pub permit_nonce: GrantNonce,
+    pub operation_id: [u8; 16],
+}
+
+impl ApplyCancel {
+    pub fn for_permit(permit: &ApplyPermit, operation_id: [u8; 16]) -> Self {
+        Self {
+            owner: permit.owner,
+            share: permit.share,
+            consumer: permit.consumer,
+            permit_nonce: permit.nonce,
+            operation_id,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplyStateView {
+    Prepared,
+    Started,
+    Restarted,
+    Drained,
+    Denied,
+    Expired,
+}
+
+/// Authenticated owner response for apply recovery. It is a journal view,
+/// not a permit and never extends an apply lease.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ApplyReceipt {
+    pub owner: EndpointId,
+    pub share: ShareId,
+    pub consumer: EndpointId,
+    pub permit_nonce: GrantNonce,
+    pub operation_id: Option<[u8; 16]>,
+    pub state: ApplyStateView,
+    pub committed: bool,
+    pub revoked: bool,
+    #[serde(default = "default_admission_open")]
+    pub admission_open: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -614,6 +882,19 @@ impl ShareGrant {
     pub fn verify_for(&self, owner: EndpointId, share: ShareId, now: u64) -> Result<()> {
         ensure!(self.owner == owner, ShareError::OwnerMismatch);
         ensure!(self.share == share, ShareError::OwnerMismatch);
+        self.verify_signature_for(owner, share)?;
+        check_issued_at(self.issued_at, now)?;
+        ensure!(self.expires_at > now, ShareError::GrantExpired);
+        Ok(())
+    }
+
+    /// Verifies the immutable signed binding while deliberately ignoring the
+    /// grant's wall-clock expiry.  Restart recovery may need to query or
+    /// cancel an already-expired row, but it must never use that fact to admit
+    /// a new payload operation.
+    pub(crate) fn verify_signature_for(&self, owner: EndpointId, share: ShareId) -> Result<()> {
+        ensure!(self.owner == owner, ShareError::OwnerMismatch);
+        ensure!(self.share == share, ShareError::OwnerMismatch);
         self.validate_shape()?;
         verify_signature(
             self.owner,
@@ -621,8 +902,6 @@ impl ShareGrant {
             &grant_payload(self),
             &self.signature,
         )?;
-        check_issued_at(self.issued_at, now)?;
-        ensure!(self.expires_at > now, ShareError::GrantExpired);
         Ok(())
     }
 
@@ -769,6 +1048,27 @@ impl ApplyPermit {
         )?;
         check_issued_at(self.issued_at, now)?;
         ensure!(self.expires_at > now, ShareError::GrantExpired);
+        Ok(())
+    }
+
+    /// Verifies an expired permit's immutable signature for journal recovery;
+    /// callers must still reject it for any new apply admission.
+    pub(crate) fn verify_signature_for(
+        &self,
+        owner: EndpointId,
+        share: ShareId,
+        consumer: EndpointId,
+    ) -> Result<()> {
+        ensure!(self.owner == owner, ShareError::OwnerMismatch);
+        ensure!(self.share == share, ShareError::OwnerMismatch);
+        ensure!(self.consumer == consumer, ShareError::EndpointMismatch);
+        self.validate_shape()?;
+        verify_signature(
+            self.owner,
+            APPLY_DOMAIN,
+            &apply_payload(self),
+            &self.signature,
+        )?;
         Ok(())
     }
 }

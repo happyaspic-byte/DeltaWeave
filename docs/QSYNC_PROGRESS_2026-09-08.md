@@ -6,11 +6,14 @@
 
 작성 agent: `qsync_contracts` / Luna Max
 
-현재 단계: D2 network authority checkpoint. A 계약 문서는 `121d042`로
+현재 단계: E1 durable activation receipt/status checkpoint. A 계약 문서는 `121d042`로
 통합되었고, B 최종 source checkpoint는 `5702ab1`, D2 source checkpoint는
 `04818f2b224249b2839b20d0b18f7b6634ae0c0a`이다. D2는 authority와
-request-start monotonic activation lease 검증까지 완료했으며
-D3 heartbeat/N0와 E data-plane은 완료로 표시하지 않는다.
+request-start monotonic activation lease 검증까지 완료했다. D3 checkpoint
+`f886ab0`은 heartbeat와 bounded endpoint-ID fallback을 포함한다. D3의 실제
+Internet/N0·relay control 검증은 `d8225bf` evidence로 완료했으며, E data-plane은
+완료로 표시하지 않는다. E1 source checkpoint는 `bfe6f92`이며, durable activation
+상태 조회/취소와 양쪽 drain 상태 검증만 포함한다.
 
 ## 작업 공간과 agent
 
@@ -23,7 +26,7 @@ D3 heartbeat/N0와 E data-plane은 완료로 표시하지 않는다.
 | B control | `/home/ubuntu/project/DeltaWeave-qsync-control-20260908` | `feat/qsync-control-20260908` | `ca63e04` persisted managed-private path recovery; prior final source `5702ab1`, Windows acceptance fixture `39ae489` |
 | C web | `/home/ubuntu/project/DeltaWeave-qsync-web-20260908` | `feat/qsync-web-20260908` | 병렬 구현 진행 |
 | validation | `/home/ubuntu/project/DeltaWeave-qsync-verification-20260908` | `test/qsync-verification-20260908` | 후속 검증 |
-| D network | `/home/ubuntu/project/DeltaWeave-qsync-network-20260908` | `feat/qsync-network-20260908` | `04818f2` D2 authority/registry/handler와 request-start activation lease checkpoint, isolated full-net 통과; D3 대기 |
+| D network | `/home/ubuntu/project/DeltaWeave-qsync-network-20260908` | `feat/qsync-network-20260908` | `bfe6f92` E1 activation status/cancel checkpoint; D3 Internet/N0·relay control 완료, E data-plane 검증 대기 |
 
 ## A에서 고정한 계약
 
@@ -141,12 +144,12 @@ flow, D N0/relay/address update, E swarm grant/manifest/max-8/fallback, root saf
   단위로 정리하며 기존 root/index/CAS 파일은 보존한다.
 
 D2에서 실제 확인한 것은 위 source-level authority/control 경계와 DirectOnly isolated
-  tests, request-start activation lease 및 isolated full-net 회귀다. 아직 D 전체 완료가
-  아닌 남은 항목은 managed worker의 30초 heartbeat와 90초
-  stale refresh, owner 주소 변경/실제 offline 복귀, Internet/N0 relay payload 증거,
-  signed roster pagination, E의 실제 `share-swarm/1` verified-CAS multi-provider data
-  handler/stream limits, Windows 3-host 및 F full CI 검증이다. DirectOnly stale-address
-  refresh와 live provider discovery는 D3 의존성으로 유지한다.
+  tests, request-start activation lease 및 isolated full-net 회귀다. D3의 실제
+  Internet/N0·relay control 경계도 `d8225bf`의 owner/member 분리 identity 실험에서
+  확인했다. 아직 D/E 전체 완료가 아닌 남은 항목은 E의 실제 `share-swarm/1`
+  verified-CAS 다중 provider data handler/stream limits, signed roster pagination,
+  Windows 3-host 및 F full CI 검증이다. 해당 D3 control byte/path 관측은 E payload
+  증거로 집계하지 않는다.
 
 ## e8122ac finding 매핑
 
@@ -193,3 +196,120 @@ root가 확인한다. Container image artifact는 운영 배포 증거와 구분
    B/C 영향 범위를 갱신한 뒤 후속 implementation을 재개한다.
 4. final integration, 3기기/Windows/Internet/full CI 검증, release 판단과 goal complete
    판정은 root가 담당한다.
+
+## D3 network lifecycle and Internet control checkpoint (`d8225bf`)
+
+- `SyncSession`의 endpoint-ID fallback은 하나의 monotonic caller deadline을
+  connect, bounded N0 lookup, 재연결에 전달한다. fallback이 있는 경우 stale
+  persisted address에 전체 시간을 소비하지 않도록 primary dial에 일부 예산만
+  배정하며, lookup 결과는 endpoint ID와 실제 주소가 일치하는 첫 usable item에서
+  멈춘다. 남은 시간이 없으면 owner에 `Activate`를 전송하지 않는다.
+- `ShareService::resume_membership`은 Internet 모드에서 저장된 주소가 stale해도
+  동일 device endpoint의 endpoint-ID lookup을 시도하고, 인증된 연결의 실제 주소
+  hint를 relationship에 저장한다. peer identity, owner/share, permission, epoch은
+  계속 authenticated response와 기존 binding으로 검증한다.
+- managed `ShareSession`은 기존 ShareService endpoint와 transport를 공유한다.
+  별도 endpoint/index/store를 열지 않으며, data synchronization gate와 독립된
+  heartbeat supervisor가 30초 cadence로 roster challenge/heartbeat를 시도한다.
+  heartbeat/control 연결은 취소 시 Drop-close되고 engine shutdown에서 task를
+  abort·await한 뒤 session을 해제한다. heartbeat 실패도 managed observer의
+  terminal `error`로 전달된다.
+- share protocol Handler의 첫 stream/Hello와 accepted Session의 첫 sync request는
+  하나의 15초 admission deadline 안에서 읽고, preview/unknown-share와 완료된
+  session의 peer close 대기도 같은 bounded 정책으로 회수한다. `SyncSession`의
+  connect와 share Session handshake도 하나의 caller deadline을 공유한다.
+- `TransportObservation`과 `N0LookupObservation`은 주소, endpoint ID, key를
+  포함하지 않는 관측값이다. 아래 Internet 실험의 byte/path 값은 인증된 roster
+  control exchange의 관측이며 `share-swarm/1` payload 증거로 사용하지 않는다.
+
+| D3 검사 | 결과 | 증거 |
+| --- | --- | --- |
+| net 전체 isolated suite | `121 passed, 0 failed`, exit `0`; outer `106` unit + `2` admission + `13` shares, child 출력 중복 제외 | `2026-09-09/d3/d3-full-net-isolated-rerun-20260909T051428Z.log`; 05:14:28Z–05:14:55Z, workspace-private HOME/USERPROFILE/TMPDIR, preserved rustup/cargo homes |
+| sync heartbeat/lease focused | `2 passed, 0 failed`, exit `0`; outer `2` | `2026-09-09/d3/d3-sync-focused-20260909T051524Z.log`; 05:15:25Z–05:15:51Z |
+| activation deadline and resume fallback | 각 outer `1 passed`, exit `0` | `d3-activation-deadline-rerun2-20260909T050211Z.log`, `d3-resume-lookup-rerun-20260909T050550Z.log`; resume의 `MemoryLookup`는 합성 lookup fixture이며 실제 pkarr/dns/N0 증거가 아님 |
+| managed heartbeat observer error | outer `1 passed`, exit `0` | `d3-heartbeat-observer-error-20260909T050732Z.log`; owner offline 시 sync 경로에서 observer `error` 확인 |
+| share focused tests | `27 passed, 0 failed`, exit `0` | `d3-share-focused-rerun-20260909T050953Z.log` 및 outer-count correction log |
+| format/diff | `git diff --check`, `cargo fmt --all -- --check` exit `0` | `d3-quality-20260909T051622Z.log`; 05:16:22Z–05:16:24Z |
+| compile/lint | locked all-target check와 strict `clippy -D warnings` exit `0` | `d3-check-all-targets-20260909T051022Z.log`, `d3-clippy-strict-rerun-20260909T051134Z.log`; check는 `52c29fe` 기반의 이전 D3 tree이고, 이후 lint 수정 뒤 최종 strict clippy와 후속 검사가 최종 source를 검증했다 |
+| delayed endpoint-ID fallback | `1 passed, 0 failed`, exit `0`; outer `1` | `d3-delayed-fallback-ipv4-rerun2-20260909T053627Z.log`; stale direct hint가 IPv4 test socket을 잘못 재사용하지 않고 남은 deadline으로 delayed lookup/reconnect를 완료 |
+| actual Internet/N0/relay harness compile | test binary compile exit `0` | `d3-actual-experiment-compile-observation-20260909T054125Z.log`; workspace-private HOME/USERPROFILE/TMPDIR 및 보존된 rustup/cargo home |
+| actual Internet/N0/relay first observation | owner service open 단계에서 즉시 실패, outer `0`, exit `101` | `d3-actual-internet-n0-relay-observed-20260909T054203Z.log`; 상세 원인은 이 실행에서 미확인으로 남기고 이후 새 격리 profile 재실행 결과와 분리 기록 |
+| actual Internet/N0/relay observed rerun | `1 passed, 0 failed`, exit `0`; outer `1`, 26.90s | `d3-actual-internet-n0-relay-observed-rerun-20260909T054241Z.log`; 실제 DNS provenance, relay-only socket/path, authenticated roster/permission/epoch, positive tx/rx bytes, owner restart/address change, offline/back resume와 binding 보존을 secret-free JSON으로 기록 |
+| final net lint/check after harness | net strict clippy와 control/net all-targets/all-features check exit `0` | `d3-net-clippy-observation-final-20260909T054328Z.log`, `d3-control-net-check-observation-final-20260909T054350Z.log`; 최종 source checkpoint `1d5be66` 직전 실행 |
+| final format/diff after harness | `git diff --check`, `cargo fmt --all -- --check` exit `0` | `d3-quality-observation-final-20260909T054409Z.log`; source checkpoint `1d5be66` |
+| bounded share admission regression | child 포함 inner/outer `1 passed`, exit `0`, 30.57s; outer count는 `1` | `d3-admission-timeout-regression-rerun-20260909T055518Z.log`; workspace-private TMPDIR와 child HOME/USERPROFILE에서 silent Hello/preview close timeout, slot recovery, 정상 enrollment 확인 |
+| final Internet/N0/relay rerun after admission fix | `1 passed, 0 failed`, exit `0`; outer `1`, 26.58s | `d3-actual-internet-n0-relay-final-d8225bf-20260909T055805Z.log`; start `05:58:05Z`, end `05:58:32Z`, source `d8225bf9f912b81a977a257f1bace9f610b368e5`; wrapper exit marker `0`, phase JSON은 실제 DNS1/relay selected/IP 없음/tx-rx 양수/동일 binding 보존을 기록 |
+| final admission lint/check | strict `clippy -D warnings` 및 locked control/net all-targets/all-features check exit `0` | `d3-admission-timeout-clippy-final-20260909T055617Z.log`, `d3-admission-timeout-check-final-20260909T055633Z.log`; source `d8225bf` 직전 |
+
+isolated resume의 `MemoryLookup` 검사는 합성 endpoint-ID lookup fixture이고 실제
+pkarr/dns/N0 증거가 아니다. source checkpoint `1d5be66`의 별도 ignored 실험은 같은
+Linux host에서 분리한 owner/member identity로 실제 DNS provenance와 relay-only
+control path를 확인했고, owner 재시작·주소변경·offline/back resume의 인증 binding을
+보존했다. JSON 관측의 tx/rx byte delta는 share-swarm payload 증거가 아니며, 이
+실험은 E의 verified-CAS 다중 provider payload 또는 세 기기 검증을 주장하지 않는다.
+durable late activation receipt/ACK, provider/consumer 양쪽 drain, Windows 3-host 및
+F release 검증은 여전히 E/F 순차 범위다.
+
+## D3 bounded admission follow-up (`e437b85`)
+
+- `wait_closed_bounded`는 bounded close-wait가 만료되면 retained `Connection` clone에
+  의존하지 않고 명시적으로 connection close를 전송한다. silent/preview admission
+  회귀는 peer close 관측과 slot 회수를 함께 확인한다.
+- `open_session_until`은 deadline이 이미 만료된 경우 `exchange`를 poll하기 전에
+  `Offline`을 반환한다. 따라서 zero-duration timeout이 Session BI stream이나 Hello를
+  생성하는 부작용을 낼 수 없다. 이 변경은 wire ordinal/정상 deadline 경로를 바꾸지
+  않는다.
+
+| 검사 | 결과 | 증거 |
+| --- | --- | --- |
+| expired session no-Hello | outer `1 passed`, exit `0`, 1.05s | `2026-09-09/d3/availability/expired-session-no-hello-20260909.log`; 06:14:59Z–06:15:18Z, pre-commit HEAD `87d6687` plus the source diff committed as `e437b85` |
+| silent/preview timeout close | outer `1 passed`, exit `0`, 30.53s; nested child는 중복 집계하지 않음 | `2026-09-09/d3/availability/admission-close-regression-20260909.log`; 06:15:32Z–06:16:03Z |
+| net all-target check | exit `0` | `2026-09-09/d3/availability/net-check-availability-20260909.log`; source 변경 적용 후 check |
+| net strict clippy (`-D warnings`) | exit `0` | `2026-09-09/d3/availability/net-clippy-availability-20260909.log`; source 변경 적용 후 clippy |
+
+CI dispatch `34317854588`는 integration ref `63cb43c4142e0d28931dd5f81decb5506aa5d948`
+에서 실행됐으며, 이 후속 로컬 commit은 해당 실행에 포함되지 않는다. 실제 integration
+CI 결과와 이 후속 source 검사는 별도 근거로 집계한다.
+
+## E1 durable activation receipt checkpoint (`bfe6f92`)
+
+- `ActivationStatus`와 `ActivationCancel`은 기존 `Operation`/`Reply` 뒤에 append되어
+  postcard wire ordinal을 보존한다. `ActivationBinding`은 owner/share/consumer/provider,
+  양쪽 epoch, manifest/request hash와 nonce를 고정하며 raw key나 endpoint secret을
+  담지 않는다. `ActivationReceipt::verify_for`는 이 binding과 요청한 activation ID를
+  exact 비교한다.
+- owner registry의 status 조회는 `GrantRow`와 양쪽 `GrantDrainState`를 하나의 redb
+  read snapshot에서 읽고 lease를 갱신하지 않는다. 저장 상태가 `Issued`인 동안 wall
+  clock만으로 `Expired`를 합성하지 않으며, `ActivationCancel`이 같은 transaction에서
+  `Issued → Denied` 또는 만료된 `Issued → Expired`를 기록한다. `Active`/`Restarted`는
+  늦은 취소가 지우지 않고 provider/consumer 양쪽 drain ACK가 모두 있을 때만 `Drained`가
+  된다. 새 grant/data admission에는 현재 epoch 검사가 남고, response-loss recovery의
+  status/cancel만 기존 exact binding을 보존한 채 membership epoch 변경을 허용한다.
+- `ShareService::unload_owned_share`는 runtime을 먼저 pause하고 registry 삭제가
+  성공한 뒤에만 runtime map에서 제거한다. nonterminal activation/apply row가 있으면
+  remove를 `RevocationPending`으로 보류하며, 같은 ShareId를 쓰는 foreign-owner
+  relationship은 삭제하지 않는다.
+
+| E1 검사 | 결과 | 증거 |
+| --- | --- | --- |
+| registry authority status/cancel/remove | `13 passed, 0 failed`, exit `0`, outer `13` | `2026-09-09/e1/registry-e1-final2-20260909T064242Z.log`, 06:42:42Z–06:43:00Z |
+| bilateral drain + idempotent cancel service regression | `1 passed, 0 failed`, exit `0`, logical outer `1`; nested child 출력 미합산; Activate 선행 후 late cancel도 Active/ID/drain flags 보존 | `2026-09-09/e1/service-bilateral-drain-e1-followup.log`, 06:57:43Z 완료 |
+| activation recovery binding after epoch change | outer `1 passed`, exit `0` | `2026-09-09/e1/service-recovery-binding-final-20260909T064351Z.log` |
+| locked net check | `cargo check --locked -p deltaweave-net --all-targets --all-features`, exit `0` | `2026-09-09/e1/net-check-e1-final2.log`, 06:48:52Z 완료; `CARGO_TARGET_DIR` 공유 캐시와 jobs `4` |
+| strict net clippy | `cargo clippy --locked -p deltaweave-net --all-targets --all-features -- -D warnings`, exit `0` | `2026-09-09/e1/net-clippy-e1-final2.log`, 06:49:14Z 완료 |
+| format | `cargo fmt --all -- --check`, exit `0` | `2026-09-09/e1/fmt-e1-followup.log`, 06:58:25Z; pre-follow-up check failure was formatting-only and normalized before final checks |
+
+E1은 provider/consumer durable intent와 late/lost Activate receipt의 양단 query/ACK
+복구, paused runtime의 별도 admission-open 확인, 실제 `share-swarm/1` verified-CAS
+다중 provider payload를 구현하지 않는다. 이 항목들은 E2/E3의 후속 소비 계약이며,
+timeout/TTL만으로 Active/Restarted를 Complete로 만들지 않는 조건을 유지한다.
+
+CI fixture `af5b21a23ce418811abae0c30da9c0ca96179da6`는 실제 owner-signed roster와
+별도 roster/heartbeat 응답을 제공하도록 수정했고 기존 rollback/divergence,
+tombstone, 파일 보존 assertion을 유지했다. `ci-malicious-owner-fixture-final2-20260909T064051Z.log`
+의 두 cargo `test ... ok` 줄은 parent와 isolated child가 같은 logical outer test를
+출력한 것이므로 `logical_outer_count=1`로 정정했다. 그 실행은 E1 net dirty tree에서
+수행되어 `af5b21a` exact-tree 검증으로 집계하지 않으며, fixture commit과 원격
+integration CI는 별도 근거다. 새 dispatch `34320666264`는 integration ref
+`af5b21a23ce418811abae0c30da9c0ca96179da6`에서 실행됐고, 이 기록 시점에는 결과를
+완료로 표시하지 않는다.

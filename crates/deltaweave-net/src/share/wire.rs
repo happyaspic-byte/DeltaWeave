@@ -1,13 +1,15 @@
 use super::{
-    ActivateGrantReply, ActivateGrantRequest, ApplyDrained, ApplyPermit, ApplyStart,
-    AuthoritativeSnapshot, GrantNonce, LegacyProof, ManifestAttestation, Membership,
-    RosterHeartbeat, ShareError, ShareGrant, ShareId, ShareTicket, SignedRoster, SnapshotToken,
-    TicketPreview,
+    ActivateGrantReply, ActivateGrantRequest, ActivationCancel, ActivationReceipt,
+    ActivationStatusQuery, ApplyCancel, ApplyDrained, ApplyPermit, ApplyReceipt, ApplyStart,
+    ApplyStatusQuery, AuthoritativeSnapshot, GrantNonce, LegacyProof, ManifestAttestation,
+    Membership, RosterHeartbeat, ShareError, ShareGrant, ShareId, ShareTicket, SignedRoster,
+    SnapshotToken, TicketPreview,
 };
 use crate::{read_frame, write_frame};
 use anyhow::{Result, ensure};
 use iroh::endpoint::{Connection, RecvStream};
 use serde::{Deserialize, Serialize};
+use std::time::Instant;
 use tokio::io::AsyncReadExt;
 
 #[derive(Serialize, Deserialize)]
@@ -63,6 +65,15 @@ pub(crate) enum Operation {
         nonce: GrantNonce,
         activation_id: [u8; 16],
     },
+    /// Queries the owner's durable activation row without extending a lease.
+    ActivationStatus(ActivationStatusQuery),
+    /// Atomically cancels an Issued activation, or returns the existing
+    /// Active/terminal receipt when activation won the race.
+    ActivationCancel(ActivationCancel),
+    /// Queries the owner's durable apply journal without extending its lease.
+    ApplyStatus(ApplyStatusQuery),
+    /// Atomically cancels a Prepared apply; active writer rows remain blockers.
+    ApplyCancel(ApplyCancel),
 }
 #[derive(Serialize, Deserialize)]
 pub(crate) enum Reply {
@@ -94,6 +105,41 @@ pub(crate) enum Reply {
     /// A grant endpoint drain acknowledgement was durably recorded.  The
     /// grant may still be Active until its other endpoint acknowledges too.
     GrantDrained,
+    /// Owner-authenticated durable activation state for status and cancel.
+    ActivationReceipt(ActivationReceipt),
+    /// Owner-authenticated durable apply state for status and recovery.
+    ApplyReceipt(ApplyReceipt),
+}
+
+/// The grant-gated data stream is deliberately separate from the legacy
+/// sync/3 CAS protocol.  The signed grant and manifest are sent on every
+/// stream so a provider never authorizes a connection from an address hint or
+/// a caller-selected role.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) enum SwarmRequest {
+    Grant {
+        grant: super::ShareGrant,
+        snapshot: super::SnapshotToken,
+        record: deltaweave_core::SyncRecord,
+        manifest: super::ManifestAttestation,
+        hashes: Vec<deltaweave_core::Hash32>,
+        operation_id: [u8; 16],
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) enum SwarmResponse {
+    Ready(super::ActivationReceipt),
+    Chunks {
+        present: Vec<deltaweave_core::Hash32>,
+        missing: Vec<deltaweave_core::Hash32>,
+    },
+    ChunkHeader {
+        hash: deltaweave_core::Hash32,
+        length: u32,
+    },
+    Finished(super::SwarmTransferReceipt),
+    Error(ShareError),
 }
 
 pub(crate) async fn read_hello(receive: &mut RecvStream) -> Result<Hello> {
@@ -106,31 +152,48 @@ pub(crate) async fn read_hello(receive: &mut RecvStream) -> Result<Hello> {
     ensure!(postcard::to_stdvec(&hello)? == bytes, ShareError::Protocol);
     Ok(hello)
 }
-pub(crate) async fn exchange(connection: &Connection, hello: Hello) -> Result<Reply> {
+/// Exchanges one frame without collapsing a peer's authenticated protocol
+/// error into the transport result. The caller can therefore distinguish a
+/// received `Reply::Error` (the operation reached the authenticated handler)
+/// from an offline/connect/read failure.
+pub(crate) async fn exchange_raw(connection: &Connection, hello: Hello) -> Result<Reply> {
     let (mut send, mut receive) = connection.open_bi().await?;
     write_frame(&mut send, &hello).await?;
     send.finish()?;
-    let reply = read_frame(&mut receive).await?;
+    read_frame(&mut receive).await
+}
+
+pub(crate) async fn exchange(connection: &Connection, hello: Hello) -> Result<Reply> {
+    let reply = exchange_raw(connection, hello).await?;
     match reply {
         Reply::Error(error) => Err(error.into()),
         other => Ok(other),
     }
 }
-pub(crate) async fn open_session(connection: &Connection, share_id: ShareId) -> Result<()> {
-    ensure!(
-        matches!(
-            exchange(
-                connection,
-                Hello {
-                    version: 3,
-                    share_id,
-                    operation: Operation::Session
-                }
-            )
-            .await?,
-            Reply::Accepted
+pub(crate) async fn open_session_until(
+    connection: &Connection,
+    share_id: ShareId,
+    deadline: Instant,
+) -> Result<()> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    // `tokio::time::timeout(Duration::ZERO, future)` may poll a ready future
+    // once. Do the expiry check before constructing/polling `exchange`, so a
+    // caller whose session deadline has elapsed cannot open a stream or send
+    // a Session hello as a side effect of a failed admission.
+    ensure!(!remaining.is_zero(), ShareError::Offline);
+    let reply = tokio::time::timeout(
+        remaining,
+        exchange(
+            connection,
+            Hello {
+                version: 3,
+                share_id,
+                operation: Operation::Session,
+            },
         ),
-        ShareError::Protocol
-    );
+    )
+    .await
+    .map_err(|_| anyhow::Error::new(ShareError::Offline))??;
+    ensure!(matches!(reply, Reply::Accepted), ShareError::Protocol);
     Ok(())
 }

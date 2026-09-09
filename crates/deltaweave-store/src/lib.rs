@@ -294,6 +294,34 @@ impl ChunkStore {
         Ok(bytes)
     }
 
+    fn read_verified_nofollow_bounded(&self, hash: Hash32, max_bytes: usize) -> Result<Vec<u8>> {
+        let path = self.chunk_path(hash);
+        let file = preservation::open_nofollow(&path, false, false)
+            .with_context(|| format!("failed to open chunk {}", path.display()))?;
+        ensure!(
+            file.metadata()?.len() <= max_bytes as u64,
+            "chunk {hash} exceeds {max_bytes} bytes"
+        );
+        let limit = u64::try_from(max_bytes)
+            .context("chunk size bound overflow")?
+            .checked_add(1)
+            .context("chunk size bound overflow")?;
+        let mut bytes = Vec::new();
+        file.take(limit)
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("failed to read chunk {}", path.display()))?;
+        ensure!(
+            bytes.len() <= max_bytes,
+            "chunk {hash} exceeds {max_bytes} bytes"
+        );
+        let actual = Hash32::digest(&bytes);
+        ensure!(
+            actual == hash,
+            "chunk {hash} is corrupt; actual digest is {actual}"
+        );
+        Ok(bytes)
+    }
+
     /// Verifies one bounded chunk without retaining its payload in memory.
     pub fn verify_bounded(&self, hash: Hash32, max_bytes: usize) -> Result<u64> {
         let path = self.chunk_path(hash);
@@ -462,6 +490,8 @@ pub struct Store {
     metadata: MetadataStore,
     materialize_lock: Mutex<()>,
     recovery_reserver: Option<RecoveryReserver>,
+    #[cfg(test)]
+    fail_next_change_write: std::sync::atomic::AtomicBool,
 }
 
 impl Store {
@@ -488,6 +518,8 @@ impl Store {
             metadata: MetadataStore::open(state_root.join("metadata.redb"))?,
             materialize_lock: Mutex::new(()),
             recovery_reserver,
+            #[cfg(test)]
+            fail_next_change_write: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -525,6 +557,132 @@ impl Store {
                 .then_some(chunk.hash)
             })
             .collect()
+    }
+
+    /// Materializes a manifest into a caller-reserved private staging root.
+    ///
+    /// This operation is deliberately separate from [`Self::materialize`].  It reads only
+    /// content-addressed chunks, verifies both the per-chunk and complete-file digests, and
+    /// installs one new private file with a same-directory no-replace rename.  It never writes
+    /// the manifest table, path-change journal, local index, or a public synchronization root.
+    /// The caller must have reserved `stage_root` with the host admission layer before calling
+    /// this method.
+    pub fn materialize_private_verified(
+        &self,
+        manifest: &FileManifest,
+        stage_root: &Path,
+        stage_path: &WirePath,
+    ) -> Result<PathBuf> {
+        let _guard = self
+            .materialize_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("materialization lock is poisoned"))?;
+
+        manifest.validate()?;
+        preservation::validate_private_directory(stage_root)?;
+        // Validate the relative path before reading any CAS bytes. `WirePath` already rejects
+        // dot, separator, and device-name components; this also keeps this API independent of
+        // any caller-provided filesystem path.
+        checked_destination(stage_root, stage_path)?;
+        let components: Vec<_> = stage_path.components().collect();
+        ensure!(!components.is_empty(), "private stage path is empty");
+
+        // Do a complete read-only pass first. Invalid or incomplete CAS state must not create
+        // even a private stage parent. The write pass repeats every read so a concurrent CAS
+        // corruption cannot turn a verified first pass into an unverified file.
+        self.verify_manifest_in_cas(manifest)?;
+        let parent = prepare_private_stage_parent(stage_root, &components)?;
+        preservation::validate_private_directory(stage_root)?;
+        preservation::validate_private_directory(&parent)?;
+        let destination = checked_destination(stage_root, stage_path)?;
+        ensure!(
+            preservation::same_volume(stage_root, &parent)?,
+            "private stage crosses volumes"
+        );
+        ensure!(
+            fs::symlink_metadata(&destination)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+            "private stage destination is already occupied"
+        );
+
+        let temporary = loop {
+            let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let temporary = parent.join(format!(
+                ".deltaweave-stage-{}-{sequence}.part",
+                destination
+                    .file_name()
+                    .context("private stage destination lacks a filename")?
+                    .to_string_lossy()
+            ));
+            match preservation::open_nofollow(&temporary, true, true) {
+                Ok(mut output) => {
+                    let write_result = (|| -> Result<()> {
+                        let mut hasher = blake3::Hasher::new();
+                        for chunk in &manifest.chunks {
+                            let chunk_length = usize::try_from(chunk.length)
+                                .context("manifest chunk length exceeds platform size")?;
+                            let bytes = self
+                                .chunks
+                                .read_verified_nofollow_bounded(chunk.hash, chunk_length)?;
+                            ensure!(
+                                bytes.len() == chunk_length,
+                                "cached extent has incorrect length"
+                            );
+                            hasher.update(&bytes);
+                            output.write_all(&bytes)?;
+                        }
+                        ensure!(
+                            Hash32::from_bytes(*hasher.finalize().as_bytes()) == manifest.file_hash,
+                            "private stage file hash mismatch"
+                        );
+                        output.sync_all()?;
+                        Ok(())
+                    })();
+                    drop(output);
+                    if let Err(error) = write_result {
+                        let _ = fs::remove_file(&temporary);
+                        return Err(error);
+                    }
+                    break temporary;
+                }
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        };
+
+        if let Err(error) = preservation::rename_noreplace(&temporary, &destination) {
+            let _ = fs::remove_file(&temporary);
+            return Err(error).context("private stage destination changed during install");
+        }
+        sync_directory(Some(&parent))?;
+        Ok(destination)
+    }
+
+    fn verify_manifest_in_cas(&self, manifest: &FileManifest) -> Result<()> {
+        let mut hasher = blake3::Hasher::new();
+        for chunk in &manifest.chunks {
+            let chunk_length = usize::try_from(chunk.length)
+                .context("manifest chunk length exceeds platform size")?;
+            let bytes = self
+                .chunks
+                .read_verified_nofollow_bounded(chunk.hash, chunk_length)?;
+            ensure!(
+                bytes.len() == chunk_length,
+                "cached extent has incorrect length"
+            );
+            hasher.update(&bytes);
+        }
+        ensure!(
+            Hash32::from_bytes(*hasher.finalize().as_bytes()) == manifest.file_hash,
+            "private stage file hash mismatch"
+        );
+        Ok(())
     }
 
     /// Chunks and verifies a local file into the durable CAS, returning its manifest.
@@ -849,8 +1007,11 @@ pub struct RemoveOutcome {
 
 fn checked_destination(root: &Path, path: &WirePath) -> Result<PathBuf> {
     let root_metadata = fs::symlink_metadata(root)?;
-    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
-        bail!("destination root must be a real directory, not a symlink");
+    if root_metadata.file_type().is_symlink()
+        || preservation::is_reparse_point(&root_metadata)
+        || !root_metadata.is_dir()
+    {
+        bail!("destination root must be a real directory without reparse points");
     }
 
     let mut destination = root.to_path_buf();
@@ -861,9 +1022,12 @@ fn checked_destination(root: &Path, path: &WirePath) -> Result<PathBuf> {
             continue;
         }
         match fs::symlink_metadata(&destination) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
+            Ok(metadata)
+                if metadata.file_type().is_symlink()
+                    || preservation::is_reparse_point(&metadata) =>
+            {
                 bail!(
-                    "refusing destination beneath symlink {}",
+                    "refusing destination beneath symlink or reparse point {}",
                     destination.display()
                 );
             }
@@ -879,6 +1043,33 @@ fn checked_destination(root: &Path, path: &WirePath) -> Result<PathBuf> {
         }
     }
     Ok(destination)
+}
+
+fn prepare_private_stage_parent(root: &Path, components: &[&str]) -> Result<PathBuf> {
+    let mut parent = root.to_path_buf();
+    for component in components.iter().take(components.len().saturating_sub(1)) {
+        parent.push(component);
+        match fs::symlink_metadata(&parent) {
+            Ok(metadata) => {
+                ensure!(
+                    metadata.is_dir() && !metadata.file_type().is_symlink(),
+                    "private stage ancestor is not a real directory"
+                );
+                preservation::validate_private_directory(&parent)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match private_directory_builder().create(&parent) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error.into()),
+                }
+                preservation::validate_private_directory(&parent)?;
+                sync_directory(Some(&parent))?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(parent)
 }
 
 fn materialization_observation(
