@@ -28,11 +28,37 @@ const PRIVATE_PERMISSIONS: &str =
 /// must already exist; this function never creates a path recursively because
 /// doing so would make the security boundary depend on unvalidated parents.
 pub(crate) fn prepare_directory(path: &Path) -> io::Result<()> {
+    prepare_directory_inner(path, false)
+}
+
+/// Validates and hardens a directory that the admission catalog has just
+/// created as the final private leaf.
+///
+/// The admission callback supplies this distinction so Windows can replace
+/// inherited ACLs on a fresh leaf without weakening the fail-closed behavior
+/// for an existing directory.  This function never creates a missing path;
+/// the admission layer owns creation and its global lock.
+pub(crate) fn prepare_directory_created(path: &Path) -> io::Result<()> {
+    prepare_directory_inner(path, true)
+}
+
+/// Checks every original path component before admission canonicalizes a
+/// requested path.  Callers that pass an admission-canonical path to the
+/// preparation callback must run this check on the user-supplied path first so
+/// aliases and reparse points cannot be hidden by canonicalization.
+pub(crate) fn validate_directory_path(path: &Path) -> io::Result<()> {
+    if path.as_os_str().is_empty() {
+        return Err(permission_error(PRIVATE_ERROR));
+    }
+    log_acl_result(reject_reparse_components(path), "pre_reparse")
+}
+
+fn prepare_directory_inner(path: &Path, admission_created: bool) -> io::Result<()> {
     if path.as_os_str().is_empty() {
         return Err(permission_error(PRIVATE_ERROR));
     }
 
-    log_acl_result(reject_reparse_components(path), "pre_reparse")?;
+    validate_directory_path(path)?;
     let existed = match fs::symlink_metadata(path) {
         Ok(metadata) => {
             validate_directory_metadata(&metadata)?;
@@ -47,6 +73,9 @@ pub(crate) fn prepare_directory(path: &Path) -> io::Result<()> {
     };
 
     if !existed {
+        if admission_created {
+            return Err(io::Error::new(ErrorKind::NotFound, PRIVATE_ERROR));
+        }
         let created = create_private_leaf(path).map_err(|error| {
             if error.kind() == ErrorKind::NotFound {
                 safe_io_error(error, PRIVATE_MISSING_PARENT)
@@ -77,7 +106,7 @@ pub(crate) fn prepare_directory(path: &Path) -> io::Result<()> {
     }
 
     #[cfg(windows)]
-    prepare_windows_acl(path, !existed)?;
+    prepare_windows_acl(path, admission_created || !existed)?;
 
     Ok(())
 }
@@ -565,6 +594,24 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn admission_created_preparation_requires_an_existing_private_leaf() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = test_directory();
+        let target = root.0.join("managed");
+        assert_eq!(
+            prepare_directory_created(&target)
+                .expect_err("admission-created preparation must not mkdir")
+                .kind(),
+            ErrorKind::NotFound
+        );
+        fs::create_dir(&target).expect("target");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).expect("private mode");
+        prepare_directory_created(&target).expect("existing admission leaf remains valid");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn rejects_symlink_target_and_parent() {
         use std::os::unix::fs::symlink;
 
@@ -604,10 +651,12 @@ mod tests {
         let canonical_parent = fs::canonicalize(&root.0).expect("canonical temp root");
         let target = canonical_parent.join("managed");
 
-        // The first call creates the leaf and validates the real DACL.  A
-        // second call exercises the existing-directory path and proves that a
-        // valid private leaf can be reopened without changing its ACL.
-        prepare_directory(&target).expect("native private directory is prepared");
+        // Simulate admission creating the leaf with inherited permissions,
+        // then use the explicit created-leaf path to apply the initial DACL.
+        fs::create_dir(&target).expect("admission-created target");
+        prepare_directory_created(&target).expect("native private directory is prepared");
+        // A second call exercises the existing-directory path and proves that
+        // a valid private leaf can be reopened without changing its ACL.
         prepare_directory(&target).expect("native preparation is idempotent");
 
         let before = windows_acl_fingerprint(&target).expect("read private ACL");
