@@ -46,6 +46,7 @@ use std::{
 };
 
 const CONTROL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+const MAX_SWARM_OPERATION_KEYS: usize = 4096;
 
 type SupplierMap = Arc<RwLock<BTreeMap<(EndpointId, ShareId), Arc<SupplierRegistrationGuard>>>>;
 
@@ -59,14 +60,78 @@ struct SupplierLifecycle {
     suppliers: SupplierMap,
 }
 
+type SwarmOperationKey = (GrantNonce, [u8; 16]);
+
+#[derive(Debug, Default)]
+struct SwarmOperationState {
+    active: BTreeSet<SwarmOperationKey>,
+    closed: BTreeSet<SwarmOperationKey>,
+}
+
+/// A process-local admission token for one exact grant nonce/operation pair.
+/// The token is acquired before an outbound task starts IO, and immediately
+/// after an inbound task has parsed its grant.  Its drop removes the accepted
+/// operation and wakes recovery proofs waiting for the same operation.
+#[derive(Debug)]
+struct SwarmOperationGuard {
+    registry: Weak<SwarmTaskRegistry>,
+    key: SwarmOperationKey,
+}
+
+impl Drop for SwarmOperationGuard {
+    fn drop(&mut self) {
+        let Some(registry) = self.registry.upgrade() else {
+            return;
+        };
+        if let Ok(mut state) = registry.operations.lock() {
+            state.active.remove(&self.key);
+        }
+        registry.operation_notify.notify_waiters();
+    }
+}
+
+/// Keeps an accepted handler inside the recovery/shutdown ownership boundary
+/// until its task has actually returned.  Inbound handlers need this token
+/// while they are still waiting to parse the grant, because their exact
+/// operation key is not known at `accept` time.
+#[derive(Debug)]
+struct PendingTaskGuard {
+    registry: Weak<SwarmTaskRegistry>,
+}
+
+impl Drop for PendingTaskGuard {
+    fn drop(&mut self) {
+        let Some(registry) = self.registry.upgrade() else {
+            return;
+        };
+        registry.pending_tasks.fetch_sub(1, Ordering::SeqCst);
+        registry.operation_notify.notify_waiters();
+    }
+}
+
 /// Service-owned registry for every accepted share-swarm operation,
 /// including outbound member fetches. A caller dropping its future therefore
 /// cannot detach a task that still owns a root/store Arc or a blocking CAS
 /// writer; shutdown closes admission and awaits the same registry.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct SwarmTaskRegistry {
     closed: AtomicBool,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    operations: Mutex<SwarmOperationState>,
+    operation_notify: tokio::sync::Notify,
+    pending_tasks: AtomicUsize,
+}
+
+impl Default for SwarmTaskRegistry {
+    fn default() -> Self {
+        Self {
+            closed: AtomicBool::new(false),
+            tasks: Mutex::new(Vec::new()),
+            operations: Mutex::new(SwarmOperationState::default()),
+            operation_notify: tokio::sync::Notify::new(),
+            pending_tasks: AtomicUsize::new(0),
+        }
+    }
 }
 
 impl SwarmTaskRegistry {
@@ -74,7 +139,127 @@ impl SwarmTaskRegistry {
         self.closed.store(true, Ordering::SeqCst);
     }
 
-    fn register(&self, task: tokio::task::JoinHandle<()>) -> bool {
+    fn reserve_task(self: &Arc<Self>) -> PendingTaskGuard {
+        self.pending_tasks.fetch_add(1, Ordering::SeqCst);
+        PendingTaskGuard {
+            registry: Arc::downgrade(self),
+        }
+    }
+
+    /// Reserves one exact operation before its task is allowed to perform
+    /// endpoint, root, or CAS work.  Recovery closes the same key under this
+    /// mutex, so a retry cannot slip in between an idle observation and the
+    /// returned drain proof.  A different operation for the same grant nonce
+    /// is rejected as well; the durable registry has one immutable operation
+    /// binding per nonce.
+    fn begin_operation(self: &Arc<Self>, key: SwarmOperationKey) -> Result<SwarmOperationGuard> {
+        ensure!(!self.closed.load(Ordering::SeqCst), ShareError::Busy);
+        let mut state = self
+            .operations
+            .lock()
+            .map_err(|_| ShareError::StateUnavailable)?;
+        ensure!(!self.closed.load(Ordering::SeqCst), ShareError::Busy);
+        ensure!(
+            !state.closed.iter().any(|(nonce, _)| nonce == &key.0),
+            ShareError::Busy
+        );
+        ensure!(
+            !state.active.iter().any(|(nonce, _)| nonce == &key.0),
+            ShareError::Busy
+        );
+        ensure!(
+            state.closed.len() < MAX_SWARM_OPERATION_KEYS || state.closed.contains(&key),
+            ShareError::Busy
+        );
+        state.active.insert(key);
+        drop(state);
+        Ok(SwarmOperationGuard {
+            registry: Arc::downgrade(self),
+            key,
+        })
+    }
+
+    /// Closes one operation's admission and waits for the exact accepted
+    /// operation task to release its token.  A still-starting inbound handler
+    /// has not acquired an operation key yet; once it parses its grant it
+    /// observes this closed key in `begin_operation` and is rejected before
+    /// any payload or storage IO.  Unkeyed accepted handlers are nevertheless
+    /// retained by `pending_tasks` for the endpoint-wide shutdown barrier.
+    async fn close_operation_and_drain(&self, key: SwarmOperationKey) -> Result<()> {
+        loop {
+            let notified = self.operation_notify.notified();
+            let wait = {
+                let mut state = self
+                    .operations
+                    .lock()
+                    .map_err(|_| ShareError::StateUnavailable)?;
+                if state.closed.iter().any(|(nonce, closed_operation)| {
+                    nonce == &key.0 && (*nonce, *closed_operation) != key
+                }) {
+                    return Err(ShareError::GrantReplay.into());
+                }
+                if !state.closed.contains(&key) {
+                    ensure!(
+                        state.closed.len() < MAX_SWARM_OPERATION_KEYS,
+                        ShareError::Busy
+                    );
+                    state.closed.insert(key);
+                }
+                state.active.iter().any(|(nonce, _)| nonce == &key.0)
+            };
+            if !wait {
+                return Ok(());
+            }
+            notified.await;
+        }
+    }
+
+    /// Nonblocking form used by bounded startup recovery.  A false result
+    /// leaves the operation closed and is retried on a later tick once the
+    /// accepted task has released its token.
+    fn try_close_operation(&self, key: SwarmOperationKey) -> Result<bool> {
+        let mut state = self
+            .operations
+            .lock()
+            .map_err(|_| ShareError::StateUnavailable)?;
+        if state
+            .closed
+            .iter()
+            .any(|(nonce, closed_operation)| nonce == &key.0 && (*nonce, *closed_operation) != key)
+        {
+            return Err(ShareError::GrantReplay.into());
+        }
+        if !state.closed.contains(&key) {
+            ensure!(
+                state.closed.len() < MAX_SWARM_OPERATION_KEYS,
+                ShareError::Busy
+            );
+            state.closed.insert(key);
+        }
+        Ok(!state.active.iter().any(|(nonce, _)| nonce == &key.0))
+    }
+
+    fn release_closed_operation(&self, key: SwarmOperationKey) -> Result<()> {
+        let mut state = self
+            .operations
+            .lock()
+            .map_err(|_| ShareError::StateUnavailable)?;
+        state.closed.remove(&key);
+        Ok(())
+    }
+
+    /// Registers a task and releases its start gate while holding the same
+    /// mutex used by shutdown.  The task is spawned before this method (the
+    /// Tokio API requires that), but it cannot perform endpoint/root/CAS IO
+    /// before the caller gives it this gate.  Combining registration and the
+    /// signal closes the gap where shutdown could snapshot an accepted task
+    /// before it started, or a cancelled caller could release the gate after
+    /// the task had escaped the registry.
+    fn register_and_start(
+        &self,
+        task: tokio::task::JoinHandle<()>,
+        start: tokio::sync::oneshot::Sender<()>,
+    ) -> bool {
         let mut tasks = match self.tasks.lock() {
             Ok(tasks) => tasks,
             Err(_) => {
@@ -88,6 +273,12 @@ impl SwarmTaskRegistry {
         }
         tasks.retain(|task| !task.is_finished());
         tasks.push(task);
+        // Sending while the registry lock is held linearizes task start with
+        // close_admission/close_and_drain. A full oneshot receiver is only
+        // possible if the task already exited before the gate; in that case
+        // no endpoint or storage work escaped and retaining the finished
+        // handle is harmless.
+        let _ = start.send(());
         true
     }
 
@@ -99,7 +290,25 @@ impl SwarmTaskRegistry {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("swarm task registry is poisoned"))?,
         );
-        crate::await_swarm_tasks(tasks).await
+        crate::await_swarm_tasks(tasks).await?;
+        // A handler can have reserved ownership and be between `spawn` and
+        // `register_and_start` when shutdown closes admission.  Its start
+        // gate is then aborted and the pending token is dropped only when the
+        // task actually returns.  Await that token as well as the registered
+        // JoinHandles so no root/store Arc escapes the service shutdown
+        // boundary.
+        self.wait_for_pending_tasks().await;
+        Ok(())
+    }
+
+    async fn wait_for_pending_tasks(&self) {
+        loop {
+            let notified = self.operation_notify.notified();
+            if self.pending_tasks.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 
@@ -147,6 +356,160 @@ impl ActivationLease {
     }
 }
 
+#[cfg(test)]
+mod swarm_task_registry_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn registration_starts_and_shutdown_drains_an_accepted_blocking_task() {
+        let registry = Arc::new(SwarmTaskRegistry::default());
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let task = tokio::spawn(async move {
+            start_rx.await.expect("registered task start gate");
+            let blocking = tokio::task::spawn_blocking(move || {
+                let _ = entered_tx.send(());
+                release_rx.recv().expect("test releases blocking IO");
+            });
+            blocking.await.expect("blocking IO task joined");
+        });
+
+        assert!(registry.register_and_start(task, start_tx));
+        entered_rx.await.expect("accepted task reached blocking IO");
+
+        let mut drain = tokio::spawn({
+            let registry = registry.clone();
+            async move { registry.close_and_drain().await }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut drain)
+                .await
+                .is_err(),
+            "shutdown must wait for accepted blocking IO"
+        );
+        release_tx.send(()).expect("release accepted blocking IO");
+        drain
+            .await
+            .expect("shutdown task joined")
+            .expect("drain succeeds");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn closed_registry_rejects_and_never_starts_a_task() {
+        let registry = SwarmTaskRegistry::default();
+        registry.close_admission();
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+        let started = Arc::new(AtomicBool::new(false));
+        let started_task = started.clone();
+        let task = tokio::spawn(async move {
+            if start_rx.await.is_ok() {
+                started_task.store(true, Ordering::SeqCst);
+            }
+        });
+
+        assert!(!registry.register_and_start(task, start_tx));
+        tokio::task::yield_now().await;
+        assert!(!started.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn operation_drain_closes_same_nonce_before_returning_proof() {
+        let registry = Arc::new(SwarmTaskRegistry::default());
+        let key = ([0x91; 32], [0x92; 16]);
+        let guard = registry.begin_operation(key).expect("operation admission");
+        let drain = tokio::spawn({
+            let registry = registry.clone();
+            async move { registry.close_operation_and_drain(key).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !drain.is_finished(),
+            "drain must own the accepted operation"
+        );
+        assert!(registry.begin_operation(key).is_err());
+        drop(guard);
+        drain
+            .await
+            .expect("drain task joined")
+            .expect("drain completed");
+        assert!(
+            registry.begin_operation(key).is_err(),
+            "a closed operation must not be admitted again"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn operation_drain_waits_for_an_accepted_task_without_lost_wakeup() {
+        let registry = Arc::new(SwarmTaskRegistry::default());
+        let key = ([0xa1; 32], [0xa2; 16]);
+        let operation = registry.begin_operation(key).expect("operation admission");
+        let mut drain = Box::pin(registry.close_operation_and_drain(key));
+
+        // Poll the drain once while the accepted task is still owned.  The
+        // release below happens at the exact final-count boundary; the
+        // implementation must have installed its Notify waiter before the
+        // count check or this test would hang forever.
+        tokio::task::yield_now().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut drain)
+                .await
+                .is_err()
+        );
+        drop(operation);
+        drain.await.expect("accepted task drain completes");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_waits_for_reserved_task_before_returning() {
+        let registry = Arc::new(SwarmTaskRegistry::default());
+        let pending = registry.reserve_task();
+        let mut shutdown = Box::pin(registry.close_and_drain());
+        tokio::task::yield_now().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut shutdown)
+                .await
+                .is_err()
+        );
+        drop(pending);
+        shutdown.await.expect("shutdown waits for reserved task");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn operation_proof_does_not_wait_for_an_unkeyed_peer_handler() {
+        let registry = Arc::new(SwarmTaskRegistry::default());
+        let key = ([0xb1; 32], [0xb2; 16]);
+        let operation = registry.begin_operation(key).expect("operation admission");
+        let pending = registry.reserve_task();
+        drop(operation);
+
+        // An inbound handler can still be before grant parsing. It must be
+        // rejected by begin_operation after this exact key is closed, but it
+        // must not make a per-operation proof wait for unrelated endpoint
+        // activity. Endpoint-wide shutdown continues to await `pending`.
+        tokio::time::timeout(
+            Duration::from_millis(25),
+            registry.close_operation_and_drain(key),
+        )
+        .await
+        .expect("exact operation drain is independent of unrelated handlers")
+        .expect("exact operation drain succeeds");
+        drop(pending);
+    }
+
+    #[test]
+    fn operation_lease_rejects_a_different_operation_for_the_same_nonce() {
+        let registry = Arc::new(SwarmTaskRegistry::default());
+        let nonce = [0x93; 32];
+        let first = registry
+            .begin_operation((nonce, [0x94; 16]))
+            .expect("first operation admission");
+        assert!(registry.begin_operation((nonce, [0x95; 16])).is_err());
+        drop(first);
+    }
+}
+
 /// One device-wide persistent endpoint. Clone its endpoint for all outbound shares;
 /// legacy per-folder identities remain separate and are never rebound here.
 #[derive(Debug)]
@@ -161,6 +524,9 @@ pub struct ShareService {
     suppliers: SupplierMap,
     supplier_lifecycle: Arc<SupplierLifecycle>,
     swarm_tasks: Arc<SwarmTaskRegistry>,
+    /// Rotates bounded recovery batches so a slow first row cannot starve
+    /// later endpoint-local intents across managed ticks.
+    intent_recovery_cursor: AtomicUsize,
     #[cfg(test)]
     admission_limit: Arc<tokio::sync::Semaphore>,
 }
@@ -202,6 +568,102 @@ pub struct SupplierRegistrationGuard {
     inflight_notify: Arc<tokio::sync::Notify>,
     generation: Arc<()>,
     lifecycle: Weak<SupplierLifecycle>,
+}
+
+/// A typed local proof that an endpoint-local grant operation has no remaining
+/// writer/stream work.  The proof binds the exact persisted intent, process
+/// generation, and managed public/private admission lease.  It is a local
+/// recovery capability only; it does not authorize a new payload operation or
+/// extend a remote activation lease.
+#[derive(Clone, Debug)]
+pub struct LocalIoDrainProof {
+    share: ShareId,
+    owner: EndpointId,
+    side: ClientSide,
+    operation_id: [u8; 16],
+    boot_id: [u8; 16],
+    root_lease: Arc<RootLease>,
+    root: PathBuf,
+    state_root: PathBuf,
+}
+
+/// Exact public/private paths held with a managed admission lease during
+/// bounded restart recovery.  Controllers construct this only from paths
+/// that were successfully acquired together; the service compares both
+/// canonical paths before using the lease as drain evidence.
+#[derive(Clone, Debug)]
+pub struct ManagedAdmissionLease {
+    lease: Arc<RootLease>,
+    root: PathBuf,
+    state_root: PathBuf,
+}
+
+impl ManagedAdmissionLease {
+    pub fn new(lease: Arc<RootLease>, root: PathBuf, state_root: PathBuf) -> Result<Self> {
+        let canonical_root = fs::canonicalize(&root)?;
+        let canonical_state_root = fs::canonicalize(&state_root)?;
+        ensure!(
+            lease.root() == canonical_root.as_path()
+                && lease
+                    .private_roots()
+                    .iter()
+                    .any(|private| private == &canonical_state_root),
+            ShareError::StateUnavailable
+        );
+        Ok(Self {
+            lease,
+            root: canonical_root,
+            state_root: canonical_state_root,
+        })
+    }
+
+    pub fn lease(&self) -> &Arc<RootLease> {
+        &self.lease
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn state_root(&self) -> &Path {
+        &self.state_root
+    }
+}
+
+impl LocalIoDrainProof {
+    pub fn share(&self) -> ShareId {
+        self.share
+    }
+
+    pub fn owner(&self) -> EndpointId {
+        self.owner
+    }
+
+    pub fn side(&self) -> ClientSide {
+        self.side
+    }
+
+    pub fn operation_id(&self) -> [u8; 16] {
+        self.operation_id
+    }
+
+    pub fn boot_id(&self) -> [u8; 16] {
+        self.boot_id
+    }
+
+    pub fn root_lease(&self) -> &Arc<RootLease> {
+        &self.root_lease
+    }
+
+    /// The canonical public root bound by the admission lease.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// The canonical private state root bound by the admission lease.
+    pub fn state_root(&self) -> &Path {
+        &self.state_root
+    }
 }
 impl SupplierRegistrationGuard {
     #[allow(dead_code)]
@@ -274,8 +736,15 @@ impl SupplierRegistrationGuard {
     }
 
     async fn wait_for_operations(&self) {
-        while self.inflight.load(Ordering::Acquire) != 0 {
-            self.inflight_notify.notified().await;
+        loop {
+            // Create the waiter before observing the counter.  A release can
+            // otherwise notify between the load and `notified()`, leaving a
+            // shutdown task asleep forever at the final operation boundary.
+            let notified = self.inflight_notify.notified();
+            if self.inflight.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
         }
     }
 }
@@ -404,6 +873,7 @@ impl ShareService {
             suppliers,
             supplier_lifecycle,
             swarm_tasks,
+            intent_recovery_cursor: AtomicUsize::new(0),
             #[cfg(test)]
             admission_limit,
         }
@@ -633,10 +1103,13 @@ impl ShareService {
         };
         let key = (owner, share);
         let mut suppliers = self.suppliers.write().expect("supplier map");
-        if let Some(existing) = suppliers.get(&key) {
-            ensure!(existing.is_drained(), ShareError::Busy);
-            suppliers.remove(&key);
-        }
+        // A drained registration remains in the map until its own drain
+        // operation has waited for accepted storage users and removed the
+        // exact generation.  Replacing it here would let a new engine acquire
+        // the same root/index/store while the old generation still owns an
+        // in-flight operation.  Callers must await `SupplierRegistrationGuard
+        // ::drain` before registering a replacement.
+        ensure!(!suppliers.contains_key(&key), ShareError::Busy);
         suppliers.insert(key, Arc::new(guard.clone()));
         Ok(guard)
     }
@@ -892,9 +1365,46 @@ impl ShareService {
     /// signed binding and operation ID, and a nonterminal row is never
     /// replaced with a newly issued grant. This is intended for manager
     /// restart/pending recovery before a fresh data snapshot is requested.
+    /// One bounded control budget covers the whole enumeration. Rows that do
+    /// not get a turn because an owner is slow or offline remain `Unknown`
+    /// and are retried by a later managed tick instead of serially extending
+    /// manager startup by one timeout per share.
     pub async fn recover_client_intents(
         &self,
         local_io_drained: bool,
+    ) -> Result<Vec<ClientIntentRow>> {
+        self.recover_client_intents_with_budget(local_io_drained, CONTROL_DEADLINE)
+            .await
+    }
+
+    /// Bounded variant used by a managed tick. The budget is shared by all
+    /// rows in this invocation, so an offline owner cannot monopolize the
+    /// worker loop with one full timeout per intent. This method has the same
+    /// recovery-only semantics as `recover_client_intents`: it never reopens
+    /// payload admission. The retained boolean parameter is an older source
+    /// compatibility surface; drain completion is now accepted only from
+    /// `recover_client_intents_with_budget_and_leases` evidence.
+    pub async fn recover_client_intents_with_budget(
+        &self,
+        _local_io_drained: bool,
+        budget: Duration,
+    ) -> Result<Vec<ClientIntentRow>> {
+        let leases = BTreeMap::new();
+        self.recover_client_intents_with_budget_and_leases(budget, &leases)
+            .await
+    }
+
+    /// Bounded restart recovery with explicit managed admission evidence. A
+    /// row may be terminalized only when its previous process generation is
+    /// known, the endpoint operation registry is quiescent, and the supplied
+    /// lease is the exact Managed(owner, share) lease with a reserved private
+    /// root. The legacy boolean argument above is retained for source
+    /// compatibility but is deliberately ignored so a caller cannot claim a
+    /// drain merely by passing `true`.
+    pub async fn recover_client_intents_with_budget_and_leases(
+        &self,
+        budget: Duration,
+        leases: &BTreeMap<ShareId, ManagedAdmissionLease>,
     ) -> Result<Vec<ClientIntentRow>> {
         let handler = SwarmAdmissionHandler {
             key: self.key.clone(),
@@ -909,14 +1419,45 @@ impl ShareService {
             inflight: Arc::new(Mutex::new(BTreeSet::new())),
         };
         let rows = self.registry.client_intents()?;
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        // A shared budget is intentionally paired with a rotating start. If
+        // the first sorted row belongs to an offline owner and consumes the
+        // tick budget, the next tick must get a chance to process the next
+        // row rather than retrying the same owner forever.
+        let start = self.intent_recovery_cursor.fetch_add(1, Ordering::AcqRel) % rows.len();
+        let recovery_deadline = Instant::now() + budget;
         let mut recovered = Vec::new();
-        for row in rows {
+        for offset in 0..rows.len() {
+            let row = rows[(start + offset) % rows.len()].clone();
+            let local_io_drained = self.local_io_drain_is_proven(&row, leases);
             if row.grant.provider == self.endpoint_id() && row.side == ClientSide::Provider {
-                recovered.push(
-                    handler
-                        .recover_provider_intent(&row.grant, row.operation_id, local_io_drained)
-                        .await?,
-                );
+                let remaining = recovery_deadline.saturating_duration_since(Instant::now());
+                let result = if remaining.is_zero() {
+                    None
+                } else {
+                    Some(
+                        tokio::time::timeout(
+                            remaining,
+                            handler.recover_provider_intent(
+                                &row.grant,
+                                row.operation_id,
+                                local_io_drained,
+                            ),
+                        )
+                        .await,
+                    )
+                };
+                match result {
+                    Some(Ok(Ok(row))) => {
+                        self.release_operation_if_terminal(&row)?;
+                        recovered.push(row)
+                    }
+                    Some(Ok(Err(_))) | Some(Err(_)) | None => {
+                        recovered.push(self.preserve_client_intent_after_error(&row)?)
+                    }
+                }
             } else if row.grant.consumer == self.endpoint_id()
                 && row.side == ClientSide::Consumer
                 && row.grant.owner != self.endpoint_id()
@@ -929,28 +1470,225 @@ impl ShareService {
                 // Internet mode can resolve the owner by identity.  Offline
                 // remains an error with the exact intent row preserved.
                 let session = match self.open_session(row.grant.owner, row.grant.share) {
-                    Ok(session) => session,
+                    Ok(session) => Some(session),
                     Err(error)
                         if error.downcast_ref::<ShareError>() == Some(&ShareError::NotMember) =>
                     {
-                        self.resume_membership(
-                            row.grant.owner,
-                            row.grant.share,
-                            EndpointAddr::new(row.grant.owner),
-                        )
-                        .await?;
-                        self.open_session(row.grant.owner, row.grant.share)?
+                        let remaining = recovery_deadline.saturating_duration_since(Instant::now());
+                        let resume = if remaining.is_zero() {
+                            None
+                        } else {
+                            Some(
+                                tokio::time::timeout(
+                                    remaining,
+                                    self.resume_membership(
+                                        row.grant.owner,
+                                        row.grant.share,
+                                        EndpointAddr::new(row.grant.owner),
+                                    ),
+                                )
+                                .await,
+                            )
+                        };
+                        match resume {
+                            Some(Ok(Ok(_))) => {
+                                self.open_session(row.grant.owner, row.grant.share).ok()
+                            }
+                            Some(Ok(Err(_))) | Some(Err(_)) | None => None,
+                        }
                     }
-                    Err(error) => return Err(error),
+                    Err(_) => None,
                 };
-                recovered.push(
-                    session
-                        .recover_swarm_intent(&row.grant, row.operation_id, local_io_drained)
-                        .await?,
-                );
+                let Some(session) = session else {
+                    recovered.push(self.preserve_client_intent_after_error(&row)?);
+                    continue;
+                };
+                let remaining = recovery_deadline.saturating_duration_since(Instant::now());
+                let result = if remaining.is_zero() {
+                    None
+                } else {
+                    Some(
+                        tokio::time::timeout(
+                            remaining,
+                            session.recover_swarm_intent_inner(
+                                &row.grant,
+                                row.operation_id,
+                                local_io_drained,
+                            ),
+                        )
+                        .await,
+                    )
+                };
+                match result {
+                    Some(Ok(Ok(row))) => {
+                        self.release_operation_if_terminal(&row)?;
+                        recovered.push(row)
+                    }
+                    Some(Ok(Err(_))) | Some(Err(_)) | None => {
+                        recovered.push(self.preserve_client_intent_after_error(&row)?)
+                    }
+                }
             }
         }
         Ok(recovered)
+    }
+
+    fn release_operation_if_terminal(&self, row: &ClientIntentRow) -> Result<()> {
+        if matches!(
+            row.phase,
+            ClientIntentPhase::Drained | ClientIntentPhase::Cancelled
+        ) {
+            self.swarm_tasks
+                .release_closed_operation((row.grant.nonce, row.operation_id))?;
+        }
+        Ok(())
+    }
+
+    /// Returns a typed local proof for a caller that has already joined and
+    /// waited for its own writer task to finish. The exact persisted row and
+    /// managed lease are captured in the proof; the proof itself cannot be
+    /// used to issue a new grant or extend an activation.
+    pub async fn prove_local_io_drained(
+        &self,
+        grant: &ShareGrant,
+        side: ClientSide,
+        operation_id: [u8; 16],
+        root_lease: Arc<RootLease>,
+        root: impl AsRef<Path>,
+        state_root: impl AsRef<Path>,
+    ) -> Result<LocalIoDrainProof> {
+        let row = self
+            .registry
+            .client_intent_exact(grant, side, operation_id)?
+            .ok_or(ShareError::GrantReplay)?;
+        ensure!(row.operation_id == operation_id, ShareError::GrantReplay);
+        let root = fs::canonicalize(root.as_ref())?;
+        let state_root = fs::canonicalize(state_root.as_ref())?;
+        ensure!(
+            Self::lease_matches_intent(&root_lease, grant, &root, &state_root),
+            ShareError::StateUnavailable
+        );
+        self.swarm_tasks
+            .close_operation_and_drain((grant.nonce, operation_id))
+            .await?;
+        Ok(LocalIoDrainProof {
+            share: grant.share,
+            owner: grant.owner,
+            side,
+            operation_id,
+            boot_id: row.boot_id,
+            root_lease,
+            root,
+            state_root,
+        })
+    }
+
+    fn lease_matches_intent(
+        lease: &RootLease,
+        grant: &ShareGrant,
+        root: &Path,
+        state_root: &Path,
+    ) -> bool {
+        matches!(
+            lease.kind(),
+            RootUse::Managed { share, owner }
+                if share == &grant.share.0 && owner == grant.owner.as_bytes()
+        ) && lease.root() == root
+            && lease
+                .private_roots()
+                .iter()
+                .any(|private| private == state_root)
+    }
+
+    /// A restart row is safe to reconcile only after all accepted swarm tasks
+    /// have gone away and the exact Managed root/private lease is held. Owner
+    /// runtimes and registered member suppliers provide that lease locally;
+    /// consumer engines supply it through the bounded recovery map from the
+    /// controller. Missing evidence intentionally keeps the row Unknown.
+    fn local_io_drain_is_proven(
+        &self,
+        row: &ClientIntentRow,
+        leases: &BTreeMap<ShareId, ManagedAdmissionLease>,
+    ) -> bool {
+        if row.previous_boot_id.is_none() {
+            return false;
+        }
+        if let Some(admission) = leases.get(&row.grant.share)
+            && Self::lease_matches_intent(
+                admission.lease(),
+                &row.grant,
+                admission.root(),
+                admission.state_root(),
+            )
+        {
+            return self
+                .swarm_tasks
+                .try_close_operation((row.grant.nonce, row.operation_id))
+                .unwrap_or(false);
+        }
+        if row.grant.provider != self.endpoint_id() {
+            return false;
+        }
+        if row.grant.owner == self.endpoint_id()
+            && let Some(runtime) = self
+                .runtimes
+                .read()
+                .ok()
+                .and_then(|runtimes| runtimes.get(&row.grant.share).cloned())
+        {
+            return Self::lease_matches_intent(
+                &runtime.lease,
+                &row.grant,
+                &runtime.config.root,
+                &runtime.config.state_root,
+            ) && self
+                .swarm_tasks
+                .try_close_operation((row.grant.nonce, row.operation_id))
+                .unwrap_or(false);
+        }
+        self.suppliers
+            .read()
+            .ok()
+            .and_then(|suppliers| suppliers.get(&(row.grant.owner, row.grant.share)).cloned())
+            .is_some_and(|supplier| {
+                Self::lease_matches_intent(
+                    &supplier.root_lease,
+                    &row.grant,
+                    supplier.index.root(),
+                    supplier.store.state_root(),
+                ) && self
+                    .swarm_tasks
+                    .try_close_operation((row.grant.nonce, row.operation_id))
+                    .unwrap_or(false)
+            })
+    }
+
+    /// Preserves one row when its owner or peer is temporarily unavailable.
+    /// Recovery errors are row-scoped: the exact signed grant, operation ID,
+    /// and binding remain durable as `Unknown`, while state/database failures
+    /// from this transition still propagate to the caller.  A later managed
+    /// tick can retry the authenticated status path without inventing a new
+    /// grant or blocking unrelated shares during service startup.
+    fn preserve_client_intent_after_error(&self, row: &ClientIntentRow) -> Result<ClientIntentRow> {
+        let current = self
+            .registry
+            .client_intent(&row.grant)?
+            .ok_or(ShareError::StateUnavailable)?;
+        if !matches!(
+            current.phase,
+            ClientIntentPhase::Unknown | ClientIntentPhase::Drained | ClientIntentPhase::Cancelled
+        ) {
+            self.registry.transition_client_intent(
+                &current.grant,
+                current.side,
+                current.operation_id,
+                ClientIntentPhase::Unknown,
+                current.activation_id,
+            )?;
+        }
+        self.registry
+            .client_intent(&current.grant)?
+            .ok_or(ShareError::StateUnavailable.into())
     }
 
     /// A managed member engine must retain this lease for its entire lifetime.
@@ -1082,6 +1820,56 @@ impl ShareSession {
 
     pub fn membership(&self) -> &Membership {
         &self.state.membership
+    }
+
+    /// Proves that this session's exact grant operation has no remaining
+    /// endpoint-local IO.  The admission key is closed while the operation
+    /// registry is checked, and the caller's managed root/private lease is
+    /// compared against the persisted binding before the proof is returned.
+    ///
+    /// This is a recovery capability only.  It does not open a new stream,
+    /// issue a grant, or extend a remote activation lease.  A caller that
+    /// drops a public recovery future cannot bypass this barrier because the
+    /// accepted operation is owned by the service task registry.
+    pub async fn prove_local_io_drained(
+        &self,
+        grant: &ShareGrant,
+        operation_id: [u8; 16],
+        root_lease: Arc<RootLease>,
+        root: impl AsRef<Path>,
+        state_root: impl AsRef<Path>,
+    ) -> Result<LocalIoDrainProof> {
+        Self::ensure_recovery_binding_for(&self.state.membership, grant)?;
+        ensure!(
+            grant.consumer == self.state.membership.endpoint,
+            ShareError::EndpointMismatch
+        );
+        let row = self
+            .state
+            .registry
+            .client_intent_exact(grant, ClientSide::Consumer, operation_id)?
+            .ok_or(ShareError::GrantReplay)?;
+        ensure!(row.operation_id == operation_id, ShareError::GrantReplay);
+        let root = fs::canonicalize(root.as_ref())?;
+        let state_root = fs::canonicalize(state_root.as_ref())?;
+        ensure!(
+            ShareService::lease_matches_intent(&root_lease, grant, &root, &state_root),
+            ShareError::StateUnavailable
+        );
+        self.state
+            .tasks
+            .close_operation_and_drain((grant.nonce, operation_id))
+            .await?;
+        Ok(LocalIoDrainProof {
+            share: grant.share,
+            owner: grant.owner,
+            side: ClientSide::Consumer,
+            operation_id,
+            boot_id: row.boot_id,
+            root_lease,
+            root,
+            state_root,
+        })
     }
 
     /// Starts the managed liveness supervisor. The task holds only a weak
@@ -1592,6 +2380,19 @@ impl ShareSession {
         &self,
         grant: &ShareGrant,
         operation_id: [u8; 16],
+        _local_io_drained: bool,
+    ) -> Result<ClientIntentRow> {
+        // Keep the historical signature source-compatible, but do not accept
+        // an untyped boolean as proof that a writer drained. Callers needing
+        // terminal recovery must use `recover_swarm_intent_with_proof`.
+        self.recover_swarm_intent_inner(grant, operation_id, false)
+            .await
+    }
+
+    async fn recover_swarm_intent_inner(
+        &self,
+        grant: &ShareGrant,
+        operation_id: [u8; 16],
         local_io_drained: bool,
     ) -> Result<ClientIntentRow> {
         Self::ensure_recovery_binding_for(&self.state.membership, grant)?;
@@ -1805,12 +2606,61 @@ impl ShareSession {
         Ok(row)
     }
 
+    /// Recovery-only variant that requires a typed local drain proof. The
+    /// legacy boolean recovery entry point remains available for callers that
+    /// only need to quarantine a row, but it cannot be used to claim that an
+    /// old local writer has finished.
+    pub async fn recover_swarm_intent_with_proof(
+        &self,
+        grant: &ShareGrant,
+        operation_id: [u8; 16],
+        proof: &LocalIoDrainProof,
+    ) -> Result<ClientIntentRow> {
+        ensure!(proof.share == grant.share, ShareError::GrantReplay);
+        ensure!(proof.owner == grant.owner, ShareError::GrantReplay);
+        ensure!(proof.side == ClientSide::Consumer, ShareError::GrantReplay);
+        ensure!(proof.operation_id == operation_id, ShareError::GrantReplay);
+        ensure!(
+            ShareService::lease_matches_intent(
+                &proof.root_lease,
+                grant,
+                &proof.root,
+                &proof.state_root,
+            ),
+            ShareError::StateUnavailable
+        );
+        self.state
+            .tasks
+            .close_operation_and_drain((grant.nonce, operation_id))
+            .await?;
+        let row = self
+            .state
+            .registry
+            .client_intent_exact(grant, ClientSide::Consumer, operation_id)?
+            .ok_or(ShareError::GrantReplay)?;
+        ensure!(row.boot_id == proof.boot_id, ShareError::GrantReplay);
+        let recovered = self
+            .recover_swarm_intent_inner(grant, operation_id, true)
+            .await?;
+        if matches!(
+            recovered.phase,
+            ClientIntentPhase::Drained | ClientIntentPhase::Cancelled
+        ) {
+            self.state
+                .tasks
+                .release_closed_operation((grant.nonce, operation_id))?;
+        }
+        Ok(recovered)
+    }
+
     /// Replays every bounded consumer intent belonging to this authenticated
     /// membership. Rows for other shares/endpoints are ignored; no caller
-    /// supplied role or membership is inferred from the journal.
+    /// supplied role or membership is inferred from the journal. Its legacy
+    /// boolean parameter is retained but cannot claim local writer drain;
+    /// use `recover_swarm_intent_with_proof` for that recovery transition.
     pub async fn recover_swarm_intents(
         &self,
-        local_io_drained: bool,
+        _local_io_drained: bool,
     ) -> Result<Vec<ClientIntentRow>> {
         let rows = self.state.registry.client_intents()?;
         let mut recovered = Vec::new();
@@ -1823,7 +2673,7 @@ impl ShareSession {
                 continue;
             }
             recovered.push(
-                self.recover_swarm_intent(&row.grant, row.operation_id, local_io_drained)
+                self.recover_swarm_intent_inner(&row.grant, row.operation_id, false)
                     .await?,
             );
         }
@@ -2100,12 +2950,21 @@ impl ShareSession {
         let hashes = hashes.to_vec();
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+        // Reserve the exact durable operation before spawning.  This closes
+        // the only interval in which a recovery proof could otherwise see an
+        // idle task registry while this same-nonce request was about to
+        // start.  The guard is moved into the manager-owned task and released
+        // only after every network/CAS path has returned.
+        let operation_guard = tasks.begin_operation((grant.nonce, operation_id))?;
+        let pending_task = tasks.reserve_task();
         let task = tokio::spawn(async move {
             // Registration is the ownership hand-off. No endpoint, root, or
             // CAS work begins until the task is in the service registry.
             if start_rx.await.is_err() {
                 return;
             }
+            let _pending_task = pending_task;
+            let _operation_guard = operation_guard;
             let _active = state.active.clone().read_owned().await;
             let session = ShareSession { state };
             let result = session
@@ -2130,10 +2989,9 @@ impl ShareSession {
             }
             let _ = result_tx.send(result);
         });
-        if !tasks.register(task) {
+        if !tasks.register_and_start(task, start_tx) {
             return Err(ShareError::Busy.into());
         }
-        let _ = start_tx.send(());
         result_rx
             .await
             .map_err(|_| anyhow::Error::new(ShareError::StateUnavailable))?
@@ -2564,6 +3422,7 @@ impl ProtocolHandler for SwarmAdmissionHandler {
         let tasks = self.tasks.clone();
         let task_connection = connection.clone();
         let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+        let pending_task = tasks.reserve_task();
         let task = tokio::spawn(async move {
             // Keep the task before its first connection operation until the
             // service-owned registry has accepted its JoinHandle. If the
@@ -2572,6 +3431,7 @@ impl ProtocolHandler for SwarmAdmissionHandler {
             if start_rx.await.is_err() {
                 return;
             }
+            let _pending_task = pending_task;
             let _stream_permit = stream_permit;
             let _active = active;
             let result = handler.run(task_connection.clone()).await;
@@ -2579,10 +3439,8 @@ impl ProtocolHandler for SwarmAdmissionHandler {
                 task_connection.close(0u8.into(), b"share swarm operation failed");
             }
         });
-        if !tasks.register(task) {
+        if !tasks.register_and_start(task, start_tx) {
             connection.close(0u8.into(), b"share swarm unavailable");
-        } else {
-            let _ = start_tx.send(());
         }
         Ok(())
     }
@@ -2690,6 +3548,10 @@ impl SwarmAdmissionHandler {
         hashes: Vec<Hash32>,
         operation_id: [u8; 16],
     ) -> Result<()> {
+        // The request is now keyed by its signed grant.  Close/recovery and
+        // this admission take the same operation mutex, so a response-loss
+        // proof cannot pass between grant parsing and provider validation.
+        let _operation_guard = self.tasks.begin_operation((grant.nonce, operation_id))?;
         let remote_consumer = connection.remote_id();
         let source = self.validate_grant(
             &grant,
@@ -5480,6 +6342,24 @@ mod tests {
             assert!(consumer_store.chunks().contains(hash));
         }
 
+        // A close marker alone is not enough to permit replacement: the
+        // original generation still owns the exact storage Arcs until its
+        // awaited drain removes the map entry.  This catches a re-register
+        // race that could otherwise overlap two suppliers on one root.
+        let duplicate = provider.register_supplier_storage(
+            owner.endpoint_id(),
+            share,
+            provider_guard.membership(),
+            &provider_root,
+            provider_guard.root_lease().clone(),
+            provider_guard.index().clone(),
+            provider_guard.store().clone(),
+        );
+        assert_eq!(
+            duplicate.unwrap_err().downcast_ref::<ShareError>(),
+            Some(&ShareError::Busy)
+        );
+
         let grant = consumer_session
             .request_swarm_grant(provider.endpoint_id(), &snapshot.token, &manifest, &hashes)
             .await
@@ -5572,6 +6452,21 @@ mod tests {
                 .expect("supplier map")
                 .contains_key(&(owner.endpoint_id(), share))
         );
+
+        // Once the first generation has fully drained and been removed, a
+        // replacement may use the same admitted storage handles safely.
+        let replacement = provider
+            .register_supplier_storage(
+                owner.endpoint_id(),
+                share,
+                &provider_membership,
+                &provider_root,
+                provider_guard.root_lease().clone(),
+                provider_guard.index().clone(),
+                provider_guard.store().clone(),
+            )
+            .unwrap();
+        replacement.drain().await.unwrap();
 
         consumer_session.close().await;
         provider_session.close().await;

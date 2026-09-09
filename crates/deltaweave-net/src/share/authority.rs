@@ -268,6 +268,13 @@ pub struct ClientIntentRow {
     /// owner response cannot make a still-recoverable row disappear early.
     #[serde(default)]
     pub terminal_at_wall: Option<u64>,
+    /// The boot generation which owned this intent before the most recent
+    /// restart. A value is present only after the registry has observed a
+    /// cross-process recovery. It is evidence that the row needs recovery;
+    /// it is never by itself evidence that a writer drained. This field is
+    /// appended so older postcard rows keep their original wire order.
+    #[serde(default)]
+    pub previous_boot_id: Option<[u8; 16]>,
 }
 
 /// Secret-free result of a verified share-swarm transfer.

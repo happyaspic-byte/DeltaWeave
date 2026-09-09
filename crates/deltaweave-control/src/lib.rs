@@ -8,7 +8,10 @@ mod worker;
 use anyhow::{Context, Result, ensure};
 use deltaweave_net::{
     root_admission::{self, RootLease, RootUse},
-    share::{Membership as NetMembership, OwnerShare, ShareError, ShareService, ShareTicket},
+    share::{
+        ManagedAdmissionLease, Membership as NetMembership, OwnerShare, ShareError, ShareService,
+        ShareTicket,
+    },
 };
 use deltaweave_sync::{ManagedSyncConfig, ManagedSyncEngine, ManagedSyncReport};
 use std::{
@@ -656,6 +659,13 @@ const MANAGED_OBSERVATION_RESAVE_LIMIT: usize = 2;
 #[derive(Default)]
 struct TestPersistGate {
     next: Mutex<Vec<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    pending_join: Mutex<
+        Vec<(
+            String,
+            std::sync::mpsc::Sender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
     resave: Mutex<Vec<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
     final_save: Mutex<Vec<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
     after_save: Mutex<Vec<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
@@ -665,6 +675,19 @@ struct TestPersistGate {
 impl TestPersistGate {
     fn arm(&self) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
         Self::arm_queue(&self.next)
+    }
+
+    fn arm_pending_join(
+        &self,
+        request_id: impl Into<String>,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered_sender, entered_receiver) = std::sync::mpsc::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        self.pending_join
+            .lock()
+            .expect("persist test gate mutex")
+            .push((request_id.into(), entered_sender, release_receiver));
+        (entered_receiver, release_sender)
     }
 
     fn arm_resave(&self) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
@@ -693,6 +716,26 @@ impl TestPersistGate {
 
     fn wait(&self) {
         Self::wait_queue(&self.next);
+    }
+
+    fn wait_pending_join(&self, config: &config::Config) {
+        let pending_request_ids = config
+            .managed
+            .pending
+            .iter()
+            .map(|pending| pending.request_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let pending = {
+            let mut queue = self.pending_join.lock().expect("persist test gate mutex");
+            queue
+                .iter()
+                .position(|(request_id, _, _)| pending_request_ids.contains(request_id.as_str()))
+                .map(|index| queue.remove(index))
+        };
+        if let Some((_, entered, release)) = pending {
+            let _ = entered.send(());
+            let _ = release.recv();
+        }
     }
 
     fn wait_resave(&self) {
@@ -1190,6 +1233,8 @@ impl Manager {
             // cannot expose a second writer to an unfinished replacement.
             #[cfg(test)]
             test_persist_gate.wait();
+            #[cfg(test)]
+            test_persist_gate.wait_pending_join(&config);
             let mut saved_observation_revision = observation_revision;
             let mut observation_resaves = 0;
             let mut changed = changed;
@@ -1288,6 +1333,45 @@ impl Manager {
         let opened = Arc::new(opened);
         *service = Some(opened.clone());
         Ok(opened)
+    }
+
+    /// Acquires only already-existing managed roots for restart recovery. The
+    /// lease is held for the bounded network recovery pass and then released
+    /// before worker restoration transfers ownership to an engine. A malformed
+    /// or currently busy record contributes no drain evidence; it is handled
+    /// by the normal worker recovery path and remains quarantined.
+    fn managed_recovery_leases(
+        &self,
+        records: &[config::ManagedShareRecord],
+    ) -> BTreeMap<ShareId, ManagedAdmissionLease> {
+        let mut leases = BTreeMap::new();
+        for record in records {
+            let Ok(share) = parse_share_id(&record.share_id) else {
+                continue;
+            };
+            let Ok(owner) = endpoint_id(&record.owner) else {
+                continue;
+            };
+            let state_root = PathBuf::from(&record.state_root);
+            let lease = root_admission::acquire_with_private(
+                Path::new(&record.root),
+                RootUse::Managed {
+                    share: share.0,
+                    owner: *owner.as_bytes(),
+                },
+                std::slice::from_ref(&state_root),
+            );
+            if let Ok(lease) = lease
+                && let Ok(lease) = ManagedAdmissionLease::new(
+                    Arc::new(lease),
+                    PathBuf::from(&record.root),
+                    state_root,
+                )
+            {
+                leases.insert(share, lease);
+            }
+        }
+        leases
     }
 
     async fn member_handle(&self, share: ShareId, endpoint: iroh::EndpointId) -> Result<String> {
@@ -2213,13 +2297,42 @@ impl Manager {
         if !has_managed {
             return Ok(());
         }
+        let configured = {
+            self.shared
+                .lock()
+                .expect("snapshot mutex")
+                .config
+                .managed
+                .shares
+                .clone()
+        };
         let service = self.ensure_managed_service().await?;
+        // Reconcile endpoint-local swarm intents before restoring fresh
+        // workers. A lost owner response or a temporarily offline peer is a
+        // share-scoped pending condition; the net service preserves that
+        // exact row as Unknown so one unavailable share cannot abort legacy
+        // startup or prevent unrelated managed shares from reopening.
+        // A process restart has no proof that a pre-crash writer drained. The
+        // net recovery path therefore quarantines active/restarted intents.
+        // It may terminalize only rows for which this startup still holds the
+        // exact managed public/private admission lease and the operation
+        // registry is quiescent. A failed preflight leaves the row Unknown;
+        // it never turns an unavailable path into a drain claim.
+        let recovery_leases = self.managed_recovery_leases(&configured);
+        let recovered_intents = service
+            .recover_client_intents_with_budget_and_leases(
+                std::time::Duration::from_secs(15),
+                &recovery_leases,
+            )
+            .await?;
+        drop(recovery_leases);
+        self.mark_recovered_intents_waiting(&recovered_intents)
+            .await?;
         let owned = service.owned_configs()?;
-        let (tombstones, configured, intents) = {
+        let (tombstones, intents) = {
             let state = self.shared.lock().expect("snapshot mutex");
             (
                 state.config.managed.tombstones.clone(),
-                state.config.managed.shares.clone(),
                 state.config.managed.intents.clone(),
             )
         };
@@ -2323,6 +2436,64 @@ impl Manager {
             .await?;
         }
         self.restore_managed_workers(service).await
+    }
+
+    /// Reflects endpoint-local recovery blockers in the matching managed
+    /// share row. The network journal remains the source of truth; this
+    /// status only keeps the UI and later ticks from presenting an Unknown or
+    /// Draining intent as Complete. Paused/Revoked lifecycle decisions retain
+    /// precedence over transient recovery observations.
+    async fn mark_recovered_intents_waiting(
+        &self,
+        intents: &[deltaweave_net::share::ClientIntentRow],
+    ) -> Result<()> {
+        let waiting_shares: std::collections::BTreeSet<_> = intents
+            .iter()
+            .filter(|row| {
+                !matches!(
+                    row.phase,
+                    deltaweave_net::share::ClientIntentPhase::Drained
+                        | deltaweave_net::share::ClientIntentPhase::Cancelled
+                )
+            })
+            .map(|row| share_id_string(row.grant.share))
+            .collect();
+        if waiting_shares.is_empty() {
+            return Ok(());
+        }
+        let now = managed_now();
+        let needs_update = {
+            let state = self.shared.lock().expect("snapshot mutex");
+            state.config.managed.shares.iter().any(|record| {
+                waiting_shares.contains(&record.share_id)
+                    && !matches!(
+                        record.status,
+                        ManagedStatus::Paused | ManagedStatus::Revoked
+                    )
+                    && (record.status != ManagedStatus::Waiting
+                        || record.phase.as_deref() != Some("waiting")
+                        || record.retry_at.is_none_or(|retry_at| retry_at <= now))
+            })
+        };
+        if !needs_update {
+            return Ok(());
+        }
+        self.persist(|config| {
+            for record in &mut config.managed.shares {
+                if waiting_shares.contains(&record.share_id)
+                    && !matches!(
+                        record.status,
+                        ManagedStatus::Paused | ManagedStatus::Revoked
+                    )
+                {
+                    record.status = ManagedStatus::Waiting;
+                    record.phase = Some("waiting".into());
+                    record.retry_at = Some(now.saturating_add(MANAGED_TICK_SECONDS));
+                }
+            }
+            Ok(())
+        })
+        .await
     }
 
     async fn cleanup_tombstones(
@@ -2916,6 +3087,31 @@ impl Manager {
                 return Ok(());
             }
             return Err(error);
+        }
+        // Retry quarantined endpoint-local intents on each managed tick using
+        // one short shared budget. Startup retains Unknown rows; this path
+        // lets an owner that comes back online converge without blocking
+        // other shares for one full control timeout per row. The recovery
+        // lease map is built from the exact managed roots held by this
+        // controller. An unavailable/busy share keeps its row recoverable;
+        // no caller-supplied boolean is accepted as a drain proof.
+        if let Some(service) = self.managed_service.lock().await.as_ref().cloned() {
+            let configured = self
+                .shared
+                .lock()
+                .expect("snapshot mutex")
+                .config
+                .managed
+                .shares
+                .clone();
+            let recovery_leases = self.managed_recovery_leases(&configured);
+            let recovered = service
+                .recover_client_intents_with_budget_and_leases(
+                    std::time::Duration::from_secs(1),
+                    &recovery_leases,
+                )
+                .await?;
+            self.mark_recovered_intents_waiting(&recovered).await?;
         }
         self.gc_pending_tickets().await?;
         self.gc_key_responses()?;
@@ -6760,7 +6956,7 @@ mod managed_error_tests {
                 .join("managed")
                 .join("member-state")
                 .join(request_hash("join_share", &join_input).unwrap());
-            let (entered, release) = member.test_persist_gate.arm();
+            let (entered, release) = member.test_persist_gate.arm_pending_join("abort-join");
             let caller_manager = Arc::clone(&member);
             let caller = tokio::spawn(async move { caller_manager.join_share(join_input).await });
             tokio::task::spawn_blocking(move || {

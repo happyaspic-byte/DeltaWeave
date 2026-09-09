@@ -20,7 +20,10 @@ pub use roster::{
 };
 pub(crate) use runtime::Authorization;
 pub use runtime::{MutationProvenance, OwnerShare};
-pub use service::{ActivationLease, ShareService, ShareSession};
+pub use service::{
+    ActivationLease, LocalIoDrainProof, ManagedAdmissionLease, ShareService, ShareSession,
+    SupplierRegistrationGuard,
+};
 
 pub const ALPN_V3: &[u8] = b"deltaweave/share/3";
 /// Separate grant-gated data protocol.  D2 registers the endpoint and
