@@ -24,7 +24,7 @@ python3 scripts/qsync_three_host_controller.py prepare \
 
 Actions workflow의 `execution_mode: prepare`는 native artifact 검증, dashboard asset test/build, `cargo build --locked --all-features --release`, role manifest 생성과 artifact 업로드를 수행한다. 이 단계의 대기 예산은 최대 60분이다. controller state에는 share key를 쓰지 않는다.
 
-## Execute
+## Execute handoff
 
 로컬 RW driver가 같은 state의 source SHA, coordination ID, fixture hash/size, `role: rw_provider`, `keepalive_observed: true`를 담은 작은 JSON readiness 파일을 만들고 flush한 뒤 controller를 호출한다. 단순 `ready=true` 문자열이나 등록 member 수는 readiness 증거가 아니다.
 
@@ -42,6 +42,34 @@ share key는 이 프로세스의 memory vault에서만 다루고 Actions 입력�
 
 execute workflow는 `prebuilt_role_run_id`의 role artifact를 직접 다운로드·검증한다. execute job은 native/Linux build를 다시 기다리지 않으며, `hosted-ro-consumer`는 그 검증 job 뒤에만 시작한다. hosted runner에는 RO key만 전달하고 Windows/owner-admin credential은 전달하지 않는다. controller는 RO result의 source SHA, `full_f_claim: false`, expected fixture hash/size, 관측된 file hash를 확인한 뒤 state를 `pass`로 기록한다.
 
+## Live run
+
+실제 로컬 controller 실행은 준비 state에서 다음 명령으로 시작한다.
+
+```text
+python3 scripts/qsync_three_host_controller.py run \
+  --repo happyaspic-byte/DeltaWeave \
+  --ref integration/qbittorrent-sync-20260908 \
+  --state /검증전용/private/prepare-1/controller-state.json \
+  --owner-api-url-env QSYNC_F_OWNER_API_URL \
+  --artifact-public-host-env QSYNC_F_ARTIFACT_PUBLIC_HOST \
+  --winrm-host-env QSYNC_F_WINRM_HOST \
+  --winrm-username-env QSYNC_F_WINRM_USERNAME \
+  --winrm-password-env QSYNC_F_WINRM_PASSWORD \
+  --winrm-destination-env QSYNC_F_WINRM_DESTINATION \
+  --owner-bind-host 0.0.0.0 \
+  --keepalive-seconds 300 \
+  --ready-timeout-seconds 120
+```
+
+`run`은 state manifest에 고정된 Linux owner와 Windows RW binary를 run-owned private copy로 다시 검증한 뒤, 격리 Linux owner를 시작하고 실제 WinRM 호출을 supervisor thread가 보유한다. WinRM callback에서 member join, fixture hash/size, `keepalive_enter`를 모두 관찰하고 호출 thread가 아직 살아 있을 때만 RO key를 일회성 repository secret으로 만들어 hosted workflow를 dispatch한다. hosted workflow 전체가 끝나기를 기다리지 않고 정확히 `F hosted Ubuntu read-only consumer` job만 선택해 완료를 확인한다. hosted 역할에는 owner-admin 또는 Windows credential을 전달하지 않는다.
+
+원격 Windows가 owner에 접근하는 실행에서는 `--owner-bind-host 0.0.0.0`처럼 controller에서 도달 가능한 bind 주소와 해당 주소를 허용하는 `QSYNC_F_PUBLIC_HOST` 환경을 운영자가 함께 지정해야 한다. 기본 `127.0.0.1`은 같은 호스트 실험용이며 원격 member의 도달성을 증명하지 않는다. owner API URL 환경값은 그 실제 도달 주소의 포트 템플릿이어야 하고 state/evidence에는 남지 않는다.
+
+RW keepalive의 남은 시간만 hosted job 대기에 사용하며 전체 상한은 900초다. WinRM handle이 종료되지 않거나 owner 종료의 managed drain을 증명하지 못하면 state는 `pending`으로 남고 runtime을 삭제하지 않는다. 강제 종료와 unknown cleanup은 성공으로 승격하지 않는다. `run`의 live attestation은 외부 `rw-ready.json`보다 우선하며, 이전 `execute` 명령의 ready file은 handoff 호환성용으로만 남아 있다.
+
+이 live 경로의 `file_hash`는 가입 후 파일 내용과 크기를 확인하는 readiness 관측이며 공급자별 조각 payload나 CAS 기여를 측정하지 않는다. owner/RW 양쪽 CAS와 두 공급자의 실제 payload는 E2/E3 실행에서 별도 계측·판정해야 한다.
+
 ## 정리와 판정
 
 ```text
@@ -52,7 +80,9 @@ python3 scripts/qsync_three_host_controller.py cleanup \
   --owner-stopped --remote-stopped --secret-released
 ```
 
-세 handle이 모두 닫혔다는 관찰이 없으면 controller-owned run directory와 state를 보존한다. 강제 종료나 unknown ACK를 graceful drain으로 기록하지 않는다. 이 checkpoint에서는 외부 3-host 실행, 새 per-run secret 생성, E2/E3의 공급자별 payload 증명을 수행하지 않았다.
+세 handle이 모두 닫혔다는 관찰이 없으면 controller-owned run directory와 state를 보존한다. 강제 종료나 unknown ACK를 graceful drain으로 기록하지 않는다. 이 checkpoint에서는 외부 3-host 실행, 새 per-run secret 생성, E2/E3의 공급자별 payload 증명을 수행하지 않았다. `run` 경로는 실제 역할 handle과 hosted job adapter를 연결하지만, 이 문서 checkpoint 자체가 3개 물리 host 동시 실행이나 share-swarm/1 다중 provider 증거를 의미하지 않는다.
+
+durable state를 다시 읽는 중 오류가 나면 이전 안전 snapshot으로 pending 기록을 만들 수는 있지만, 이를 성공으로 승격하거나 run directory를 삭제하지 않는다. `state_refresh_failed`와 `state_invalid` 판정은 operator reconciliation이 필요한 경계다.
 
 로컬 도구 검사는 다음 경계만 확인한다.
 

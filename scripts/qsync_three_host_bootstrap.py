@@ -1308,6 +1308,7 @@ def _run_winrm_powershell(
     command: str,
     *,
     command_deadline_seconds: int = WINRM_COMMAND_DEADLINE_SECONDS,
+    on_stdout: Callable[[bytes], None] | None = None,
 ) -> WinRMResult:
     """Run PowerShell through WinRS with bounded output polling.
 
@@ -1494,6 +1495,18 @@ def _run_winrm_powershell(
                             stdout_bytes = bytes(std_out)
                             std_out_parts.append(stdout_bytes)
                             observe_trace_bytes(stdout_bytes)
+                            if on_stdout is not None:
+                                try:
+                                    on_stdout(stdout_bytes)
+                                except Exception:
+                                    # A readiness observer is advisory to the
+                                    # remote process, but an observer failure
+                                    # must fail closed without exposing its
+                                    # exception text or discarding partial
+                                    # transport evidence.
+                                    transport_error_class = transport_error_class or "remote_failure"
+                                    status_code = -1
+                                    break
                         if std_err:
                             std_err_parts.append(bytes(std_err))
                         if sum(map(len, std_out_parts)) + sum(map(len, std_err_parts)) > WINRM_MAX_STDIN_PAYLOAD_BYTES:
@@ -1572,6 +1585,7 @@ def run_winrm_member(
     vault: SecretVault,
     keepalive_seconds: int = 0,
     expected_file_size: int | None = None,
+    on_stdout: Callable[[bytes], None] | None = None,
 ) -> RemoteRun:
     """Run the approved Windows role over encrypted WinRM without a fake local pass."""
 
@@ -1632,6 +1646,7 @@ def run_winrm_member(
                 session,
                 wrapper,
                 command_deadline_seconds=WINRM_COMMAND_DEADLINE_SECONDS + keepalive_seconds,
+                on_stdout=on_stdout,
             )
         except ImportError:
             # This is a controller precondition; no remote shell was created.
