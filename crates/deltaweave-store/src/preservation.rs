@@ -796,6 +796,207 @@ impl Store {
         self.put_change(change)
     }
 
+    /// Rolls back an unadopted managed attempt without promoting any index state.
+    ///
+    /// This is intentionally narrower than [`Self::rollback_causal_change`].  It accepts only
+    /// noncausal attempts which have not reached index adoption.  A prepared file still lives in
+    /// `staging` and has not displaced the expected local object.  A preserved file has already
+    /// moved that expected object to `artifact`; this method restores it after moving the
+    /// incoming staging object to the durable rollback artifact.  A materialized target is first
+    /// captured into that artifact and then the expected object is restored with the same
+    /// no-replace rule used by legacy recovery.  If local drift or a concurrent occupant makes
+    /// either operation unsafe, both recoverable objects remain and the journal stays nonterminal.
+    /// Fresh owner authorization and the caller's mutation gate are deliberately outside Store.
+    pub fn rollback_unadopted_path_change(&self, change: &mut PathChange) -> Result<()> {
+        let _guard = self
+            .materialize_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("materialization lock is poisoned"))?;
+        self.validate_change(change)?;
+        ensure!(
+            change.causal.is_none(),
+            "unadopted rollback requires a noncausal path change"
+        );
+        ensure!(
+            matches!(
+                change.state,
+                PathChangeState::Prepared
+                    | PathChangeState::Preserved
+                    | PathChangeState::Materialized
+                    | PathChangeState::RollingBack
+            ),
+            "path change is already adopted or terminal"
+        );
+        ensure!(
+            !change.metadata_only,
+            "metadata-only path changes require an authenticated metadata rollback"
+        );
+        validate_private_directory(
+            change
+                .rollback_artifact
+                .parent()
+                .context("rollback artifact lacks parent")?,
+        )?;
+        validate_private_directory(change.artifact.parent().context("artifact lacks parent")?)?;
+
+        let destination = checked_destination(&change.root, &change.path)?;
+        let current = PathObservation::at(&destination)?;
+        if change.state != PathChangeState::RollingBack {
+            ensure!(
+                path_is_absent(&change.rollback_artifact)?,
+                PreservationError::StateUnavailable
+            );
+            match change.state {
+                PathChangeState::Prepared => {
+                    ensure!(current == change.expected, PreservationError::LocalChanged);
+                    ensure!(
+                        path_is_absent(&change.artifact)?,
+                        PreservationError::StateUnavailable
+                    );
+                }
+                PathChangeState::Preserved => {
+                    ensure!(current.is_none(), PreservationError::LocalChanged);
+                }
+                PathChangeState::Materialized => {
+                    ensure!(
+                        target_matches_observation(&change.target, &current),
+                        PreservationError::LocalChanged
+                    );
+                }
+                _ => unreachable!(),
+            }
+            // Write ahead before moving either the incoming object or the installed target.  A
+            // crash after this commit can resume from the deterministic artifact paths below.
+            change.state = PathChangeState::RollingBack;
+            self.put_change(change)?;
+        }
+        self.continue_unadopted_rollback(change)
+    }
+
+    fn continue_unadopted_rollback(&self, change: &mut PathChange) -> Result<()> {
+        let destination = checked_destination(&change.root, &change.path)?;
+        let mut current = PathObservation::at(&destination)?;
+        let artifact_exists = !path_is_absent(&change.artifact)?;
+        let staging_exists = !path_is_absent(&change.staging)?;
+        let mut rollback_exists = !path_is_absent(&change.rollback_artifact)?;
+
+        if let Some(expected) = &change.expected {
+            if artifact_exists {
+                ensure!(
+                    PathObservation::at(&change.artifact)? == Some(expected.clone()),
+                    PreservationError::StateUnavailable
+                );
+            }
+        } else {
+            ensure!(!artifact_exists, PreservationError::StateUnavailable);
+        }
+
+        if staging_exists {
+            ensure!(!rollback_exists, PreservationError::StateUnavailable);
+            match &change.target {
+                PathTarget::File(manifest) => ensure!(
+                    file_matches_manifest(&change.staging, manifest)?,
+                    PreservationError::StateUnavailable
+                ),
+                PathTarget::Directory | PathTarget::Absent => {
+                    bail!(PreservationError::StateUnavailable)
+                }
+            }
+            move_unadopted_incoming(change)?;
+            rollback_exists = true;
+            current = PathObservation::at(&destination)?;
+        }
+
+        if rollback_exists {
+            ensure!(
+                rollback_artifact_matches_target(change)?,
+                PreservationError::StateUnavailable
+            );
+        }
+
+        if current == change.expected {
+            // Prepared attempts have not displaced the local object.  A rollback artifact here
+            // means the incoming staging was durably moved before the previous caller stopped;
+            // either case is already restored and safe to terminalize.
+        } else if target_matches_observation(&change.target, &current) && current.is_some() {
+            ensure!(!rollback_exists, PreservationError::LocalChanged);
+            let observed = current.clone();
+            capture_into_vault(&destination, &change.rollback_artifact)?;
+            sync_directory(destination.parent())?;
+            sync_directory(change.rollback_artifact.parent())?;
+            ensure!(
+                PathObservation::at(&change.rollback_artifact)? == observed,
+                PreservationError::LocalChanged
+            );
+            rollback_exists = true;
+            current = PathObservation::at(&destination)?;
+        } else if target_matches_observation(&change.target, &current)
+            && matches!(change.target, PathTarget::Absent)
+            && change.expected.is_some()
+        {
+            // An interrupted materialization of an absence has no installed incoming object to
+            // capture. The expected object remains in `artifact` and is restored below.
+        } else if current.is_none()
+            && change.expected.is_some()
+            && matches!(change.target, PathTarget::Directory | PathTarget::Absent)
+        {
+            // Directory creation and an absence target have no incoming staging object before
+            // materialization. Their expected artifact can be restored directly.
+        } else if !(rollback_exists && current.is_none() && change.expected.is_some()) {
+            // The only non-target/non-expected state allowed after a durable capture is the
+            // empty destination waiting for the expected artifact to be restored.
+            bail!(PreservationError::LocalChanged);
+        }
+
+        match &change.expected {
+            Some(expected) if current.is_none() => {
+                ensure!(
+                    rollback_exists
+                        || matches!(change.target, PathTarget::Directory | PathTarget::Absent),
+                    PreservationError::StateUnavailable
+                );
+                ensure!(
+                    PathObservation::at(&change.artifact)? == Some(expected.clone()),
+                    PreservationError::StateUnavailable
+                );
+                if let Err(error) = rename_noreplace(&change.artifact, &destination) {
+                    sync_directory(destination.parent())?;
+                    sync_directory(change.artifact.parent())?;
+                    return Err(error).context(PreservationError::LocalChanged);
+                }
+                sync_directory(destination.parent())?;
+                sync_directory(change.artifact.parent())?;
+                current = PathObservation::at(&destination)?;
+                ensure!(
+                    current == Some(expected.clone()),
+                    PreservationError::LocalChanged
+                );
+            }
+            Some(expected) => ensure!(
+                current == Some(expected.clone()),
+                PreservationError::LocalChanged
+            ),
+            None => {
+                ensure!(current.is_none(), PreservationError::LocalChanged);
+                ensure!(
+                    path_is_absent(&change.artifact)?,
+                    PreservationError::StateUnavailable
+                );
+            }
+        }
+
+        change.state = PathChangeState::RolledBack;
+        match self.put_change(change) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                // Keep a caller-held value retryable when the final journal commit itself fails.
+                // The filesystem work is complete, while the durable state is still RollingBack.
+                change.state = PathChangeState::RollingBack;
+                Err(error)
+            }
+        }
+    }
+
     /// Reconciles interrupted attempts before scanning or accepting new filesystem work.
     /// Unadopted captures restore without overwrite; installed targets remain for verified rescan.
     pub fn recover_path_changes(&self, root: &Path) -> Result<Vec<PathChange>> {
@@ -824,6 +1025,60 @@ impl Store {
     }
 }
 
+fn move_unadopted_incoming(change: &PathChange) -> Result<()> {
+    if path_is_absent(&change.staging)? {
+        return Ok(());
+    }
+    ensure!(
+        path_is_absent(&change.rollback_artifact)?,
+        PreservationError::StateUnavailable
+    );
+    capture_into_vault(&change.staging, &change.rollback_artifact)?;
+    sync_directory(change.staging.parent())?;
+    sync_directory(change.rollback_artifact.parent())?;
+    if let PathTarget::File(manifest) = &change.target {
+        ensure!(
+            file_matches_manifest(&change.rollback_artifact, manifest)?,
+            PreservationError::StateUnavailable
+        );
+    }
+    Ok(())
+}
+
+fn path_is_absent(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn target_matches_observation(target: &PathTarget, observation: &Option<PathObservation>) -> bool {
+    match (target, observation) {
+        (PathTarget::File(manifest), Some(observation)) => {
+            observation.kind == 0
+                && observation.size == manifest.size
+                && observation.hash == manifest.file_hash
+        }
+        (PathTarget::Directory, Some(observation)) => observation.kind == 1,
+        (PathTarget::Absent, None) => true,
+        _ => false,
+    }
+}
+
+fn rollback_artifact_matches_target(change: &PathChange) -> Result<bool> {
+    match &change.target {
+        PathTarget::File(manifest) => file_matches_manifest(&change.rollback_artifact, manifest),
+        PathTarget::Directory => {
+            let metadata = fs::symlink_metadata(&change.rollback_artifact)?;
+            Ok(metadata.is_dir()
+                && !metadata.file_type().is_symlink()
+                && !is_reparse_point(&metadata))
+        }
+        PathTarget::Absent => Ok(false),
+    }
+}
+
 fn validate_real_directory(path: &Path) -> Result<()> {
     let mut cursor = PathBuf::new();
     for component in path.components() {
@@ -840,6 +1095,76 @@ fn validate_real_directory(path: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+pub(super) fn validate_private_directory(path: &Path) -> Result<()> {
+    ensure!(
+        !path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir)),
+        "private path must not contain a parent traversal"
+    );
+    let metadata = fs::symlink_metadata(path)?;
+    ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink() && !is_reparse_point(&metadata),
+        "private stage root must be a real directory"
+    );
+    validate_real_directory(path)?;
+    validate_private_components(path)?;
+    let canonical = fs::canonicalize(path)?;
+    #[cfg(windows)]
+    {
+        // `canonicalize` commonly returns a verbatim `\\?\` spelling while callers may retain
+        // the equivalent ordinary Windows spelling. Compare the directory identity so both
+        // spellings are accepted without allowing a reparse alias.
+        let identity =
+            file_identity(path, &metadata).context("private directory identity unavailable")?;
+        let canonical_metadata = fs::metadata(&canonical)?;
+        ensure!(
+            file_identity(&canonical, &canonical_metadata) == Some(identity),
+            "private stage root is not a canonical directory"
+        );
+    }
+    #[cfg(not(windows))]
+    ensure!(canonical == path, "private stage root must be canonical");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        ensure!(
+            metadata.permissions().mode() & 0o077 == 0,
+            "private stage root permissions are too broad"
+        );
+    }
+    Ok(())
+}
+
+fn validate_private_components(path: &Path) -> Result<()> {
+    let mut cursor = PathBuf::new();
+    for component in path.components() {
+        cursor.push(component);
+        if matches!(component, std::path::Component::Prefix(_)) {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&cursor)?;
+        ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink() && !is_reparse_point(&metadata),
+            "private stage path contains a symlink or reparse point"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+const fn is_reparse_point(_metadata: &fs::Metadata) -> bool {
+    false
 }
 
 fn sync_preserved_file(path: &Path) -> Result<()> {
@@ -861,7 +1186,7 @@ fn sync_preserved_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn same_volume(left: &Path, right: &Path) -> Result<bool> {
+pub(super) fn same_volume(left: &Path, right: &Path) -> Result<bool> {
     let left =
         file_identity(left, &fs::metadata(left)?).context("filesystem identity unavailable")?;
     let right =
@@ -940,7 +1265,7 @@ pub(super) fn open_for_permissions(path: &Path) -> Result<File> {
 }
 
 #[cfg(target_os = "linux")]
-fn rename_noreplace(source: &Path, destination: &Path) -> Result<()> {
+pub(super) fn rename_noreplace(source: &Path, destination: &Path) -> Result<()> {
     let source_parent = real_parent(source)?;
     let destination_parent = real_parent(destination)?;
     rustix::fs::renameat_with(
@@ -972,7 +1297,7 @@ fn capture_into_vault(source: &Path, destination: &Path) -> Result<()> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn rename_noreplace(source: &Path, destination: &Path) -> Result<()> {
+pub(super) fn rename_noreplace(source: &Path, destination: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(source)?;
     if metadata.is_file() && !metadata.file_type().is_symlink() {
         // Install/restore only: the source is private, so linking retains the same inode and
@@ -1001,4 +1326,133 @@ fn rename_noreplace(source: &Path, destination: &Path) -> Result<()> {
         }
     }
     bail!("atomic no-replace move unavailable for this filesystem object")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use deltaweave_core::{ChunkingProfile, WirePath};
+
+    fn checkpoint_fixture() -> (tempfile::TempDir, Store, PathBuf, PathChange) {
+        let base = tempfile::tempdir().expect("temporary store");
+        let root = base.path().join("root");
+        fs::create_dir(&root).expect("root");
+        let source = base.path().join("source");
+        fs::write(&source, b"incoming content").expect("source");
+        fs::write(root.join("file"), b"local content").expect("local");
+        let store = Store::open(base.path().join("state")).expect("store");
+        let manifest = store
+            .ingest_file(&source, ChunkingProfile::DEFAULT)
+            .expect("manifest");
+        let path = WirePath::new("file").expect("wire path");
+        let expected = PathObservation::read(&root, &path).expect("expected");
+        let change = store
+            .prepare_path_change(&root, &path, PathTarget::File(manifest), expected, false)
+            .expect("prepared");
+        (base, store, root, change)
+    }
+
+    fn persist_rolling_back(store: &Store, change: &mut PathChange) {
+        change.state = PathChangeState::RollingBack;
+        store.put_change(change).expect("rolling-back journal");
+    }
+
+    #[test]
+    fn unadopted_rollback_reopens_after_each_filesystem_checkpoint() {
+        for checkpoint in 0..3 {
+            let (_base, store, root, mut change) = checkpoint_fixture();
+            match checkpoint {
+                // Prepared: the incoming object reached its durable rollback name first.
+                0 => {
+                    rename_noreplace(&change.staging, &change.rollback_artifact)
+                        .expect("incoming checkpoint");
+                }
+                // Preserved: the incoming object moved, then the expected object was restored.
+                1 => {
+                    store.capture_path_change(&mut change).expect("capture");
+                    rename_noreplace(&change.staging, &change.rollback_artifact)
+                        .expect("incoming checkpoint");
+                    rename_noreplace(&change.artifact, &root.join("file"))
+                        .expect("expected restore checkpoint");
+                }
+                // Materialized: the installed incoming object was captured, then the expected
+                // object was restored before the final journal transition.
+                2 => {
+                    store.capture_path_change(&mut change).expect("capture");
+                    store
+                        .materialize_path_change(&mut change)
+                        .expect("materialize");
+                    rename_noreplace(&root.join("file"), &change.rollback_artifact)
+                        .expect("target capture checkpoint");
+                    rename_noreplace(&change.artifact, &root.join("file"))
+                        .expect("expected restore checkpoint");
+                }
+                _ => unreachable!(),
+            }
+            persist_rolling_back(&store, &mut change);
+            let id = change.id.clone();
+            let state = store.state_root().to_path_buf();
+            drop(store);
+
+            let store = Store::open(state).expect("reopen store");
+            let mut resumed = store
+                .path_changes()
+                .expect("journal")
+                .into_iter()
+                .find(|candidate| candidate.id == id)
+                .expect("checkpoint journal");
+            store
+                .rollback_unadopted_path_change(&mut resumed)
+                .expect("resumed rollback");
+            assert_eq!(resumed.state, PathChangeState::RolledBack);
+            assert_eq!(
+                fs::read(root.join("file")).expect("restored bytes"),
+                b"local content"
+            );
+            assert_eq!(
+                fs::read(&resumed.rollback_artifact).expect("retained incoming"),
+                b"incoming content"
+            );
+            assert!(!resumed.staging.exists());
+            assert!(!resumed.artifact.exists());
+        }
+    }
+
+    #[test]
+    fn rolling_back_keeps_both_objects_pending_when_restore_is_occupied() {
+        let (_base, store, root, mut change) = checkpoint_fixture();
+        store.capture_path_change(&mut change).expect("capture");
+        rename_noreplace(&change.staging, &change.rollback_artifact).expect("incoming checkpoint");
+        persist_rolling_back(&store, &mut change);
+
+        fs::write(root.join("file"), b"unrelated occupant").expect("occupant");
+        assert!(store.rollback_unadopted_path_change(&mut change).is_err());
+        assert_eq!(change.state, PathChangeState::RollingBack);
+        assert_eq!(
+            fs::read(root.join("file")).expect("occupant bytes"),
+            b"unrelated occupant"
+        );
+        assert_eq!(
+            fs::read(&change.artifact).expect("old bytes"),
+            b"local content"
+        );
+        assert_eq!(
+            fs::read(&change.rollback_artifact).expect("incoming bytes"),
+            b"incoming content"
+        );
+
+        fs::remove_file(root.join("file")).expect("remove occupant");
+        store
+            .rollback_unadopted_path_change(&mut change)
+            .expect("retry rollback");
+        assert_eq!(change.state, PathChangeState::RolledBack);
+        assert_eq!(
+            fs::read(root.join("file")).expect("restored bytes"),
+            b"local content"
+        );
+        assert_eq!(
+            fs::read(&change.rollback_artifact).expect("retained incoming"),
+            b"incoming content"
+        );
+    }
 }
