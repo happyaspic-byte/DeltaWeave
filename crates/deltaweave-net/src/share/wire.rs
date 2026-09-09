@@ -1,6 +1,8 @@
 use super::{
-    GrantNonce, LegacyProof, Membership, RosterHeartbeat, ShareError, ShareId, ShareTicket,
-    SignedRoster, TicketPreview,
+    ActivateGrantReply, ActivateGrantRequest, ApplyDrained, ApplyPermit, ApplyStart,
+    AuthoritativeSnapshot, GrantNonce, LegacyProof, ManifestAttestation, Membership,
+    RosterHeartbeat, ShareError, ShareGrant, ShareId, ShareTicket, SignedRoster, SnapshotToken,
+    TicketPreview,
 };
 use crate::{read_frame, write_frame};
 use anyhow::{Result, ensure};
@@ -29,6 +31,30 @@ pub(crate) enum Operation {
     Roster,
     /// Submits a member-signed address heartbeat for a previously issued challenge.
     Heartbeat(RosterHeartbeat),
+    /// Requests a complete owner-authoritative snapshot token and record set.
+    Snapshot,
+    /// Requests an owner attestation for one exact file record in a snapshot.
+    Manifest {
+        snapshot: SnapshotToken,
+        record: deltaweave_core::SyncRecord,
+    },
+    /// Requests one exact provider grant for a sorted hash subset.
+    SwarmGrant {
+        provider: iroh::EndpointId,
+        snapshot: SnapshotToken,
+        manifest: ManifestAttestation,
+        hashes: Vec<deltaweave_core::Hash32>,
+    },
+    /// Revalidates the consumer snapshot/root before a local apply.
+    Revalidate {
+        snapshot: SnapshotToken,
+    },
+    /// Records the start of a local apply operation against a permit nonce.
+    ApplyStart(ApplyStart),
+    /// Records completion of a local apply operation against a permit nonce.
+    ApplyDrained(ApplyDrained),
+    /// Provider asks the owner to activate an already signed grant.
+    Activate(ActivateGrantRequest),
 }
 #[derive(Serialize, Deserialize)]
 pub(crate) enum Reply {
@@ -45,6 +71,16 @@ pub(crate) enum Reply {
     },
     /// Owner-signed roster after accepting a member address heartbeat.
     Heartbeat(SignedRoster),
+    /// Complete owner-authoritative snapshot and signed token.
+    Snapshot(AuthoritativeSnapshot),
+    /// Owner-signed manifest attestation.
+    Manifest(ManifestAttestation),
+    /// Owner-signed one-request provider grant.
+    Grant(ShareGrant),
+    /// Owner-signed bounded apply permit.
+    ApplyPermit(ApplyPermit),
+    /// Owner-signed activation response.
+    Activate(ActivateGrantReply),
 }
 
 pub(crate) async fn read_hello(receive: &mut RecvStream) -> Result<Hello> {

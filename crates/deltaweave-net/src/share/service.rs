@@ -2,6 +2,11 @@ use super::{
     ALPN_V3, GrantNonce, LegacyProof, MemberRelationship, Membership, OwnedShareConfig,
     RosterHeartbeat, ShareError, ShareId, ShareTicket, SignedRoster, TicketPreview,
 };
+use super::authority::{
+    ActivateGrantReply, ActivateGrantRequest, ApplyDrained, ApplyPermit, ApplyStart,
+    AuthoritativeSnapshot, ManifestAttestation, ShareGrant, SnapshotToken, request_hash,
+};
+use super::roster::random_nonce;
 use super::{
     registry::Registry,
     runtime::{Authorization, OwnedRuntime, OwnerShare},
@@ -15,6 +20,7 @@ use crate::{
     write_frame,
 };
 use anyhow::{Result, ensure};
+use deltaweave_cdc::manifest_from_path;
 use deltaweave_core::{ChunkingProfile, Hash32, ReplicaId, SyncRecord};
 use deltaweave_index::{IndexOptions, LocalIndex};
 use deltaweave_reconcile::MerkleTree;
@@ -29,6 +35,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, RwLock, atomic::Ordering},
+    time::Duration,
 };
 
 /// One device-wide persistent endpoint. Clone its endpoint for all outbound shares;

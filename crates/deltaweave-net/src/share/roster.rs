@@ -16,7 +16,11 @@ pub(crate) const ROSTER_TTL_SECONDS: u64 = 90;
 pub const ROSTER_HEARTBEAT_INTERVAL_SECONDS: u64 = 30;
 pub(crate) const ROSTER_STALE_AFTER_SECONDS: u64 = 90;
 pub(crate) const MAX_ROSTER_ENTRIES: usize = 4096;
-pub(crate) const MAX_ROSTER_FRAME_BYTES: usize = 64 * 1024;
+/// One complete roster is bounded independently of the membership count. The
+/// existing catalog supports 4096 members; a 16 MiB bound preserves that
+/// support without silently truncating discovery. Future pagination may split
+/// this frame, but a consumer must never treat a partial roster as complete.
+pub(crate) const MAX_ROSTER_FRAME_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const MAX_ENDPOINT_ADDRESSES: usize = 16;
 pub(crate) const MAX_CLOCK_SKEW_SECONDS: u64 = 5;
 

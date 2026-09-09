@@ -1,10 +1,15 @@
 //! Owner-mediated, folder-scoped sharing over one persistent device endpoint.
+mod authority;
 mod registry;
 mod roster;
 mod runtime;
 mod service;
 mod ticket;
 pub(crate) mod wire;
+pub use authority::{
+    ActivateGrantReply, ActivateGrantRequest, ApplyDrained, ApplyPermit, ApplyStart,
+    AuthoritativeSnapshot, ManifestAttestation, RevocationReceipt, ShareGrant, SnapshotToken,
+};
 pub use registry::{Invitation, MemberRelationship, Membership, OwnedShareConfig};
 pub use roster::{
     GrantNonce, PermissionEpoch, ROSTER_HEARTBEAT_INTERVAL_SECONDS, RosterEntry, RosterHeartbeat,
