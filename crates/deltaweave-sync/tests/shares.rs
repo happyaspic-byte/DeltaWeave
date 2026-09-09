@@ -204,6 +204,18 @@ fn managed_read_only_uses_owner_and_member_suppliers_for_real_chunks() {
 }
 
 #[test]
+fn managed_read_only_owner_originated_file_uses_both_suppliers() {
+    isolated(
+        "managed_read_only_owner_originated_file_uses_both_suppliers",
+        || {
+            tokio::runtime::Runtime::new().unwrap().block_on(
+                run_managed_read_only_two_suppliers_with_options(false, false, true),
+            );
+        },
+    );
+}
+
+#[test]
 fn managed_read_only_partial_swarm_emits_single_fallback_event() {
     isolated(
         "managed_read_only_partial_swarm_emits_single_fallback_event",
@@ -221,19 +233,20 @@ fn managed_read_only_mid_transfer_supplier_loss_is_observed() {
         "managed_read_only_mid_transfer_supplier_loss_is_observed",
         || {
             tokio::runtime::Runtime::new().unwrap().block_on(
-                run_managed_read_only_two_suppliers_with_options(false, true),
+                run_managed_read_only_two_suppliers_with_options(false, true, false),
             );
         },
     );
 }
 
 async fn run_managed_read_only_two_suppliers(force_owner_fallback: bool) {
-    run_managed_read_only_two_suppliers_with_options(force_owner_fallback, false).await;
+    run_managed_read_only_two_suppliers_with_options(force_owner_fallback, false, false).await;
 }
 
 async fn run_managed_read_only_two_suppliers_with_options(
     force_owner_fallback: bool,
     interrupt_provider: bool,
+    owner_originated: bool,
 ) {
     let temp = tempfile::tempdir().unwrap();
     let base = temp.path();
@@ -289,13 +302,27 @@ async fn run_managed_read_only_two_suppliers_with_options(
         config(base, "provider"),
     )
     .unwrap();
-    fs::write(base.join("provider-root/payload.bin"), &payload).unwrap();
+    if owner_originated {
+        fs::write(base.join("owner-root/payload.bin"), &payload).unwrap();
+        owned.refresh_inventory().await.unwrap();
+    } else {
+        fs::write(base.join("provider-root/payload.bin"), &payload).unwrap();
+    }
     let provider_report = provider_engine.sync_read_write(None).await.unwrap();
-    assert!(provider_report.pushed_bytes > 0);
+    assert_eq!(provider_report.status, "pass");
+    if owner_originated {
+        assert_eq!(
+            fs::read(base.join("provider-root/payload.bin")).unwrap(),
+            payload,
+            "the RW supplier must seed its public tree from the owner-originated file"
+        );
+    } else {
+        assert!(provider_report.pushed_bytes > 0);
+    }
 
     // The owner's inventory scan supplies authoritative metadata.  The
     // authenticated Manifest request below warms the already-open owner CAS;
-    // the RW upload above gives the member supplier its own complete CAS, so
+    // the RW round above gives the member supplier its own complete CAS, so
     // both selected suppliers are real sources for the subsequent RO transfer.
     let probe = provider
         .open_session(provider_grant.owner, provider_grant.share_id)
@@ -726,18 +753,11 @@ async fn run_managed_read_only_two_suppliers_with_options(
             .filter(|event| event.bytes > 0)
             .map(|event| event.peer)
             .collect();
-        if interrupt_provider {
-            assert!(
-                provider_peers.contains(&provider_peer_id),
-                "the interrupted member supplier delivered bytes before shutdown"
-            );
-        } else {
-            assert_eq!(
-                provider_peers.len(),
-                2,
-                "both authenticated suppliers delivered verified bytes"
-            );
-        }
+        assert_eq!(
+            provider_peers.len(),
+            2,
+            "both authenticated suppliers delivered verified bytes"
+        );
         let first_verified = events
             .iter()
             .position(|event| inbound_swarm(&event) && event.bytes > 0)
@@ -747,24 +767,20 @@ async fn run_managed_read_only_two_suppliers_with_options(
             .filter(|event| inbound_swarm(event) && event.bytes == 0)
             .map(|event| event.operation_id)
             .collect();
-        if !interrupt_provider {
-            assert!(
-                started_before_first.len() >= 2,
-                "two admitted providers must start before the first verified chunk"
-            );
-        }
-        if !interrupt_provider {
-            let verified_swarm_bytes = events
-                .iter()
-                .filter(|event| inbound_swarm(event) && event.bytes > 0)
-                .map(|event| event.bytes)
-                .sum::<u64>();
-            assert_eq!(
-                verified_swarm_bytes + fallback_bytes,
-                report.pulled_bytes,
-                "typed verified swarm plus fallback bytes equals the aggregate report"
-            );
-        }
+        assert!(
+            started_before_first.len() >= 2,
+            "two admitted providers must start before the first verified chunk"
+        );
+        let verified_swarm_bytes = events
+            .iter()
+            .filter(|event| inbound_swarm(event) && event.bytes > 0)
+            .map(|event| event.bytes)
+            .sum::<u64>();
+        assert_eq!(
+            verified_swarm_bytes + fallback_bytes,
+            report.pulled_bytes,
+            "typed verified swarm plus fallback bytes equals the aggregate report"
+        );
     }
     assert_eq!(
         fs::read(base.join("consumer-root/payload.bin")).unwrap(),
