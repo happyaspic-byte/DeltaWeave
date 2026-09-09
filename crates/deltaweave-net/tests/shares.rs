@@ -1254,6 +1254,8 @@ fn closed_catalog_bytes(path: &std::path::Path) -> Vec<u8> {
             "share-swarm-grant-drain-v1",
             "share-swarm-grant-v1",
             "share-swarm-snapshot-v1",
+            "share_roster_heartbeat_v1",
+            "share_roster_v1",
         ]
     );
     assert!(read.list_multimap_tables().unwrap().next().is_none());
