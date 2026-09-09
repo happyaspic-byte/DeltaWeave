@@ -188,6 +188,17 @@ fn managed_read_only_uses_owner_and_member_suppliers_for_real_chunks() {
                     ShareService::open(base.join("consumer-device"), NetworkMode::DirectOnly, None)
                         .await
                         .unwrap();
+                let share_events = Arc::new(Mutex::new(Vec::<ShareTransferEvent>::new()));
+                let observed_share_events = Arc::clone(&share_events);
+                let share_observer = ShareTransferObserver::new(move |event| {
+                    observed_share_events
+                        .lock()
+                        .expect("share observer lock")
+                        .push(event);
+                });
+                owner.set_share_observer(Some(share_observer.clone()));
+                provider.set_share_observer(Some(share_observer.clone()));
+                consumer.set_share_observer(Some(share_observer));
                 let owned = owner
                     .create_owned_share(
                         "two suppliers".into(),
@@ -321,6 +332,42 @@ fn managed_read_only_uses_owner_and_member_suppliers_for_real_chunks() {
                         starts.iter().all(|(started, _)| started < first_verified)
                     }));
                 }
+                {
+                    let events = share_events.lock().expect("share observer lock");
+                    let inbound_swarm = |event: &&ShareTransferEvent| {
+                        event.phase == SharePhase::Swarm
+                            && event.direction == TransferDirection::Inbound
+                            && event.grant.is_some()
+                    };
+                    let provider_peers: BTreeSet<_> = events
+                        .iter()
+                        .filter(|event| inbound_swarm(event))
+                        .filter(|event| {
+                            event.peer == provider.endpoint_id()
+                                || event.peer == owner.endpoint_id()
+                        })
+                        .filter(|event| event.bytes > 0)
+                        .map(|event| event.peer)
+                        .collect();
+                    assert_eq!(
+                        provider_peers.len(),
+                        2,
+                        "both authenticated suppliers delivered verified bytes"
+                    );
+                    let first_verified = events
+                        .iter()
+                        .position(|event| inbound_swarm(&event) && event.bytes > 0)
+                        .expect("verified swarm payload event");
+                    let started_before_first: BTreeSet<_> = events[..first_verified]
+                        .iter()
+                        .filter(|event| inbound_swarm(event) && event.bytes == 0)
+                        .map(|event| event.operation_id)
+                        .collect();
+                    assert!(
+                        started_before_first.len() >= 2,
+                        "two admitted providers must start before the first verified chunk"
+                    );
+                }
                 assert_eq!(
                     fs::read(base.join("consumer-root/payload.bin")).unwrap(),
                     payload
@@ -382,6 +429,16 @@ fn managed_read_only_uses_owner_and_member_suppliers_for_real_chunks() {
                         event.phase == "swarm_provider_verified"
                             && event.peer.as_deref() == Some(owner_peer.as_str())
                             && event.bytes > 0
+                    }));
+                }
+                {
+                    let events = share_events.lock().expect("share observer lock");
+                    assert!(events.iter().any(|event| {
+                        event.phase == SharePhase::Swarm
+                            && event.direction == TransferDirection::Inbound
+                            && event.peer == owner.endpoint_id()
+                            && event.bytes > 0
+                            && event.grant.is_some()
                     }));
                 }
                 consumer2_engine.shutdown().await.unwrap();

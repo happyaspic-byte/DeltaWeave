@@ -396,8 +396,11 @@ impl Drop for ManagedStageGuard {
 /// grow that catalog without adding a new exclusion boundary.  A stage gets a
 /// process/sequence-qualified name and an existing name is never reused.
 fn managed_stage_path(state_root: &Path, stage_name: &str) -> Result<PathBuf> {
-    let state_root = fs::canonicalize(state_root)?;
-    let metadata = fs::symlink_metadata(&state_root)?;
+    // Do not canonicalize first: canonicalize follows a replaced symlink or
+    // junction.  The caller's lexical parent must itself be a real directory
+    // before we resolve it, otherwise the stage could escape the RootLease's
+    // admitted namespace during a same-name replacement race.
+    let metadata = fs::symlink_metadata(state_root)?;
     ensure!(metadata.is_dir() && !metadata.file_type().is_symlink());
     #[cfg(windows)]
     {
@@ -408,6 +411,15 @@ fn managed_stage_path(state_root: &Path, stage_name: &str) -> Result<PathBuf> {
             ShareError::StateUnavailable
         );
     }
+    let canonical_state_root = fs::canonicalize(state_root)?;
+    // Store::state_root is derived from the canonical managed root.  Reject a
+    // spelling that resolves elsewhere rather than accepting an unadmitted
+    // alias.  This also keeps the exact-parent check in cleanup meaningful.
+    ensure!(
+        canonical_state_root == state_root,
+        ShareError::StateUnavailable
+    );
+    let state_root = canonical_state_root;
     for _ in 0..64 {
         let sequence = MANAGED_STAGE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let candidate = state_root.join(format!(
@@ -4238,6 +4250,29 @@ mod tests {
         create_managed_stage_directory(&second).expect("second stage created");
         assert!(first.is_dir());
         assert!(second.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_stage_path_rejects_replaced_parent_alias() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("stage alias test root");
+        let admitted_root = temp.path().join("admitted");
+        let outside_root = temp.path().join("outside");
+        let alias = temp.path().join("state");
+        std::fs::create_dir_all(&admitted_root).expect("admitted root created");
+        std::fs::create_dir_all(&outside_root).expect("outside root created");
+        symlink(&outside_root, &alias).expect("parent alias created");
+
+        assert!(managed_stage_path(&alias, "unit").is_err());
+        assert!(
+            outside_root
+                .read_dir()
+                .expect("outside root readable")
+                .next()
+                .is_none()
+        );
     }
 
     #[test]
