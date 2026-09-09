@@ -54,6 +54,68 @@ const MAX_AUTHORITY_ROWS: usize = 4096;
 const MAX_AUTHORITY_BYTES: usize = 16 * 1024 * 1024;
 const AUTHORITY_RETENTION_SECONDS: u64 = 60 * 60;
 const CLIENT_INTENT_RETENTION_SECONDS: u64 = 60 * 60;
+/// New endpoint-intent rows carry an explicit envelope marker.  Existing
+/// deployments wrote the unmarked legacy row; keeping a strict decoder for
+/// both forms avoids relying on postcard's trailing-field behavior for a
+/// security-sensitive recovery journal.
+const CLIENT_INTENT_ENCODING_MAGIC: &[u8] = b"DWCI1";
+
+#[derive(Deserialize, Serialize)]
+struct LegacyClientIntentRow {
+    grant: ShareGrant,
+    binding: ActivationBinding,
+    side: ClientSide,
+    activation_id: Option<[u8; 16]>,
+    operation_id: [u8; 16],
+    phase: ClientIntentPhase,
+    boot_id: [u8; 16],
+    started_at_wall: u64,
+    #[serde(default)]
+    terminal_at_wall: Option<u64>,
+}
+
+fn decode_postcard_exact<'a, T>(bytes: &'a [u8]) -> Result<T>
+where
+    T: Deserialize<'a>,
+{
+    let mut deserializer = postcard::Deserializer::from_bytes(bytes);
+    let value = T::deserialize(&mut deserializer)?;
+    ensure!(
+        deserializer.finalize()?.is_empty(),
+        ShareError::StateUnavailable
+    );
+    Ok(value)
+}
+
+fn decode_client_intent(bytes: &[u8]) -> Result<ClientIntentRow> {
+    if let Some(payload) = bytes.strip_prefix(CLIENT_INTENT_ENCODING_MAGIC) {
+        return decode_postcard_exact(payload);
+    }
+    // Unmarked bytes are the pre-envelope row format.  A defaulted appended
+    // field is not treated as a wire-version marker: postcard must never
+    // guess a newer shape for a legacy or partially written row.  The
+    // explicit envelope above is the only representation that carries the
+    // additive fields.
+    let legacy: LegacyClientIntentRow = decode_postcard_exact(bytes)?;
+    Ok(ClientIntentRow {
+        grant: legacy.grant,
+        binding: legacy.binding,
+        side: legacy.side,
+        activation_id: legacy.activation_id,
+        operation_id: legacy.operation_id,
+        phase: legacy.phase,
+        boot_id: legacy.boot_id,
+        started_at_wall: legacy.started_at_wall,
+        terminal_at_wall: legacy.terminal_at_wall,
+        previous_boot_id: None,
+    })
+}
+
+fn encode_client_intent(row: &ClientIntentRow) -> Result<Vec<u8>> {
+    let mut bytes = CLIENT_INTENT_ENCODING_MAGIC.to_vec();
+    bytes.extend(postcard::to_stdvec(row)?);
+    Ok(bytes)
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OwnedShareConfig {
@@ -307,7 +369,7 @@ impl Registry {
                 let mut rows = Vec::new();
                 for item in table.iter()? {
                     let (key, value) = item?;
-                    let row: ClientIntentRow = postcard::from_bytes(value.value())?;
+                    let row = decode_client_intent(value.value())?;
                     rows.push((key.value().to_owned(), row));
                 }
                 rows
@@ -321,8 +383,9 @@ impl Registry {
                     )
                 {
                     row.phase = ClientIntentPhase::Unknown;
+                    row.previous_boot_id = Some(row.boot_id);
                     row.boot_id = boot_id;
-                    let bytes = postcard::to_stdvec(&row)?;
+                    let bytes = encode_client_intent(&row)?;
                     table.insert(key.as_str(), bytes.as_slice())?;
                 } else if matches!(
                     row.phase,
@@ -334,7 +397,7 @@ impl Registry {
                     // old start time must never cause immediate cleanup of a
                     // terminal record whose confirmation age is unknown.
                     row.terminal_at_wall = Some(now());
-                    let bytes = postcard::to_stdvec(&row)?;
+                    let bytes = encode_client_intent(&row)?;
                     table.insert(key.as_str(), bytes.as_slice())?;
                 }
             }
@@ -359,6 +422,7 @@ impl Registry {
         );
         Ok(registry)
     }
+
     fn read(&self) -> Result<Catalog> {
         let read = self.db.begin_read()?;
         let table = read.open_table(CATALOG)?;
@@ -1403,7 +1467,7 @@ impl Registry {
                 total_bytes <= MAX_AUTHORITY_BYTES,
                 ShareError::StateUnavailable
             );
-            rows.push((key.value().to_owned(), postcard::from_bytes(value.value())?));
+            rows.push((key.value().to_owned(), decode_client_intent(value.value())?));
         }
         Ok(rows)
     }
@@ -1422,11 +1486,11 @@ impl Registry {
             value.value().len() <= super::authority::MAX_AUTHORITY_FRAME_BYTES,
             ShareError::StateUnavailable
         );
-        Ok(Some(postcard::from_bytes(value.value())?))
+        Ok(Some(decode_client_intent(value.value())?))
     }
 
     fn write_client_intent(&self, key: &str, row: &ClientIntentRow) -> Result<()> {
-        let bytes = postcard::to_stdvec(row)?;
+        let bytes = encode_client_intent(row)?;
         ensure!(
             bytes.len() <= super::authority::MAX_AUTHORITY_FRAME_BYTES,
             ShareError::StateUnavailable
@@ -1504,13 +1568,14 @@ impl Registry {
             operation_id,
             phase: ClientIntentPhase::Prepared,
             boot_id: self.boot_id,
+            previous_boot_id: None,
             started_at_wall: wall,
             terminal_at_wall: None,
         };
         let intents = self.read_client_intents()?;
-        let row_bytes = postcard::to_stdvec(&row)?.len();
+        let row_bytes = encode_client_intent(&row)?.len();
         let total_bytes = intents.iter().try_fold(row_bytes, |total, (_, intent)| {
-            Ok::<_, postcard::Error>(total.saturating_add(postcard::to_stdvec(intent)?.len()))
+            Ok::<_, anyhow::Error>(total.saturating_add(encode_client_intent(intent)?.len()))
         })?;
         ensure!(
             intents.len() < MAX_AUTHORITY_ROWS && total_bytes <= MAX_AUTHORITY_BYTES,
@@ -3150,6 +3215,8 @@ mod tests {
         assert_eq!(after_restart.binding, before_restart.binding);
         assert_eq!(after_restart.operation_id, operation_id);
         assert_ne!(after_restart.boot_id, before_restart.boot_id);
+        assert_eq!(after_restart.previous_boot_id, Some(before_restart.boot_id));
+        assert_eq!(reopened.boot_id, after_restart.boot_id);
         assert_eq!(
             reopened
                 .transition_client_intent(
@@ -3172,6 +3239,49 @@ mod tests {
                 None,
             )
             .unwrap();
+    }
+
+    #[test]
+    fn client_intent_codec_migrates_legacy_rows_and_rejects_trailing_bytes() {
+        let (_temp, owner, share, peer, registry) = authority_fixture();
+        let grant = ShareGrant::sign(
+            &owner,
+            share,
+            peer,
+            owner.public(),
+            1,
+            0,
+            [0xc5; 32],
+            Hash32::digest(b"legacy-intent-manifest"),
+            Hash32::digest(b"legacy-intent-request"),
+            [0xc6; 32],
+            now(),
+        )
+        .unwrap();
+        let row = registry
+            .prepare_client_intent(&grant, ClientSide::Consumer, [0xc7; 16])
+            .unwrap();
+        let legacy = LegacyClientIntentRow {
+            grant: row.grant.clone(),
+            binding: row.binding.clone(),
+            side: row.side,
+            activation_id: row.activation_id,
+            operation_id: row.operation_id,
+            phase: row.phase,
+            boot_id: row.boot_id,
+            started_at_wall: row.started_at_wall,
+            terminal_at_wall: row.terminal_at_wall,
+        };
+        let bytes = postcard::to_stdvec(&legacy).unwrap();
+        let decoded = decode_client_intent(&bytes).unwrap();
+        assert_eq!(decoded.grant, row.grant);
+        assert_eq!(decoded.binding, row.binding);
+        assert_eq!(decoded.operation_id, row.operation_id);
+        assert_eq!(decoded.previous_boot_id, None);
+
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert!(decode_client_intent(&trailing).is_err());
     }
 
     #[test]

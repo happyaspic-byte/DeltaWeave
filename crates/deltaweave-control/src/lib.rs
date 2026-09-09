@@ -8,7 +8,10 @@ mod worker;
 use anyhow::{Context, Result, ensure};
 use deltaweave_net::{
     root_admission::{self, RootLease, RootUse},
-    share::{Membership as NetMembership, OwnerShare, ShareError, ShareService, ShareTicket},
+    share::{
+        ManagedAdmissionLease, Membership as NetMembership, OwnerShare, ShareError, ShareService,
+        ShareTicket,
+    },
 };
 use deltaweave_sync::{ManagedSyncConfig, ManagedSyncEngine, ManagedSyncReport};
 use std::{
@@ -1290,6 +1293,45 @@ impl Manager {
         Ok(opened)
     }
 
+    /// Acquires only already-existing managed roots for restart recovery. The
+    /// lease is held for the bounded network recovery pass and then released
+    /// before worker restoration transfers ownership to an engine. A malformed
+    /// or currently busy record contributes no drain evidence; it is handled
+    /// by the normal worker recovery path and remains quarantined.
+    fn managed_recovery_leases(
+        &self,
+        records: &[config::ManagedShareRecord],
+    ) -> BTreeMap<ShareId, ManagedAdmissionLease> {
+        let mut leases = BTreeMap::new();
+        for record in records {
+            let Ok(share) = parse_share_id(&record.share_id) else {
+                continue;
+            };
+            let Ok(owner) = endpoint_id(&record.owner) else {
+                continue;
+            };
+            let state_root = PathBuf::from(&record.state_root);
+            let lease = root_admission::acquire_with_private(
+                Path::new(&record.root),
+                RootUse::Managed {
+                    share: share.0,
+                    owner: *owner.as_bytes(),
+                },
+                std::slice::from_ref(&state_root),
+            );
+            if let Ok(lease) = lease
+                && let Ok(lease) = ManagedAdmissionLease::new(
+                    Arc::new(lease),
+                    PathBuf::from(&record.root),
+                    state_root,
+                )
+            {
+                leases.insert(share, lease);
+            }
+        }
+        leases
+    }
+
     async fn member_handle(&self, share: ShareId, endpoint: iroh::EndpointId) -> Result<String> {
         let mut key = self.member_handle_key.lock().await;
         let secret = if let Some(secret) = *key {
@@ -2213,6 +2255,15 @@ impl Manager {
         if !has_managed {
             return Ok(());
         }
+        let configured = {
+            self.shared
+                .lock()
+                .expect("snapshot mutex")
+                .config
+                .managed
+                .shares
+                .clone()
+        };
         let service = self.ensure_managed_service().await?;
         // Reconcile endpoint-local swarm intents before restoring fresh
         // workers. A lost owner response or a temporarily offline peer is a
@@ -2220,18 +2271,26 @@ impl Manager {
         // exact row as Unknown so one unavailable share cannot abort legacy
         // startup or prevent unrelated managed shares from reopening.
         // A process restart has no proof that a pre-crash writer drained. The
-        // net recovery path therefore quarantines active/restarted intents
-        // and only the owning engine's real drain barrier may later pass
-        // `local_io_drained = true`.
-        let recovered_intents = service.recover_client_intents(false).await?;
+        // net recovery path therefore quarantines active/restarted intents.
+        // It may terminalize only rows for which this startup still holds the
+        // exact managed public/private admission lease and the operation
+        // registry is quiescent. A failed preflight leaves the row Unknown;
+        // it never turns an unavailable path into a drain claim.
+        let recovery_leases = self.managed_recovery_leases(&configured);
+        let recovered_intents = service
+            .recover_client_intents_with_budget_and_leases(
+                std::time::Duration::from_secs(15),
+                &recovery_leases,
+            )
+            .await?;
+        drop(recovery_leases);
         self.mark_recovered_intents_waiting(&recovered_intents)
             .await?;
         let owned = service.owned_configs()?;
-        let (tombstones, configured, intents) = {
+        let (tombstones, intents) = {
             let state = self.shared.lock().expect("snapshot mutex");
             (
                 state.config.managed.tombstones.clone(),
-                state.config.managed.shares.clone(),
                 state.config.managed.intents.clone(),
             )
         };
