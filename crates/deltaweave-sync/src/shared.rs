@@ -322,3 +322,109 @@ fn validate_transferred_lease(
     );
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use deltaweave_net::root_admission::{self, RootUse};
+
+    #[test]
+    fn transferred_lease_rejects_wrong_role_share_and_private_root() {
+        if std::env::var_os("DW_MANAGED_LEASE_BINDING_CHILD").is_none() {
+            let home = tempfile::tempdir().expect("isolated home");
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "shared::tests::transferred_lease_rejects_wrong_role_share_and_private_root",
+                    "--nocapture",
+                ])
+                .env("DW_MANAGED_LEASE_BINDING_CHILD", "1")
+                .env("HOME", home.path())
+                .env("USERPROFILE", home.path())
+                .status()
+                .expect("run isolated lease test");
+            assert!(status.success());
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("test root");
+        let owner = iroh::SecretKey::generate().public();
+        let other_owner = iroh::SecretKey::generate().public();
+        let share = ShareId([1; 32]);
+        let other_share = ShareId([2; 32]);
+
+        let root = temp.path().join("managed-root");
+        let state = temp.path().join("managed-state");
+        let wrong_state = temp.path().join("wrong-state");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::create_dir_all(&wrong_state).unwrap();
+        root_admission::reserve_private(&state).unwrap();
+        let lease = root_admission::acquire_with_private(
+            &root,
+            RootUse::Managed {
+                share: share.0,
+                owner: *owner.as_bytes(),
+            },
+            std::slice::from_ref(&state),
+        )
+        .unwrap();
+        let config = ManagedSyncConfig {
+            root: root.clone(),
+            state_root: state.clone(),
+            profile: ChunkingProfile::default(),
+            min_free_space_bytes: 0,
+        };
+
+        assert!(validate_transferred_lease(&lease, owner, share, &config).is_ok());
+
+        let legacy_root = temp.path().join("legacy-root");
+        let legacy_state = temp.path().join("legacy-state");
+        std::fs::create_dir_all(&legacy_root).unwrap();
+        std::fs::create_dir_all(&legacy_state).unwrap();
+        root_admission::reserve_private(&legacy_state).unwrap();
+        let legacy_lease = root_admission::acquire_with_private(
+            &legacy_root,
+            RootUse::Legacy,
+            std::slice::from_ref(&legacy_state),
+        )
+        .unwrap();
+        let legacy_config = ManagedSyncConfig {
+            root: legacy_root,
+            state_root: legacy_state,
+            profile: ChunkingProfile::default(),
+            min_free_space_bytes: 0,
+        };
+        assert!(validate_transferred_lease(&legacy_lease, owner, share, &legacy_config).is_err());
+
+        let other_root = temp.path().join("other-root");
+        let other_state = temp.path().join("other-state");
+        std::fs::create_dir_all(&other_root).unwrap();
+        std::fs::create_dir_all(&other_state).unwrap();
+        root_admission::reserve_private(&other_state).unwrap();
+        let other_lease = root_admission::acquire_with_private(
+            &other_root,
+            RootUse::Managed {
+                share: other_share.0,
+                owner: *other_owner.as_bytes(),
+            },
+            std::slice::from_ref(&other_state),
+        )
+        .unwrap();
+        let other_config = ManagedSyncConfig {
+            root: other_root,
+            state_root: other_state,
+            profile: ChunkingProfile::default(),
+            min_free_space_bytes: 0,
+        };
+        assert!(validate_transferred_lease(&other_lease, owner, share, &other_config).is_err());
+
+        let wrong_private_config = ManagedSyncConfig {
+            root,
+            state_root: wrong_state,
+            profile: ChunkingProfile::default(),
+            min_free_space_bytes: 0,
+        };
+        assert!(validate_transferred_lease(&lease, owner, share, &wrong_private_config).is_err());
+    }
+}
