@@ -22,8 +22,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
@@ -40,6 +41,7 @@ DEFAULT_WORKFLOW = "ci.yml"
 PREPARED_ROLE_ARTIFACT_PREFIX = "qsync-f-linux-role-"
 NATIVE_ARTIFACT_PREFIX = "qsync-native-windows-"
 RO_EVIDENCE_PREFIX = "qsync-f-ro-evidence-"
+HOSTED_RO_JOB_NAME = "F hosted Ubuntu read-only consumer"
 FIXTURE_SIZE_BYTES = 8 * 1024 * 1024
 FIXTURE_CHUNK_BYTES = 64 * 1024
 FIXTURE_SEED = b"deltaweave-qsync-f-fixture-v2"
@@ -81,6 +83,12 @@ class ControllerError(Exception):
             "source_mismatch",
             "binary_missing",
             "binary_hash_mismatch",
+            "external_unavailable",
+            "remote_failure",
+            "process_start_failed",
+            "auth_failed",
+            "api_http_error",
+            "api_response_invalid",
             "secret_exists",
             "secret_set_failed",
             "secret_delete_failed",
@@ -271,6 +279,68 @@ def _hash_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _reject_symlink_components(root: Path, relative: str) -> Path:
+    """Resolve a prepared relative name without following any component."""
+
+    if not root.is_absolute() or root.is_symlink() or not root.is_dir():
+        fail("artifact_invalid")
+    candidate = root
+    for component in Path(relative).parts:
+        candidate = candidate / component
+        try:
+            if candidate.is_symlink():
+                fail("artifact_invalid")
+        except OSError:
+            fail("artifact_invalid")
+    return candidate
+
+
+def prepared_role_binary(state_path: Path, state: Mapping[str, Any], role: str) -> dict[str, Any]:
+    """Return a manifest-bound prepared binary for one controller role.
+
+    The state contains only a safe relative artifact name.  Every path
+    component is checked before opening it, and the bytes are re-hashed at the
+    point of use so an artifact replacement cannot change the role provenance
+    between prepare and execute.
+    """
+
+    if role not in {"owner", "rw_provider", "ro_consumer"}:
+        fail("artifact_invalid")
+    source_sha = require_source_sha(state.get("source_sha"))
+    artifacts = state.get("artifacts")
+    roles = artifacts.get("roles") if isinstance(artifacts, Mapping) else None
+    descriptor = roles.get(role) if isinstance(roles, Mapping) else None
+    if not isinstance(descriptor, Mapping):
+        fail("artifact_invalid")
+    if descriptor.get("source_sha") != source_sha or descriptor.get("workflow_sha") != source_sha:
+        fail("source_mismatch")
+    expected_target = "windows" if role == "rw_provider" else "linux"
+    if descriptor.get("target") != expected_target:
+        fail("artifact_invalid")
+    expected_hash = require_sha256(descriptor.get("sha256"), "artifact_invalid")
+    expected_size = require_positive_size(descriptor.get("size_bytes"))
+    relative = _safe_relative_name(descriptor.get("binary_name"))
+    if not state_path.is_absolute() or state_path.name != STATE_FILENAME or state_path.is_symlink():
+        fail("path_invalid")
+    candidate = _reject_symlink_components(state_path.parent, relative)
+    try:
+        if not candidate.is_file() or candidate.is_symlink():
+            fail("binary_missing")
+        actual_size = candidate.stat().st_size
+    except OSError:
+        fail("binary_missing")
+    if actual_size != expected_size or _hash_file(candidate) != expected_hash:
+        fail("binary_hash_mismatch")
+    return {
+        "path": candidate,
+        "source_sha": source_sha,
+        "target": expected_target,
+        "sha256": expected_hash,
+        "size_bytes": expected_size,
+        "binary_name": relative,
+    }
+
+
 def _scan_artifact_tree(root: Path) -> None:
     if not root.is_dir() or root.is_symlink():
         fail("artifact_invalid")
@@ -437,6 +507,18 @@ class ActionsBackend(Protocol):
         timeout_seconds: int = MAX_EXECUTE_WAIT_SECONDS,
     ) -> dict[str, Any]: ...
 
+    def wait_hosted_job(
+        self,
+        workflow: str,
+        ref: str,
+        source_sha: str,
+        not_before: float,
+        *,
+        excluded_run_ids: frozenset[str] = frozenset(),
+        coordination_run_id: str | None = None,
+        timeout_seconds: int = MAX_EXECUTE_WAIT_SECONDS,
+    ) -> dict[str, Any]: ...
+
     def download_artifact(self, run_id: str, name: str, destination: Path) -> Path: ...
 
     def list_secret_names(self) -> set[str]: ...
@@ -571,6 +653,88 @@ class GhActions:
                 fail("workflow_timeout", "pending", 2)
             time.sleep(min(5.0, remaining))
 
+    def wait_hosted_job(
+        self,
+        workflow: str,
+        ref: str,
+        source_sha: str,
+        not_before: float,
+        *,
+        excluded_run_ids: frozenset[str] = frozenset(),
+        coordination_run_id: str | None = None,
+        timeout_seconds: int = MAX_EXECUTE_WAIT_SECONDS,
+    ) -> dict[str, Any]:
+        """Wait only for the hosted RO job in one already-correlated run.
+
+        The caller run can contain unrelated or skipped jobs.  Once the exact
+        dispatch is selected, pin its numeric ID and poll its job list rather
+        than waiting for the whole workflow to complete.
+        """
+
+        source_sha = require_source_sha(source_sha)
+        if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= MAX_PREPARE_WAIT_SECONDS:
+            fail("config_invalid")
+        deadline = time.monotonic() + timeout_seconds
+        selected_run: dict[str, Any] | None = None
+        selected_run_id: str | None = None
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                fail("workflow_timeout", "pending", 2)
+            if selected_run is None:
+                rows = self.list_runs(workflow, ref)
+                try:
+                    selected_run = select_dispatched_run(
+                        rows,
+                        source_sha,
+                        not_before,
+                        excluded_run_ids=excluded_run_ids,
+                        coordination_run_id=coordination_run_id,
+                    )
+                except ControllerError as error:
+                    if error.error_class != "workflow_run_missing":
+                        raise
+                    time.sleep(min(5.0, remaining))
+                    continue
+                selected_run_id = require_run_id(selected_run.get("databaseId"))
+            result = self._run(
+                [
+                    "gh",
+                    "run",
+                    "view",
+                    selected_run_id,
+                    "--repo",
+                    self.repo,
+                    "--json",
+                    "jobs",
+                ],
+                timeout=min(60.0, max(1.0, remaining)),
+            )
+            if result.returncode != 0:
+                fail("workflow_run_missing", "pending", 2)
+            try:
+                payload = json.loads(result.stdout.decode("utf-8", "strict"))
+            except (UnicodeError, json.JSONDecodeError):
+                fail("workflow_run_missing", "pending", 2)
+            jobs = payload.get("jobs") if isinstance(payload, dict) else None
+            if not isinstance(jobs, list):
+                fail("workflow_run_missing", "pending", 2)
+            matching = [job for job in jobs if isinstance(job, dict) and job.get("name") == HOSTED_RO_JOB_NAME]
+            if len(matching) > 1:
+                fail("workflow_run_missing", "pending", 2)
+            if matching:
+                job = matching[0]
+                if job.get("status") == "completed":
+                    if job.get("conclusion") != "success":
+                        fail("workflow_failed")
+                    return {"run": selected_run, "job": job}
+            if selected_run.get("status") == "completed" and not matching:
+                fail("workflow_run_missing", "pending", 2)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                fail("workflow_timeout", "pending", 2)
+            time.sleep(min(5.0, remaining))
+
     def download_artifact(self, run_id: str, name: str, destination: Path) -> Path:
         run_id = require_run_id(run_id)
         if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", name):
@@ -685,6 +849,203 @@ def select_dispatched_run(
     return candidates[0]
 
 
+class RemoteReadinessObserver:
+    """Extract a live RW readiness attestation from WinRM stdout chunks.
+
+    Only the fixed FROLE/FTRACE vocabulary is retained.  The complete remote
+    transcript remains owned by the worker and is never copied into controller
+    state or evidence by this observer.
+    """
+
+    _MAX_BUFFER_BYTES = 64 * 1024
+
+    def __init__(self, expected_file_hash: str, expected_file_size: int, keepalive_seconds: int):
+        self.expected_file_hash = require_sha256(expected_file_hash)
+        self.expected_file_size = require_positive_size(expected_file_size, exact=FIXTURE_SIZE_BYTES)
+        if type(keepalive_seconds) is not int or not 1 <= keepalive_seconds <= 900:
+            fail("config_invalid")
+        self.keepalive_seconds = keepalive_seconds
+        self._buffer = b""
+        self._lock = threading.Lock()
+        self._ready = threading.Event()
+        self._ready_at: float | None = None
+        self._member_join_ok = False
+        self._file_hash_ok = False
+        self._file_hash: str | None = None
+        self._file_size: int | None = None
+        self._keepalive_enter = False
+        self._keepalive_count: int | None = None
+        self._error_class: str | None = None
+
+    def _maybe_ready(self) -> None:
+        if (
+            self._member_join_ok
+            and self._file_hash_ok
+            and self._keepalive_enter
+            and self._keepalive_count == self.keepalive_seconds
+            and self._error_class is None
+            and not self._ready.is_set()
+        ):
+            self._ready_at = time.monotonic()
+            self._ready.set()
+
+    def _consume_line(self, line: bytes) -> None:
+        try:
+            text = line.strip().decode("ascii", "strict")
+        except UnicodeDecodeError:
+            return
+        phase = bootstrap.REMOTE_LINE_RE.fullmatch(text)
+        if phase is not None:
+            name, ok, hash_value, size_value, _forced, _signal, error_class = phase.groups()
+            if error_class not in (None, "none"):
+                # Keep the controller vocabulary fixed even when the remote
+                # role reports a known-but-more-specific error.  A failed
+                # phase must never be followed by a later line that is
+                # mistaken for a live readiness attestation.
+                self._error_class = "remote_failure"
+            if name == "member_join":
+                self._member_join_ok = ok == "true"
+            elif name == "file_hash":
+                self._file_hash = hash_value
+                self._file_size = int(size_value) if size_value is not None else None
+                self._file_hash_ok = (
+                    ok == "true"
+                    and hash_value == self.expected_file_hash
+                    and self._file_size == self.expected_file_size
+                )
+            self._maybe_ready()
+            return
+        trace = bootstrap.REMOTE_TRACE_RE.fullmatch(text)
+        if trace is None or trace.group(1) != "keepalive_enter":
+            return
+        count = trace.group(2)
+        if count is None:
+            self._error_class = "remote_failure"
+            return
+        self._keepalive_count = int(count)
+        self._keepalive_enter = self._keepalive_count == self.keepalive_seconds
+        self._maybe_ready()
+
+    def feed(self, chunk: bytes) -> None:
+        if not isinstance(chunk, bytes) or not chunk:
+            return
+        with self._lock:
+            self._buffer += chunk
+            if len(self._buffer) > self._MAX_BUFFER_BYTES:
+                # Keep only the incomplete tail; old, non-readiness output is
+                # intentionally discarded rather than retained in memory.
+                self._buffer = self._buffer[-self._MAX_BUFFER_BYTES :]
+                newline = self._buffer.find(b"\n")
+                if newline >= 0:
+                    self._buffer = self._buffer[newline + 1 :]
+            while b"\n" in self._buffer:
+                line, self._buffer = self._buffer.split(b"\n", 1)
+                self._consume_line(line)
+
+    def wait_ready(self, timeout_seconds: float) -> bool:
+        if timeout_seconds < 0:
+            return False
+        return self._ready.wait(timeout_seconds)
+
+    def is_ready(self) -> bool:
+        return self._ready.is_set()
+
+    @property
+    def ready_at(self) -> float | None:
+        with self._lock:
+            return self._ready_at
+
+    @property
+    def error_class(self) -> str | None:
+        with self._lock:
+            return self._error_class
+
+    def attestation(self, source_sha: str, coordination_run_id: str) -> dict[str, Any]:
+        source_sha = require_source_sha(source_sha)
+        coordination_run_id = require_run_id(coordination_run_id)
+        with self._lock:
+            if not self._ready.is_set() or self._error_class is not None:
+                fail("rw_not_ready", "pending", 2)
+            return {
+                "status": "ready",
+                "role": "rw_provider",
+                "source_sha": source_sha,
+                "coordination_run_id": coordination_run_id,
+                "expected_file_hash": self.expected_file_hash,
+                "expected_file_size_bytes": self.expected_file_size,
+                "member_join_observed": self._member_join_ok,
+                "file_hash_observed": self._file_hash_ok,
+                "keepalive_observed": self._keepalive_enter,
+                "live_handle_observed": True,
+            }
+
+
+class RwSupervisor:
+    """Own one WinRM member call until its terminal result is observed."""
+
+    def __init__(self, runner: Callable[..., bootstrap.RemoteRun], observer: RemoteReadinessObserver):
+        self.runner = runner
+        self.observer = observer
+        self._finished = threading.Event()
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self._result: bootstrap.RemoteRun | None = None
+        self._error_class: str | None = None
+
+    def start(self) -> None:
+        with self._lock:
+            if self._thread is not None:
+                fail("unexpected")
+            self._thread = threading.Thread(target=self._run, name="qsync-f-rw-supervisor", daemon=True)
+            self._thread.start()
+
+    def _run(self) -> None:
+        try:
+            result = self.runner(on_stdout=self.observer.feed)
+            if not isinstance(result, bootstrap.RemoteRun):
+                self._error_class = "remote_failure"
+            else:
+                self._result = result
+        except bootstrap.HarnessError as error:
+            self._error_class = error.error_class
+        except Exception:
+            self._error_class = "remote_failure"
+        finally:
+            self._finished.set()
+
+    def wait_ready(self, timeout_seconds: float) -> bool:
+        return self.observer.wait_ready(timeout_seconds)
+
+    def attestation(self, source_sha: str, coordination_run_id: str) -> dict[str, Any]:
+        """Take readiness only while this supervisor still owns a live call."""
+
+        if not self.is_alive():
+            fail("rw_not_ready", "pending", 2)
+        attestation = self.observer.attestation(source_sha, coordination_run_id)
+        if not self.is_alive():
+            fail("rw_not_ready", "pending", 2)
+        return attestation
+
+    def is_alive(self) -> bool:
+        thread = self._thread
+        return thread is not None and thread.is_alive()
+
+    def wait_finished(self, timeout_seconds: float) -> bootstrap.RemoteRun | None:
+        if timeout_seconds < 0 or not self._finished.wait(timeout_seconds):
+            return None
+        if self._result is not None:
+            return self._result
+        return bootstrap.RemoteRun(
+            status_code=-1,
+            transport_cleanup_completed=False,
+            transport_error_class=self._error_class or "remote_failure",
+        )
+
+    @property
+    def error_class(self) -> str | None:
+        return self._error_class
+
+
 class SecretLease:
     """Create a generated repository secret only after a no-overwrite check."""
 
@@ -785,6 +1146,17 @@ def load_state(path: Path) -> dict[str, Any]:
     return value
 
 
+def _load_state_or(path: Path, fallback: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
+    """Refresh state and retain whether the durable snapshot was unreadable."""
+
+    try:
+        return load_state(path), False
+    except ControllerError:
+        # The fallback is useful for writing a bounded pending record, but it
+        # is never evidence that the original durable state was valid.
+        return dict(fallback), True
+
+
 def cleanup_owned_run(
     run_root: Path,
     *,
@@ -822,6 +1194,38 @@ class PrepareResult:
     source_sha: str
     expected_file_hash: str
     expected_file_size_bytes: int
+
+
+def _controller_error_from_harness(error: bootstrap.HarnessError) -> ControllerError:
+    """Translate a tool result without carrying remote text across layers."""
+
+    allowed = {
+        "config_invalid",
+        "path_invalid",
+        "workflow_dispatch_failed",
+        "workflow_run_missing",
+        "workflow_failed",
+        "workflow_timeout",
+        "artifact_download_failed",
+        "artifact_invalid",
+        "source_mismatch",
+        "binary_missing",
+        "binary_hash_mismatch",
+        "external_unavailable",
+        "remote_failure",
+        "process_start_failed",
+        "auth_failed",
+        "api_http_error",
+        "api_response_invalid",
+        "rw_not_ready",
+        "state_invalid",
+        "cleanup_incomplete",
+        "fixture_invalid",
+        "unexpected",
+    }
+    error_class = error.error_class if error.error_class in allowed else "unexpected"
+    status = "pending" if error.status in {"pending", "blocked"} else "failed"
+    return ControllerError(error_class, status, error.exit_code)
 
 
 class LocalController:
@@ -985,10 +1389,15 @@ class LocalController:
         rw_ready: Mapping[str, Any] | Callable[[], Mapping[str, Any]],
         secret_name: str | None = None,
         dispatch_utc: float | None = None,
+        timeout_seconds: int = MAX_EXECUTE_WAIT_SECONDS,
+        require_live_readiness: bool = False,
+        finalize_status: bool = True,
     ) -> dict[str, Any]:
         state = load_state(state_path)
         if state.get("ref") != self.ref:
             fail("source_mismatch")
+        if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= MAX_PREPARE_WAIT_SECONDS:
+            fail("config_invalid")
         vault = bootstrap.SecretVault()
         share_key = vault.hold(share_key)
         ready = rw_ready() if callable(rw_ready) else rw_ready
@@ -1003,26 +1412,36 @@ class LocalController:
             or ready.get("expected_file_hash") != state.get("expected_file_hash")
             or ready.get("expected_file_size_bytes") != state.get("expected_file_size_bytes")
             or ready.get("keepalive_observed") is not True
+            or (require_live_readiness and ready.get("live_handle_observed") is not True)
+            or (
+                require_live_readiness
+                and (
+                    ready.get("member_join_observed") is not True
+                    or ready.get("file_hash_observed") is not True
+                )
+            )
         ):
             vault.clear()
             fail("rw_not_ready", "pending", 2)
         secret_name = require_secret_name(secret_name or ("QSYNC_F_RO_" + state["coordination_run_id"]))
         lease = SecretLease(self.actions, secret_name)
         dispatch_started = time.time() if dispatch_utc is None else float(dispatch_utc)
-        prior_run_ids = self._existing_run_ids()
+        prior_run_ids: frozenset[str] = frozenset()
         ro_run: dict[str, Any] | None = None
         result: dict[str, Any] = {
             "status": "pending",
-            "secret_released": False,
+            "ephemeral_released": False,
             "ro_evidence_downloaded": False,
         }
         state_after = {
             **state,
             "status": "pending",
             "ephemeral_slot": {"name": secret_name, "status": "creating"},
+            "ephemeral_released": False,
         }
         try:
             write_state(state_path, state_after)
+            prior_run_ids = self._existing_run_ids()
             lease.create(share_key)
             state_after = {
                 **state_after,
@@ -1047,24 +1466,44 @@ class LocalController:
                     "qsync_three_host_ro_secret_name": secret_name,
                 },
             )
-            ro_run = self.actions.wait_run(
+            hosted = self.actions.wait_hosted_job(
                 self.workflow,
                 self.ref,
                 state["source_sha"],
                 dispatch_started,
                 excluded_run_ids=prior_run_ids,
                 coordination_run_id=state["coordination_run_id"],
-                timeout_seconds=MAX_EXECUTE_WAIT_SECONDS,
+                timeout_seconds=timeout_seconds,
             )
+            if not isinstance(hosted, Mapping):
+                fail("workflow_run_missing", "pending", 2)
+            ro_run = hosted.get("run")
+            hosted_job = hosted.get("job")
+            if not isinstance(ro_run, Mapping) or not isinstance(hosted_job, Mapping):
+                fail("workflow_run_missing", "pending", 2)
+            if (
+                hosted_job.get("name") != HOSTED_RO_JOB_NAME
+                or hosted_job.get("status") != "completed"
+                or hosted_job.get("conclusion") != "success"
+            ):
+                fail("workflow_failed")
             ro_run_id = require_run_id(ro_run.get("databaseId"))
-            if ro_run.get("headSha") != state["source_sha"] or ro_run.get("status") != "completed" or ro_run.get("conclusion") != "success":
+            # The selected workflow may still be running unrelated jobs.  The
+            # hosted consumer job is the completion boundary for this phase;
+            # requiring the parent workflow to be completed would reintroduce
+            # the long native/test critical path.
+            if ro_run.get("headSha") != state["source_sha"] or ro_run.get("event") != "workflow_dispatch":
                 fail("workflow_failed")
             evidence_destination = state_path.parent / "ro-evidence"
             self.actions.download_artifact(ro_run_id, RO_EVIDENCE_PREFIX + ro_run_id, evidence_destination)
             evidence = verify_ro_evidence(evidence_destination, state)
             state_after = {
                 **state_after,
-                "status": "pass",
+                # A live controller run keeps the owner/RW handles open until
+                # its final contract check.  Keep the durable state pending
+                # while execute records a successful hosted RO result.
+                "status": "pass" if finalize_status else "pending",
+                "ro_status": "pass",
                 "ro_run_id": ro_run_id,
                 "ro_evidence_root": "ro-evidence",
                 "ro_evidence_downloaded": True,
@@ -1103,15 +1542,348 @@ class LocalController:
                         "status": "unknown" if lease.ownership_unknown else "owned",
                     },
                     "execute_error_class": "secret_delete_failed",
+                    "ephemeral_released": False,
                 }
             else:
                 if lease.created:
                     state_after = {
                         **state_after,
                         "ephemeral_slot": {"name": secret_name, "status": "released"},
+                        "ephemeral_released": True,
                     }
             write_state(state_path, state_after)
             vault.clear()
+
+    def run(
+        self,
+        state_path: Path,
+        *,
+        owner_api_url_env: str = "QSYNC_F_OWNER_API_URL",
+        artifact_public_host_env: str = "QSYNC_F_ARTIFACT_PUBLIC_HOST",
+        winrm_host_env: str = "QSYNC_F_WINRM_HOST",
+        winrm_username_env: str = "QSYNC_F_WINRM_USERNAME",
+        winrm_password_env: str = "QSYNC_F_WINRM_PASSWORD",
+        winrm_destination_env: str = "QSYNC_F_WINRM_DESTINATION",
+        owner_bind_host: str = "127.0.0.1",
+        keepalive_seconds: int = 300,
+        ready_timeout_seconds: int = 120,
+    ) -> dict[str, Any]:
+        """Run the local owner/RW handoff and the hosted RO consumer.
+
+        Readiness comes from the live WinRM supervisor callback and its still
+        running handle.  A ready JSON file can be useful for the older
+        ``execute`` handoff, but it is never used by this method as proof that
+        the RW provider is alive.
+        """
+
+        state = load_state(state_path)
+        if state.get("ref") != self.ref or state.get("status") != "prepared":
+            fail("state_invalid")
+        source_sha = require_source_sha(state.get("source_sha"))
+        expected_file_hash = require_sha256(state.get("expected_file_hash"), "artifact_invalid")
+        expected_file_size = require_positive_size(state.get("expected_file_size_bytes"), exact=FIXTURE_SIZE_BYTES)
+        coordination_run_id = require_run_id(state.get("coordination_run_id"))
+        owner_api_url_env = bootstrap.validate_env_name(owner_api_url_env)
+        artifact_public_host_env = bootstrap.validate_env_name(artifact_public_host_env)
+        winrm_host_env = bootstrap.validate_env_name(winrm_host_env)
+        winrm_username_env = bootstrap.validate_env_name(winrm_username_env)
+        winrm_password_env = bootstrap.validate_env_name(winrm_password_env)
+        winrm_destination_env = bootstrap.validate_env_name(winrm_destination_env)
+        owner_bind_host = bootstrap.validate_host(owner_bind_host)
+        if type(keepalive_seconds) is not int or not 1 <= keepalive_seconds <= 900:
+            fail("config_invalid")
+        if type(ready_timeout_seconds) is not int or not 1 <= ready_timeout_seconds <= 900:
+            fail("config_invalid")
+
+        owner_info = prepared_role_binary(state_path, state, "owner")
+        rw_info = prepared_role_binary(state_path, state, "rw_provider")
+        run_root = state_path.parent / ("runtime-" + coordination_run_id)
+        if run_root.exists() or run_root.is_symlink() or not _within(run_root, state_path.parent):
+            fail("path_invalid")
+        try:
+            run_root.mkdir(mode=0o700, parents=False, exist_ok=False)
+            run_root.chmod(0o700)
+            marker = run_root / OWNED_MARKER
+            marker.write_text("owned", encoding="ascii")
+            marker.chmod(0o600)
+        except OSError:
+            fail("path_invalid")
+
+        vault = bootstrap.SecretVault()
+        owner_process: bootstrap.LocalWebProcess | None = None
+        supervisor: RwSupervisor | None = None
+        observer: RemoteReadinessObserver | None = None
+        remote_result: bootstrap.RemoteRun | None = None
+        owner_stopped = False
+        owner_forced = False
+        runtime_removed = False
+        ro_result: dict[str, Any] | None = None
+        run_error: ControllerError | None = None
+        state_refresh_failed = False
+        state_after: dict[str, Any] = {
+            **state,
+            "status": "pending",
+            "run_status": "starting",
+            "owner_stopped": False,
+            "owner_forced": False,
+            "rw_ready": False,
+            "rw_completed": False,
+            "rw_contract_valid": False,
+            "ro_status": "unrun",
+            "ephemeral_released": False,
+            "runtime_removed": False,
+            "cleanup_pending": True,
+            "run_error_class": "none",
+        }
+        try:
+            write_state(state_path, state_after)
+            owner_spec = bootstrap.RoleSpec(
+                name="owner",
+                runner="local",
+                binary=owner_info["path"],
+                binary_sha256=owner_info["sha256"],
+                api_url_env=None,
+                admin_token_env=None,
+                destination_env=None,
+                bind_host=owner_bind_host,
+                winrm_host_env=None,
+                winrm_username_env=None,
+                winrm_password_env=None,
+            )
+            staged_owner = bootstrap.stage_role_binary(owner_spec, owner_info, run_root)
+            owner_spec = replace(owner_spec, binary=staged_owner)
+            rw_spec = bootstrap.RoleSpec(
+                name="rw_provider",
+                runner="winrm",
+                binary=rw_info["path"],
+                binary_sha256=rw_info["sha256"],
+                api_url_env=None,
+                admin_token_env=None,
+                destination_env=winrm_destination_env,
+                bind_host="127.0.0.1",
+                winrm_host_env=winrm_host_env,
+                winrm_username_env=winrm_username_env,
+                winrm_password_env=winrm_password_env,
+            )
+            staged_rw = bootstrap.stage_role_binary(rw_spec, rw_info, run_root)
+            rw_spec = replace(rw_spec, binary=staged_rw)
+
+            owner_process = bootstrap.LocalWebProcess(owner_spec, run_root, "owner", vault)
+            owner_process.start()
+            owner_client = owner_process.client()
+            fixture_path = owner_process.root / "fixture-a.bin"
+            actual_file_hash = write_fixture(fixture_path, expected_file_size)
+            if actual_file_hash != expected_file_hash:
+                fail("fixture_invalid")
+            share_id = owner_client.create_share(owner_process.root)
+            rw_key = vault.hold(owner_client.issue_key(share_id, "read_write"))
+            ro_key = vault.hold(owner_client.issue_key(share_id, "read_only"))
+
+            owner_url_template = os.environ.get(owner_api_url_env)
+            public_host_raw = os.environ.get(artifact_public_host_env)
+            if not owner_url_template or not public_host_raw:
+                fail("external_unavailable", "blocked", 2)
+            public_host = bootstrap.validate_host(public_host_raw)
+            if owner_process.base_url is None:
+                fail("process_start_failed")
+            owner_port = owner_process.base_url.rsplit(":", 1)[-1]
+            if not owner_port.isdecimal() or not 1 <= int(owner_port) <= 65535:
+                fail("config_invalid")
+            owner_url_raw = owner_url_template.replace("{port}", owner_port)
+            if "{" in owner_url_raw or "}" in owner_url_raw:
+                fail("config_invalid")
+            owner_url = vault.hold(owner_url_raw)
+            # Constructing this client validates the opaque endpoint format;
+            # it does not perform an extra login or retain the endpoint in
+            # state/evidence.
+            bootstrap.ApiClient(owner_url, vault)
+            destination = bootstrap.fresh_winrm_destination(rw_spec)
+            observer = RemoteReadinessObserver(expected_file_hash, expected_file_size, keepalive_seconds)
+
+            def run_rw(*, on_stdout: Callable[[bytes], None]) -> bootstrap.RemoteRun:
+                return bootstrap.run_winrm_member(
+                    rw_spec,
+                    staged_rw,
+                    rw_info["sha256"],
+                    owner_url,
+                    rw_key,
+                    destination,
+                    expected_file_hash,
+                    public_host,
+                    rw_info["size_bytes"],
+                    vault,
+                    keepalive_seconds=keepalive_seconds,
+                    expected_file_size=expected_file_size,
+                    on_stdout=on_stdout,
+                )
+
+            supervisor = RwSupervisor(run_rw, observer)
+            supervisor.start()
+            if not supervisor.wait_ready(ready_timeout_seconds):
+                fail("rw_not_ready", "pending", 2)
+            if not supervisor.is_alive():
+                fail("rw_not_ready", "pending", 2)
+            ready = supervisor.attestation(source_sha, coordination_run_id)
+            state_after = {
+                **state_after,
+                "run_status": "rw_ready",
+                "rw_ready": True,
+            }
+            write_state(state_path, state_after)
+            ready_at = observer.ready_at
+            if ready_at is None:
+                fail("rw_not_ready", "pending", 2)
+            remaining = keepalive_seconds - max(0.0, time.monotonic() - ready_at)
+            if remaining < 1:
+                fail("workflow_timeout", "pending", 2)
+            ro_result = self.execute_hosted_ro(
+                state_path,
+                ro_key,
+                rw_ready=ready,
+                secret_name="QSYNC_F_RO_" + coordination_run_id,
+                dispatch_utc=time.time(),
+                timeout_seconds=max(1, min(MAX_EXECUTE_WAIT_SECONDS, int(remaining))),
+                require_live_readiness=True,
+                finalize_status=False,
+            )
+            state_after, refresh_failed = _load_state_or(state_path, state_after)
+            state_refresh_failed = state_refresh_failed or refresh_failed
+            state_after = {
+                **state_after,
+                "run_status": "ro_complete",
+                "ro_status": "pass" if ro_result.get("status") == "pass" else "failed",
+                "ephemeral_released": ro_result.get("secret_released") is True,
+            }
+            write_state(state_path, state_after)
+        except ControllerError as error:
+            run_error = error
+        except bootstrap.HarnessError as error:
+            run_error = _controller_error_from_harness(error)
+        except Exception:
+            run_error = ControllerError("unexpected")
+
+        # A terminal remote result is the only point at which it is safe to
+        # stop the local owner.  If the WinRM call is still live at the bounded
+        # deadline, leave the state/runtime retained for reconciliation.
+        if supervisor is not None:
+            ready_at = observer.ready_at if observer is not None else None
+            if ready_at is not None:
+                remaining = max(0.0, keepalive_seconds - (time.monotonic() - ready_at))
+                remote_result = supervisor.wait_finished(remaining)
+            else:
+                remote_result = supervisor.wait_finished(0)
+        # If no remote call owns a live handle, stopping the local owner is
+        # safe even when setup failed before the supervisor could start.  A
+        # still-live supervisor deliberately keeps the owner/runtime retained
+        # for reconciliation instead of guessing that the remote child is
+        # gone.
+        remote_handle_live = supervisor is not None and supervisor.is_alive()
+        if remote_result is None and not remote_handle_live and owner_process is not None:
+            try:
+                owner_stopped = owner_process.stop()
+            except Exception:
+                owner_stopped = False
+            owner_forced = bool(owner_process.forced_termination)
+        if remote_result is not None:
+            state_after, refresh_failed = _load_state_or(state_path, state_after)
+            state_refresh_failed = state_refresh_failed or refresh_failed
+            state_after = {**state_after, "rw_completed": True}
+            if owner_process is not None:
+                try:
+                    owner_stopped = owner_process.stop()
+                except Exception:
+                    owner_stopped = False
+                owner_forced = bool(owner_process.forced_termination)
+            rw_contract_valid = bootstrap.remote_contract_is_complete(
+                remote_result,
+                rw_info["sha256"],
+                rw_info["size_bytes"],
+                expected_file_hash,
+                expected_file_size,
+                require_keepalive=True,
+            )
+        else:
+            rw_contract_valid = False
+        if owner_process is not None:
+            owner_forced = owner_forced or bool(owner_process.forced_termination)
+
+        current_state, refresh_failed = _load_state_or(state_path, state_after)
+        state_refresh_failed = state_refresh_failed or refresh_failed
+        ro_status = str((ro_result or {}).get("status") or current_state.get("ro_status") or "unrun")
+        secret_released = bool(
+            (ro_result or {}).get("secret_released") or current_state.get("ephemeral_released")
+        )
+        owner_drain_proven = bool(owner_process is not None and owner_process.graceful_drain_proven)
+        fully_clean = bool(
+            remote_result is not None
+            and rw_contract_valid
+            and owner_stopped
+            and not owner_forced
+            and owner_drain_proven
+            and ro_status == "pass"
+            and secret_released
+            and not state_refresh_failed
+        )
+        if fully_clean:
+            try:
+                marker = run_root / OWNED_MARKER
+                if (
+                    run_root.is_dir()
+                    and not run_root.is_symlink()
+                    and marker.is_file()
+                    and not marker.is_symlink()
+                ):
+                    shutil.rmtree(run_root)
+                    runtime_removed = not run_root.exists()
+            except OSError:
+                runtime_removed = False
+            fully_clean = runtime_removed
+        if run_error is None and state_refresh_failed:
+            run_error = ControllerError("state_invalid", "pending", 2)
+        if run_error is None and not fully_clean:
+            run_error = ControllerError("cleanup_incomplete", "pending", 2)
+        final_status = "pass" if run_error is None else ("pending" if run_error.status == "pending" else "failed")
+        final_error_class = run_error.error_class if run_error is not None else "none"
+        final_state = {
+            **current_state,
+            "status": final_status,
+            "run_status": final_status,
+            "owner_stopped": owner_stopped,
+            "owner_forced": owner_forced,
+            "owner_drain_proven": owner_drain_proven,
+            "rw_ready": bool(observer is not None and observer.is_ready()),
+            "rw_completed": remote_result is not None,
+            "rw_contract_valid": bool(rw_contract_valid),
+            "ro_status": ro_status,
+            "ephemeral_released": secret_released,
+            "runtime_removed": runtime_removed,
+            "cleanup_pending": not fully_clean,
+            "state_refresh_failed": state_refresh_failed,
+            "run_error_class": final_error_class,
+            "run_finished_utc": utc_now(),
+        }
+        try:
+            write_state(state_path, final_state)
+        except ControllerError:
+            if run_error is None:
+                run_error = ControllerError("state_invalid")
+                final_status = "failed"
+        if remote_result is not None or (owner_stopped and not remote_handle_live):
+            vault.clear()
+        if run_error is not None:
+            raise run_error
+        return {
+            "status": final_status,
+            "source_sha": source_sha,
+            "coordination_run_id": coordination_run_id,
+            "owner_stopped": owner_stopped,
+            "rw_ready": bool(observer is not None and observer.is_ready()),
+            "rw_completed": remote_result is not None,
+            "rw_contract_valid": bool(rw_contract_valid),
+            "ro_status": ro_status,
+            "secret_released": secret_released,
+            "runtime_removed": runtime_removed,
+        }
 
     def cleanup(self, state_path: Path, *, owner_stopped: bool, remote_stopped: bool, secret_released: bool) -> dict[str, bool]:
         state = load_state(state_path)
@@ -1146,6 +1918,20 @@ def _cli() -> argparse.ArgumentParser:
     execute.add_argument("--rw-ready-file", required=True, type=Path)
     execute.add_argument("--secret-name")
     execute.add_argument("--workflow", default=DEFAULT_WORKFLOW)
+    run = sub.add_parser("run")
+    run.add_argument("--repo", required=True)
+    run.add_argument("--ref", required=True)
+    run.add_argument("--state", required=True, type=Path)
+    run.add_argument("--owner-api-url-env", default="QSYNC_F_OWNER_API_URL")
+    run.add_argument("--artifact-public-host-env", default="QSYNC_F_ARTIFACT_PUBLIC_HOST")
+    run.add_argument("--winrm-host-env", default="QSYNC_F_WINRM_HOST")
+    run.add_argument("--winrm-username-env", default="QSYNC_F_WINRM_USERNAME")
+    run.add_argument("--winrm-password-env", default="QSYNC_F_WINRM_PASSWORD")
+    run.add_argument("--winrm-destination-env", default="QSYNC_F_WINRM_DESTINATION")
+    run.add_argument("--owner-bind-host", default="127.0.0.1")
+    run.add_argument("--keepalive-seconds", default=300, type=int)
+    run.add_argument("--ready-timeout-seconds", default=120, type=int)
+    run.add_argument("--workflow", default=DEFAULT_WORKFLOW)
     cleanup = sub.add_parser("cleanup")
     cleanup.add_argument("--repo", required=True)
     cleanup.add_argument("--ref", required=True)
@@ -1207,6 +1993,21 @@ def main(argv: list[str] | None = None) -> int:
                 secret_name=args.secret_name,
             )
             print(f"QSYNC_F_CONTROLLER|phase=execute|ok={str(result['status'] == 'pass').lower()}|status={result['status']}")
+            return 0 if result["status"] == "pass" else 2
+        if args.command == "run":
+            result = controller.run(
+                args.state,
+                owner_api_url_env=args.owner_api_url_env,
+                artifact_public_host_env=args.artifact_public_host_env,
+                winrm_host_env=args.winrm_host_env,
+                winrm_username_env=args.winrm_username_env,
+                winrm_password_env=args.winrm_password_env,
+                winrm_destination_env=args.winrm_destination_env,
+                owner_bind_host=args.owner_bind_host,
+                keepalive_seconds=args.keepalive_seconds,
+                ready_timeout_seconds=args.ready_timeout_seconds,
+            )
+            print(f"QSYNC_F_CONTROLLER|phase=run|ok={str(result['status'] == 'pass').lower()}|status={result['status']}")
             return 0 if result["status"] == "pass" else 2
         result = controller.cleanup(
             args.state,
