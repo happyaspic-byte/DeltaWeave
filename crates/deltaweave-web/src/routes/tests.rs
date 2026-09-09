@@ -6,6 +6,7 @@ use deltaweave_control::{
 };
 use http_body_util::BodyExt;
 use std::net::{SocketAddr, UdpSocket};
+use std::process::Command;
 use std::time::Duration;
 use tower::ServiceExt;
 
@@ -307,6 +308,24 @@ async fn managed_routes_keep_session_host_origin_csrf_and_input_boundaries() {
 
 #[tokio::test]
 async fn authenticated_pending_retry_preserves_request_and_replays_enrollment() {
+    const TEST_NAME: &str =
+        "routes::tests::authenticated_pending_retry_preserves_request_and_replays_enrollment";
+    if std::env::var("DELTAWEAVE_WEB_RETRY_TEST").ok().as_deref() != Some(TEST_NAME) {
+        let profile = tempfile::tempdir().unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env("DELTAWEAVE_WEB_RETRY_TEST", TEST_NAME)
+            .env("HOME", profile.path())
+            .env("USERPROFILE", profile.path())
+            .env("TMPDIR", temporary.path())
+            .env("TMP", temporary.path())
+            .env("TEMP", temporary.path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "isolated pending retry route test failed");
+        return;
+    }
     let h = Harness::new_with_options(ManagerOptions {
         managed_network: NetworkMode::DirectOnly,
         managed_bind: None,
