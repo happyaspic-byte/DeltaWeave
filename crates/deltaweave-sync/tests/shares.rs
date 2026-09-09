@@ -755,6 +755,110 @@ fn real_shared_rw_conflict_restart_and_cross_filesystem_owner_mutations() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn managed_rw_preserves_unseen_descendant_when_owner_deletes_ancestor() {
+    isolated(
+        "managed_rw_preserves_unseen_descendant_when_owner_deletes_ancestor",
+        || {
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                let base = tempfile::tempdir_in("/tmp").unwrap();
+                let state = tempfile::tempdir_in("/dev/shm").unwrap();
+                let owner = ShareService::open(
+                    base.path().join("owner-device"),
+                    NetworkMode::DirectOnly,
+                    None,
+                )
+                .await
+                .unwrap();
+                let member = ShareService::open(
+                    base.path().join("rw-device"),
+                    NetworkMode::DirectOnly,
+                    None,
+                )
+                .await
+                .unwrap();
+                let share = owner
+                    .create_owned_share(
+                        "unseen descendant".into(),
+                        base.path().join("owner-root"),
+                        state.path().join("owner-state"),
+                        None,
+                        0,
+                    )
+                    .await
+                    .unwrap();
+                fs::create_dir(base.path().join("owner-root/tree")).unwrap();
+                fs::write(
+                    base.path().join("owner-root/tree/known.txt"),
+                    b"owner-known",
+                )
+                .unwrap();
+                let grant = member
+                    .enroll(
+                        &share
+                            .issue_key(Permission::ReadWrite, None, owner.endpoint_addr())
+                            .unwrap(),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let mut cfg = config(base.path(), "rw-unseen");
+                cfg.state_root = state.path().join("member-state");
+                let engine =
+                    ManagedSyncEngine::open(&member, grant.owner, grant.share_id, cfg.clone())
+                        .unwrap();
+                engine.sync_read_write(None).await.unwrap();
+
+                // This child exists only on the member.  The owner then
+                // removes the known directory, so the merge must preserve the
+                // member-only bytes while retaining the directory namespace.
+                fs::write(
+                    base.path().join("rw-unseen-root/tree/new.txt"),
+                    b"member-unseen",
+                )
+                .unwrap();
+                fs::remove_file(base.path().join("owner-root/tree/known.txt")).unwrap();
+                fs::remove_dir(base.path().join("owner-root/tree")).unwrap();
+
+                let report = engine.sync_read_write(None).await.unwrap();
+                assert!(
+                    report
+                        .conflicts
+                        .iter()
+                        .any(|conflict| conflict.path.as_str() == "tree"),
+                    "ancestor deletion with an unseen child must be a namespace conflict"
+                );
+                for root in [
+                    base.path().join("owner-root"),
+                    base.path().join("rw-unseen-root"),
+                ] {
+                    assert!(root.join("tree").is_dir());
+                    assert_eq!(
+                        fs::read(root.join("tree/new.txt")).unwrap(),
+                        b"member-unseen"
+                    );
+                    assert!(!root.join("tree/known.txt").exists());
+                }
+
+                // A second round must converge without re-emitting the local
+                // child or resurrecting the causally deleted known child.
+                let second = engine.sync_read_write(None).await.unwrap();
+                assert_eq!(second.local_actions, 0);
+                assert_eq!(second.remote_actions, 0);
+                assert_eq!(
+                    fs::read(base.path().join("owner-root/tree/new.txt")).unwrap(),
+                    b"member-unseen"
+                );
+                assert!(!base.path().join("owner-root/tree/known.txt").exists());
+                engine.shutdown().await.unwrap();
+                member.shutdown().await.unwrap();
+                owner.shutdown().await.unwrap();
+            });
+        },
+    );
+}
+
 #[test]
 fn read_only_racing_recreation_is_preserved_and_never_propagated() {
     isolated(
