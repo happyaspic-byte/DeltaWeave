@@ -25,6 +25,68 @@ pub use service::{
     SupplierRegistrationGuard,
 };
 
+/// Authenticated phase of one share-scoped operation.  These events are
+/// additive to the legacy `TransferObserver`: roster/address observations are
+/// deliberately absent because they do not represent admitted payload work.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SharePhase {
+    Query,
+    Manifest,
+    Grant,
+    Swarm,
+    Drain,
+    Materialize,
+    Reject,
+    Done,
+}
+
+/// Direction of an authenticated share operation from the observing device.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferDirection {
+    Inbound,
+    Outbound,
+}
+
+/// Secret-free, share-scoped operation telemetry.  `bytes` is a verified
+/// delta and is emitted only after the corresponding CAS write or stream send
+/// has completed.  `grant` is the public nonce binding, never a bearer key.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ShareTransferEvent {
+    pub operation_id: [u8; 16],
+    pub share: ShareId,
+    pub peer: iroh::EndpointId,
+    pub phase: SharePhase,
+    pub direction: TransferDirection,
+    pub bytes: u64,
+    pub epoch: PermissionEpoch,
+    pub provider_epoch: Option<PermissionEpoch>,
+    pub grant: Option<GrantNonce>,
+}
+
+/// Optional non-blocking callback for authenticated share operation events.
+/// Observer panics are isolated from the transfer path just like the legacy
+/// observer.
+#[derive(Clone)]
+pub struct ShareTransferObserver(std::sync::Arc<dyn Fn(ShareTransferEvent) + Send + Sync>);
+
+impl std::fmt::Debug for ShareTransferObserver {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ShareTransferObserver(..)")
+    }
+}
+
+impl ShareTransferObserver {
+    pub fn new(callback: impl Fn(ShareTransferEvent) + Send + Sync + 'static) -> Self {
+        Self(std::sync::Arc::new(callback))
+    }
+
+    pub fn emit(&self, event: ShareTransferEvent) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (self.0)(event)));
+    }
+}
+
 pub const ALPN_V3: &[u8] = b"deltaweave/share/3";
 /// Separate grant-gated data protocol.  D2 registers the endpoint and
 /// rejects unauthenticated streams; E supplies the chunk adapter after the
