@@ -86,13 +86,29 @@ jobs:
           npm --prefix web test
           npm --prefix web run build
       - uses: dtolnay/rust-toolchain@1.91.0
+      - name: Parse managed private ACL script
+        shell: pwsh
+        run: |
+          $source = [System.IO.File]::ReadAllText('crates/deltaweave-control/src/private.rs')
+          $match = [System.Text.RegularExpressions.Regex]::Match($source, 'const WINDOWS_ACL_SCRIPT: &str = r#"(?<script>[\s\S]*?)"#;')
+          if (-not $match.Success) { Write-Output 'managed private ACL parser: source_marker_missing=1'; exit 1 }
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseInput($match.Groups['script'].Value, [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors.Count -ne 0) {
+            Write-Output ("managed private ACL parser: error_count={0}" -f $errors.Count)
+            exit 1
+          }
+          Write-Output 'managed private ACL parser: error_count=0'
       - name: Probe managed private ACL boundary
         continue-on-error: true
         shell: pwsh
         run: |
           $probe = Join-Path $env:RUNNER_TEMP 'deltaweave-private-acl-probe.exe'
           rustc --edition 2024 --test crates/deltaweave-control/src/private.rs -o $probe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $probe --exact tests::native_acl_preparation_is_idempotent_and_fails_closed --nocapture
+          exit $LASTEXITCODE
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
