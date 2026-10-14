@@ -99,7 +99,7 @@ jobs:
           Copy-Item ".\docs\assets" $package -Recurse
           Copy-Item ".\LICENSE" $package
           Compress-Archive -Path "$package\*" -DestinationPath "dist\$name.zip"
-      - uses: actions/upload-artifact@v7.0.1
+      - uses: actions/upload-artifact@v7.0.2
         with:
           name: windows-x86_64
           path: dist/*.zip
@@ -194,7 +194,7 @@ jobs:
             }
             END { exit invalid }
           '
-      - uses: actions/upload-artifact@v7.0.1
+      - uses: actions/upload-artifact@v7.0.2
         with:
           name: synology-${{ matrix.arch }}
           path: dist/*.tar.gz
